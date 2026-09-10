@@ -108,6 +108,13 @@ export const formatSendMessageError = (
         message: `Workspace is starting: ${error.message}`,
         errorType: "runtime_start_failed",
       };
+    case "context_budget_blocked":
+      return { message: error.message, errorType: "context_budget_blocked" };
+    case "context_budget_exceeded":
+      return {
+        message: `Request for ${error.model} is estimated at ${error.estimate} tokens, above the usable context budget of ${error.hardCeiling}. Shorten the request or choose a larger-context model.`,
+        errorType: "context_budget_blocked",
+      };
     case "unknown":
       return {
         message: error.raw,
@@ -125,6 +132,8 @@ export const formatSendMessageError = (
  * Stream-error payload helpers.
  */
 export interface StreamErrorPayload {
+  /** Internal per-attempt preflight failure; not part of the renderer wire payload. */
+  contextBudgetExceeded?: Extract<SendMessageError, { type: "context_budget_exceeded" }>;
   messageId: string;
   error: string;
   errorType?: StreamErrorType;

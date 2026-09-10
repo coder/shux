@@ -13,13 +13,18 @@ import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import "./styles/globals.css";
 
-function TerminalWindowContent(props: { workspaceId: string; sessionId: string }) {
+function TerminalWindowContent(props: {
+  workspaceId: string;
+  sessionId: string;
+  initialTitle?: string;
+}) {
   const { api } = useAPI();
 
   return (
     <TerminalView
       workspaceId={props.workspaceId}
       sessionId={props.sessionId}
+      initialTitle={props.initialTitle}
       visible={true}
       onExit={() => {
         api?.terminal.closeWindow({ workspaceId: props.workspaceId }).catch((err) => {
@@ -42,6 +47,7 @@ installWindowOpenLocalhostProxyNormalization();
 const params = new URLSearchParams(window.location.search);
 const workspaceId = params.get("workspaceId");
 const sessionId = params.get("sessionId");
+const initialTitle = params.get("title") ?? undefined;
 
 if (!workspaceId || !sessionId) {
   document.body.innerHTML = `
@@ -58,7 +64,11 @@ if (!workspaceId || !sessionId) {
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <APIProvider>
       <TerminalRouterProvider>
-        <TerminalWindowContent workspaceId={workspaceId} sessionId={sessionId} />
+        <TerminalWindowContent
+          workspaceId={workspaceId}
+          sessionId={sessionId}
+          initialTitle={initialTitle}
+        />
       </TerminalRouterProvider>
     </APIProvider>
   );

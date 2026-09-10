@@ -1,6 +1,6 @@
 /**
- * Flush-aware process exit shared by headless CLI entry points (mux workflow,
- * mux trust). Dependency-free so src/cli/index.ts can import it statically
+ * Flush-aware process exit shared by headless CLI entry points (xum workflow,
+ * xum trust). Dependency-free so src/cli/index.ts can import it statically
  * without defeating its lazy-loading of heavy subcommand modules.
  */
 export function exitAfterStdoutFlush(exitCode: number): void {

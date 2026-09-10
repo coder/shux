@@ -267,7 +267,7 @@ export const HyperEdgeCaseGallery: AppStory = {
               toolCalls: [
                 createPendingTool("gallery-active-read", "file_read", { path: "src/App.tsx" }),
                 createPendingTool("gallery-active-search", "web_search", {
-                  query: "Mux transcript density",
+                  query: "Xum transcript density",
                 }),
               ],
             }),

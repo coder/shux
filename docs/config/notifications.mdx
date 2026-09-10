@@ -5,7 +5,7 @@ description: Configure how agents notify you about important events
 
 ## Overview
 
-Mux can send system notifications to alert you about important events. Notifications appear as native OS notifications (macOS Notification Center, Windows Toast, Linux notification daemon) and work even when Mux is in the background. Clicking a notification takes you directly to the workspace that sent it.
+Xum can send system notifications to alert you about important events. Notifications appear as native OS notifications (macOS Notification Center, Windows Toast, Linux notification daemon) and work even when Xum is in the background. Clicking a notification takes you directly to the workspace that sent it.
 
 There are two ways to receive notifications:
 
@@ -53,7 +53,7 @@ See [Instruction Files](/agents/instruction-files) for more on scoped instructio
 If you have an agent that should not interrupt you (e.g. a `review` agent), remove `notify` from that agent's tool policy:
 
 ```md
-# .mux/agents/review.md
+# .xum/agents/review.md
 
 ---
 
@@ -81,7 +81,7 @@ Notifications use your operating system's native notification system:
 | Windows  | Toast notifications                             |
 | Linux    | Desktop notifications (via notification daemon) |
 
-Notification settings (sound, Do Not Disturb, etc.) are controlled by your OS preferences, not Mux.
+Notification settings (sound, Do Not Disturb, etc.) are controlled by your OS preferences, not Xum.
 
 ## Tool definition
 

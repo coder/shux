@@ -8,6 +8,7 @@ import React, {
   useState,
   useRef,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useImperativeHandle,
   forwardRef,
@@ -36,6 +37,15 @@ import {
 } from "@/common/utils/ai/models";
 import { Button } from "../Button/Button";
 import { modelMatchesQuery } from "./modelFilter";
+import { DESKTOP_TITLEBAR_HEIGHT_PX } from "@/browser/hooks/useDesktopTitlebar";
+
+// The dropdown opens upward, so in short windows it can extend past the top of
+// the viewport and under the title/menu bar (a window-drag region in desktop
+// mode that swallows clicks). Clamp its height to the space above the trigger,
+// keeping clear of the bar.
+const PANEL_TOP_CLEARANCE_PX = DESKTOP_TITLEBAR_HEIGHT_PX + 8;
+// Below this the panel is unusable; prefer slight bar overlap in pathological layouts.
+const PANEL_MIN_HEIGHT_PX = 150;
 
 interface ModelSelectorProps {
   value: string;
@@ -101,6 +111,22 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
       setShowAllModels(false);
       setHighlightedIndex(0);
     }, []);
+
+    // Clamp the panel to the space above the trigger so it stays fully visible.
+    const [panelMaxHeight, setPanelMaxHeight] = useState<number | null>(null);
+    useLayoutEffect(() => {
+      if (!isOpen) return;
+
+      const updatePanelMaxHeight = () => {
+        const triggerTop = containerRef.current?.getBoundingClientRect().top;
+        if (triggerTop === undefined) return;
+        setPanelMaxHeight(Math.max(triggerTop - PANEL_TOP_CLEARANCE_PX, PANEL_MIN_HEIGHT_PX));
+      };
+
+      updatePanelMaxHeight();
+      window.addEventListener("resize", updatePanelMaxHeight);
+      return () => window.removeEventListener("resize", updatePanelMaxHeight);
+    }, [isOpen]);
 
     // Close dropdown on outside click
     useEffect(() => {
@@ -377,13 +403,14 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
         {/* Dropdown content - rendered inline for testability */}
         {isOpen && (
           <div
+            style={panelMaxHeight != null ? { maxHeight: panelMaxHeight } : undefined}
             className={cn(
-              "absolute bottom-full left-0 z-[1020] mb-1 w-82",
+              "absolute bottom-full left-0 z-[1020] mb-1 flex w-82 flex-col",
               COMPOSER_PICKER_PANEL_CLASS
             )}
           >
             {/* Search input */}
-            <div className="border-border-light border-b px-2.5 py-1.5">
+            <div className="border-border-light shrink-0 border-b px-2.5 py-1.5">
               <input
                 ref={inputRef}
                 type="text"
@@ -397,7 +424,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
             </div>
 
             {/* Scrollable list */}
-            <div ref={listRef} className="max-h-[280px] overflow-y-auto py-1">
+            <div ref={listRef} className="max-h-[280px] min-h-0 overflow-y-auto py-1">
               {filteredModels.length === 0 ? (
                 <div className="text-muted py-2 text-center text-[10px]">No matching models</div>
               ) : (
@@ -540,7 +567,7 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
 
             {/* Footer actions (last row in dropdown) */}
             {(hiddenModels.length > 0 || onOpenSettings) && (
-              <div className="border-border-light flex flex-col gap-1 border-t py-1">
+              <div className="border-border-light flex shrink-0 flex-col gap-1 border-t py-1">
                 {hiddenModels.length > 0 && (
                   <button
                     type="button"

@@ -11,13 +11,13 @@ let cleanupDom: (() => void) | null = null;
 let apiStatus: "auth_required" | "connecting" | "error" = "auth_required";
 let apiError: string | null = "Authentication required";
 
-void mock.module("@/browser/assets/logos/mux-logo-dark.svg?react", () => ({
+void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,
-  default: () => <svg data-testid="mux-logo-dark" />,
+  default: () => <svg data-testid="xum-logo-dark" />,
 }));
-void mock.module("@/browser/assets/logos/mux-logo-light.svg?react", () => ({
+void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
   __esModule: true,
-  default: () => <svg data-testid="mux-logo-light" />,
+  default: () => <svg data-testid="xum-logo-light" />,
 }));
 
 // AppLoader imports App, which pulls in Lottie-based components. In happy-dom,
@@ -113,7 +113,7 @@ describe("AppLoader", () => {
 
     const { getByTestId, queryByText } = render(<AppLoader />);
 
-    expect(queryByText("Loading Mux")).toBeNull();
+    expect(queryByText("Loading Xum")).toBeNull();
     expect(getByTestId("AuthTokenModalMock").textContent).toContain("Authentication required");
   });
 

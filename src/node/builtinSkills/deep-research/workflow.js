@@ -2,6 +2,22 @@ export const meta = {
   name: "Deep Research",
   description:
     "Fan out web research, fetch sources, adversarially verify claims, and synthesize a cited report.",
+  phases: [
+    { name: "scope", label: "Scope", description: "Frame the question and pick research angles" },
+    {
+      name: "search-fetch",
+      label: "Search & Fetch",
+      description: "Parallel searches, then fetch and extract sources",
+      parallel: true,
+    },
+    {
+      name: "verify",
+      label: "Verify",
+      description: "Adversarial verification votes per claim",
+      parallel: true,
+    },
+    { name: "synthesize", label: "Synthesize", description: "Write the cited report" },
+  ],
   argsSchema: {
     type: "object",
     additionalProperties: false,

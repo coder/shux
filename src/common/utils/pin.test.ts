@@ -1,8 +1,113 @@
 import { describe, expect, it } from "bun:test";
 
-import { comparePinnedOrder, reassignPinnedTimestamps, recomposePinnedOrder } from "./pin";
+import {
+  appendPinnedTimestamp,
+  comparePinnedOrder,
+  nextMonotonicPinnedAtIso,
+  reassignPinnedTimestamps,
+  recomposePinnedOrder,
+} from "./pin";
+
+describe("nextMonotonicPinnedAtIso", () => {
+  it("appends strictly after the latest existing pin across all values", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["2026-01-01T00:00:00.000Z", "2026-01-03T00:00:00.000Z", undefined],
+      Date.parse("2026-01-02T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-01-03T00:00:00.001Z");
+  });
+
+  it("uses the current time when it already exceeds every pin", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["2026-01-01T00:00:00.000Z"],
+      Date.parse("2026-02-01T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-02-01T00:00:00.000Z");
+  });
+
+  it("clamps generated successors so they stay sortable and scannable at the boundary", () => {
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const generated = nextMonotonicPinnedAtIso([saneMax], Date.parse("2026-01-01T00:00:00.000Z"));
+    // Clamped to the sane maximum rather than escaping into a value that
+    // ordering and later scans would classify as corrupted.
+    expect(generated).toBe(saneMax);
+    expect(nextMonotonicPinnedAtIso([generated], Date.parse("2026-01-01T00:00:00.000Z"))).toBe(
+      saneMax
+    );
+    const rows = [
+      { id: "clamped", pinnedAt: generated },
+      { id: "normal", pinnedAt: "2026-01-01T00:00:00.000Z" },
+    ];
+    expect(rows.sort(comparePinnedOrder).map((row) => row.id)).toEqual(["normal", "clamped"]);
+  });
+
+  it("ignores corrupted timestamps whose +1ms successor is unrepresentable", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["+275760-09-13T00:00:00.000Z", "2026-01-03T00:00:00.000Z"],
+      Date.parse("2026-01-02T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-01-03T00:00:00.001Z");
+  });
+});
+
+describe("appendPinnedTimestamp", () => {
+  it("mints max+1ms without touching existing pins", () => {
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [{ id: "a", pinnedAt: "2026-01-03T00:00:00.000Z" }],
+      Date.parse("2026-01-01T00:00:00.000Z")
+    );
+    expect(changed.size).toBe(0);
+    expect(pinnedAt).toBe("2026-01-03T00:00:00.001Z");
+  });
+
+  it("detects capped collisions by parsed value, not string equality", () => {
+    const capMs = 8_640_000_000_000_000 - 1;
+    // Noncanonical representation of the cap (offset form instead of Z).
+    const noncanonicalCap = "+275760-09-12T23:59:59.999+00:00";
+    expect(new Date(noncanonicalCap).getTime()).toBe(capMs);
+    const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [{ id: "capped", pinnedAt: noncanonicalCap }],
+      nowMs
+    );
+    expect(pinnedAt).toBe(new Date(nowMs).toISOString());
+    expect(changed.get("capped")).toBe(new Date(nowMs - 1).toISOString());
+  });
+
+  it("renumbers all pins when the sane key range saturates, keeping keys unique and ordered", () => {
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [
+        { id: "old", pinnedAt: "2026-01-01T00:00:00.000Z" },
+        { id: "capped", pinnedAt: saneMax },
+      ],
+      nowMs
+    );
+    // The new pin gets a strictly greatest unique key and existing pins are
+    // renumbered below it in their current visual order.
+    expect(pinnedAt).toBe(new Date(nowMs).toISOString());
+    expect(changed.get("old")).toBe(new Date(nowMs - 2).toISOString());
+    expect(changed.get("capped")).toBe(new Date(nowMs - 1).toISOString());
+    const keys = [changed.get("old"), changed.get("capped"), pinnedAt];
+    expect(new Set(keys).size).toBe(3);
+  });
+});
 
 describe("comparePinnedOrder", () => {
+  it("sorts corrupted boundary timestamps first so new pins still append last", () => {
+    const rows = [
+      { id: "new-pin", pinnedAt: "2026-01-02T00:00:00.000Z" },
+      { id: "corrupt", pinnedAt: "+275760-09-13T00:00:00.000Z" },
+      { id: "old-pin", pinnedAt: "2026-01-01T00:00:00.000Z" },
+    ];
+    expect(rows.sort(comparePinnedOrder).map((row) => row.id)).toEqual([
+      "corrupt",
+      "old-pin",
+      "new-pin",
+    ]);
+  });
+
   it("sorts by pinnedAt ascending with id tie-break", () => {
     const rows = [
       { id: "b", pinnedAt: "2026-01-01T00:00:02.000Z" },
@@ -22,6 +127,35 @@ describe("comparePinnedOrder", () => {
 });
 
 describe("reassignPinnedTimestamps", () => {
+  it("compacts capped ties below the sane maximum so reorders still apply", () => {
+    const capMs = 8_640_000_000_000_000 - 1;
+    const capIso = new Date(capMs).toISOString();
+    const changed = reassignPinnedTimestamps(
+      ["b", "a"],
+      new Map([
+        ["a", capIso],
+        ["b", capIso],
+      ])
+    );
+    // Both share the cap, so the id tie-break renders a before b; requesting
+    // b first must yield strictly increasing unique keys within the cap.
+    expect(changed.get("b")).toBe(new Date(capMs - 1).toISOString());
+    expect(changed.has("a")).toBe(false);
+  });
+
+  it("re-deals corrupted boundary timestamps instead of overflowing the Date range", () => {
+    const boundary = "+275760-09-13T00:00:00.000Z";
+    const changed = reassignPinnedTimestamps(
+      ["a", "b"],
+      new Map([
+        ["a", boundary],
+        ["b", boundary],
+      ])
+    );
+    expect(changed.get("a")).toBe("1970-01-01T00:00:00.000Z");
+    expect(changed.get("b")).toBe("1970-01-01T00:00:00.001Z");
+  });
+
   const iso = (ms: number) => new Date(ms).toISOString();
 
   it("re-deals the existing pool onto the new order and reports only changed entries", () => {

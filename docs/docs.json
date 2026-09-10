@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "maple",
-  "name": "Mux",
+  "name": "Xum",
   "logo": {
     "light": "/img/logo-black.svg",
     "dark": "/img/logo-white.svg"
@@ -47,13 +47,14 @@
               "workspaces",
               "workspaces/scratch-chats",
               "workspaces/fork",
-              "workspaces/muxignore",
+              "workspaces/xumignore",
               {
                 "group": "Compaction",
                 "pages": [
                   "workspaces/compaction",
                   "workspaces/compaction/manual",
                   "workspaces/compaction/automatic",
+                  "workspaces/compaction/token-budget",
                   "workspaces/compaction/customization"
                 ]
               },
@@ -117,6 +118,7 @@
           {
             "group": "Reference",
             "pages": [
+              "reference/mux-compatibility",
               "reference/debugging",
               "reference/telemetry",
               "reference/storybook",
@@ -145,6 +147,7 @@
     { "source": "/why-parallelize", "destination": "/getting-started/why-parallelize" },
     { "source": "/mux-codes", "destination": "/getting-started/mux-gateway" },
     { "source": "/getting-started/mux-codes", "destination": "/getting-started/mux-gateway" },
+    { "source": "/workspaces/muxignore", "destination": "/workspaces/xumignore" },
     { "source": "/fork", "destination": "/workspaces/fork" },
     { "source": "/init-hooks", "destination": "/hooks/init" },
     { "source": "/agent-skills", "destination": "/agents/agent-skills" },

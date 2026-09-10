@@ -4,8 +4,9 @@ import * as fsPromises from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
+import { createStreamLifecycleMocks } from "@/node/services/agentSession.testHarness";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as gitModule from "@/node/git";
@@ -71,10 +72,11 @@ interface WorkspaceServiceTestOptions {
   aiService?: AIService;
   initStateManager?: InitStateManager;
   experimentsEnabled?: boolean;
+  secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
 }
 function createMockAIService(metadata?: WorkspaceMetadata): AIService {
   return {
-    isStreaming: mock(() => false),
+    ...createStreamLifecycleMocks(),
     getWorkspaceMetadata: mock(() => Promise.resolve(metadata ? Ok(metadata) : Ok(undefined))),
     on: mock(() => undefined),
     off: mock(() => undefined),
@@ -91,7 +93,10 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
     undefined,
     undefined,
     undefined,
-    createMockExperimentsService(options.experimentsEnabled ?? true)
+    createMockExperimentsService(options.experimentsEnabled ?? true),
+    undefined,
+    undefined,
+    options.secretsStore
   );
 }
 interface ExecuteBashHarnessOptions {
@@ -107,7 +112,8 @@ interface ExecuteBashHarnessOptions {
   trustedProjects?: Array<[string, boolean]>;
   runtimeWorkspacePaths?: Record<string, string>;
   findWorkspaceProjectPath?: string;
-  getEffectiveSecrets?: Config["getEffectiveSecrets"];
+  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
+  secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
   onCreateRuntime?: (
     projectPath: string,
     options: Parameters<typeof runtimeFactory.createRuntime>[1]
@@ -180,9 +186,15 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
       getInitState: mock(() => undefined),
       waitForInit: waitForInitMock,
     } as unknown as InitStateManager,
+    secretsStore:
+      options.secretsStore ??
+      ({ getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []) } satisfies Pick<
+        SecretsStore,
+        "getEffectiveSecrets"
+      >),
     config: {
       srcDir,
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => ({
         projectPath: options.findWorkspaceProjectPath ?? projectAPath,
         workspacePath: primaryWorkspacePath,
@@ -195,7 +207,6 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
           ])
         ),
       })),
-      getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []),
     },
   });
   return {
@@ -388,7 +399,9 @@ describe("WorkspaceService executeBash runtime selection", () => {
       historyService,
       workspaceId,
       workspaceName,
-      getEffectiveSecrets: getEffectiveSecretsMock as Config["getEffectiveSecrets"],
+      secretsStore: {
+        getEffectiveSecrets: getEffectiveSecretsMock,
+      },
     });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");
@@ -495,13 +508,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       } as unknown as InitStateManager,
       config: {
         srcDir: "/tmp/src",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         findWorkspace: mock(() => ({ projectPath, workspacePath })),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
         })),
-        getEffectiveSecrets: mock(() => []),
       },
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
     try {
       const result = await workspaceService.executeBash(workspaceId, "pwd");
@@ -710,12 +723,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           );
         }),
-        getEffectiveSecrets: mock(() => []),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -877,12 +889,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getEffectiveSecrets: mock(() => []),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1028,12 +1039,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
         srcDir,
         generateStableId: mock(() => workspaceId),
         loadConfigOrDefault: mock(() => configState),
-        getEffectiveSecrets: mock(() => []),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1174,12 +1184,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getEffectiveSecrets: mock(() => []),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1289,11 +1298,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
         rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1333,10 +1342,10 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1381,6 +1390,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const removeWorkspaceMock = mock(() => Promise.resolve());
       const mockConfig: Partial<Config> = {
+        rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([
@@ -1388,7 +1398,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -1476,6 +1486,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const removeWorkspaceMock = mock(() => Promise.resolve());
       const mockConfig: Partial<Config> = {
+        rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([
@@ -1483,7 +1494,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -1632,7 +1643,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
               : []
           );
         }),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -1673,13 +1684,13 @@ describe("WorkspaceService multi-project lifecycle", () => {
           if (options?.projectPath === projectAPath) {
             return {
               renameWorkspace: renameWorkspaceAMock,
-              getMuxHome: mock(() => rootDir),
+              getXumHome: mock(() => rootDir),
             } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
           }
           if (options?.projectPath === projectBPath) {
             return {
               renameWorkspace: renameWorkspaceBMock,
-              getMuxHome: mock(() => rootDir),
+              getXumHome: mock(() => rootDir),
             } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
           }
           throw new Error(`Unexpected projectPath: ${options?.projectPath ?? "missing"}`);
@@ -1805,7 +1816,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
               : []
           );
         }),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -1846,13 +1857,13 @@ describe("WorkspaceService multi-project lifecycle", () => {
           if (options?.projectPath === projectAPath) {
             return {
               renameWorkspace: renameWorkspaceAMock,
-              getMuxHome: mock(() => rootDir),
+              getXumHome: mock(() => rootDir),
             } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
           }
           if (options?.projectPath === projectBPath) {
             return {
               renameWorkspace: renameWorkspaceBMock,
-              getMuxHome: mock(() => rootDir),
+              getXumHome: mock(() => rootDir),
             } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
           }
           throw new Error(`Unexpected projectPath: ${options?.projectPath ?? "missing"}`);
@@ -1958,7 +1969,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -2151,7 +2162,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -2398,7 +2409,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),

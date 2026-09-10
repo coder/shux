@@ -6,11 +6,11 @@ description: Block dangerous commands, lint after edits, and set up your environ
 <Note>Tool hooks are experimental. Expect breaking changes while we iterate.</Note>
 
 <Tip>
-  **The easiest way to set up tool hooks is to ask Mux.** Just tell Mux what you want (e.g., "lint
+  **The easiest way to set up tool hooks is to ask Xum.** Just tell Xum what you want (e.g., "lint
   Python files after edits" or "block force pushes") and it will create the hook scripts for you.
 </Tip>
 
-Tool hooks let you run your own scripts before and after Mux tool executions.
+Tool hooks let you run your own scripts before and after Xum tool executions.
 
 ## What do you want to do?
 
@@ -30,14 +30,14 @@ Tool hooks let you run your own scripts before and after Mux tool executions.
 
 ## Block dangerous commands
 
-Create `.mux/tool_pre` to validate commands before they run. Exit non-zero to block:
+Create `.xum/tool_pre` to validate commands before they run. Exit non-zero to block:
 
 ```bash
 #!/usr/bin/env bash
-# .mux/tool_pre - runs before every tool
+# .xum/tool_pre - runs before every tool
 
-if [[ "$MUX_TOOL" == "bash" ]]; then
-  script="$MUX_TOOL_INPUT_SCRIPT"
+if [[ "$XUM_TOOL" == "bash" ]]; then
+  script="$XUM_TOOL_INPUT_SCRIPT"
 
   if echo "$script" | grep -q 'push.*--force'; then
     echo "❌ Force push blocked" >&2
@@ -54,7 +54,7 @@ exit 0  # Allow tool to run
 ```
 
 ```bash
-chmod +x .mux/tool_pre
+chmod +x .xum/tool_pre
 ```
 
 The agent sees your error message and can adjust its approach.
@@ -63,15 +63,15 @@ The agent sees your error message and can adjust its approach.
 
 ## Lint after file edits
 
-Create `.mux/tool_post` to run validation after tools complete:
+Create `.xum/tool_post` to run validation after tools complete:
 
 ```bash
 #!/usr/bin/env bash
-# .mux/tool_post - runs after every tool
+# .xum/tool_post - runs after every tool
 set -euo pipefail
 
-[[ "$MUX_TOOL" == file_edit_* ]] || exit 0
-file="${MUX_TOOL_INPUT_FILE_PATH:-}"
+[[ "$XUM_TOOL" == file_edit_* ]] || exit 0
+file="${XUM_TOOL_INPUT_FILE_PATH:-}"
 [[ -n "$file" ]] || exit 0
 
 case "$file" in
@@ -85,7 +85,7 @@ esac
 ```
 
 ```bash
-chmod +x .mux/tool_post
+chmod +x .xum/tool_post
 ```
 
 <details>
@@ -93,11 +93,11 @@ chmod +x .mux/tool_post
 
 ```bash
 #!/usr/bin/env bash
-# .mux/tool_post - runs after every tool
+# .xum/tool_post - runs after every tool
 set -euo pipefail
 
-[[ "$MUX_TOOL" == file_edit_* ]] || exit 0
-file="${MUX_TOOL_INPUT_FILE_PATH:-}"
+[[ "$XUM_TOOL" == file_edit_* ]] || exit 0
+file="${XUM_TOOL_INPUT_FILE_PATH:-}"
 [[ "$file" == *.go ]] || exit 0
 
 gofmt -w "$file"
@@ -117,10 +117,10 @@ Lint errors appear in `hook_output` and the agent can fix them.
 
 ## Set up environment
 
-Create `.mux/tool_env` to configure your shell environment. This file is **sourced** before every `bash` tool call:
+Create `.xum/tool_env` to configure your shell environment. This file is **sourced** before every `bash` tool call:
 
 ```bash
-# .mux/tool_env - sourced before bash commands
+# .xum/tool_env - sourced before bash commands
 
 # direnv
 eval "$(direnv export bash 2>/dev/null)" || true
@@ -148,19 +148,19 @@ All hooks receive these environment variables:
 
 | Variable              | Description                                                      |
 | --------------------- | ---------------------------------------------------------------- |
-| `MUX_TOOL`            | Tool name: `bash`, `file_edit_replace_string`, `file_read`, etc. |
-| `MUX_WORKSPACE_ID`    | Current workspace identifier                                     |
-| `MUX_TOOL_INPUT_PATH` | Path to file containing full tool input (always set)             |
+| `XUM_TOOL`            | Tool name: `bash`, `file_edit_replace_string`, `file_read`, etc. |
+| `XUM_WORKSPACE_ID`    | Current workspace identifier                                     |
+| `XUM_TOOL_INPUT_PATH` | Path to file containing full tool input (always set)             |
 
-Mux flattens the tool input into `MUX_TOOL_INPUT_<...>` environment variables (see the appendix below). Fields longer than 8KB are omitted—use `MUX_TOOL_INPUT_PATH` for full access.
+Xum flattens the tool input into `XUM_TOOL_INPUT_<...>` environment variables (see the appendix below). Fields longer than 8KB are omitted—use `XUM_TOOL_INPUT_PATH` for full access.
 
 **Post-hook only (`tool_post`):**
 
 | Variable               | Description                              |
 | ---------------------- | ---------------------------------------- |
-| `MUX_TOOL_RESULT_PATH` | Path to file containing full tool result |
+| `XUM_TOOL_RESULT_PATH` | Path to file containing full tool result |
 
-Flattened result fields are available as `MUX_TOOL_RESULT_<...>`. Fields longer than 8KB are omitted—use `MUX_TOOL_RESULT_PATH` for full access.
+Flattened result fields are available as `XUM_TOOL_RESULT_<...>`. Fields longer than 8KB are omitted—use `XUM_TOOL_RESULT_PATH` for full access.
 
 </Accordion>
 
@@ -175,10 +175,10 @@ Flattened result fields are available as `MUX_TOOL_RESULT_<...>`. Fields longer 
 
 <Accordion title="Hook Priority & Location">
 
-Mux searches for each hook file in this order:
+Xum searches for each hook file in this order:
 
-1. Project-level: `.mux/<hook>`
-2. User-level: `~/.mux/<hook>`
+1. Project-level: `.xum/<hook>`
+2. User-level: `~/.xum/<hook>`
 
 This applies to `tool_pre`, `tool_post`, and `tool_env`.
 
@@ -196,7 +196,7 @@ Keep hooks fast—if you need longer operations, consider running them asynchron
 
 <Accordion title="Comparison">
 
-| Feature        | `.mux/tool_pre`          | `.mux/tool_post`      | `.mux/tool_env`         |
+| Feature        | `.xum/tool_pre`          | `.xum/tool_post`      | `.xum/tool_env`         |
 | -------------- | ------------------------ | --------------------- | ----------------------- |
 | **Purpose**    | Block dangerous commands | Lint/validate results | Environment setup       |
 | **Runs**       | Before tool              | After tool            | Sourced in bash shell   |
@@ -207,13 +207,13 @@ Keep hooks fast—if you need longer operations, consider running them asynchron
 
 <Accordion title="Appendix: Tool input env vars (auto-generated)">
 
-Mux also provides flattened tool input env vars so hook scripts can stay compact.
+Xum also provides flattened tool input env vars so hook scripts can stay compact.
 
-- Scalars become `MUX_TOOL_INPUT_<FIELD>`
-- Nested objects become `MUX_TOOL_INPUT_<PARENT>_<CHILD>`
+- Scalars become `XUM_TOOL_INPUT_<FIELD>`
+- Nested objects become `XUM_TOOL_INPUT_<PARENT>_<CHILD>`
 - Arrays also include `..._COUNT` and per-index variables like `..._<INDEX>`
 
-If a value is too large for the environment, it may be omitted (not set). Mux also caps the number of flattened env vars and array elements to keep hook execution reliable.
+If a value is too large for the environment, it may be omitted (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.
 
 {/* BEGIN TOOL_HOOK_ENV_VARS */}
 
@@ -222,7 +222,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                   | JSON path  | Type   | Description |
 | ------------------------- | ---------- | ------ | ----------- |
-| `MUX_TOOL_INPUT_QUESTION` | `question` | string | —           |
+| `XUM_TOOL_INPUT_QUESTION` | `question` | string | —           |
 
 </details>
 
@@ -231,8 +231,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                          | JSON path        | Type   | Description |
 | -------------------------------- | ---------------- | ------ | ----------- |
-| `MUX_TOOL_INPUT_REPORT_MARKDOWN` | `reportMarkdown` | string | —           |
-| `MUX_TOOL_INPUT_TITLE`           | `title`          | string | —           |
+| `XUM_TOOL_INPUT_REPORT_MARKDOWN` | `reportMarkdown` | string | —           |
+| `XUM_TOOL_INPUT_TITLE`           | `title`          | string | —           |
 
 </details>
 
@@ -241,10 +241,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                    | JSON path  | Type    | Description                                                                                                        |
 | -------------------------- | ---------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_CONFIRM`   | `confirm`  | boolean | Must be true to confirm deletion                                                                                   |
-| `MUX_TOOL_INPUT_FILE_PATH` | `filePath` | string  | Relative file path within the skill directory to delete. Required when target is 'file'                            |
-| `MUX_TOOL_INPUT_NAME`      | `name`     | string  | Skill name to delete                                                                                               |
-| `MUX_TOOL_INPUT_TARGET`    | `target`   | enum    | Deletion target: 'file' to delete a specific file, 'skill' to remove the entire skill directory (defaults to file) |
+| `XUM_TOOL_INPUT_CONFIRM`   | `confirm`  | boolean | Must be true to confirm deletion                                                                                   |
+| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string  | Relative file path within the skill directory to delete. Required when target is 'file'                            |
+| `XUM_TOOL_INPUT_NAME`      | `name`     | string  | Skill name to delete                                                                                               |
+| `XUM_TOOL_INPUT_TARGET`    | `target`   | enum    | Deletion target: 'file' to delete a specific file, 'skill' to remove the entire skill directory (defaults to file) |
 
 </details>
 
@@ -253,7 +253,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                               | JSON path             | Type    | Description                                                                                           |
 | ------------------------------------- | --------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_INCLUDE_UNADVERTISED` | `includeUnadvertised` | boolean | When true, includes skills hidden from the index (advertise: false or disable-model-invocation: true) |
+| `XUM_TOOL_INPUT_INCLUDE_UNADVERTISED` | `includeUnadvertised` | boolean | When true, includes skills hidden from the index (advertise: false or disable-model-invocation: true) |
 
 </details>
 
@@ -262,7 +262,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var               | JSON path | Type   | Description                                       |
 | --------------------- | --------- | ------ | ------------------------------------------------- |
-| `MUX_TOOL_INPUT_NAME` | `name`    | string | Skill name (directory name under the skills root) |
+| `XUM_TOOL_INPUT_NAME` | `name`    | string | Skill name (directory name under the skills root) |
 
 </details>
 
@@ -271,10 +271,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                    | JSON path  | Type   | Description                                                                    |
 | -------------------------- | ---------- | ------ | ------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path to the file within the skill directory (relative)                         |
-| `MUX_TOOL_INPUT_LIMIT`     | `limit`    | number | Number of lines to return from offset (optional, returns all if not specified) |
-| `MUX_TOOL_INPUT_NAME`      | `name`     | string | Skill name (directory name under the skills root)                              |
-| `MUX_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based starting line number (optional, defaults to 1)                         |
+| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Path to the file within the skill directory (relative)                         |
+| `XUM_TOOL_INPUT_LIMIT`     | `limit`    | number | Number of lines to return from offset (optional, returns all if not specified) |
+| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill name (directory name under the skills root)                              |
+| `XUM_TOOL_INPUT_OFFSET`    | `offset`   | number | 1-based starting line number (optional, defaults to 1)                         |
 
 </details>
 
@@ -283,9 +283,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                    | JSON path  | Type   | Description                                                |
 | -------------------------- | ---------- | ------ | ---------------------------------------------------------- |
-| `MUX_TOOL_INPUT_CONTENT`   | `content`  | string | File content to write                                      |
-| `MUX_TOOL_INPUT_FILE_PATH` | `filePath` | string | Relative path within skill directory. Defaults to SKILL.md |
-| `MUX_TOOL_INPUT_NAME`      | `name`     | string | Skill name (directory name under the global skills root)   |
+| `XUM_TOOL_INPUT_CONTENT`   | `content`  | string | File content to write                                      |
+| `XUM_TOOL_INPUT_FILE_PATH` | `filePath` | string | Relative path within skill directory. Defaults to SKILL.md |
+| `XUM_TOOL_INPUT_NAME`      | `name`     | string | Skill name (directory name under the global skills root)   |
 
 </details>
 
@@ -294,12 +294,12 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                         | JSON path         | Type   | Description                                                                         |
 | ------------------------------- | ----------------- | ------ | ----------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_SQL`            | `sql`             | string | DuckDB SQL query to execute                                                         |
-| `MUX_TOOL_INPUT_TITLE`          | `title`           | string | Optional chart title                                                                |
-| `MUX_TOOL_INPUT_VISUALIZATION`  | `visualization`   | enum   | Optional visualization type for rendering the query result                          |
-| `MUX_TOOL_INPUT_X_AXIS`         | `x_axis`          | string | Optional column name for the visualization X axis                                   |
-| `MUX_TOOL_INPUT_Y_AXIS_<INDEX>` | `y_axis[<INDEX>]` | string | Optional column name(s) for the visualization Y axis                                |
-| `MUX_TOOL_INPUT_Y_AXIS_COUNT`   | `y_axis.length`   | number | Number of elements in y_axis (Optional column name(s) for the visualization Y axis) |
+| `XUM_TOOL_INPUT_SQL`            | `sql`             | string | DuckDB SQL query to execute                                                         |
+| `XUM_TOOL_INPUT_TITLE`          | `title`           | string | Optional chart title                                                                |
+| `XUM_TOOL_INPUT_VISUALIZATION`  | `visualization`   | enum   | Optional visualization type for rendering the query result                          |
+| `XUM_TOOL_INPUT_X_AXIS`         | `x_axis`          | string | Optional column name for the visualization X axis                                   |
+| `XUM_TOOL_INPUT_Y_AXIS_<INDEX>` | `y_axis[<INDEX>]` | string | Optional column name(s) for the visualization Y axis                                |
+| `XUM_TOOL_INPUT_Y_AXIS_COUNT`   | `y_axis.length`   | number | Number of elements in y_axis (Optional column name(s) for the visualization Y axis) |
 
 </details>
 
@@ -308,14 +308,14 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                                        | JSON path                                         | Type    | Description                                            |
 | -------------------------------------------------------------- | ------------------------------------------------- | ------- | ------------------------------------------------------ |
-| `MUX_TOOL_INPUT_ANSWERS_<KEY>`                                 | `answers[<KEY>]`                                  | string  | —                                                      |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_HEADER`                      | `questions[<INDEX>].header`                       | string  | Short label shown in the UI (keep it concise)          |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_MULTI_SELECT`                | `questions[<INDEX>].multiSelect`                  | boolean | —                                                      |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_<INDEX>_DESCRIPTION` | `questions[<INDEX>].options[<INDEX>].description` | string  | —                                                      |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_<INDEX>_LABEL`       | `questions[<INDEX>].options[<INDEX>].label`       | string  | —                                                      |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_COUNT`               | `questions[<INDEX>].options.length`               | number  | Number of elements in questions[&lt;INDEX&gt;].options |
-| `MUX_TOOL_INPUT_QUESTIONS_<INDEX>_QUESTION`                    | `questions[<INDEX>].question`                     | string  | —                                                      |
-| `MUX_TOOL_INPUT_QUESTIONS_COUNT`                               | `questions.length`                                | number  | Number of elements in questions                        |
+| `XUM_TOOL_INPUT_ANSWERS_<KEY>`                                 | `answers[<KEY>]`                                  | string  | —                                                      |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_HEADER`                      | `questions[<INDEX>].header`                       | string  | Short label shown in the UI (keep it concise)          |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_MULTI_SELECT`                | `questions[<INDEX>].multiSelect`                  | boolean | —                                                      |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_<INDEX>_DESCRIPTION` | `questions[<INDEX>].options[<INDEX>].description` | string  | —                                                      |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_<INDEX>_LABEL`       | `questions[<INDEX>].options[<INDEX>].label`       | string  | —                                                      |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_OPTIONS_COUNT`               | `questions[<INDEX>].options.length`               | number  | Number of elements in questions[&lt;INDEX&gt;].options |
+| `XUM_TOOL_INPUT_QUESTIONS_<INDEX>_QUESTION`                    | `questions[<INDEX>].question`                     | string  | —                                                      |
+| `XUM_TOOL_INPUT_QUESTIONS_COUNT`                               | `questions.length`                                | number  | Number of elements in questions                        |
 
 </details>
 
@@ -324,26 +324,27 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                     | JSON path   | Type   | Description                                                            |
 | --------------------------- | ----------- | ------ | ---------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_FILENAME`   | `filename`  | string | Optional filename override to present to the model.                    |
-| `MUX_TOOL_INPUT_MEDIA_TYPE` | `mediaType` | string | Optional media type override when the filename/extension is ambiguous. |
-| `MUX_TOOL_INPUT_PATH`       | `path`      | string | The path to the file to attach (absolute or relative)                  |
+| `XUM_TOOL_INPUT_FILENAME`   | `filename`  | string | Optional filename override to present to the model.                    |
+| `XUM_TOOL_INPUT_MEDIA_TYPE` | `mediaType` | string | Optional media type override when the filename/extension is ambiguous. |
+| `XUM_TOOL_INPUT_PATH`       | `path`      | string | The path to the file to attach (absolute or relative)                  |
 
 </details>
 
 <details>
-<summary>bash (9)</summary>
+<summary>bash (10)</summary>
 
-| Env var                                 | JSON path                | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| --------------------------------------- | ------------------------ | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_DISPLAY_NAME`           | `display_name`           | string  | Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). Required for all bash invocations since any process can be sent to background.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_MODEL_INTENT`           | `model_intent`           | string  | Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. Use a present-participle phrase in plain English, under 100 characters. Do not repeat the command or include duration, because Mux appends those. Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `MUX_TOOL_INPUT_MONITOR_COOLDOWN_MS`    | `monitor.cooldown_ms`    | number  | Milliseconds to coalesce matching lines before one wake. Defaults to 1000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_MONITOR_FILTER`         | `monitor.filter`         | string  | Regex applied to each complete output line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_MONITOR_FILTER_EXCLUDE` | `monitor.filter_exclude` | boolean | When true, wake for complete lines that do not match filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `MUX_TOOL_INPUT_MONITOR_MAX_EVENTS`     | `monitor.max_events`     | number  | Stop monitoring after this many matching lines; the process keeps running.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_RUN_IN_BACKGROUND`      | `run_in_background`      | boolean | Run this command in the background without blocking. Use for processes running &gt;5s (dev servers, builds, file watchers). Do NOT use for quick commands (&lt;5s), interactive processes (no stdin support), or processes requiring real-time output (use foreground with larger timeout instead). Returns immediately with a taskId (bash:&lt;processId&gt;) and backgroundProcessId. Read output with task_await (returns only new output since last check). Terminate with task_terminate using the taskId. List active tasks with task_list. Process persists until timeout_secs expires, terminated, or workspace is removed. For long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. With monitor, matching complete output lines wake this workspace, including after your current response; use task_await only if you need surrounding/full output. Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. When you actually need the output, read it with task_await; do not poll task_await just because the process is still running. |
-| `MUX_TOOL_INPUT_SCRIPT`                 | `script`                 | string  | The bash script/command to execute                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_TIMEOUT_SECS`           | `timeout_secs`           | number  | Timeout in seconds. For foreground: max execution time before kill. For background: max lifetime before auto-termination. Start small and increase on retry; avoid large initial values to keep UX responsive                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Env var                                 | JSON path                | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------------------------- | ------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_DISPLAY_NAME`           | `display_name`           | string  | Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). Required for all bash invocations since any process can be sent to background.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `XUM_TOOL_INPUT_MODEL_INTENT`           | `model_intent`           | string  | Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. Use a present-participle phrase in plain English, under 100 characters. Do not repeat the command or include duration, because Xum appends those. Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `XUM_TOOL_INPUT_MONITOR_COOLDOWN_MS`    | `monitor.cooldown_ms`    | number  | Milliseconds to coalesce matching lines before one wake. Defaults to 1000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_MONITOR_FILTER`         | `monitor.filter`         | string  | Regex applied to each complete output line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `XUM_TOOL_INPUT_MONITOR_FILTER_EXCLUDE` | `monitor.filter_exclude` | boolean | When true, wake for complete lines that do not match filter.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `XUM_TOOL_INPUT_MONITOR_MAX_EVENTS`     | `monitor.max_events`     | number  | Stop monitoring after this many matching lines; the process keeps running. A monitor retired this way also stops watching for process settlement (no exit wake).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `XUM_TOOL_INPUT_MONITOR_WAKE_ON_EXIT`   | `monitor.wake_on_exit`   | boolean | Also wake when the monitored process settles (exit, kill, timeout), even if no line ever matched. Explicit cancellation (task_stop, terminate without flush, workspace cleanup) and max_events retirement produce no settlement wake. Defaults to true.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `XUM_TOOL_INPUT_RUN_IN_BACKGROUND`      | `run_in_background`      | boolean | Run this command in the background without blocking. Use for processes running &gt;5s (dev servers, builds, file watchers). Do NOT use for quick commands (&lt;5s), interactive processes (no stdin support), or processes requiring real-time output (use foreground with larger timeout instead). Returns immediately with a taskId (bash:&lt;processId&gt;) and backgroundProcessId. Read output with task_await (returns only new output since last check). Stop with task_stop using the taskId. List active tasks with task_list. Process persists until timeout_secs expires, terminated, or workspace is removed. For long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. When you actually need the output, read it with task_await; do not poll task_await just because the process is still running. |
+| `XUM_TOOL_INPUT_SCRIPT`                 | `script`                 | string  | The bash script/command to execute                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `XUM_TOOL_INPUT_TIMEOUT_SECS`           | `timeout_secs`           | number  | Timeout in seconds. For foreground: max execution time before kill. For background: max lifetime before auto-termination. Start small and increase on retry; avoid large initial values to keep UX responsive                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 </details>
 
@@ -352,7 +353,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                     | JSON path    | Type   | Description                        |
 | --------------------------- | ------------ | ------ | ---------------------------------- |
-| `MUX_TOOL_INPUT_PROCESS_ID` | `process_id` | string | Background process ID to terminate |
+| `XUM_TOOL_INPUT_PROCESS_ID` | `process_id` | string | Background process ID to terminate |
 
 </details>
 
@@ -361,10 +362,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                         | JSON path        | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------- | ---------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_FILTER`         | `filter`         | string  | Optional regex to filter output lines. By default, only matching lines are returned. When filter_exclude is true, matching lines are excluded instead. Non-matching lines are permanently discarded and cannot be retrieved later.                                                                                                                                                                                 |
-| `MUX_TOOL_INPUT_FILTER_EXCLUDE` | `filter_exclude` | boolean | When true, lines matching 'filter' are excluded instead of kept. Key behavior: excluded lines do NOT cause early return from timeout - waiting continues until non-excluded output arrives or process exits. Use to avoid busy polling on progress spam (e.g., filter='⏳\|waiting\|\.\.\.' with filter_exclude=true lets you set a long timeout and only wake on meaningful output). Requires 'filter' to be set. |
-| `MUX_TOOL_INPUT_PROCESS_ID`     | `process_id`     | string  | The ID of the background process to retrieve output from                                                                                                                                                                                                                                                                                                                                                           |
-| `MUX_TOOL_INPUT_TIMEOUT_SECS`   | `timeout_secs`   | number  | Seconds to wait for new output. If no output is immediately available and process is still running, blocks up to this duration. Returns early when output arrives or process exits. Only use long timeouts (&gt;15s) when no other useful work can be done in parallel.                                                                                                                                            |
+| `XUM_TOOL_INPUT_FILTER`         | `filter`         | string  | Optional regex to filter output lines. By default, only matching lines are returned. When filter_exclude is true, matching lines are excluded instead. Non-matching lines are permanently discarded and cannot be retrieved later.                                                                                                                                                                                 |
+| `XUM_TOOL_INPUT_FILTER_EXCLUDE` | `filter_exclude` | boolean | When true, lines matching 'filter' are excluded instead of kept. Key behavior: excluded lines do NOT cause early return from timeout - waiting continues until non-excluded output arrives or process exits. Use to avoid busy polling on progress spam (e.g., filter='⏳\|waiting\|\.\.\.' with filter_exclude=true lets you set a long timeout and only wake on meaningful output). Requires 'filter' to be set. |
+| `XUM_TOOL_INPUT_PROCESS_ID`     | `process_id`     | string  | The ID of the background process to retrieve output from                                                                                                                                                                                                                                                                                                                                                           |
+| `XUM_TOOL_INPUT_TIMEOUT_SECS`   | `timeout_secs`   | number  | Seconds to wait for new output. If no output is immediately available and process is still running, blocks up to this duration. Returns early when output arrives or process exits. Only use long timeouts (&gt;15s) when no other useful work can be done in parallel.                                                                                                                                            |
 
 </details>
 
@@ -373,7 +374,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var               | JSON path | Type   | Description                                   |
 | --------------------- | --------- | ------ | --------------------------------------------- |
-| `MUX_TOOL_INPUT_CODE` | `code`    | string | JavaScript code to execute in the PTC sandbox |
+| `XUM_TOOL_INPUT_CODE` | `code`    | string | JavaScript code to execute in the PTC sandbox |
 
 </details>
 
@@ -382,8 +383,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                  | JSON path | Type   | Description                                                                                                                                                                                           |
 | ------------------------ | --------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_GOAL_ID` | `goalId`  | string | Optional optimistic-concurrency token. Pass the `goalId` returned by `get\_goal` to ensure the completion is rejected with a typed conflict error if the user clears or replaces the goal mid-stream. |
-| `MUX_TOOL_INPUT_SUMMARY` | `summary` | string | Required 1-2 sentence justification for completing the current goal.                                                                                                                                  |
+| `XUM_TOOL_INPUT_GOAL_ID` | `goalId`  | string | Optional optimistic-concurrency token. Pass the `goalId` returned by `get\_goal` to ensure the completion is rejected with a typed conflict error if the user clears or replaces the goal mid-stream. |
+| `XUM_TOOL_INPUT_SUMMARY` | `summary` | string | Required 1-2 sentence justification for completing the current goal.                                                                                                                                  |
 
 </details>
 
@@ -392,9 +393,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                 | JSON path | Type   | Description                                       |
 | ----------------------- | --------- | ------ | ------------------------------------------------- |
-| `MUX_TOOL_INPUT_BUTTON` | `button`  | enum   | Optional mouse button to click. Defaults to left. |
-| `MUX_TOOL_INPUT_X`      | `x`       | number | Target X coordinate in screen pixels.             |
-| `MUX_TOOL_INPUT_Y`      | `y`       | number | Target Y coordinate in screen pixels.             |
+| `XUM_TOOL_INPUT_BUTTON` | `button`  | enum   | Optional mouse button to click. Defaults to left. |
+| `XUM_TOOL_INPUT_X`      | `x`       | number | Target X coordinate in screen pixels.             |
+| `XUM_TOOL_INPUT_Y`      | `y`       | number | Target Y coordinate in screen pixels.             |
 
 </details>
 
@@ -403,9 +404,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                 | JSON path | Type   | Description                                              |
 | ----------------------- | --------- | ------ | -------------------------------------------------------- |
-| `MUX_TOOL_INPUT_BUTTON` | `button`  | enum   | Optional mouse button to double-click. Defaults to left. |
-| `MUX_TOOL_INPUT_X`      | `x`       | number | Target X coordinate in screen pixels.                    |
-| `MUX_TOOL_INPUT_Y`      | `y`       | number | Target Y coordinate in screen pixels.                    |
+| `XUM_TOOL_INPUT_BUTTON` | `button`  | enum   | Optional mouse button to double-click. Defaults to left. |
+| `XUM_TOOL_INPUT_X`      | `x`       | number | Target X coordinate in screen pixels.                    |
+| `XUM_TOOL_INPUT_Y`      | `y`       | number | Target Y coordinate in screen pixels.                    |
 
 </details>
 
@@ -414,10 +415,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                  | JSON path | Type   | Description                             |
 | ------------------------ | --------- | ------ | --------------------------------------- |
-| `MUX_TOOL_INPUT_END_X`   | `endX`    | number | Ending X coordinate in screen pixels.   |
-| `MUX_TOOL_INPUT_END_Y`   | `endY`    | number | Ending Y coordinate in screen pixels.   |
-| `MUX_TOOL_INPUT_START_X` | `startX`  | number | Starting X coordinate in screen pixels. |
-| `MUX_TOOL_INPUT_START_Y` | `startY`  | number | Starting Y coordinate in screen pixels. |
+| `XUM_TOOL_INPUT_END_X`   | `endX`    | number | Ending X coordinate in screen pixels.   |
+| `XUM_TOOL_INPUT_END_Y`   | `endY`    | number | Ending Y coordinate in screen pixels.   |
+| `XUM_TOOL_INPUT_START_X` | `startX`  | number | Starting X coordinate in screen pixels. |
+| `XUM_TOOL_INPUT_START_Y` | `startY`  | number | Starting Y coordinate in screen pixels. |
 
 </details>
 
@@ -426,7 +427,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var              | JSON path | Type   | Description                                     |
 | -------------------- | --------- | ------ | ----------------------------------------------- |
-| `MUX_TOOL_INPUT_KEY` | `key`     | string | Key or key combination to press on the desktop. |
+| `XUM_TOOL_INPUT_KEY` | `key`     | string | Key or key combination to press on the desktop. |
 
 </details>
 
@@ -435,8 +436,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var            | JSON path | Type   | Description                           |
 | ------------------ | --------- | ------ | ------------------------------------- |
-| `MUX_TOOL_INPUT_X` | `x`       | number | Target X coordinate in screen pixels. |
-| `MUX_TOOL_INPUT_Y` | `y`       | number | Target Y coordinate in screen pixels. |
+| `XUM_TOOL_INPUT_X` | `x`       | number | Target X coordinate in screen pixels. |
+| `XUM_TOOL_INPUT_Y` | `y`       | number | Target Y coordinate in screen pixels. |
 
 </details>
 
@@ -445,8 +446,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                        | JSON path      | Type   | Description                                                     |
 | ------------------------------ | -------------- | ------ | --------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_SCALED_HEIGHT` | `scaledHeight` | number | Optional scaled height hint in pixels for downstream consumers. |
-| `MUX_TOOL_INPUT_SCALED_WIDTH`  | `scaledWidth`  | number | Optional scaled width hint in pixels for downstream consumers.  |
+| `XUM_TOOL_INPUT_SCALED_HEIGHT` | `scaledHeight` | number | Optional scaled height hint in pixels for downstream consumers. |
+| `XUM_TOOL_INPUT_SCALED_WIDTH`  | `scaledWidth`  | number | Optional scaled width hint in pixels for downstream consumers.  |
 
 </details>
 
@@ -455,10 +456,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                  | JSON path | Type   | Description                                 |
 | ------------------------ | --------- | ------ | ------------------------------------------- |
-| `MUX_TOOL_INPUT_DELTA_X` | `deltaX`  | number | Optional horizontal scroll delta in pixels. |
-| `MUX_TOOL_INPUT_DELTA_Y` | `deltaY`  | number | Vertical scroll delta in pixels.            |
-| `MUX_TOOL_INPUT_X`       | `x`       | number | Target X coordinate in screen pixels.       |
-| `MUX_TOOL_INPUT_Y`       | `y`       | number | Target Y coordinate in screen pixels.       |
+| `XUM_TOOL_INPUT_DELTA_X` | `deltaX`  | number | Optional horizontal scroll delta in pixels. |
+| `XUM_TOOL_INPUT_DELTA_Y` | `deltaY`  | number | Vertical scroll delta in pixels.            |
+| `XUM_TOOL_INPUT_X`       | `x`       | number | Target X coordinate in screen pixels.       |
+| `XUM_TOOL_INPUT_Y`       | `y`       | number | Target Y coordinate in screen pixels.       |
 
 </details>
 
@@ -467,7 +468,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var               | JSON path | Type   | Description                                  |
 | --------------------- | --------- | ------ | -------------------------------------------- |
-| `MUX_TOOL_INPUT_TEXT` | `text`    | string | Text to type into the active desktop target. |
+| `XUM_TOOL_INPUT_TEXT` | `text`    | string | Text to type into the active desktop target. |
 
 </details>
 
@@ -476,10 +477,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                        | JSON path       | Type   | Description                                                                             |
 | ------------------------------ | --------------- | ------ | --------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_CONTENT`       | `content`       | string | The content to insert                                                                   |
-| `MUX_TOOL_INPUT_INSERT_AFTER`  | `insert_after`  | string | Anchor text to insert after. Content will be placed immediately after this substring.   |
-| `MUX_TOOL_INPUT_INSERT_BEFORE` | `insert_before` | string | Anchor text to insert before. Content will be placed immediately before this substring. |
-| `MUX_TOOL_INPUT_PATH`          | `path`          | string | Path to the file to edit (absolute or relative to the current workspace)                |
+| `XUM_TOOL_INPUT_CONTENT`       | `content`       | string | The content to insert                                                                   |
+| `XUM_TOOL_INPUT_INSERT_AFTER`  | `insert_after`  | string | Anchor text to insert after. Content will be placed immediately after this substring.   |
+| `XUM_TOOL_INPUT_INSERT_BEFORE` | `insert_before` | string | Anchor text to insert before. Content will be placed immediately before this substring. |
+| `XUM_TOOL_INPUT_PATH`          | `path`          | string | Path to the file to edit (absolute or relative to the current workspace)                |
 
 </details>
 
@@ -488,13 +489,13 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                 | JSON path                 | Type   | Description                                                                                                                               |
 | --------------------------------------- | ------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_END_LINE`               | `end_line`                | number | 1-indexed end line (inclusive) to replace                                                                                                 |
-| `MUX_TOOL_INPUT_EXPECTED_LINES_<INDEX>` | `expected_lines[<INDEX>]` | string | Optional safety check. When provided, the current lines in the specified range must match exactly.                                        |
-| `MUX_TOOL_INPUT_EXPECTED_LINES_COUNT`   | `expected_lines.length`   | number | Number of elements in expected_lines (Optional safety check. When provided, the current lines in the specified range must match exactly.) |
-| `MUX_TOOL_INPUT_NEW_LINES_<INDEX>`      | `new_lines[<INDEX>]`      | string | Replacement lines. Provide an empty array to delete the specified range.                                                                  |
-| `MUX_TOOL_INPUT_NEW_LINES_COUNT`        | `new_lines.length`        | number | Number of elements in new_lines (Replacement lines. Provide an empty array to delete the specified range.)                                |
-| `MUX_TOOL_INPUT_PATH`                   | `path`                    | string | Path to the file to edit (absolute or relative to the current workspace)                                                                  |
-| `MUX_TOOL_INPUT_START_LINE`             | `start_line`              | number | 1-indexed start line (inclusive) to replace                                                                                               |
+| `XUM_TOOL_INPUT_END_LINE`               | `end_line`                | number | 1-indexed end line (inclusive) to replace                                                                                                 |
+| `XUM_TOOL_INPUT_EXPECTED_LINES_<INDEX>` | `expected_lines[<INDEX>]` | string | Optional safety check. When provided, the current lines in the specified range must match exactly.                                        |
+| `XUM_TOOL_INPUT_EXPECTED_LINES_COUNT`   | `expected_lines.length`   | number | Number of elements in expected_lines (Optional safety check. When provided, the current lines in the specified range must match exactly.) |
+| `XUM_TOOL_INPUT_NEW_LINES_<INDEX>`      | `new_lines[<INDEX>]`      | string | Replacement lines. Provide an empty array to delete the specified range.                                                                  |
+| `XUM_TOOL_INPUT_NEW_LINES_COUNT`        | `new_lines.length`        | number | Number of elements in new_lines (Replacement lines. Provide an empty array to delete the specified range.)                                |
+| `XUM_TOOL_INPUT_PATH`                   | `path`                    | string | Path to the file to edit (absolute or relative to the current workspace)                                                                  |
+| `XUM_TOOL_INPUT_START_LINE`             | `start_line`              | number | 1-indexed start line (inclusive) to replace                                                                                               |
 
 </details>
 
@@ -503,10 +504,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                        | JSON path       | Type   | Description                                                                                                                                          |
 | ------------------------------ | --------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_NEW_STRING`    | `new_string`    | string | The replacement text                                                                                                                                 |
-| `MUX_TOOL_INPUT_OLD_STRING`    | `old_string`    | string | The exact text to replace (must be unique in file if replace_count is 1). Include enough context (indentation, surrounding lines) to make it unique. |
-| `MUX_TOOL_INPUT_PATH`          | `path`          | string | Path to the file to edit (absolute or relative to the current workspace)                                                                             |
-| `MUX_TOOL_INPUT_REPLACE_COUNT` | `replace_count` | number | Number of occurrences to replace (default: 1). Use -1 to replace all occurrences. If 1, old_string must be unique in the file.                       |
+| `XUM_TOOL_INPUT_NEW_STRING`    | `new_string`    | string | The replacement text                                                                                                                                 |
+| `XUM_TOOL_INPUT_OLD_STRING`    | `old_string`    | string | The exact text to replace (must be unique in file if replace_count is 1). Include enough context (indentation, surrounding lines) to make it unique. |
+| `XUM_TOOL_INPUT_PATH`          | `path`          | string | Path to the file to edit (absolute or relative to the current workspace)                                                                             |
+| `XUM_TOOL_INPUT_REPLACE_COUNT` | `replace_count` | number | Number of occurrences to replace (default: 1). Use -1 to replace all occurrences. If 1, old_string must be unique in the file.                       |
 
 </details>
 
@@ -515,9 +516,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                 | JSON path | Type   | Description                                                                    |
 | ----------------------- | --------- | ------ | ------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_LIMIT`  | `limit`   | number | Number of lines to return from offset (optional, returns all if not specified) |
-| `MUX_TOOL_INPUT_OFFSET` | `offset`  | number | 1-based starting line number (optional, defaults to 1)                         |
-| `MUX_TOOL_INPUT_PATH`   | `path`    | string | The path to the file to read (absolute or relative)                            |
+| `XUM_TOOL_INPUT_LIMIT`  | `limit`   | number | Number of lines to return from offset (optional, returns all if not specified) |
+| `XUM_TOOL_INPUT_OFFSET` | `offset`  | number | 1-based starting line number (optional, defaults to 1)                         |
+| `XUM_TOOL_INPUT_PATH`   | `path`    | string | The path to the file to read (absolute or relative)                            |
 
 </details>
 
@@ -526,13 +527,33 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                       | JSON path     | Type    | Description                                                                                                                                                                                                                                                                                                                                                                |
 | ----------------------------- | ------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_ACTION`       | `action`      | enum    | Operation to perform: "get" reads the current heartbeat, "set" enables or configures it, and "unset" removes this workspace's heartbeat settings.                                                                                                                                                                                                                          |
-| `MUX_TOOL_INPUT_CONTEXT_MODE` | `contextMode` | enum    | set: context preparation for heartbeat turns: "normal" uses current context, "compact" compacts first, and "reset" appends a reset boundary first. Omit to preserve the current mode.                                                                                                                                                                                      |
-| `MUX_TOOL_INPUT_ENABLED`      | `enabled`     | boolean | set: whether scheduled heartbeats are enabled. Omit to preserve the current value; when creating new settings, omitted means "enabled".                                                                                                                                                                                                                                    |
-| `MUX_TOOL_INPUT_INTERVAL_MS`  | `intervalMs`  | number  | set: heartbeat interval in milliseconds (300000–86400000). Omit to preserve the current interval or use the global default for new settings.                                                                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_MESSAGE`      | `message`     | string  | set: optional custom instruction body appended after the fixed idle-workspace lead-in. Pass an empty string to clear the custom message.                                                                                                                                                                                                                                   |
-| `MUX_TOOL_INPUT_TRIGGER`      | `trigger`     | enum    | set: countdown anchoring: "idle" resets on workspace activity (fires only after a full quiet interval), "interval" fires on a fixed wall-clock cadence regardless of activity. Omit to preserve the current value; unset resolves to "idle" at read time.                                                                                                                  |
-| `MUX_TOOL_INPUT_WHEN_BUSY`    | `whenBusy`    | enum    | set: behavior when a heartbeat fires while the workspace is busy: "skip" misses the slot, "tool-end" queues the heartbeat into the current turn at the next tool boundary, "turn-end" queues it as its own turn after the current one. Omit to preserve the current value; unset resolves at read time to "skip" for trigger "idle" and "turn-end" for trigger "interval". |
+| `XUM_TOOL_INPUT_ACTION`       | `action`      | enum    | Operation to perform: "get" reads the current heartbeat, "set" enables or configures it, and "unset" removes this workspace's heartbeat settings.                                                                                                                                                                                                                          |
+| `XUM_TOOL_INPUT_CONTEXT_MODE` | `contextMode` | enum    | set: context preparation for heartbeat turns: "normal" uses current context, "compact" compacts first, and "reset" appends a reset boundary first. Omit to preserve the current mode.                                                                                                                                                                                      |
+| `XUM_TOOL_INPUT_ENABLED`      | `enabled`     | boolean | set: whether scheduled heartbeats are enabled. Omit to preserve the current value; when creating new settings, omitted means "enabled".                                                                                                                                                                                                                                    |
+| `XUM_TOOL_INPUT_INTERVAL_MS`  | `intervalMs`  | number  | set: heartbeat interval in milliseconds (300000–86400000). Omit to preserve the current interval or use the global default for new settings.                                                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_MESSAGE`      | `message`     | string  | set: optional custom instruction body appended after the fixed idle-workspace lead-in. Pass an empty string to clear the custom message.                                                                                                                                                                                                                                   |
+| `XUM_TOOL_INPUT_TRIGGER`      | `trigger`     | enum    | set: countdown anchoring: "idle" resets on workspace activity (fires only after a full quiet interval), "interval" fires on a fixed wall-clock cadence regardless of activity. Omit to preserve the current value; unset resolves to "idle" at read time.                                                                                                                  |
+| `XUM_TOOL_INPUT_WHEN_BUSY`    | `whenBusy`    | enum    | set: behavior when a heartbeat fires while the workspace is busy: "skip" misses the slot, "tool-end" queues the heartbeat into the current turn at the next tool boundary, "turn-end" queues it as its own turn after the current one. Omit to preserve the current value; unset resolves at read time to "skip" for trigger "idle" and "turn-end" for trigger "interval". |
+
+</details>
+
+<details>
+<summary>intuition (1)</summary>
+
+| Env var              | JSON path | Type   | Description |
+| -------------------- | --------- | ------ | ----------- |
+| `XUM_TOOL_INPUT_CUE` | `cue`     | string | —           |
+
+</details>
+
+<details>
+<summary>mcp_prompt_get (3)</summary>
+
+| Env var                          | JSON path          | Type   | Description                                                                                                                                         |
+| -------------------------------- | ------------------ | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_ARGUMENTS_<KEY>` | `arguments[<KEY>]` | string | Prompt argument values by argument name. Arguments marked with ? are optional; all others are required.                                             |
+| `XUM_TOOL_INPUT_LIST_OFFSET`     | `list_offset`      | number | When an unknown-name error truncates the prompt listing, repeat the call with the suggested list_offset to page through the remaining prompt names. |
+| `XUM_TOOL_INPUT_NAME`            | `name`             | string | Prompt name from the available list, e.g. "mcp\_\_server\_\_prompt"                                                                                 |
 
 </details>
 
@@ -541,17 +562,17 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                      | JSON path     | Type   | Description                                                                                     |
 | ---------------------------- | ------------- | ------ | ----------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_COMMAND`     | `command`     | enum   | The memory operation to perform.                                                                |
-| `MUX_TOOL_INPUT_FILE_TEXT`   | `file_text`   | string | create: full contents of the new file.                                                          |
-| `MUX_TOOL_INPUT_INSERT_LINE` | `insert_line` | number | insert: line number to insert after (0 = top of file).                                          |
-| `MUX_TOOL_INPUT_INSERT_TEXT` | `insert_text` | string | insert: text to insert.                                                                         |
-| `MUX_TOOL_INPUT_LIMIT`       | `limit`       | number | view on a file: number of lines to return from offset (optional).                               |
-| `MUX_TOOL_INPUT_NEW_PATH`    | `new_path`    | string | rename: new virtual path (same scope).                                                          |
-| `MUX_TOOL_INPUT_NEW_STR`     | `new_str`     | string | str_replace: replacement text.                                                                  |
-| `MUX_TOOL_INPUT_OFFSET`      | `offset`      | number | view on a file: 1-based starting line number (optional).                                        |
-| `MUX_TOOL_INPUT_OLD_PATH`    | `old_path`    | string | rename: current virtual path.                                                                   |
-| `MUX_TOOL_INPUT_OLD_STR`     | `old_str`     | string | str_replace: exact text to replace (must be unique in the file).                                |
-| `MUX_TOOL_INPUT_PATH`        | `path`        | string | Virtual memory path (e.g. /memories/global/notes.md). Required for every command except rename. |
+| `XUM_TOOL_INPUT_COMMAND`     | `command`     | enum   | The memory operation to perform.                                                                |
+| `XUM_TOOL_INPUT_FILE_TEXT`   | `file_text`   | string | create: full contents of the new file.                                                          |
+| `XUM_TOOL_INPUT_INSERT_LINE` | `insert_line` | number | insert: line number to insert after (0 = top of file).                                          |
+| `XUM_TOOL_INPUT_INSERT_TEXT` | `insert_text` | string | insert: text to insert.                                                                         |
+| `XUM_TOOL_INPUT_LIMIT`       | `limit`       | number | view on a file: number of lines to return from offset (optional).                               |
+| `XUM_TOOL_INPUT_NEW_PATH`    | `new_path`    | string | rename: new virtual path (same scope).                                                          |
+| `XUM_TOOL_INPUT_NEW_STR`     | `new_str`     | string | str_replace: replacement text.                                                                  |
+| `XUM_TOOL_INPUT_OFFSET`      | `offset`      | number | view on a file: 1-based starting line number (optional).                                        |
+| `XUM_TOOL_INPUT_OLD_PATH`    | `old_path`    | string | rename: current virtual path.                                                                   |
+| `XUM_TOOL_INPUT_OLD_STR`     | `old_str`     | string | str_replace: exact text to replace (must be unique in the file).                                |
+| `XUM_TOOL_INPUT_PATH`        | `path`        | string | Virtual memory path (e.g. /memories/global/notes.md). Required for every command except rename. |
 
 </details>
 
@@ -560,8 +581,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                      | JSON path    | Type    | Description                                                                            |
 | ---------------------------- | ------------ | ------- | -------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_CONFIRM`     | `confirm`    | boolean | Must be true to apply the write. The agent should ask the user for confirmation first. |
-| `MUX_TOOL_INPUT_NEW_CONTENT` | `newContent` | string  | The full new contents of the AGENTS.md file                                            |
+| `XUM_TOOL_INPUT_CONFIRM`     | `confirm`    | boolean | Must be true to apply the write. The agent should ask the user for confirmation first. |
+| `XUM_TOOL_INPUT_NEW_CONTENT` | `newContent` | string  | The full new contents of the AGENTS.md file                                            |
 
 </details>
 
@@ -570,9 +591,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                       | JSON path       | Type   | Description                                                                                                               |
 | ----------------------------- | --------------- | ------ | ------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_FILE`         | `file`          | enum   | Which configuration file to read                                                                                          |
-| `MUX_TOOL_INPUT_PATH_<INDEX>` | `path[<INDEX>]` | string | Optional path segments to read a specific nested value. If omitted, returns the full config.                              |
-| `MUX_TOOL_INPUT_PATH_COUNT`   | `path.length`   | number | Number of elements in path (Optional path segments to read a specific nested value. If omitted, returns the full config.) |
+| `XUM_TOOL_INPUT_FILE`         | `file`          | enum   | Which configuration file to read                                                                                          |
+| `XUM_TOOL_INPUT_PATH_<INDEX>` | `path[<INDEX>]` | string | Optional path segments to read a specific nested value. If omitted, returns the full config.                              |
+| `XUM_TOOL_INPUT_PATH_COUNT`   | `path.length`   | number | Number of elements in path (Optional path segments to read a specific nested value. If omitted, returns the full config.) |
 
 </details>
 
@@ -581,13 +602,13 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                          | JSON path                           | Type    | Description                                                                   |
 | ------------------------------------------------ | ----------------------------------- | ------- | ----------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_CONFIRM`                         | `confirm`                           | boolean | Must be true to apply the write. Ask the user for confirmation first.         |
-| `MUX_TOOL_INPUT_FILE`                            | `file`                              | enum    | Which configuration file to write                                             |
-| `MUX_TOOL_INPUT_OPERATIONS_<INDEX>_OP`           | `operations[<INDEX>].op`            | literal | —                                                                             |
-| `MUX_TOOL_INPUT_OPERATIONS_<INDEX>_PATH_<INDEX>` | `operations[<INDEX>].path[<INDEX>]` | string  | —                                                                             |
-| `MUX_TOOL_INPUT_OPERATIONS_<INDEX>_PATH_COUNT`   | `operations[<INDEX>].path.length`   | number  | Number of elements in operations[&lt;INDEX&gt;].path                          |
-| `MUX_TOOL_INPUT_OPERATIONS_<INDEX>_VALUE`        | `operations[<INDEX>].value`         | unknown | —                                                                             |
-| `MUX_TOOL_INPUT_OPERATIONS_COUNT`                | `operations.length`                 | number  | Number of elements in operations (Operations to apply to the config document) |
+| `XUM_TOOL_INPUT_CONFIRM`                         | `confirm`                           | boolean | Must be true to apply the write. Ask the user for confirmation first.         |
+| `XUM_TOOL_INPUT_FILE`                            | `file`                              | enum    | Which configuration file to write                                             |
+| `XUM_TOOL_INPUT_OPERATIONS_<INDEX>_OP`           | `operations[<INDEX>].op`            | literal | —                                                                             |
+| `XUM_TOOL_INPUT_OPERATIONS_<INDEX>_PATH_<INDEX>` | `operations[<INDEX>].path[<INDEX>]` | string  | —                                                                             |
+| `XUM_TOOL_INPUT_OPERATIONS_<INDEX>_PATH_COUNT`   | `operations[<INDEX>].path.length`   | number  | Number of elements in operations[&lt;INDEX&gt;].path                          |
+| `XUM_TOOL_INPUT_OPERATIONS_<INDEX>_VALUE`        | `operations[<INDEX>].value`         | unknown | —                                                                             |
+| `XUM_TOOL_INPUT_OPERATIONS_COUNT`                | `operations.length`                 | number  | Number of elements in operations (Operations to apply to the config document) |
 
 </details>
 
@@ -596,8 +617,18 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                  | JSON path | Type   | Description                                                                                                 |
 | ------------------------ | --------- | ------ | ----------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_MESSAGE` | `message` | string | Optional notification body with more details (max 200 chars). Keep it brief - users may only see a preview. |
-| `MUX_TOOL_INPUT_TITLE`   | `title`   | string | Short notification title (max 64 chars). Should be concise and actionable.                                  |
+| `XUM_TOOL_INPUT_MESSAGE` | `message` | string | Optional notification body with more details (max 200 chars). Keep it brief - users may only see a preview. |
+| `XUM_TOOL_INPUT_TITLE`   | `title`   | string | Short notification title (max 64 chars). Should be concise and actionable.                                  |
+
+</details>
+
+<details>
+<summary>refinement_rollback (2)</summary>
+
+| Env var                 | JSON path | Type   | Description                                                        |
+| ----------------------- | --------- | ------ | ------------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_ID`     | `id`      | string | Refinement row id (envelope id) to roll back                       |
+| `XUM_TOOL_INPUT_REASON` | `reason`  | string | Why this refinement is being rolled back (recorded in the journal) |
 
 </details>
 
@@ -606,10 +637,31 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                | JSON path                | Type   | Description                                                                                                                                                                                                                           |
 | -------------------------------------- | ------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_HUNKS_<INDEX>_COMMENT` | `hunks[<INDEX>].comment` | string | Short note (~1 sentence) telling the user what to look at and why.                                                                                                                                                                    |
-| `MUX_TOOL_INPUT_HUNKS_<INDEX>_PATH`    | `hunks[<INDEX>].path`    | string | Filter in `path[:range]` form, e.g. "src/foo.ts" or "src/foo.ts:42-58". Path is project-relative; use './' or '../' when the path must resolve from the current tool working directory. Range uses new-file line numbers (inclusive). |
-| `MUX_TOOL_INPUT_HUNKS_COUNT`           | `hunks.length`           | number | Number of elements in hunks (List of hunks to flag for review.)                                                                                                                                                                       |
-| `MUX_TOOL_INPUT_OPERATION`             | `operation`              | enum   | 'replace' overwrites the assisted set; 'add' appends to it.                                                                                                                                                                           |
+| `XUM_TOOL_INPUT_HUNKS_<INDEX>_COMMENT` | `hunks[<INDEX>].comment` | string | Short note (~1 sentence) telling the user what to look at and why.                                                                                                                                                                    |
+| `XUM_TOOL_INPUT_HUNKS_<INDEX>_PATH`    | `hunks[<INDEX>].path`    | string | Filter in `path[:range]` form, e.g. "src/foo.ts" or "src/foo.ts:42-58". Path is project-relative; use './' or '../' when the path must resolve from the current tool working directory. Range uses new-file line numbers (inclusive). |
+| `XUM_TOOL_INPUT_HUNKS_COUNT`           | `hunks.length`           | number | Number of elements in hunks (List of hunks to flag for review.)                                                                                                                                                                       |
+| `XUM_TOOL_INPUT_OPERATION`             | `operation`              | enum   | 'replace' overwrites the assisted set; 'add' appends to it.                                                                                                                                                                           |
+
+</details>
+
+<details>
+<summary>session_history (13)</summary>
+
+| Env var                             | JSON path            | Type    | Description |
+| ----------------------------------- | -------------------- | ------- | ----------- |
+| `XUM_TOOL_INPUT_ACTION`             | `action`             | enum    | —           |
+| `XUM_TOOL_INPUT_CURSOR`             | `cursor`             | string  | —           |
+| `XUM_TOOL_INPUT_ITEM_ID`            | `item_id`            | string  | —           |
+| `XUM_TOOL_INPUT_LIMIT`              | `limit`              | number  | —           |
+| `XUM_TOOL_INPUT_LIMIT_CHARS`        | `limit_chars`        | number  | —           |
+| `XUM_TOOL_INPUT_MAX_CHARS_PER_ITEM` | `max_chars_per_item` | number  | —           |
+| `XUM_TOOL_INPUT_OFFSET_CHARS`       | `offset_chars`       | number  | —           |
+| `XUM_TOOL_INPUT_QUERY`              | `query`              | string  | —           |
+| `XUM_TOOL_INPUT_RECENT_FIRST`       | `recent_first`       | boolean | —           |
+| `XUM_TOOL_INPUT_ROLE`               | `role`               | enum    | —           |
+| `XUM_TOOL_INPUT_TASK_ID`            | `task_id`            | string  | —           |
+| `XUM_TOOL_INPUT_TOOL_NAME`          | `tool_name`          | string  | —           |
+| `XUM_TOOL_INPUT_WINDOW_ID`          | `window_id`          | string  | —           |
 
 </details>
 
@@ -618,11 +670,11 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                | JSON path             | Type    | Description                                                                                                                   |
 | -------------------------------------- | --------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_BUDGET_CENTS`          | `budgetCents`         | number  | Optional positive budget in cents. Omit/null to apply the effective workspace goal default.                                   |
-| `MUX_TOOL_INPUT_EXPECTED_GOAL_ID`      | `expectedGoalId`      | string  | Optimistic-concurrency token required when replacing an active, paused, or budget-limited goal. Use the goalId from get_goal. |
-| `MUX_TOOL_INPUT_OBJECTIVE`             | `objective`           | string  | Concrete, measurable objective to pursue over automatic goal continuations.                                                   |
-| `MUX_TOOL_INPUT_REPLACE_EXISTING_GOAL` | `replaceExistingGoal` | boolean | Set true only when the user explicitly asked to replace the current goal.                                                     |
-| `MUX_TOOL_INPUT_TURN_CAP`              | `turnCap`             | number  | Optional positive maximum automatic continuation turns. Omit/null to apply the effective workspace goal default.              |
+| `XUM_TOOL_INPUT_BUDGET_CENTS`          | `budgetCents`         | number  | Optional positive budget in cents. Omit/null to apply the effective workspace goal default.                                   |
+| `XUM_TOOL_INPUT_EXPECTED_GOAL_ID`      | `expectedGoalId`      | string  | Optimistic-concurrency token required when replacing an active, paused, or budget-limited goal. Use the goalId from get_goal. |
+| `XUM_TOOL_INPUT_OBJECTIVE`             | `objective`           | string  | Concrete, measurable objective to pursue over automatic goal continuations.                                                   |
+| `XUM_TOOL_INPUT_REPLACE_EXISTING_GOAL` | `replaceExistingGoal` | boolean | Set true only when the user explicitly asked to replace the current goal.                                                     |
+| `XUM_TOOL_INPUT_TURN_CAP`              | `turnCap`             | number  | Optional positive maximum automatic continuation turns. Omit/null to apply the effective workspace goal default.              |
 
 </details>
 
@@ -631,9 +683,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                   | JSON path | Type   | Description                                                         |
 | ------------------------- | --------- | ------ | ------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_OWNER`    | `owner`   | string | GitHub owner from the search result (e.g. 'vercel-labs')            |
-| `MUX_TOOL_INPUT_REPO`     | `repo`    | string | GitHub repository name from the search result (e.g. 'agent-skills') |
-| `MUX_TOOL_INPUT_SKILL_ID` | `skillId` | string | Skill ID from the search result                                     |
+| `XUM_TOOL_INPUT_OWNER`    | `owner`   | string | GitHub owner from the search result (e.g. 'vercel-labs')            |
+| `XUM_TOOL_INPUT_REPO`     | `repo`    | string | GitHub repository name from the search result (e.g. 'agent-skills') |
+| `XUM_TOOL_INPUT_SKILL_ID` | `skillId` | string | Skill ID from the search result                                     |
 
 </details>
 
@@ -642,35 +694,33 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                | JSON path | Type   | Description                                       |
 | ---------------------- | --------- | ------ | ------------------------------------------------- |
-| `MUX_TOOL_INPUT_LIMIT` | `limit`   | number | Maximum number of results to return (default: 10) |
-| `MUX_TOOL_INPUT_QUERY` | `query`   | string | Search query to find skills in the catalog        |
+| `XUM_TOOL_INPUT_LIMIT` | `limit`   | number | Maximum number of results to return (default: 10) |
+| `XUM_TOOL_INPUT_QUERY` | `query`   | string | Search query to find skills in the catalog        |
 
 </details>
 
 <details>
-<summary>task (19)</summary>
+<summary>task (17)</summary>
 
 | Env var                                        | JSON path                     | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------------------------------- | ----------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_AGENT_ID`                      | `agentId`                     | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_ISOLATION`                     | `isolation`                   | enum    | Workspace isolation for the sub-agent. "fork" (the default) runs it in an isolated copy of this workspace created from committed state. "none" runs it directly in this workspace's checkout, sharing the working tree (including uncommitted changes) and skipping the fork + init overhead. Use "none" only for read-only analysis (e.g. the explore agent) or when you instruct the sub-agent to avoid editing shared files, since it can otherwise modify the same files concurrently. Omit to fork. |
-| `MUX_TOOL_INPUT_KIND`                          | `kind`                        | enum    | Task kind. Omit or use "subagent" for the existing child-workspace sub-agent flow; use "workspace" to start a normal full workspace turn.                                                                                                                                                                                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_MODEL`                         | `model`                       | string  | Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. Do not assume any particular model is available.                                                                                                                                                                                            |
-| `MUX_TOOL_INPUT_N`                             | `n`                           | number  | Optional best-of count. Use n when several agents should try the same prompt independently. Mutually exclusive with variants; omit both for a single task. Only use grouped runs for sub-agents without interfering side effects, such as read-only agents like explore.                                                                                                                                                                                                                                 |
-| `MUX_TOOL_INPUT_PROMPT`                        | `prompt`                      | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_RUN_IN_BACKGROUND`             | `run_in_background`           | boolean | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_STICKY`                        | `sticky`                      | boolean | Keep this sub-agent workspace after it reports instead of cleaning it up automatically. Set true only when the user explicitly asks for a sticky or persistent sub-agent (for example, to own a separate PR); otherwise omit it. Only valid for kind="subagent".                                                                                                                                                                                                                                         |
-| `MUX_TOOL_INPUT_SUBAGENT_TYPE`                 | `subagent_type`               | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_THINKING`                      | `thinking`                    | string  | Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level.                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_TITLE`                         | `title`                       | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_VARIANTS_<INDEX>`              | `variants[<INDEX>]`           | string  | Optional labels for sibling runs of the same prompt template. Use variants when the task should be repeated across labeled lanes such as issue numbers, commit windows, or frontend/backend/tests/docs review lanes. Mutually exclusive with n. When provided, Mux launches one sibling per label and substitutes ${variant} in the prompt.                                                                                                                                                              |
-| `MUX_TOOL_INPUT_VARIANTS_COUNT`                | `variants.length`             | number  | Number of elements in variants (Optional labels for sibling runs of the same prompt template. Use variants when the task should be repeated across labeled lanes such as issue numbers, commit windows, or frontend/backend/tests/docs review lanes. Mutually exclusive with n. When provided, Mux launches one sibling per label and substitutes ${variant} in the prompt.)                                                                                                                             |
-| `MUX_TOOL_INPUT_WORKSPACE_BRANCH_NAME`         | `workspace.branchName`        | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_WORKSPACE_DISPOSABLE`          | `workspace.disposable`        | boolean | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_WORKSPACE_MODE`                | `workspace.mode`              | enum    | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_WORKSPACE_QUEUE_DISPATCH_MODE` | `workspace.queueDispatchMode` | enum    | For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn.                                                                                                                                                                                                                                                                                                 |
-| `MUX_TOOL_INPUT_WORKSPACE_TRUNK_BRANCH`        | `workspace.trunkBranch`       | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_WORKSPACE_WORKSPACE_ID`        | `workspace.workspaceId`       | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_AGENT_ID`                      | `agentId`                     | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_DESKTOP`                       | `desktop`                     | enum    | Desktop target for sub-agents, independent of checkout isolation. "shared" uses the caller's desktop; "isolated" starts a separate desktop. Defaults to shared for agentId="desktop", isolated otherwise. Only one active shared child can control desktop tools; n &gt; 1 requires isolation. Does not exclude human viewer input, shell tools, or external CDP clients.                                                                                                                                |
+| `XUM_TOOL_INPUT_ISOLATION`                     | `isolation`                   | enum    | Workspace isolation for the sub-agent. "fork" (the default) runs it in an isolated copy of this workspace created from committed state. "none" runs it directly in this workspace's checkout, sharing the working tree (including uncommitted changes) and skipping the fork + init overhead. Use "none" only for read-only analysis (e.g. the explore agent) or when you instruct the sub-agent to avoid editing shared files, since it can otherwise modify the same files concurrently. Omit to fork. |
+| `XUM_TOOL_INPUT_KIND`                          | `kind`                        | enum    | Task kind. Omit or use "subagent" for the existing child-workspace sub-agent flow; use "workspace" to start a normal full workspace turn.                                                                                                                                                                                                                                                                                                                                                                |
+| `XUM_TOOL_INPUT_MODEL`                         | `model`                       | string  | Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. Do not assume any particular model is available.                                                                                                                                                                                            |
+| `XUM_TOOL_INPUT_N`                             | `n`                           | number  | Optional best-of count. Use n when several agents should try the same prompt independently; omit it for a single task. Only use grouped runs for sub-agents without interfering side effects, such as read-only agents like explore.                                                                                                                                                                                                                                                                     |
+| `XUM_TOOL_INPUT_PROMPT`                        | `prompt`                      | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_RUN_IN_BACKGROUND`             | `run_in_background`           | boolean | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_SUBAGENT_TYPE`                 | `subagent_type`               | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_THINKING`                      | `thinking`                    | string  | Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level.                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TITLE`                         | `title`                       | string  | Parent-chosen title. For a persistent sub-agent, use a short, friendly reusable role name such as "Reviewer" or "Simplicity Auditor", not the current assignment. For kind="workspace", use a normal work-specific chat title.                                                                                                                                                                                                                                                                           |
+| `XUM_TOOL_INPUT_WORKSPACE_BRANCH_NAME`         | `workspace.branchName`        | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_WORKSPACE_DISPOSABLE`          | `workspace.disposable`        | boolean | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_WORKSPACE_MODE`                | `workspace.mode`              | enum    | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_WORKSPACE_QUEUE_DISPATCH_MODE` | `workspace.queueDispatchMode` | enum    | For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn. Tool-end dispatch supersedes the caller's own active delegated turn on that workspace quietly (the old handle settles interrupted without a separate wake).                                                                                                                                     |
+| `XUM_TOOL_INPUT_WORKSPACE_TRUNK_BRANCH`        | `workspace.trunkBranch`       | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_WORKSPACE_WORKSPACE_ID`        | `workspace.workspaceId`       | string  | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 </details>
 
@@ -679,12 +729,12 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                            | JSON path           | Type    | Description                                                                                                                    |
 | ---------------------------------- | ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_DRY_RUN`           | `dry_run`           | boolean | When true, attempt to apply the patch in a temporary git worktree and then discard it (does not modify the current workspace). |
-| `MUX_TOOL_INPUT_EXPECTED_HEAD_SHA` | `expected_head_sha` | string  | When provided, refuse to apply unless the target repository HEAD matches this SHA.                                             |
-| `MUX_TOOL_INPUT_FORCE`             | `force`             | boolean | When true, allow apply even if the patch was previously applied.                                                               |
-| `MUX_TOOL_INPUT_PROJECT_PATH`      | `project_path`      | string  | When provided, apply only the patch artifact for this project path.                                                            |
-| `MUX_TOOL_INPUT_TASK_ID`           | `task_id`           | string  | Child task ID whose patch artifact should be applied                                                                           |
-| `MUX_TOOL_INPUT_THREE_WAY`         | `three_way`         | boolean | When true, run git am with --3way                                                                                              |
+| `XUM_TOOL_INPUT_DRY_RUN`           | `dry_run`           | boolean | When true, attempt to apply the patch in a temporary git worktree and then discard it (does not modify the current workspace). |
+| `XUM_TOOL_INPUT_EXPECTED_HEAD_SHA` | `expected_head_sha` | string  | When provided, refuse to apply unless the target repository HEAD matches this SHA.                                             |
+| `XUM_TOOL_INPUT_FORCE`             | `force`             | boolean | When true, allow apply even if the patch was previously applied.                                                               |
+| `XUM_TOOL_INPUT_PROJECT_PATH`      | `project_path`      | string  | When provided, apply only the patch artifact for this project path.                                                            |
+| `XUM_TOOL_INPUT_TASK_ID`           | `task_id`           | string  | Child task ID whose patch artifact should be applied                                                                           |
+| `XUM_TOOL_INPUT_THREE_WAY`         | `three_way`         | boolean | When true, run git am with --3way                                                                                              |
 
 </details>
 
@@ -693,60 +743,99 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                           | JSON path           | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------- | ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_FILTER`           | `filter`            | string  | Optional regex to filter bash task output lines. By default, only matching lines are returned. When filter_exclude is true, matching lines are excluded instead. Non-matching lines are discarded and cannot be retrieved later.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_FILTER_EXCLUDE`   | `filter_exclude`    | boolean | When true, lines matching 'filter' are excluded instead of kept. Requires 'filter' to be set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `MUX_TOOL_INPUT_MIN_COMPLETED`    | `min_completed`     | number  | Number of awaited tasks that must complete before this call returns. Defaults to 1, so by default task_await returns as soon as the FIRST awaited task completes, letting you act on it while the rest keep running. The result still includes every task complete at that moment plus current status (running/queued) for the rest. Tasks that have not yet completed keep running and remain re-awaitable on a later task_await call. Raise this (e.g. set it to the total number of awaited tasks) when you genuinely need more before proceeding — for example best-of-N synthesis that must compare every candidate. Clamped to the number of awaited tasks; values above that behave like 'wait for all'. |
-| `MUX_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string  | List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, or workflow_run results; never fabricate an ID. task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs.                                                                                                                                                                                                   |
-| `MUX_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number  | Number of elements in task_ids (List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, or workflow_run results; never fabricate an ID. task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs.)                                                                                                                                                                  |
-| `MUX_TOOL_INPUT_TIMEOUT_SECS`     | `timeout_secs`      | number  | Maximum time to wait in seconds for each task. For bash tasks, this waits for NEW output (or process exit). If exceeded, the result returns status=queued\|starting\|running\|awaiting_report (task is still active). Defaults to 600 seconds (10 minutes) if not specified. Set to 0 for a non-blocking status check.                                                                                                                                                                                                                                                                                                                                                                                          |
+| `XUM_TOOL_INPUT_FILTER`           | `filter`            | string  | Optional regex to filter bash task output lines. By default, only matching lines are returned. When filter_exclude is true, matching lines are excluded instead. Non-matching lines are discarded and cannot be retrieved later.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `XUM_TOOL_INPUT_FILTER_EXCLUDE`   | `filter_exclude`    | boolean | When true, lines matching 'filter' are excluded instead of kept. Requires 'filter' to be set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `XUM_TOOL_INPUT_MIN_COMPLETED`    | `min_completed`     | number  | Number of awaited tasks that must complete before this call returns. Defaults to 1, so by default task_await returns as soon as the FIRST awaited task completes, letting you act on it while the rest keep running. The result still includes every task complete at that moment plus current status (running/queued) for the rest. Tasks that have not yet completed keep running and remain re-awaitable on a later task_await call. Raise this (e.g. set it to the total number of awaited tasks) when you genuinely need more before proceeding — for example best-of-N synthesis that must compare every candidate. Clamped to the number of awaited tasks; values above that behave like 'wait for all'. |
+| `XUM_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string  | List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, or workflow_run results; never fabricate an ID. task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs.                                                                                                                                                                                                   |
+| `XUM_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number  | Number of elements in task_ids (List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, or workflow_run results; never fabricate an ID. task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs.)                                                                                                                                                                  |
+| `XUM_TOOL_INPUT_TIMEOUT_SECS`     | `timeout_secs`      | number  | Maximum time to wait in seconds for each task. For bash tasks, this waits for NEW output (or process exit). If exceeded, the result returns status=queued\|starting\|running\|awaiting_report (task is still active). Defaults to 600 seconds (10 minutes) if not specified. Set to 0 for a non-blocking status check.                                                                                                                                                                                                                                                                                                                                                                                          |
 
 </details>
 
 <details>
-<summary>task_list (3)</summary>
+<summary>task_list (4)</summary>
 
-| Env var                           | JSON path           | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| --------------------------------- | ------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_INCLUDE_ARCHIVED` | `includeArchived`   | boolean | Whether to include archived child workspace tasks. Defaults to false, hiding archived non-actionable child workspace work.                                                                                                                                                                                                                                                                                                                                                                                 |
-| `MUX_TOOL_INPUT_STATUSES_<INDEX>` | `statuses[<INDEX>]` | enum    | Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.                                  |
-| `MUX_TOOL_INPUT_STATUSES_COUNT`   | `statuses.length`   | number  | Number of elements in statuses (Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.) |
+| Env var                           | JSON path           | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------------- | ------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_INCLUDE_ARCHIVED` | `includeArchived`   | boolean | Compatibility option for archived workspace-turn and bash records. Legacy archived sub-agents remain listable as inactive children regardless.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `XUM_TOOL_INPUT_SCOPE`            | `scope`             | enum    | Listing scope. "descendants" (default) lists this workspace's own tasks, workflow runs, and bash processes. "tree" lists every agent workspace in this task tree — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you; use it to discover task_send_message peer targets.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `XUM_TOOL_INPUT_STATUSES_<INDEX>` | `statuses[<INDEX>]` | enum    | Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus the root row under scope:"tree"). Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.                                  |
+| `XUM_TOOL_INPUT_STATUSES_COUNT`   | `statuses.length`   | number  | Number of elements in statuses (Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus the root row under scope:"tree"). Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.) |
+
+</details>
+
+<details>
+<summary>task_message_parent (1)</summary>
+
+| Env var                  | JSON path | Type   | Description                                 |
+| ------------------------ | --------- | ------ | ------------------------------------------- |
+| `XUM_TOOL_INPUT_MESSAGE` | `message` | string | Message to queue for your parent workspace. |
+
+</details>
+
+<details>
+<summary>task_message_sibling (2)</summary>
+
+| Env var                  | JSON path | Type   | Description                                                  |
+| ------------------------ | --------- | ------ | ------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_MESSAGE` | `message` | string | Message to deliver to the sibling task.                      |
+| `XUM_TOOL_INPUT_TASK_ID` | `task_id` | string | Sibling task ID; it must share your direct parent workspace. |
+
+</details>
+
+<details>
+<summary>task_remove (2)</summary>
+
+| Env var                           | JSON path           | Type   | Description                                                         |
+| --------------------------------- | ------------------- | ------ | ------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string | Inactive child task IDs to remove.                                  |
+| `XUM_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number | Number of elements in task_ids (Inactive child task IDs to remove.) |
+
+</details>
+
+<details>
+<summary>task_retitle (2)</summary>
+
+| Env var                  | JSON path | Type   | Description                                                 |
+| ------------------------ | --------- | ------ | ----------------------------------------------------------- |
+| `XUM_TOOL_INPUT_TASK_ID` | `task_id` | string | Stable descendant sub-agent task ID.                        |
+| `XUM_TOOL_INPUT_TITLE`   | `title`   | string | New short, friendly reusable role name, such as "Reviewer". |
 
 </details>
 
 <details>
 <summary>task_send_message (3)</summary>
 
-| Env var                              | JSON path             | Type   | Description                                                                                                                             |
-| ------------------------------------ | --------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_MESSAGE`             | `message`             | string | Updated guidance to send to the sub-agent.                                                                                              |
-| `MUX_TOOL_INPUT_QUEUE_DISPATCH_MODE` | `queue_dispatch_mode` | enum   | When the child is busy, dispatch the guidance at "tool-end" after its next tool call (default) or at "turn-end" after its current turn. |
-| `MUX_TOOL_INPUT_TASK_ID`             | `task_id`             | string | Active descendant sub-agent task ID returned by task or task_list.                                                                      |
+| Env var                              | JSON path             | Type   | Description                                                                                                                                                                                                                                                              |
+| ------------------------------------ | --------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_MESSAGE`             | `message`             | string | Plain-text message to deliver to the target. Sibling/upward sends are capped at 16384 characters and draw from shared per-pair/per-target session budgets; descendant guidance is uncapped.                                                                              |
+| `XUM_TOOL_INPUT_QUEUE_DISPATCH_MODE` | `queue_dispatch_mode` | enum   | When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor targets (often human-driven; do not cut into their active turn). |
+| `XUM_TOOL_INPUT_TASK_ID`             | `task_id`             | string | Tree target ID returned by task or task_list — a descendant sub-agent task ID or, for sibling/upward messages, a same-tree peer, ancestor, or root workspace ID (task_list scope:"tree").                                                                                |
 
 </details>
 
 <details>
-<summary>task_terminate (2)</summary>
+<summary>task_stop (2)</summary>
 
-| Env var                           | JSON path           | Type   | Description                                                                                                                                                                                                                                                                       |
-| --------------------------------- | ------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string | List of task IDs to terminate. Sub-agent task IDs and bash task IDs must belong to descendants of the current workspace; workflow run IDs (wfr\_...) must belong to the current workspace and are interrupted (resumable) rather than destroyed.                                  |
-| `MUX_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number | Number of elements in task_ids (List of task IDs to terminate. Sub-agent task IDs and bash task IDs must belong to descendants of the current workspace; workflow run IDs (wfr\_...) must belong to the current workspace and are interrupted (resumable) rather than destroyed.) |
+| Env var                           | JSON path           | Type   | Description                                        |
+| --------------------------------- | ------------------- | ------ | -------------------------------------------------- |
+| `XUM_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string | Task IDs to stop.                                  |
+| `XUM_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number | Number of elements in task_ids (Task IDs to stop.) |
 
 </details>
 
 <details>
-<summary>task_workspace_lifecycle (8)</summary>
+<summary>task_workspace_lifecycle (7)</summary>
 
 | Env var                                                     | JSON path                                      | Type    | Description                                                                                                                                                                                     |
 | ----------------------------------------------------------- | ---------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_<INDEX>` | `acknowledged_untracked_paths[<KEY>][<INDEX>]` | string  | Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.                                                                   |
-| `MUX_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_COUNT`   | `acknowledged_untracked_paths[<KEY>].length`   | number  | Number of elements in acknowledged_untracked_paths[&lt;KEY&gt;] (Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.) |
-| `MUX_TOOL_INPUT_ACTION`                                     | `action`                                       | enum    | Lifecycle action to perform: "archive" is the safe default, "delete_worktree" reclaims disk after archive, and "remove" irreversibly deletes archived workspace metadata/session state.         |
-| `MUX_TOOL_INPUT_FORCE`                                      | `force`                                        | boolean | Only applies to remove. Does not bypass ownership, active-turn, archive, or archive-confirmation safety checks.                                                                                 |
-| `MUX_TOOL_INPUT_INTERRUPT_ACTIVE`                           | `interrupt_active`                             | boolean | When true, interrupt active workspace turns for the target before performing an otherwise-eligible lifecycle action. Defaults to false.                                                         |
-| `MUX_TOOL_INPUT_TARGETS_<INDEX>_TASK_ID`                    | `targets[<INDEX>].taskId`                      | string  | —                                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_TARGETS_<INDEX>_WORKSPACE_ID`               | `targets[<INDEX>].workspaceId`                 | string  | —                                                                                                                                                                                               |
-| `MUX_TOOL_INPUT_TARGETS_COUNT`                              | `targets.length`                               | number  | Number of elements in targets (Parent-owned workspace-turn targets. Provide exactly one of taskId (wst\_...) or workspaceId for each target.)                                                   |
+| `XUM_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_<INDEX>` | `acknowledged_untracked_paths[<KEY>][<INDEX>]` | string  | Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.                                                                   |
+| `XUM_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_COUNT`   | `acknowledged_untracked_paths[<KEY>].length`   | number  | Number of elements in acknowledged_untracked_paths[&lt;KEY&gt;] (Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.) |
+| `XUM_TOOL_INPUT_ACTION`                                     | `action`                                       | enum    | Reversible lifecycle action: "archive" hides and suspends the workspace without deleting state, "unarchive" restores it.                                                                        |
+| `XUM_TOOL_INPUT_INTERRUPT_ACTIVE`                           | `interrupt_active`                             | boolean | Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false.                                     |
+| `XUM_TOOL_INPUT_TARGETS_<INDEX>_TASK_ID`                    | `targets[<INDEX>].taskId`                      | string  | —                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TARGETS_<INDEX>_WORKSPACE_ID`               | `targets[<INDEX>].workspaceId`                 | string  | —                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TARGETS_COUNT`                              | `targets.length`                               | number  | Number of elements in targets (Workspace-turn targets this workspace created via task(kind="workspace"). Provide exactly one of taskId (wst\_...) or workspaceId for each target.)              |
 
 </details>
 
@@ -755,8 +844,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                      | JSON path     | Type   | Description                            |
 | ---------------------------- | ------------- | ------ | -------------------------------------- |
-| `MUX_TOOL_INPUT_CATEGORY`    | `category`    | enum   | Optional event category.               |
-| `MUX_TOOL_INPUT_DESCRIPTION` | `description` | string | One sentence describing what happened. |
+| `XUM_TOOL_INPUT_CATEGORY`    | `category`    | enum   | Optional event category.               |
+| `XUM_TOOL_INPUT_DESCRIPTION` | `description` | string | One sentence describing what happened. |
 
 </details>
 
@@ -765,9 +854,9 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                                | JSON path                | Type   | Description                                                                                                                  |
 | -------------------------------------- | ------------------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_TODOS_<INDEX>_CONTENT` | `todos[<INDEX>].content` | string | Task description with tense matching status: past for completed, present progressive for in_progress, imperative for pending |
-| `MUX_TOOL_INPUT_TODOS_<INDEX>_STATUS`  | `todos[<INDEX>].status`  | enum   | Task status                                                                                                                  |
-| `MUX_TOOL_INPUT_TODOS_COUNT`           | `todos.length`           | number | Number of elements in todos                                                                                                  |
+| `XUM_TOOL_INPUT_TODOS_<INDEX>_CONTENT` | `todos[<INDEX>].content` | string | Task description with tense matching status: past for completed, present progressive for in_progress, imperative for pending |
+| `XUM_TOOL_INPUT_TODOS_<INDEX>_STATUS`  | `todos[<INDEX>].status`  | enum   | Task status                                                                                                                  |
+| `XUM_TOOL_INPUT_TODOS_COUNT`           | `todos.length`           | number | Number of elements in todos                                                                                                  |
 
 </details>
 
@@ -776,8 +865,8 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                | JSON path | Type   | Description                                                                                               |
 | ---------------------- | --------- | ------ | --------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_LIMIT` | `limit`   | number | Maximum number of matches to return (default 10, max 25)                                                  |
-| `MUX_TOOL_INPUT_QUERY` | `query`   | string | Task or capability keywords to search for (matched against tool names, descriptions, and parameter names) |
+| `XUM_TOOL_INPUT_LIMIT` | `limit`   | number | Maximum number of matches to return (default 10, max 25)                                                  |
+| `XUM_TOOL_INPUT_QUERY` | `query`   | string | Task or capability keywords to search for (matched against tool names, descriptions, and parameter names) |
 
 </details>
 
@@ -786,7 +875,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var              | JSON path | Type   | Description                      |
 | -------------------- | --------- | ------ | -------------------------------- |
-| `MUX_TOOL_INPUT_URL` | `url`     | string | The URL to fetch (http or https) |
+| `XUM_TOOL_INPUT_URL` | `url`     | string | The URL to fetch (http or https) |
 
 </details>
 
@@ -795,21 +884,22 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 | Env var                            | JSON path           | Type    | Description                                                                                                                                                                                                                                                     |
 | ---------------------------------- | ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_MODE`              | `mode`              | enum    | Defaults to 'resume', which continues interrupted or crash-orphaned runs from durable state and never re-executes completed steps. Use 'retry_from_checkpoint' only for failed runs; it re-executes work after the last checkpoint and is rejected when unsafe. |
-| `MUX_TOOL_INPUT_RUN_ID`            | `run_id`            | string  | Workflow run ID (wfr\_...) to resume. Must belong to the current workspace.                                                                                                                                                                                     |
-| `MUX_TOOL_INPUT_RUN_IN_BACKGROUND` | `run_in_background` | boolean | Defaults to false (foreground): waits until the run reaches a terminal status and returns its result. Set true to resume in the background and continue other work; await the runId with task_await when you need the result.                                   |
+| `XUM_TOOL_INPUT_MODE`              | `mode`              | enum    | Defaults to 'resume', which continues interrupted or crash-orphaned runs from durable state and never re-executes completed steps. Use 'retry_from_checkpoint' only for failed runs; it re-executes work after the last checkpoint and is rejected when unsafe. |
+| `XUM_TOOL_INPUT_RUN_ID`            | `run_id`            | string  | Workflow run ID (wfr\_...) to resume. Must belong to the current workspace.                                                                                                                                                                                     |
+| `XUM_TOOL_INPUT_RUN_IN_BACKGROUND` | `run_in_background` | boolean | Defaults to false (foreground): waits until the run reaches a terminal status and returns its result. Set true to resume in the background and continue other work; await the runId with task_await when you need the result.                                   |
 
 </details>
 
 <details>
-<summary>workflow_run (4)</summary>
+<summary>workflow_run (5)</summary>
 
 | Env var                            | JSON path           | Type    | Description                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------------------- | ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MUX_TOOL_INPUT_ARGS`              | `args`              | unknown | —                                                                                                                                                                                                                                                                                                                                                                        |
-| `MUX_TOOL_INPUT_RUN_IN_BACKGROUND` | `run_in_background` | boolean | Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result. |
-| `MUX_TOOL_INPUT_SCRIPT_PATH`       | `script_path`       | string  | Explicit workflow script path, such as "skill://deep-research/workflow.js" or "./workflows/research.js". Use paths for reusable, reviewable, or skill-packaged workflows.                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_SCRIPT_SOURCE`     | `script_source`     | string  | Inline JavaScript workflow source for one-off conductors, including prose-described processes codified in place. The exact source is snapshotted into the durable run for replay/resume.                                                                                                                                                                                 |
+| `XUM_TOOL_INPUT_ALLOW_CONCURRENT`  | `allow_concurrent`  | boolean | Pass true only to intentionally start another active run of the same script in this workspace. By default workflow_run refuses when the same script already has an active (pending/running/backgrounded) run and reports that run so you can task_await or workflow_resume it instead of duplicating it.                                                                 |
+| `XUM_TOOL_INPUT_ARGS`              | `args`              | unknown | —                                                                                                                                                                                                                                                                                                                                                                        |
+| `XUM_TOOL_INPUT_RUN_IN_BACKGROUND` | `run_in_background` | boolean | Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result. |
+| `XUM_TOOL_INPUT_SCRIPT_PATH`       | `script_path`       | string  | Explicit workflow script path, such as "skill://deep-research/workflow.js" or "./workflows/research.js". Use paths for reusable, reviewable, or skill-packaged workflows.                                                                                                                                                                                                |
+| `XUM_TOOL_INPUT_SCRIPT_SOURCE`     | `script_source`     | string  | Inline JavaScript workflow source for one-off conductors, including prose-described processes codified in place. The exact source is snapshotted into the durable run for replay/resume.                                                                                                                                                                                 |
 
 </details>
 
@@ -825,10 +915,10 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 
 ```bash
 #!/usr/bin/env bash
-# .mux/tool_post
+# .xum/tool_post
 
-if [[ "$MUX_TOOL" == file_edit_* ]]; then
-  file="$MUX_TOOL_INPUT_FILE_PATH"
+if [[ "$XUM_TOOL" == file_edit_* ]]; then
+  file="$XUM_TOOL_INPUT_FILE_PATH"
   prettier --write --log-level silent "$file" 2>/dev/null || true
 fi
 ```
@@ -839,10 +929,10 @@ fi
 
 ```bash
 #!/usr/bin/env bash
-# .mux/tool_post
+# .xum/tool_post
 
-# Tool results are available via MUX_TOOL_RESULT_* if needed.
-echo "$(date '+%H:%M:%S') $MUX_TOOL completed" >> /tmp/mux-tools.log
+# Tool results are available via XUM_TOOL_RESULT_* if needed.
+echo "$(date '+%H:%M:%S') $XUM_TOOL completed" >> /tmp/xum-tools.log
 ```
 
 </Accordion>
@@ -851,12 +941,12 @@ echo "$(date '+%H:%M:%S') $MUX_TOOL completed" >> /tmp/mux-tools.log
 
 ```python
 #!/usr/bin/env python3
-# .mux/tool_pre
+# .xum/tool_pre
 
 import os, sys
 
-tool = os.environ.get('MUX_TOOL', '')
-script = os.environ.get('MUX_TOOL_INPUT_SCRIPT', '')
+tool = os.environ.get('XUM_TOOL', '')
+script = os.environ.get('XUM_TOOL_INPUT_SCRIPT', '')
 
 if tool == 'bash':
     if 'rm -rf /' in script:

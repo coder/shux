@@ -1,7 +1,7 @@
 {
   "name": "@coder/mux-chat-components",
   "version": "0.1.0",
-  "description": "Shared chat components for Mux conversation rendering",
+  "description": "Shared chat components for Xum conversation rendering",
   "packageManager": "bun@1.3.5",
   "type": "module",
   "main": "./dist/index.js",
@@ -42,7 +42,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/coder/mux.git",
+    "url": "git+https://github.com/coder/xum.git",
     "directory": "packages/chat-components"
   },
   "license": "AGPL-3.0-only",

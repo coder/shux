@@ -40,7 +40,8 @@ export const DEFAULT_TERMINAL_SIZE = { cols: 80, rows: 24 };
 export function openTerminalPopout(
   api: APIClient,
   workspaceId: string,
-  sessionId: string
+  sessionId: string,
+  initialTitle?: string
 ): Promise<void> {
   const isBrowser = !window.api;
 
@@ -48,6 +49,9 @@ export function openTerminalPopout(
     // In browser mode, we must open the window client-side
     // The backend cannot open a window on the user's client
     const params = new URLSearchParams({ workspaceId, sessionId });
+    if (initialTitle) {
+      params.set("title", initialTitle);
+    }
     const terminalUrl = resolveBrowserAssetUrl(`terminal.html?${params.toString()}`);
     window.open(
       terminalUrl,
@@ -59,7 +63,7 @@ export function openTerminalPopout(
   // Open via backend (Electron pops up BrowserWindow, browser already opened above).
   // Returned to the caller so a backend rejection can be observed instead of vanishing
   // into an unhandled promise rejection.
-  return api.terminal.openWindow({ workspaceId, sessionId });
+  return api.terminal.openWindow({ workspaceId, sessionId, initialTitle });
 }
 
 /**

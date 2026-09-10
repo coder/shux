@@ -19,6 +19,7 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { listModelCatalogIds } from "@/common/utils/tokens/modelCatalog";
 import { isCodexOauthRequiredModelId } from "@/common/constants/codexOAuth";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import {
@@ -26,7 +27,7 @@ import {
   getModelProvider,
   supports1MContext,
 } from "@/common/utils/ai/models";
-import { getAllowedProvidersForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import {
@@ -101,16 +102,22 @@ function buildProviderModelEntry(
   return entry;
 }
 
-export function shouldShowModelInSettings(modelId: string, codexOauthConfigured: boolean): boolean {
+export function shouldShowModelInSettings(
+  modelId: string,
+  codexOauthConfigured: boolean,
+  // A configured gateway (mux-gateway, openrouter, ...) supplies its own
+  // credentials, so the row must stay visible for users to pick that route.
+  hasConfiguredGatewayRoute = false
+): boolean {
   // OpenAI OAuth gating only applies to OpenAI-routed models; other providers can
   // reuse the same providerModelId string without requiring OpenAI OAuth.
   if (getModelProvider(modelId) !== "openai") {
     return true;
   }
 
-  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected,
-  // so users don't pick defaults that fail at send time.
-  return codexOauthConfigured || !isCodexOauthRequiredModelId(modelId);
+  // Keep OAuth-required OpenAI models out of Settings until OAuth is connected
+  // or a gateway can serve them, so users don't pick defaults that fail at send time.
+  return codexOauthConfigured || hasConfiguredGatewayRoute || !isCodexOauthRequiredModelId(modelId);
 }
 
 export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
@@ -150,8 +157,14 @@ export function ModelsSection() {
     setLastProvider(allowedProviders[0] ?? "");
   }, [config, allowedProviders, lastProvider, setLastProvider]);
 
-  const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
-    useModelsFromSettings();
+  const {
+    defaultModel,
+    setDefaultModel,
+    hiddenModels,
+    hideModel,
+    unhideModel,
+    isAllowedByPolicyOnActiveRoute,
+  } = useModelsFromSettings();
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
@@ -160,12 +173,10 @@ export function ModelsSection() {
   // cross-hook timing mismatches while settings are loading/refetching.
   const codexOauthConfigured = config?.openai?.codexOauthSet === true;
 
-  // "Treat as" dropdown should only list known models — custom models don't have
-  // the metadata (pricing, context window, tokenizer) that mapping inherits.
-  // Static list — React Compiler handles memoization; no manual useMemo needed.
-  const knownModelIds = Object.values(KNOWN_MODELS)
-    .map((model) => model.id)
-    .sort();
+  // "Treat as" targets must carry the metadata (pricing, context window) that
+  // mapping inherits: any model in the token catalog qualifies, not just the
+  // curated KNOWN_MODELS list (#3727).
+  const treatAsModelIds = listModelCatalogIds();
 
   // Check if a model already exists (for duplicate prevention)
   const modelExists = useCallback(
@@ -185,7 +196,7 @@ export function ModelsSection() {
 
     // mux-gateway is a routing layer, not a provider users should add models under.
     if (HIDDEN_PROVIDERS.has(lastProvider)) {
-      setError("Mux Gateway models can't be added directly. Enable Gateway per-model instead.");
+      setError("Xum Gateway models can't be added directly. Enable Gateway per-model instead.");
       return;
     }
     const trimmedModelId = newModelId.trim();
@@ -378,6 +389,8 @@ export function ModelsSection() {
 
   // Get built-in models from KNOWN_MODELS.
   // Filter by policy so the settings table doesn't list models users can't ever select.
+  // The policy applies to the active route's identity (like the backend), so a
+  // gateway-only policy keeps rows whose route is that gateway.
   const builtInModels = Object.values(KNOWN_MODELS)
     .map((model) => ({
       provider: model.provider,
@@ -385,8 +398,16 @@ export function ModelsSection() {
       fullId: model.id,
       aliases: model.aliases,
     }))
-    .filter((model) => shouldShowModelInSettings(model.fullId, codexOauthConfigured))
-    .filter((model) => isModelAllowedByPolicy(effectivePolicy, model.fullId));
+    .filter((model) =>
+      shouldShowModelInSettings(
+        model.fullId,
+        codexOauthConfigured,
+        routing
+          .availableRoutes(model.fullId)
+          .some((route) => route.route !== "direct" && route.isConfigured)
+      )
+    )
+    .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
 
   const customModels = getCustomModels();
 
@@ -473,7 +494,7 @@ export function ModelsSection() {
                       editMappedToModel={isModelEditing ? editing.mappedToModel : undefined}
                       editAutofocus={isModelEditing ? editing.focus : undefined}
                       customContextWindowTokens={model.contextWindowTokens}
-                      allModels={knownModelIds}
+                      allModels={treatAsModelIds}
                       editError={isModelEditing ? error : undefined}
                       saving={false}
                       hasActiveEdit={editing !== null}
@@ -528,10 +549,11 @@ export function ModelsSection() {
                         minThinking.setMinThinkingLevel(model.fullId, level)
                       }
                       onToggle1MContext={
-                        supports1MContext(model.fullId)
+                        supports1MContext(model.fullId, config)
                           ? () => toggle1MContext(model.fullId)
                           : undefined
                       }
+                      providersConfig={config}
                     />
                   );
                 })}
@@ -577,10 +599,11 @@ export function ModelsSection() {
                     minThinking.setMinThinkingLevel(model.fullId, level)
                   }
                   onToggle1MContext={
-                    supports1MContext(model.fullId)
+                    supports1MContext(model.fullId, config)
                       ? () => toggle1MContext(model.fullId)
                       : undefined
                   }
+                  providersConfig={config}
                 />
               ))}
             </tbody>

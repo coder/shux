@@ -91,3 +91,131 @@ export const BackgroundProcesses: AppStory = {
     },
   },
 };
+
+/**
+ * A one-shot watcher matched its monitor filter and exited, but the synthetic wake turn
+ * has not been delivered yet. The banner must keep the process visible with a pending
+ * indicator instead of vanishing (which previously looked like a lost wake).
+ */
+export const MonitorWakePendingAfterExit: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+            createAssistantMessage(
+              "msg-2",
+              "I've started a background watcher that prints WAKE: when the checks finish.",
+              {
+                historySequence: 2,
+                timestamp: STABLE_TIMESTAMP - 50000,
+                toolCalls: [
+                  createTerminalTool("call-1", "./watch_pr_checks.sh", "Watching PR checks..."),
+                ],
+              }
+            ),
+          ],
+          backgroundProcesses: [
+            {
+              id: "bash_watcher",
+              pid: 22345,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 1000,
+                totalMatches: 1,
+                droppedLines: 0,
+                lastLines: ["WAKE: all checks green"],
+                stopped: true,
+                pendingWakeKind: "match",
+              },
+              status: "exited",
+              exitCode: 0,
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // The waking indicator sits on its own non-truncating line specifically so narrow
+  // rows cannot ellipsize it away; snapshot the phone width (alongside desktop) so the
+  // guarded condition is actually exercised.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "A one-shot watcher matched and exited while its monitor wake is still pending delivery. The banner stays visible with a 'waking agent' indicator, no live duration, and no terminate button.",
+      },
+    },
+  },
+};
+
+export const MonitorLostWakePendingAfterRestart: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            // Synthesized from a durable pending monitor-lost wake after restart: no live
+            // process (pid 0), so no pid line, no output action, and "monitor lost" wording
+            // instead of claiming a match.
+            {
+              id: "bash_watcher",
+              pid: 0,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              synthesized: true,
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 0,
+                totalMatches: 0,
+                droppedLines: 0,
+                lastLines: [],
+                stopped: true,
+                pendingWakeKind: "monitor-lost",
+              },
+              status: "exited",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // Same phone-width coverage as MonitorWakePendingAfterExit: the lost-monitor label
+  // must stay visible on narrow rows too.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
+      },
+    },
+  },
+};

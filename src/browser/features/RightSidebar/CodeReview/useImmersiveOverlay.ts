@@ -66,6 +66,12 @@ interface UseImmersiveOverlayDataInput {
    * refresh) without busting it when a hunk is merely filtered out by mark-read.
    */
   fileContentVersion: string;
+  /**
+   * Multi-project workspaces read from the shared container root, whose per-project
+   * entries are symlinks; their reads must anchor symlink containment to the resolved
+   * project root instead of the container cwd.
+   */
+  isMultiProjectWorkspace?: boolean;
 }
 
 interface UseImmersiveOverlayInput extends UseImmersiveOverlayDataInput {
@@ -440,6 +446,7 @@ function useImmersiveOverlayData(input: UseImmersiveOverlayDataInput) {
           script: buildReadFileScript(resolvedFilePath, {
             maxSizeBytes: MAX_FULL_FILE_CONTEXT_BYTES,
             maxLineCount: MAX_FULL_FILE_CONTEXT_LINES,
+            containmentAnchor: input.isMultiProjectWorkspace ? "first-segment" : "cwd",
           }),
         })
       );
@@ -510,6 +517,7 @@ function useImmersiveOverlayData(input: UseImmersiveOverlayDataInput) {
     activeFileContentCacheKey,
     input.activeFilePath,
     input.api,
+    input.isMultiProjectWorkspace,
     input.theme,
     input.workspaceId,
     shouldLoadFullFileContext,

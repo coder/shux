@@ -1,6 +1,7 @@
 import React from "react";
 import { AlertTriangle, Check, CircleDot, EyeOff, X } from "lucide-react";
 import type { ToolErrorResult } from "@/common/types/tools";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   useStickyExpand,
   type UseStickyExpandOptions,
@@ -165,6 +166,22 @@ export function unwrapResult(result: unknown): unknown {
   return result;
 }
 
+/** Preserve wrapper compatibility before strict result validation without mutating hook/UI output. */
+export function normalizeToolResultForRendering(result: unknown): unknown {
+  const unwrapped = unwrapResult(result);
+  if (!isPlainObject(unwrapped)) return unwrapped;
+  const core = { ...unwrapped };
+  delete core.hook_output;
+  delete core.hook_duration_ms;
+  delete core.hook_path;
+  delete core.ui_only;
+  // Blocking pre-hooks return a bare error instead of the tool's result schema.
+  if (typeof core.error === "string" && !("success" in core) && !("status" in core)) {
+    return { success: false, error: core.error };
+  }
+  return core;
+}
+
 /**
  * Type guard for ToolErrorResult shape: { success: false, error: string }.
  * Use this when you need type narrowing to access error.
@@ -193,6 +210,11 @@ export function isFailedToolOutput(output: unknown): boolean {
  * - output-available + success → "completed"
  * - input-available + parentInterrupted → "interrupted"
  * - input-available + running → "executing"
+ *
+ * An explicit `failed` flag wins over shape-derived detection: reload-time
+ * reconstruction of RLM kernel-mode records persists no output to sniff, so
+ * failure travels out-of-band (never as a synthetic output shape that a real
+ * tool result could collide with).
  */
 export function getNestedToolStatus(
   state: "input-available" | "output-available" | "output-redacted",
@@ -201,7 +223,7 @@ export function getNestedToolStatus(
   failed?: boolean
 ): ToolStatus {
   if (state === "output-available") {
-    return isFailedToolOutput(output) ? "failed" : "completed";
+    return (failed ?? isFailedToolOutput(output)) ? "failed" : "completed";
   }
   if (state === "output-redacted") return failed ? "failed" : "redacted";
   return parentInterrupted ? "interrupted" : "executing";

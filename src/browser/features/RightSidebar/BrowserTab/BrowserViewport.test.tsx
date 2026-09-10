@@ -75,7 +75,7 @@ describe("BrowserViewport", () => {
     ).toBeNull();
   });
 
-  test("maps intrinsic frame size so capped streams are not stretched into gutters", () => {
+  test("defaults intrinsic frame mapping to 1x display scale", () => {
     const highResolutionMetadata = {
       ...FRAME_METADATA,
       deviceWidth: 2160,
@@ -100,6 +100,63 @@ describe("BrowserViewport", () => {
         { frameImageSize: { width: 720, height: 720 } }
       )
     ).toBeNull();
+  });
+
+  test("maps input within the DPR-capped frame", () => {
+    const highResolutionMetadata = {
+      ...FRAME_METADATA,
+      deviceWidth: 2160,
+      deviceHeight: 2160,
+    };
+    const options = {
+      devicePixelRatio: 2,
+      frameImageSize: { width: 720, height: 720 },
+    };
+
+    expect(
+      mapDomPointToViewport(
+        500,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toEqual({ x: 1080, y: 1080 });
+    expect(
+      mapDomPointToViewport(
+        330,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toEqual({ x: 60, y: 1080 });
+    expect(
+      mapDomPointToViewport(
+        300,
+        500,
+        { left: 0, top: 0, width: 1000, height: 1000 },
+        highResolutionMetadata,
+        options
+      )
+    ).toBeNull();
+  });
+
+  test("does not enlarge the frame when device pixel ratio is below 1", () => {
+    const highResolutionMetadata = {
+      ...FRAME_METADATA,
+      deviceWidth: 2160,
+      deviceHeight: 2160,
+    };
+    const surface = { left: 0, top: 0, width: 360, height: 360 };
+    const frameImageSize = { width: 720, height: 720 };
+
+    expect(
+      mapDomPointToViewport(180, 180, surface, highResolutionMetadata, {
+        devicePixelRatio: 0.5,
+        frameImageSize,
+      })
+    ).toEqual(mapDomPointToViewport(180, 180, surface, highResolutionMetadata, { frameImageSize }));
   });
 
   test("maps decoded frame height when Chrome outer height differs from the page viewport", () => {
@@ -251,7 +308,11 @@ describe("BrowserViewport", () => {
     });
   });
 
-  test("uses loaded screenshot dimensions for pointer hit testing", () => {
+  test("DPR-caps the loaded screenshot and pointer hit testing", () => {
+    Object.defineProperty(globalThis.window, "devicePixelRatio", {
+      configurable: true,
+      value: 2,
+    });
     const view = renderViewport(
       createSession({
         frameMetadata: {
@@ -261,12 +322,15 @@ describe("BrowserViewport", () => {
         },
       })
     );
-    const image = view.getByAltText("Browser session screenshot");
+    const image = view.getByAltText("Browser session screenshot") as HTMLImageElement;
     Object.defineProperties(image, {
       naturalWidth: { configurable: true, value: 720 },
       naturalHeight: { configurable: true, value: 720 },
     });
     fireEvent.load(image);
+
+    expect(image.style.maxWidth).toBe("min(100%, 360px)");
+    expect(image.style.maxHeight).toBe("min(100%, 360px)");
 
     const viewport = view.getByRole("region", { name: "Browser viewport" });
     Object.assign(viewport, {
@@ -293,7 +357,7 @@ describe("BrowserViewport", () => {
       pointerId: 7,
       button: 0,
       buttons: 1,
-      clientX: 100,
+      clientX: 500,
       clientY: 500,
       detail: 1,
     });
@@ -301,7 +365,7 @@ describe("BrowserViewport", () => {
       pointerId: 8,
       button: 0,
       buttons: 1,
-      clientX: 500,
+      clientX: 300,
       clientY: 500,
       detail: 1,
     });

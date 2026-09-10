@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentIdSchema } from "./agentDefinition";
+import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
@@ -64,10 +64,27 @@ export const OnChatModeSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("live") }),
 ]);
 
+/**
+ * Why a requested since-mode replay was downgraded to full replay.
+ * Ordered by check precedence: the first failing predicate wins.
+ */
+export const OnChatDowngradeReasonSchema = z.enum([
+  "cursor-row-missing",
+  "oldest-mismatch",
+  "fingerprint-mismatch",
+  "history-read-failed",
+]);
+
 export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
+  /**
+   * Present only when the client requested since-mode and the server downgraded to
+   * full replay. Silent downgrades defeat incremental reconnects, so this must stay
+   * observable to clients and tests.
+   */
+  downgradeReason: OnChatDowngradeReasonSchema.optional(),
   /**
    * Authoritative pagination signal for full replays.
    * Omitted for since/live replays so the client can preserve existing pagination state.
@@ -93,19 +110,13 @@ export const RuntimeStatusEventSchema = z.object({
   detail: z.string().optional(), // Human-readable status like "Starting Coder workspace..."
 });
 
-export const HistoryClearedEventSchema = z.object({
-  type: z.literal("history-cleared"),
-  workspaceId: z.string(),
-  reason: z.string(),
-});
-
-export const AutoCompactionTriggeredEventSchema = z.object({
+const AutoCompactionTriggeredEventSchema = z.object({
   type: z.literal("auto-compaction-triggered"),
   reason: z.enum(["on-send", "mid-stream", "idle"]),
   usagePercent: z.number(),
 });
 
-export const AutoCompactionCompletedEventSchema = z.object({
+const AutoCompactionCompletedEventSchema = z.object({
   type: z.literal("auto-compaction-completed"),
   newUsagePercent: z.number(),
 });
@@ -155,6 +166,15 @@ export const StreamStartEventSchema = z.object({
     .optional()
     .meta({ description: "True when this event is emitted during stream replay" }),
   model: z.string(),
+  metadataModel: z
+    .string()
+    .optional()
+    .meta({
+      description:
+        "Request-pinned pricing/metadata identity resolved at stream start; " +
+        "frontends must prefer it over re-resolving the raw model against a " +
+        "possibly refreshed providers config",
+    }),
   routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
   historySequence: z.number().meta({
@@ -274,7 +294,7 @@ export const StreamEndEventSchema = z.object({
 
 export const StreamAbortReasonSchema = z.enum(["user", "startup", "system"]);
 
-export const StreamLifecyclePhaseSchema = z.enum([
+const StreamLifecyclePhaseSchema = z.enum([
   "idle",
   "preparing",
   "streaming",
@@ -316,6 +336,8 @@ export const StreamAbortEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       duration: z.number().optional(),
+      model: z.string().optional(),
+      metadataModel: z.string().optional(),
     })
     .optional()
     .meta({
@@ -601,7 +623,7 @@ export const WorkspaceInitEventSchema = z.discriminatedUnion("type", [
 ]);
 
 // Chat message wrapper with type discriminator for streaming events
-// MuxMessageSchema is used for persisted data (chat.jsonl) which doesn't have a type field.
+// XumMessageSchema is used for persisted data (chat.jsonl) which doesn't have a type field.
 // This wrapper adds a type discriminator for real-time streaming events.
 export const ChatMuxMessageSchema = MuxMessageSchema.extend({
   type: z.literal("message"),
@@ -650,9 +672,16 @@ export const RestoreToInputEventSchema = z.object({
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
-// MuxMessages (user/assistant chat messages) are emitted with type: "message"
+// XumMessages (user/assistant chat messages) are emitted with type: "message"
 // when loading from history or sending new messages.
+export const PrefixSwapInvalidatedEventSchema = z.object({
+  type: z.literal("prefix-swap-invalidated"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
+  PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
   HeartbeatEventSchema,
   CaughtUpMessageSchema,
@@ -685,7 +714,6 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
-  HistoryClearedEventSchema,
   // Auto-compaction status events
   AutoCompactionTriggeredEventSchema,
   AutoCompactionCompletedEventSchema,
@@ -702,12 +730,36 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 // Update Status
+export const RestartBlockerSchema = z.object({
+  kind: z.enum([
+    "active-streams",
+    "pending-turns",
+    "workspace-inits",
+    "workspace-lifecycle",
+    "workflows",
+    "projects",
+    "requests",
+    "desktop-sessions",
+    "queued-messages",
+    "auto-retries",
+    "terminals",
+    "background-processes",
+  ]),
+  count: z.number().int().positive(),
+});
+
 export const UpdateStatusSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("idle") }),
   z.object({ type: z.literal("checking") }),
   z.object({ type: z.literal("available"), info: z.object({ version: z.string() }) }),
   z.object({ type: z.literal("up-to-date") }),
-  z.object({ type: z.literal("downloading"), percent: z.number() }),
+  z.object({ type: z.literal("unsupported"), reason: z.string() }),
+  z.object({
+    type: z.literal("install-blocked"),
+    info: z.object({ version: z.string() }),
+    blockers: z.array(RestartBlockerSchema),
+  }),
+  z.object({ type: z.literal("downloading"), percent: z.number().nullable() }),
   z.object({ type: z.literal("downloaded"), info: z.object({ version: z.string() }) }),
   z.object({
     type: z.literal("error"),
@@ -736,17 +788,42 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
 // Unknown keys (e.g. `goals` from older persisted send-options written
 // before the Goals experiment graduated to GA) are stripped by Zod's
 // default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.object({
-  programmaticToolCalling: z.boolean().optional(),
-  programmaticToolCallingExclusive: z.boolean().optional(),
-  advisorTool: z.boolean().optional(),
-  dynamicWorkflows: z.boolean().optional(),
-  execSubagentHardRestart: z.boolean().optional(),
-  memory: z.boolean().optional(),
-  timeline: z.boolean().optional(),
-  workspaceHeartbeats: z.boolean().optional(),
-  toolSearch: z.boolean().optional(),
-});
+export const ExperimentsSchema = z.preprocess(
+  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
+  // Exclusive Mode" was a separate experiment may carry only the exclusive
+  // flag; the merged PTC experiment activates exactly that posture (`true`
+  // wins over an explicit programmaticToolCalling: false).
+  (value) =>
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
+      ? { ...value, programmaticToolCalling: true }
+      : value,
+  z.object({
+    programmaticToolCalling: z.boolean().optional(),
+    /**
+     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
+     * through parsing and stamped alongside programmaticToolCalling in
+     * persisted startup-retry snapshots so a downgraded build resumes in the
+     * exclusive posture instead of supplement mode.
+     */
+    programmaticToolCallingExclusive: z.boolean().optional(),
+    /**
+     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
+     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
+     */
+    rlm: z.boolean().optional(),
+    advisorTool: z.boolean().optional(),
+    dynamicWorkflows: z.boolean().optional(),
+    memory: z.boolean().optional(),
+    memoryIntuition: z.boolean().optional(),
+    timeline: z.boolean().optional(),
+    workspaceHeartbeats: z.boolean().optional(),
+    toolSearch: z.boolean().optional(),
+    continuousCompaction: z.boolean().optional(),
+    tokenBudget: z.boolean().optional(),
+  })
+);
 
 /**
  * `steer` is accepted for older clients, but the backend treats every manual
@@ -795,6 +872,49 @@ export const SendMessageOptionsSchema = z.object({
    */
   disableWorkspaceAgents: z.boolean().optional(),
   /**
+   * When truthy, a top-level send whose agentId cannot be resolved (or is hidden or
+   * disabled) at stream time fails loudly instead of silently falling back to exec.
+   * Workspace-turn launches with explicit agent overrides set this: pre-dispatch
+   * validation races init hooks and user edits, so stream-time resolution — which
+   * runs after initialization completes — is the last sound gate against running
+   * a different agent than the caller asked for. The object form additionally pins
+   * the validated definition's provenance: if the id resolves from a different
+   * scope than launch validation saw (e.g. a validated project shadow vanished and
+   * a global/built-in definition with the same id took over), the send fails
+   * instead of running a different prompt/tool policy. A single field (rather than
+   * a sibling flag) so every option-preservation path copies it verbatim.
+   */
+  strictAgentResolution: z
+    .union([
+      z.boolean(),
+      z.object({
+        expectedScope: AgentDefinitionScopeSchema,
+        /**
+         * Exact source identity from AgentDefinitionPackage.source ("built-in" or the
+         * discovery root). Scope alone collapses distinct candidates (project files
+         * and project plugins both report "project"), so this pins the definition
+         * itself when known.
+         */
+        expectedSource: z.string().optional(),
+        /**
+         * Provenance of the full resolved base chain (leaf first), pinned because
+         * stream-time inheritance resolution reloads every base independently — a
+         * vanished base shadow must not silently swap a different definition into
+         * the chain's prompt/tool policy.
+         */
+        expectedChain: z
+          .array(
+            z.object({
+              id: AgentIdSchema,
+              scope: AgentDefinitionScopeSchema,
+              source: z.string().optional(),
+            })
+          )
+          .optional(),
+      }),
+    ])
+    .optional(),
+  /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
    * continuation-backed goal for its current parent workspace. Headless callers
    * omit this, so plain one-shot mux run stays one-shot.
@@ -803,6 +923,3 @@ export const SendMessageOptionsSchema = z.object({
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
 });
-
-// Re-export ChatUsageDisplaySchema for convenience
-export { ChatUsageDisplaySchema };

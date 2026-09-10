@@ -23,6 +23,7 @@ export interface MockStreamStartEvent extends MockAssistantEventBase {
   messageId: string;
   model: string;
   mode?: "plan" | "exec" | "compact";
+  agentId?: string;
   thinkingLevel?: StreamStartEvent["thinkingLevel"];
 }
 

@@ -16,6 +16,10 @@ import type { CodeExecutionResult, NestedToolCall } from "./Shared/codeExecution
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { resolveCodeExecutionViewMode, type CodeExecutionViewMode } from "./codeExecutionViewMode";
+import { ToolResultImages, sanitizeImageData } from "./Shared/ToolResultImages";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
+import { DisplayOnlyFile, MediaAttachmentDownloadCard } from "./Shared/AttachmentCards";
 
 interface CodeExecutionToolCallProps {
   args: { code: string };
@@ -23,6 +27,8 @@ interface CodeExecutionToolCallProps {
   status?: ToolStatus;
   /** Nested tool calls from streaming (takes precedence over result.toolCalls) */
   nestedCalls?: NestedToolCall[];
+  workspaceId?: string;
+  toolCallTimestamp?: number;
 }
 
 interface ViewToggleProps {
@@ -66,6 +72,8 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   result,
   status = "pending",
   nestedCalls,
+  workspaceId,
+  toolCallTimestamp,
 }) => {
   // Use streaming nested calls if available, otherwise fall back to result
   const toolCalls = nestedCalls ?? [];
@@ -105,6 +113,30 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       ? result.result
       : JSON.stringify(result.result, null, 2);
   }, [result]);
+
+  // Carrier attachments from nested tool results, split by kind: images
+  // render inline via ToolResultImages, media the gallery refuses (PDF, SVG)
+  // gets download cards, and display-only files get preview/download cards.
+  // Self-healing: history replays hand this renderer unvalidated results, so
+  // a non-array attachments value or malformed members must be filtered out
+  // rather than allowed to throw and brick the workspace.
+  const attachmentParts: unknown[] = Array.isArray(result?.attachments) ? result.attachments : [];
+  const mediaAttachments = attachmentParts.filter(isMediaPart);
+  const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
+  const attachmentsResult =
+    mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;
+  const downloadOnlyMedia = mediaAttachments
+    .filter((media) => sanitizeImageData(media.mediaType, media.data) === null)
+    .map((media) => ({
+      type: "media" as const,
+      data: media.data,
+      mediaType: media.mediaType,
+      // Untrusted optional metadata (r24/r25): only well-formed filenames
+      // reach the download card.
+      ...(typeof media.filename === "string" && media.filename.length > 0
+        ? { filename: media.filename }
+        : {}),
+    }));
 
   // Determine result icon and variant
   const isInterrupted = status === "interrupted";
@@ -164,7 +196,12 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
 
       {/* Content based on view mode */}
       {effectiveViewMode === "tools" && hasToolCalls && (
-        <NestedToolsContainer calls={toolCalls} parentInterrupted={isInterrupted} />
+        <NestedToolsContainer
+          calls={toolCalls}
+          parentInterrupted={isInterrupted}
+          workspaceId={workspaceId}
+          toolCallTimestamp={toolCallTimestamp}
+        />
       )}
 
       {effectiveViewMode === "code" && (
@@ -203,6 +240,27 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
         ) : (
           <div className="text-muted text-xs italic">Execution in progress...</div>
         ))}
+
+      {/* Attachments carried out of nested tool results (attach_file): the
+          nested result only holds a stub, so previews render from the carrier. */}
+      {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
+      {downloadOnlyMedia.length > 0 && (
+        <div className="space-y-2">
+          {downloadOnlyMedia.map((media, index) => (
+            <MediaAttachmentDownloadCard
+              key={`${media.filename ?? media.mediaType}-${index}`}
+              media={media}
+            />
+          ))}
+        </div>
+      )}
+      {displayAttachments.length > 0 && (
+        <div className="space-y-2">
+          {displayAttachments.map((file, index) => (
+            <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
+          ))}
+        </div>
+      )}
     </fieldset>
   );
 };

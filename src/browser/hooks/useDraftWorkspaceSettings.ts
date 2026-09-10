@@ -376,6 +376,7 @@ export function useDraftWorkspaceSettings(
       : defaultRuntimeMode;
 
   const setLastRuntimeConfig = useCallback(
+    // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
       setLastRuntimeConfigs((prev) => {
         const existing = prev[mode];

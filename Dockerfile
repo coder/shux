@@ -1,8 +1,11 @@
-# mux server Docker image
+# Xum server Docker image
 # Multi-stage build with esbuild bundling for minimal runtime image
 #
-# Build:   docker build -t mux-server .
-# Run:     docker run -p 3000:3000 -v ~/.mux:/root/.mux mux-server
+# Build:   docker build -t xum-server .
+# Run:     docker run -p 3000:3000 -v ~/.xum:/root/.mux xum-server
+#
+# /root/.mux remains the container volume target so existing images and compose
+# volumes can upgrade and downgrade against the same data.
 #
 # See docker-compose.yml for easier orchestration
 
@@ -36,7 +39,12 @@ COPY patches/ patches/
 COPY scripts/postinstall.sh scripts/
 
 # Install dependencies and create Makefile sentinel so build targets don't reinstall.
-RUN bun install --frozen-lockfile && \
+# tsgo typechecks electron-importing sources, so the optional electron package must
+# install even though the server image never runs it. Its binary download can fail
+# transiently, and bun then silently drops the package instead of failing the install.
+# Skip the unused download, and Electron-ABI native rebuilds via XUM_HEADLESS.
+# Keep MUX_HEADLESS set for older postinstall tooling in cached dependency layers.
+RUN XUM_HEADLESS=1 MUX_HEADLESS=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
     touch node_modules/.installed
 
 # Copy build orchestration files used by Make targets.
@@ -48,7 +56,7 @@ COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
 COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/
 COPY docs/ docs/
-COPY index.html terminal.html vite.config.ts ./
+COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
 COPY static/ static/
 
@@ -78,7 +86,7 @@ FROM node:22-slim
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/coder/mux"
 LABEL org.opencontainers.image.version="${VERSION}"
-LABEL org.opencontainers.image.description="Mux server — parallel AI agent workflows"
+LABEL org.opencontainers.image.description="Xum server — parallel AI agent workflows"
 LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 WORKDIR /app
@@ -107,8 +115,6 @@ COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
 COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
-# - @1password/sdk + sdk-core: externalized; contains native WASM for secret resolution
-COPY --from=builder /app/node_modules/@1password ./node_modules/@1password
 
 # Copy frontend/static assets from least to most volatile for better cache reuse.
 # Vite outputs JS/CSS/HTML directly to dist/ (assetsDir: ".").
@@ -123,12 +129,13 @@ COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib
 # Copy runtime bundles last (most volatile layer during backend iteration).
 COPY --from=builder /app/dist/runtime ./dist/runtime
 
-# Create mux data directory
+# Keep the established container data path for existing volumes and downgraded images.
 RUN mkdir -p /root/.mux
 
-# Default environment variables
+# XUM_ROOT is canonical; MUX_ROOT keeps older image entry points on the same volume.
 ENV NODE_ENV=production
-ENV MUX_HOME=/root/.mux
+ENV XUM_ROOT=/root/.mux
+ENV MUX_ROOT=/root/.mux
 
 # Expose server port
 EXPOSE 3000
@@ -137,7 +144,7 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD node -e "fetch('http://localhost:3000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
-# Run bundled mux server
+# Run bundled xum server
 # --host 0.0.0.0: bind to all interfaces (required for Docker networking)
 # --port 3000: default port (can be remapped via docker run -p)
 ENTRYPOINT ["node", "dist/runtime/server-bundle.js"]

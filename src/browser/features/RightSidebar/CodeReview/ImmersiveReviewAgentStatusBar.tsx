@@ -101,7 +101,7 @@ export const ImmersiveReviewAgentStatusBar: React.FC<ImmersiveReviewAgentStatusB
       return (
         <span className="bg-plan-mode-alpha text-plan-mode-light flex items-center gap-1 rounded px-1.5 py-0.5 font-medium">
           <CircleHelp aria-hidden="true" className="h-3 w-3 shrink-0" />
-          <span>Mux has a question</span>
+          <span>Xum has a question</span>
         </span>
       );
     }

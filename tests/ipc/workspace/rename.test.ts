@@ -1,3 +1,4 @@
+import * as path from "path";
 /**
  * Integration tests for WORKSPACE_RENAME IPC handler
  *
@@ -113,7 +114,7 @@ describeIntegration("WORKSPACE_RENAME with both runtimes", () => {
             );
 
             const oldWorkspacePath = workspacePath;
-            const oldSessionDir = env.config.getSessionDir(workspaceId);
+            const oldSessionDir = path.join(env.config.sessionsDir, workspaceId);
 
             // Rename the workspace
             const newName = "renamed-branch";
@@ -132,7 +133,7 @@ describeIntegration("WORKSPACE_RENAME with both runtimes", () => {
             expect(newWorkspaceId).toBe(workspaceId);
 
             // Session directory should still be the same (stable IDs don't move directories)
-            const sessionDir = env.config.getSessionDir(workspaceId);
+            const sessionDir = path.join(env.config.sessionsDir, workspaceId);
             expect(sessionDir).toBe(oldSessionDir);
 
             // Verify metadata was updated (name changed, path changed, but ID stays the same)

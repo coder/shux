@@ -29,7 +29,6 @@ export function useStartHere(
     setIsModalOpen(true);
   };
 
-  // Closes the modal
   const closeModal = () => {
     setIsModalOpen(false);
   };

@@ -5,7 +5,10 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getWorkspaceNameStateKey } from "@/common/constants/storage";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import type { NameGenerationError } from "@/common/types/errors";
-import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
+import {
+  validateWorkspaceBranchName,
+  validateWorkspaceName,
+} from "@/common/utils/validation/workspaceValidation";
 
 /** Discriminated error type for workspace name operations */
 export type WorkspaceNameUIError =
@@ -164,7 +167,6 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
 
-  // Debounce timer
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
   const pendingMessageRef = useRef<string>("");
@@ -359,7 +361,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       setStored((prev) => ({ ...prev, manualName: newName }));
       // Validate in real-time as user types (skip empty - will show on submit)
       if (newName.trim()) {
-        const validation = validateWorkspaceName(newName);
+        const validation = validateWorkspaceBranchName(newName);
         setError(validation.error ? { kind: "validation", message: validation.error } : null);
       } else {
         setError(null);

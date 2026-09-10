@@ -1,5 +1,5 @@
 /**
- * Governor Section - Enrollment UI for Mux Governor (enterprise policy service).
+ * Governor Section - Enrollment UI for Xum Governor (enterprise policy service).
  * Gated behind the MUX_GOVERNOR experiment flag.
  */
 
@@ -360,7 +360,7 @@ export function GovernorSection() {
   if (loadingConfig) {
     return (
       <div className="space-y-4">
-        <h2 className="text-lg font-semibold">Mux Governor</h2>
+        <h2 className="text-lg font-semibold">Xum Governor</h2>
         <p className="text-muted-foreground text-sm">Loading...</p>
       </div>
     );
@@ -368,13 +368,13 @@ export function GovernorSection() {
 
   return (
     <div className="space-y-4">
-      <h2 className="text-lg font-semibold">Mux Governor</h2>
+      <h2 className="text-lg font-semibold">Xum Governor</h2>
 
       {enrolled ? (
         // Enrolled state
         <div className="space-y-4">
           <p className="text-muted-foreground text-sm">
-            You are enrolled in Mux Governor for enterprise policy delivery.
+            You are enrolled in Xum Governor for enterprise policy delivery.
           </p>
           <div className="flex items-center gap-2 text-sm">
             <ShieldCheck className="h-4 w-4 text-green-500" />
@@ -392,7 +392,7 @@ export function GovernorSection() {
               {refreshingPolicy ? "Refreshing..." : "Refresh policy"}
             </Button>
             <Button variant="destructive" size="sm" onClick={() => void handleUnenroll()}>
-              Unenroll from Mux Governor
+              Unenroll from Xum Governor
             </Button>
           </div>
 
@@ -429,12 +429,12 @@ export function GovernorSection() {
         // Not enrolled - show enroll button
         <div className="space-y-4">
           <p className="text-muted-foreground text-sm">
-            Mux Governor enables enterprise policy delivery for centralized agent control. Enroll to
+            Xum Governor enables enterprise policy delivery for centralized agent control. Enroll to
             connect to your organization&apos;s Governor server.
           </p>
           <Button onClick={handleOpenUrlDialog}>
             <ExternalLink className="mr-2 h-4 w-4" />
-            Enroll in Mux Governor
+            Enroll in Xum Governor
           </Button>
         </div>
       ) : enrollStatus === "starting" ? (
@@ -482,7 +482,7 @@ export function GovernorSection() {
           </DialogHeader>
           <div className="space-y-4 pt-4">
             <p className="text-muted-foreground text-sm">
-              Enter the URL of your organization&apos;s Mux Governor server.
+              Enter the URL of your organization&apos;s Xum Governor server.
             </p>
             <Input
               placeholder="https://governor.corp.com"

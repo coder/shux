@@ -5,7 +5,7 @@ export type ResolvedAuthToken =
   | { mode: "enabled"; token: string; source: "cli" | "env" | "generated" };
 
 /**
- * Resolve the auth token for `mux server` from CLI flags, env vars, or generate one.
+ * Resolve the auth token for `xum server` from CLI flags, env vars, or generate one.
  *
  * Precedence: --no-auth > --auth-token > MUX_SERVER_AUTH_TOKEN > auto-generated.
  */

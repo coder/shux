@@ -12,7 +12,7 @@ import {
   type WorkspaceTimelineSnapshot,
 } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { TimelineEvent, TimelinePreview } from "@/common/orpc/schemas/timeline";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 
 import { installDom } from "../dom";
@@ -64,6 +64,7 @@ function renderTimeline(params: {
   loadOlderHistory?: jest.Mock<Promise<"loaded">, [string]>;
   snapshot?: Partial<WorkspaceTimelineSnapshot>;
   hasOlderHistory?: boolean;
+  preview?: TimelinePreview;
 }) {
   const loadOlderHistory = params.loadOlderHistory ?? jest.fn().mockResolvedValue("loaded");
   const workspaceState: { messages: unknown[]; muxMessages: unknown[]; hasOlderHistory: boolean } =
@@ -88,10 +89,12 @@ function renderTimeline(params: {
   const api = {
     workspace: {
       timeline: {
-        preview: jest.fn().mockResolvedValue({
-          role: "assistant",
-          textExcerpt: "Preview fixture",
-        }),
+        preview: jest.fn().mockResolvedValue(
+          params.preview ?? {
+            role: "assistant",
+            textExcerpt: "Preview fixture",
+          }
+        ),
       },
     },
   };
@@ -303,6 +306,393 @@ describe("TimelinePanel", () => {
     ).toBe("true");
   });
 
+  // Production timeline pages are newest-first, so these fixtures list descending seq.
+  test("collapses wake/turn-completed churn into one expandable group", () => {
+    const events = [
+      makeEvent("report", "task.reported", 5, { source: { system: "task" } }),
+      makeEvent("turn-2", "turn.completed", 4),
+      makeEvent("wake-2", "turn.monitor_wake", 3),
+      makeEvent("turn-1", "turn.completed", 2),
+      makeEvent("wake-1", "turn.monitor_wake", 1),
+    ];
+
+    const view = renderTimeline({ events });
+    const collapsedRun = view.container.querySelector<HTMLElement>(
+      '[data-timeline-collapsed-kind="turn.monitor_wake"][data-timeline-collapsed-count="2"]'
+    );
+
+    expect(collapsedRun).not.toBeNull();
+    expect(view.container.querySelectorAll('[role="separator"]')).toHaveLength(0);
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+
+    fireEvent.click(collapsedRun!);
+
+    expect(
+      view.container.querySelectorAll('[data-timeline-event-kind="turn.monitor_wake"]')
+    ).toHaveLength(2);
+    expect(view.container.querySelectorAll('[role="separator"]')).toHaveLength(2);
+  });
+
+  test("keeps a lone machinery event as a plain row with its turn rule", () => {
+    const events = [
+      makeEvent("report", "task.reported", 3, { source: { system: "task" } }),
+      makeEvent("turn", "turn.completed", 2),
+      makeEvent("wake", "turn.monitor_wake", 1),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector("[data-timeline-collapsed-kind]")).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="wake"]')).not.toBeNull();
+    expect(view.container.querySelectorAll('[role="separator"]')).toHaveLength(1);
+  });
+
+  test("groups adjacent machinery events across different kinds", () => {
+    const events = [
+      makeEvent("report", "task.reported", 3, { source: { system: "task" } }),
+      makeEvent("continuation", "goal.continuation_dispatched", 2, {
+        source: { system: "goal" },
+      }),
+      makeEvent("wake", "turn.monitor_wake", 1),
+    ];
+
+    const view = renderTimeline({ events });
+    const collapsedRun = view.container.querySelector<HTMLElement>(
+      '[data-timeline-collapsed-count="2"]'
+    );
+
+    expect(collapsedRun).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="wake"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="continuation"]')).toBeNull();
+
+    fireEvent.click(collapsedRun!);
+
+    expect(view.container.querySelector('[data-timeline-event-id="wake"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="continuation"]')).not.toBeNull();
+  });
+
+  test("drops the sub-agent started row once a newer row for its task lands", () => {
+    const events = [
+      makeEvent("done-report", "task.reported", 3, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Auditor finished", digest: "Found two issues" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("done-start", "task.created", 2, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "call-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("inflight-start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-b" },
+        status: "started",
+        anchor: { taskId: "task-b", toolCallId: "call-b", childWorkspaceId: "task-b" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="done-start"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="done-report"]')).not.toBeNull();
+    expect(
+      view.container.querySelector('[data-timeline-event-id="inflight-start"]')
+    ).not.toBeNull();
+  });
+
+  test("drops the sub-agent update row once the same task's report lands", () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Comment audit finding", digest: "No must-fix issues" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Comment audit finding", digest: "No must-fix issues" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("keeps earlier updates with distinct findings after the report lands", () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Final summary", digest: "All checks pass" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("finding", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Important finding", digest: "Found a race in the loader" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="finding"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("keeps default-titled updates whose digests differ", () => {
+    const events = [
+      makeEvent("update-late", "task.progress", 2, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "Cache poisoning suspected" },
+        anchor: { taskId: "task-a", messageId: "msg-2", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-early", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "Found a race in the loader" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update-late"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-early"]')).not.toBeNull();
+  });
+
+  test("drops an untitled update when the terminal report repeats its content", () => {
+    // Mapper update rows carry the producer fallback title; TaskService terminal rows omit it.
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { digest: "All timeline suites pass" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Subagent (explore) update", digest: "All timeline suites pass" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("drops an update whose report repeats it beyond the row digest cap", () => {
+    const reportMarkdown = "finding detail ".repeat(20).trim();
+    const rowCapped = `${reportMarkdown.slice(0, 117)}...`;
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Audit result", digest: reportMarkdown },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update", "task.progress", 1, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Audit result", digest: rowCapped },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="report"]')).not.toBeNull();
+  });
+
+  test("collapses duplicate update rows while keeping distinct checkpoints", () => {
+    const events = [
+      makeEvent("update-late", "task.progress", 4, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Second checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-3", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-dupe", "task.progress", 3, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "Second checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-2", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("update-early", "task.progress", 2, {
+        source: { system: "task" },
+        status: "started",
+        data: { title: "First checkpoint" },
+        anchor: { taskId: "task-a", messageId: "msg-1", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "call-a", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="update-late"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-dupe"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="update-early"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="start"]')).toBeNull();
+  });
+
+  test("shows a single representation when the preview excerpt duplicates the digest", async () => {
+    // Mirror the producer: a >120-char prompt is digested to a 117-char cut plus "...".
+    const longPrompt = "alpha beta gamma delta epsilon ".repeat(8).trim();
+    const truncatedDigest = `${longPrompt.slice(0, 117)}...`;
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: truncatedDigest },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: { role: "user", textExcerpt: longPrompt },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+    await waitFor(() => view.getByText(longPrompt));
+
+    // The digest still renders in the row detail; the card itself shows only the excerpt.
+    expect(view.getAllByText(truncatedDigest)).toHaveLength(1);
+  });
+
+  test("keeps the reveal path when the retained task row lacks a transcript anchor", async () => {
+    const events = [
+      makeEvent("report", "task.reported", 2, {
+        source: { system: "task", key: "task-report:task-a" },
+        status: "completed",
+        data: { title: "Auditor finished" },
+        anchor: { taskId: "task-a", childWorkspaceId: "task-a" },
+      }),
+      makeEvent("start", "task.created", 1, {
+        source: { system: "task", key: "task-created:task-a" },
+        status: "started",
+        anchor: { taskId: "task-a", toolCallId: "spawn-call", childWorkspaceId: "task-a" },
+      }),
+    ];
+
+    const view = renderTimeline({ events });
+    expect(view.container.querySelector('[data-timeline-event-id="start"]')).toBeNull();
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="report"]')!);
+
+    // The report row inherited the started row's spawning tool-call anchor, so the reveal
+    // action stays available even though TaskService recorded the report without one.
+    await waitFor(() => view.getByTestId("timeline-reveal"));
+  });
+
+  test("does not hide the excerpt behind a generic title the prompt happens to open with", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: "User prompt: reproduce the issue" },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: {
+        role: "user",
+        textExcerpt: "User prompt: reproduce the issue with the beta build",
+      },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+
+    await waitFor(() => view.getByText("User prompt: reproduce the issue with the beta build"));
+  });
+
+  test("keeps a digest whose natural trailing ellipsis is not a truncation marker", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("prompt", "turn.user", 1, {
+          data: { digest: "Investigate..." },
+          anchor: { messageId: "user-1" },
+        }),
+      ],
+      preview: { role: "user", textExcerpt: "Investigate the logs" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="prompt"]')!);
+    await waitFor(() => view.getByText("Investigate the logs"));
+
+    expect(view.getAllByText("Investigate...")).toHaveLength(2);
+  });
+
+  test("hides an excerpt that only repeats an agent event's description", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("agent-note", "agent.event", 1, {
+          source: { system: "agent", key: "timeline-event:note" },
+          data: { description: "Pushed the branch and opened the PR", category: "handoff" },
+          anchor: { toolCallId: "tool-1" },
+        }),
+      ],
+      preview: { role: "assistant", textExcerpt: "Pushed the branch and opened the PR" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="agent-note"]')!);
+    await waitFor(() => view.getByTestId("timeline-reveal"));
+    await waitFor(() => {
+      if (view.queryByText("Loading preview…")) throw new Error("Preview still loading");
+    });
+
+    expect(view.getAllByText("Pushed the branch and opened the PR")).toHaveLength(2);
+  });
+
+  test("keeps a digest the preview excerpt does not cover", async () => {
+    const view = renderTimeline({
+      events: [
+        makeEvent("report", "task.reported", 1, {
+          source: { system: "task", key: "task-report:task-c" },
+          status: "completed",
+          data: { digest: "Report digest text" },
+          anchor: { messageId: "report-1", taskId: "task-c" },
+        }),
+      ],
+      preview: { role: "assistant", textExcerpt: "Unrelated transcript excerpt" },
+    });
+
+    fireEvent.click(view.container.querySelector('[data-timeline-event-id="report"]')!);
+    await waitFor(() => view.getByText("Unrelated transcript excerpt"));
+
+    expect(view.getAllByText("Report digest text")).toHaveLength(2);
+  });
+
+  test("drops the abandoned-retry row that duplicates an adjacent interruption", () => {
+    const events = [
+      makeEvent("retry-real", "retry.abandoned", 3, { data: { reason: "max retries" } }),
+      makeEvent("stop", "turn.interrupted", 2, { status: "interrupted" }),
+      makeEvent("retry", "retry.abandoned", 1, { data: { reason: "aborted" } }),
+    ];
+
+    const view = renderTimeline({ events });
+
+    expect(view.container.querySelector('[data-timeline-event-id="retry"]')).toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="stop"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-timeline-event-id="retry-real"]')).not.toBeNull();
+
+    // Under the Errors filter the interruption row is gone, so the retry row must come back.
+    const errorsFilter = Array.from(view.container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Errors"
+    );
+    if (!errorsFilter) throw new Error("Expected the errors filter control");
+    fireEvent.click(errorsFilter);
+
+    expect(view.container.querySelector('[data-timeline-event-id="retry"]')).not.toBeNull();
+  });
+
   test("stops reveal pagination at the page cap when the target remains unavailable", async () => {
     const loadOlderHistory = jest.fn<Promise<"loaded">, [string]>().mockResolvedValue("loaded");
     const event = makeEvent("anchored", "turn.completed", 1, {
@@ -434,6 +824,35 @@ describe("TimelinePanel", () => {
       await waitFor(() => {
         if (revealed.length === 0) throw new Error("Reveal was not dispatched");
       });
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
+  test("ignores the reveal shortcut in a panel hidden behind an open modal", async () => {
+    // A CSS-hidden sidebar keeps its panel mounted while the mobile timeline dialog mounts a
+    // second one; Radix marks content outside the open modal aria-hidden. The hidden panel's
+    // window-level shortcut listener must not fire a competing reveal.
+    const event = makeEvent("anchored", "turn.completed", 1, {
+      anchor: { messageId: "loaded-message" },
+    });
+    const view = renderTimeline({ events: [event] });
+    view.workspaceState.messages = [{ historyId: "loaded-message" }];
+    const revealed: unknown[] = [];
+    const listener = (revealEvent: Event) => revealed.push(revealEvent);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+
+    try {
+      fireEvent.click(view.container.querySelector('[data-timeline-event-id="anchored"]')!);
+      const revealButton = await waitFor(() => view.getByTestId("timeline-reveal"));
+
+      view.container.setAttribute("aria-hidden", "true");
+      fireEvent.keyDown(window, { key: "Enter", ctrlKey: true, shiftKey: true });
+
+      // The guard rejects synchronously, so the button never enters the revealing state.
+      expect(revealButton.textContent).toBe("Reveal in transcript");
+      await Promise.resolve();
+      expect(revealed).toHaveLength(0);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }

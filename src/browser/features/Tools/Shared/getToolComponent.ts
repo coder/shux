@@ -6,7 +6,12 @@
  */
 import type { ComponentType } from "react";
 import { z, type ZodSchema } from "zod";
-import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import {
+  TaskTerminateToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
+  TOOL_DEFINITIONS,
+  type ToolName,
+} from "@/common/utils/tools/toolDefinitions";
 
 import { AnalyticsQueryToolCall } from "../analyticsQuery/AnalyticsQueryToolCall";
 import { AttachFileToolCall } from "../AttachFileToolCall";
@@ -21,6 +26,7 @@ import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
 import { AgentSkillListToolCall } from "../AgentSkillListToolCall";
 import { FileReadToolCall } from "../FileReadToolCall";
 import { MemoryToolCall } from "../MemoryToolCall";
+import { IntuitionToolCall } from "../IntuitionToolCall";
 import { WebFetchToolCall } from "../WebFetchToolCall";
 import { WebSearchToolCall } from "../WebSearchToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
@@ -42,6 +48,9 @@ import {
   TaskAwaitToolCall,
   TaskListToolCall,
   TaskSendMessageToolCall,
+  TaskRetitleToolCall,
+  TaskStopToolCall,
+  TaskRemoveToolCall,
   TaskTerminateToolCall,
 } from "../TaskToolCall";
 import { TaskApplyGitPatchToolCall } from "../TaskApplyGitPatchToolCall";
@@ -62,20 +71,65 @@ import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyToolComponent = ComponentType<any>;
 
-interface ToolRegistryEntry {
-  component: AnyToolComponent;
-  schema: ZodSchema;
-}
+/** Component bindings stay separate because UI components are browser-only. */
+const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
+  bash: BashToolCall,
+  file_read: FileReadToolCall,
+  memory: MemoryToolCall,
+  intuition: IntuitionToolCall,
+  attach_file: AttachFileToolCall,
+  desktop_screenshot: DesktopScreenshotToolCall,
+  desktop_move_mouse: DesktopActionToolCall,
+  desktop_click: DesktopActionToolCall,
+  desktop_double_click: DesktopActionToolCall,
+  desktop_drag: DesktopActionToolCall,
+  desktop_scroll: DesktopActionToolCall,
+  desktop_type: DesktopActionToolCall,
+  desktop_key_press: DesktopActionToolCall,
+  agent_skill_read: AgentSkillReadToolCall,
+  agent_skill_read_file: AgentSkillReadFileToolCall,
+  agent_skill_list: AgentSkillListToolCall,
+  file_edit_replace_string: FileEditToolCall,
+  file_edit_replace_lines: FileEditToolCall,
+  file_edit_insert: FileEditToolCall,
+  ask_user_question: AskUserQuestionToolCall,
+  propose_plan: ProposePlanToolCall,
+  todo_write: TodoToolCall,
+  status_set: StatusSetToolCall,
+  notify: NotifyToolCall,
+  tool_catalog_search: ToolSearchToolCall,
+  tool_search: ToolSearchToolCall,
+  analytics_query: AnalyticsQueryToolCall,
+  advisor: AdvisorToolCall,
+  web_fetch: WebFetchToolCall,
+  bash_background_list: BashBackgroundListToolCall,
+  bash_background_terminate: BashBackgroundTerminateToolCall,
+  bash_output: BashOutputToolCall,
+  code_execution: CodeExecutionToolCall,
+  task: TaskToolCall,
+  task_await: TaskAwaitToolCall,
+  task_list: TaskListToolCall,
+  task_send_message: TaskSendMessageToolCall,
+  task_retitle: TaskRetitleToolCall,
+  task_stop: TaskStopToolCall,
+  task_remove: TaskRemoveToolCall,
+  task_terminate: TaskTerminateToolCall,
+  task_apply_git_patch: TaskApplyGitPatchToolCall,
+  task_workspace_lifecycle: WorkspaceLifecycleToolCall,
+  workflow_run: WorkflowRunToolCall,
+  workflow_resume: WorkflowResumeToolCall,
+  agent_report: AgentReportToolCall,
+  set_goal: SetGoalToolCall,
+  get_goal: GetGoalToolCall,
+  complete_goal: CompleteGoalToolCall,
+  heartbeat: HeartbeatToolCall,
+  timeline_event: TimelineEventToolCall,
+  review_pane_update: ReviewPaneUpdateToolCall,
+  review_pane_get: ReviewPaneGetToolCall,
+  web_search: WebSearchToolCall,
+  "server:GOOGLE_SEARCH_WEB": GoogleSearchToolCall,
+};
 
-/**
- * Registry mapping tool names to their components and validation schemas.
- * Adding a new tool: add one line here.
- *
- * Note: Some tools (ask_user_question, propose_plan, todo_write) require
- * props like workspaceId/toolCallId that aren't available in nested context. This is
- * fine because the backend excludes these from code_execution sandbox (see EXCLUDED_TOOLS
- * in src/node/services/ptc/toolBridge.ts). They can never appear in nested tool calls.
- */
 const legacyStatusSetSchema = z.object({
   emoji: z.string(),
   message: z.string(),
@@ -90,165 +144,28 @@ const legacyAgentReportFileArgsSchema = z
   })
   .strict();
 
-const agentReportRenderSchema = z.union([
-  TOOL_DEFINITIONS.agent_report.schema,
-  legacyAgentReportFileArgsSchema,
-]);
-
-const TOOL_REGISTRY: Record<string, ToolRegistryEntry> = {
-  bash: { component: BashToolCall, schema: TOOL_DEFINITIONS.bash.schema },
-  file_read: { component: FileReadToolCall, schema: TOOL_DEFINITIONS.file_read.schema },
-  memory: { component: MemoryToolCall, schema: TOOL_DEFINITIONS.memory.schema },
-  attach_file: { component: AttachFileToolCall, schema: TOOL_DEFINITIONS.attach_file.schema },
-  desktop_screenshot: {
-    component: DesktopScreenshotToolCall,
-    schema: TOOL_DEFINITIONS.desktop_screenshot.schema,
-  },
-  desktop_move_mouse: {
-    component: DesktopActionToolCall,
-    schema: TOOL_DEFINITIONS.desktop_move_mouse.schema,
-  },
-  desktop_click: {
-    component: DesktopActionToolCall,
-    schema: TOOL_DEFINITIONS.desktop_click.schema,
-  },
-  desktop_double_click: {
-    component: DesktopActionToolCall,
-    schema: TOOL_DEFINITIONS.desktop_double_click.schema,
-  },
-  desktop_drag: { component: DesktopActionToolCall, schema: TOOL_DEFINITIONS.desktop_drag.schema },
-  desktop_scroll: {
-    component: DesktopActionToolCall,
-    schema: TOOL_DEFINITIONS.desktop_scroll.schema,
-  },
-  desktop_type: { component: DesktopActionToolCall, schema: TOOL_DEFINITIONS.desktop_type.schema },
-  desktop_key_press: {
-    component: DesktopActionToolCall,
-    schema: TOOL_DEFINITIONS.desktop_key_press.schema,
-  },
-  agent_skill_read: {
-    component: AgentSkillReadToolCall,
-    schema: TOOL_DEFINITIONS.agent_skill_read.schema,
-  },
-  agent_skill_read_file: {
-    component: AgentSkillReadFileToolCall,
-    schema: TOOL_DEFINITIONS.agent_skill_read_file.schema,
-  },
-  agent_skill_list: {
-    component: AgentSkillListToolCall,
-    schema: TOOL_DEFINITIONS.agent_skill_list.schema,
-  },
-  file_edit_replace_string: {
-    component: FileEditToolCall,
-    schema: TOOL_DEFINITIONS.file_edit_replace_string.schema,
-  },
-  file_edit_replace_lines: {
-    component: FileEditToolCall,
-    schema: TOOL_DEFINITIONS.file_edit_replace_lines.schema,
-  },
-  file_edit_insert: {
-    component: FileEditToolCall,
-    schema: TOOL_DEFINITIONS.file_edit_insert.schema,
-  },
-  ask_user_question: {
-    component: AskUserQuestionToolCall,
-    schema: TOOL_DEFINITIONS.ask_user_question.schema,
-  },
-  propose_plan: {
-    component: ProposePlanToolCall,
-    schema: TOOL_DEFINITIONS.propose_plan.schema,
-  },
-  todo_write: { component: TodoToolCall, schema: TOOL_DEFINITIONS.todo_write.schema },
-  // Legacy-only transcript renderer for historical status_set calls.
-  status_set: { component: StatusSetToolCall, schema: legacyStatusSetSchema },
-  notify: { component: NotifyToolCall, schema: TOOL_DEFINITIONS.notify.schema },
-  tool_catalog_search: {
-    component: ToolSearchToolCall,
-    schema: TOOL_DEFINITIONS.tool_catalog_search.schema,
-  },
-  // Legacy-only transcript renderer from before AI SDK 7 reserved tool_search.
-  tool_search: {
-    component: ToolSearchToolCall,
-    schema: TOOL_DEFINITIONS.tool_catalog_search.schema,
-  },
-  analytics_query: {
-    component: AnalyticsQueryToolCall,
-    schema: TOOL_DEFINITIONS.analytics_query.schema,
-  },
-  advisor: { component: AdvisorToolCall, schema: TOOL_DEFINITIONS.advisor.schema },
-  web_fetch: { component: WebFetchToolCall, schema: TOOL_DEFINITIONS.web_fetch.schema },
-  bash_background_list: {
-    component: BashBackgroundListToolCall,
-    schema: TOOL_DEFINITIONS.bash_background_list.schema,
-  },
-  bash_background_terminate: {
-    component: BashBackgroundTerminateToolCall,
-    schema: TOOL_DEFINITIONS.bash_background_terminate.schema,
-  },
-  bash_output: { component: BashOutputToolCall, schema: TOOL_DEFINITIONS.bash_output.schema },
-  code_execution: {
-    component: CodeExecutionToolCall,
-    schema: TOOL_DEFINITIONS.code_execution.schema,
-  },
-  task: { component: TaskToolCall, schema: TOOL_DEFINITIONS.task.schema },
-  task_await: { component: TaskAwaitToolCall, schema: TOOL_DEFINITIONS.task_await.schema },
-  task_list: { component: TaskListToolCall, schema: TOOL_DEFINITIONS.task_list.schema },
-  task_send_message: {
-    component: TaskSendMessageToolCall,
-    schema: TOOL_DEFINITIONS.task_send_message.schema,
-  },
-  task_terminate: {
-    component: TaskTerminateToolCall,
-    schema: TOOL_DEFINITIONS.task_terminate.schema,
-  },
-  task_apply_git_patch: {
-    component: TaskApplyGitPatchToolCall,
-    schema: TOOL_DEFINITIONS.task_apply_git_patch.schema,
-  },
-  task_workspace_lifecycle: {
-    component: WorkspaceLifecycleToolCall,
-    schema: TOOL_DEFINITIONS.task_workspace_lifecycle.schema,
-  },
-  workflow_run: {
-    component: WorkflowRunToolCall,
-    schema: TOOL_DEFINITIONS.workflow_run.schema,
-  },
-  workflow_resume: {
-    component: WorkflowResumeToolCall,
-    schema: TOOL_DEFINITIONS.workflow_resume.schema,
-  },
-  agent_report: {
-    component: AgentReportToolCall,
-    schema: agentReportRenderSchema,
-  },
-  set_goal: { component: SetGoalToolCall, schema: TOOL_DEFINITIONS.set_goal.schema },
-  get_goal: { component: GetGoalToolCall, schema: TOOL_DEFINITIONS.get_goal.schema },
-  complete_goal: {
-    component: CompleteGoalToolCall,
-    schema: TOOL_DEFINITIONS.complete_goal.schema,
-  },
-  heartbeat: { component: HeartbeatToolCall, schema: TOOL_DEFINITIONS.heartbeat.schema },
-  timeline_event: {
-    component: TimelineEventToolCall,
-    schema: TOOL_DEFINITIONS.timeline_event.schema,
-  },
-  review_pane_update: {
-    component: ReviewPaneUpdateToolCall,
-    schema: TOOL_DEFINITIONS.review_pane_update.schema,
-  },
-  review_pane_get: {
-    component: ReviewPaneGetToolCall,
-    schema: TOOL_DEFINITIONS.review_pane_get.schema,
-  },
-  // Provider-defined tool (Anthropic/OpenAI) - no TOOL_DEFINITIONS entry
-  // Anthropic: args.query, OpenAI: args={}, query in result.action.query
-  web_search: { component: WebSearchToolCall, schema: z.object({ query: z.string().optional() }) },
-  // Google native search grounding (Gemini 3+), provider-executed — name comes from the wire.
-  // queries stays optional so streaming/pending args don't bounce to GenericToolCall.
-  "server:GOOGLE_SEARCH_WEB": {
-    component: GoogleSearchToolCall,
-    schema: z.object({ queries: z.array(z.string()).optional() }),
-  },
+const TOOL_SCHEMA_OVERRIDES: Record<string, ZodSchema> = {
+  // Legacy file-backed reports remain renderable from persisted transcripts.
+  agent_report: z.union([TOOL_DEFINITIONS.agent_report.schema, legacyAgentReportFileArgsSchema]),
+  // status_set is a removed dynamic tool that still appears in history.
+  status_set: legacyStatusSetSchema,
+  // tool_search is the historical wire name for tool_catalog_search.
+  tool_search: TOOL_DEFINITIONS.tool_catalog_search.schema,
+  // task_terminate is retained only for historical task transcripts.
+  task_terminate: TaskTerminateToolArgsSchema,
+  // Historical lifecycle transcripts include actions removed from the live input schema.
+  task_workspace_lifecycle: TaskWorkspaceLifecycleToolArgsSchema,
+  // Kernel-nested workflow_run calls can arrive with a __kernelBounded args marker
+  // (oversized launch args); the card still renders from the attached durable run,
+  // so don't bounce those to the generic JSON renderer.
+  workflow_run: z.union([
+    TOOL_DEFINITIONS.workflow_run.schema,
+    z.object({ __kernelBounded: z.literal(true), script_path: z.string().nullish() }),
+  ]),
+  // Provider-executed web search tools have no catalog definition.
+  web_search: z.object({ query: z.string().optional() }),
+  // Pending Google search arguments can arrive before queries are parsed.
+  "server:GOOGLE_SEARCH_WEB": z.object({ queries: z.array(z.string()).optional() }),
 };
 
 /**
@@ -260,9 +177,12 @@ export function getToolComponent(toolName: string, args: unknown): AnyToolCompon
   // A bare index lookup returns truthy inherited members for names like "constructor",
   // which would then throw on .schema and brick the workspace view instead of degrading
   // to the generic renderer (self-healing invariant).
-  const entry = Object.hasOwn(TOOL_REGISTRY, toolName) ? TOOL_REGISTRY[toolName] : undefined;
-  if (!entry?.schema.safeParse(args).success) {
-    return GenericToolCall;
-  }
-  return entry.component;
+  const component = Object.hasOwn(TOOL_REGISTRY, toolName) ? TOOL_REGISTRY[toolName] : undefined;
+  const schema = Object.hasOwn(TOOL_SCHEMA_OVERRIDES, toolName)
+    ? TOOL_SCHEMA_OVERRIDES[toolName]
+    : Object.hasOwn(TOOL_DEFINITIONS, toolName)
+      ? TOOL_DEFINITIONS[toolName as ToolName].schema
+      : undefined;
+  if (!component || !schema?.safeParse(args).success) return GenericToolCall;
+  return component;
 }

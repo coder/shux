@@ -16,10 +16,13 @@ import {
   parseSubagentReportEnvelope,
   SubagentReportMessageContent,
 } from "./SubagentReportMessageContent";
+import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
+import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
+import { createDownloadRetryCache } from "@/browser/utils/downloadFile";
 import {
   buildEditingStateFromDisplayed,
   canEditDisplayedUserMessage,
@@ -46,17 +49,6 @@ function base64ToBlob(dataBase64: string, mediaType: string): Blob {
   return new Blob([bytes], { type: mediaType });
 }
 
-function downloadBlob(blob: Blob, filename: string): void {
-  const blobUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = blobUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-}
-
 /** Navigation info for navigating between user messages */
 export interface UserMessageNavigation {
   /** History ID of the previous user message (undefined if this is the first) */
@@ -77,6 +69,11 @@ interface UserMessageProps {
   navigation?: UserMessageNavigation;
 }
 
+// Module-level so all messages share one retry slot, bounding retained
+// staged-attachment bytes to a single blob renderer-wide (iOS share-sheet
+// retries only ever target the most recent tap).
+const stagedDownloads = createDownloadRetryCache();
+
 export const UserMessage: React.FC<UserMessageProps> = ({
   message,
   className,
@@ -93,6 +90,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   // Only backend-authored synthetic messages may opt into protocol-aware presentation. A user who
   // types a lookalike envelope should continue to see an ordinary escaped user message.
   const subagentReport = isSynthetic ? parseSubagentReportEnvelope(content) : null;
+  const subagentFailure = isSynthetic ? parseSubagentFailureEnvelope(content) : null;
   const structuredOutputJson = subagentReport
     ? formatSubagentStructuredOutput(subagentReport)
     : undefined;
@@ -112,33 +110,51 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   const workspaceContext = useOptionalWorkspaceContext();
   const workspaceId = workspaceContext?.selectedWorkspace?.workspaceId ?? null;
 
-  const handleDownloadStagedAttachment = async (attachment: DisplayStagedAttachment) => {
-    if (api == null || workspaceId == null) {
-      console.warn("Cannot download staged attachment without an active workspace connection.");
-      return;
-    }
+  // Tracks the workspace this message currently renders for (null once
+  // unmounted), so an in-flight download fetch can detect that the user
+  // navigated away and must not fire a share sheet for the old workspace.
+  const activeWorkspaceIdRef = React.useRef<string | null>(workspaceId);
+  React.useEffect(() => {
+    activeWorkspaceIdRef.current = workspaceId;
+    return () => {
+      activeWorkspaceIdRef.current = null;
+    };
+  }, [workspaceId]);
 
-    const result = await api.workspace.downloadStagedAttachment({
-      workspaceId,
-      stagedPath: attachment.stagedPath,
-    });
-    if (!result.success) {
-      console.error("Failed to download staged attachment:", result.error);
-      return;
-    }
+  // Forked workspaces copy staged attachments under the same relative path,
+  // so the cache key needs the workspaceId to avoid serving another
+  // workspace's bytes after navigation.
+  const handleDownloadStagedAttachment = (attachment: DisplayStagedAttachment) =>
+    stagedDownloads.download(
+      `${workspaceId ?? ""}:${attachment.stagedPath}`,
+      async () => {
+        if (api == null || workspaceId == null) {
+          console.warn("Cannot download staged attachment without an active workspace connection.");
+          return null;
+        }
 
-    downloadBlob(
-      base64ToBlob(result.data.dataBase64, result.data.mediaType),
-      result.data.filename || attachment.filename
+        const result = await api.workspace.downloadStagedAttachment({
+          workspaceId,
+          stagedPath: attachment.stagedPath,
+        });
+        if (!result.success) {
+          console.error("Failed to download staged attachment:", result.error);
+          return null;
+        }
+
+        return {
+          blob: base64ToBlob(result.data.dataBase64, result.data.mediaType),
+          filename: result.data.filename || attachment.filename,
+        };
+      },
+      () => activeWorkspaceIdRef.current === workspaceId
     );
-  };
 
   console.assert(
     typeof clipboardWriteText === "function",
     "UserMessage expects clipboardWriteText to be a callable function."
   );
 
-  // Check if this is a local command output
   const isLocalCommandOutput =
     content.startsWith("<local-command-stdout>") && content.endsWith("</local-command-stdout>");
 
@@ -246,6 +262,13 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         {isInProgress ? "subagent update" : "subagent report"}
       </span>
     );
+  } else if (subagentFailure) {
+    label = (
+      <span className="bg-muted/20 text-muted flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
+        <Bot aria-hidden="true" className="h-3 w-3" />
+        subagent
+      </span>
+    );
   } else if (isSynthetic) {
     label = (
       <span className="bg-muted/20 text-muted rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
@@ -255,8 +278,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   }
   const syntheticClassName = cn(
     className,
-    isSynthetic && !subagentReport && "opacity-70",
-    subagentReport && "ml-0 w-full",
+    isSynthetic && !subagentReport && !subagentFailure && "opacity-70",
+    (subagentReport ?? subagentFailure) && "ml-0 w-full",
     (isGoalContinuation || isBudgetLimitWrapup) && "italic"
   );
 
@@ -272,6 +295,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     );
   } else if (subagentReport) {
     renderedContent = <SubagentReportMessageContent report={subagentReport} />;
+  } else if (subagentFailure) {
+    renderedContent = <SubagentFailureMessageContent failure={subagentFailure} />;
   } else {
     renderedContent = (
       <UserMessageContent

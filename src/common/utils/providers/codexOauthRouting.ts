@@ -11,6 +11,16 @@
 
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+
+/** Request-level inputs the stored providers config cannot carry. */
+export interface CodexOauthRoutingOptions {
+  /**
+   * Request-level OpenAI wire format (muxProviderOptions.openai.wireFormat).
+   * The stored `openai.wireFormat` wins when set, matching providerModelFactory.
+   */
+  openaiWireFormat?: OpenAIWireFormat | null;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -63,18 +73,26 @@ export function hasOpenAIApiKey(config: unknown): boolean {
  * Would a direct-OpenAI request for this model route through Codex OAuth?
  *
  * Mirrors providerModelFactory: allowed model + stored OAuth tokens, then
- * required models always route OAuth; otherwise OAuth wins when no API key is
- * configured or when `codexOauthDefaultAuth` prefers OAuth over a present key.
+ * Chat Completions with an API key never routes OAuth, required models always
+ * route OAuth; otherwise OAuth wins when no API key is configured or when
+ * `codexOauthDefaultAuth` prefers OAuth over a present key.
  */
 export function wouldRouteOpenAIThroughCodexOauth(
   model: string,
-  providersConfig: ProvidersConfigMap | null | undefined
+  providersConfig: ProvidersConfigMap | null | undefined,
+  options?: CodexOauthRoutingOptions
 ): boolean {
   const openAIConfig = providersConfig?.openai;
   if (!isCodexOauthAllowedModel(model, providersConfig ?? null)) {
     return false;
   }
   if (!hasCodexOauthTokens(openAIConfig)) {
+    return false;
+  }
+  // Codex OAuth serves only the Responses API. With Chat Completions selected,
+  // the factory falls back to the API key whenever one exists.
+  const wireFormat = asRecord(openAIConfig)?.wireFormat ?? options?.openaiWireFormat;
+  if (wireFormat === "chatCompletions" && hasOpenAIApiKey(openAIConfig)) {
     return false;
   }
   if (isCodexOauthRequiredModel(model, providersConfig ?? null)) {

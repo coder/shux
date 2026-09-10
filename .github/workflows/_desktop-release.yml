@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -60,6 +60,9 @@ jobs:
         # Retry for transient Apple timestamp-server failures during code signing.
         run: ./scripts/retry.sh 3 30 make dist-mac
 
+      - name: Create legacy mux artifact aliases
+        run: ./scripts/create-legacy-mux-artifact-aliases.sh
+
       - name: Smoke test packaged macOS attach_file runtime
         run: make check-mac-attach-file-runtime
 
@@ -72,6 +75,10 @@ jobs:
           # which breaks reruns. Force-upload all macOS assets with --clobber
           # so reruns reliably attach artifacts to the release.
           gh release upload "$RELEASE_TAG" \
+            release/xum-*.dmg \
+            release/xum-*.dmg.blockmap \
+            release/xum-*.zip \
+            release/xum-*.zip.blockmap \
             release/mux-*.dmg \
             release/mux-*.dmg.blockmap \
             release/mux-*.zip \
@@ -95,7 +102,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -112,12 +119,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Create legacy mux artifact aliases
+        run: ./scripts/create-legacy-mux-artifact-aliases.sh
+
       - name: Upload Linux assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Same electron-builder 2-hour staleness workaround as macOS.
           gh release upload "$RELEASE_TAG" \
+            release/xum-*.AppImage \
             release/mux-*.AppImage \
             release/*-linux.yml \
             --clobber
@@ -144,7 +155,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -159,13 +170,19 @@ jobs:
       - name: Package for Linux arm64
         run: bun x electron-builder --linux --arm64 --publish never
 
+      - name: Create legacy mux artifact aliases
+        run: ./scripts/create-legacy-mux-artifact-aliases.sh
+
       - name: Upload arm64 AppImage to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Upload only the AppImage (not latest-linux.yml) to avoid
           # overwriting the auto-update manifest produced by the x64 job.
-          gh release upload "$RELEASE_TAG" release/mux-*-arm64.AppImage --clobber
+          gh release upload "$RELEASE_TAG" \
+            release/xum-*-arm64-linux.AppImage \
+            release/mux-*-arm64-linux.AppImage \
+            --clobber
 
   build-windows:
     name: Build and Release Windows
@@ -184,7 +201,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Add MSYS2 make to PATH
         shell: pwsh
@@ -229,6 +246,10 @@ jobs:
           EV_TSA_URL: ${{ vars.EV_TSA_URL }}
           GCLOUD_ACCESS_TOKEN: ${{ steps.signing.outputs.gcloud_access_token }}
 
+      - name: Create legacy mux artifact aliases
+        shell: bash
+        run: ./scripts/create-legacy-mux-artifact-aliases.sh
+
       - name: Upload Windows assets to release
         shell: bash
         env:
@@ -236,6 +257,8 @@ jobs:
         run: |
           # Same electron-builder 2-hour staleness workaround as macOS.
           gh release upload "$RELEASE_TAG" \
+            release/xum-*.exe \
+            release/xum-*.exe.blockmap \
             release/mux-*.exe \
             release/mux-*.exe.blockmap \
             release/*.yml \
@@ -265,12 +288,14 @@ jobs:
         run: |
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "mux-*-x86_64.AppImage" \
-            --pattern "mux-*-arm64.AppImage" \
+            --pattern "xum-*-x86_64-linux.AppImage" \
+            --pattern "xum-*-arm64-linux.AppImage" \
+            --pattern "mux-*-x86_64-linux.AppImage" \
+            --pattern "mux-*-arm64-linux.AppImage" \
             --dir artifacts
 
           cd artifacts
-          for file in mux-*.AppImage; do
+          for file in xum-*.AppImage mux-*.AppImage; do
             sha256sum "$file" > "${file}.sha256"
           done
 

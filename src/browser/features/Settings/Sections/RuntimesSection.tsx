@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 
+import { Button } from "@/browser/components/Button/Button";
+import { Input } from "@/browser/components/Input/Input";
+import { getErrorMessage } from "@/common/utils/errors";
+
 import {
   CoderWorkspaceForm,
   resolveCoderAvailability,
@@ -132,6 +136,85 @@ function deriveProjectOverrideState(
     projectEnablement: enablement,
     projectDefaultRuntime: defaultRuntime ?? null,
   };
+}
+
+/**
+ * Per-project opt-in path of a VS Code .code-workspace file that xum keeps in
+ * sync with the project's active worktrees (issue #3722). Parent keys this by
+ * project path so drafts reset on scope switches.
+ */
+function CodeWorkspaceSyncField(props: { projectPath: string }) {
+  const { userProjects, updateCodeWorkspaceSyncPath } = useProjectContext();
+  const savedPath = userProjects.get(props.projectPath)?.codeWorkspaceSyncPath ?? "";
+  // null = untouched: the input shows the saved value.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const draftValue = draft ?? savedPath;
+  const isDirty = draftValue.trim() !== savedPath;
+
+  // DOM attributes must not receive promise-returning handlers
+  // (@typescript-eslint/no-misused-promises), so instead of awaiting inline,
+  // unexpected rejections are explicitly routed into the visible error state.
+  const saveDraft = () => {
+    void handleSave().catch((saveError: unknown) => {
+      setError(getErrorMessage(saveError));
+      setSaving(false);
+    });
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    const result = await updateCodeWorkspaceSyncPath(
+      props.projectPath,
+      draftValue.trim() ? draftValue.trim() : null
+    );
+    if (result.success) {
+      setDraft(null);
+    } else {
+      setError(result.error ?? "Failed to save workspace file path");
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div className="border-border-light bg-background-secondary rounded-md border px-3 py-2">
+      <div className="text-foreground text-sm">VS Code workspace file</div>
+      <div className="text-muted text-xs">
+        Path of a <code className="text-accent">.code-workspace</code> file kept in sync with this
+        project&apos;s active worktrees (absolute, <code className="text-accent">~</code>, or
+        relative to the project). Leave empty to disable.
+      </div>
+      <div className="mt-2 flex items-center gap-2">
+        <Input
+          value={draftValue}
+          onChange={(event) => {
+            setDraft(event.target.value);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && isDirty && !saving) {
+              event.preventDefault();
+              saveDraft();
+            }
+          }}
+          disabled={saving}
+          placeholder="e.g. ~/my-project.code-workspace"
+          aria-label="VS Code workspace file path"
+          className="max-w-[360px] min-w-0"
+        />
+        <Button onClick={saveDraft} disabled={!isDirty || saving} className="shrink-0">
+          {saving ? "Saving..." : "Save"}
+        </Button>
+      </div>
+      {error && (
+        <div className="bg-destructive/10 text-destructive mt-2 rounded-md px-3 py-2 text-sm">
+          {error}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function RuntimesSection() {
@@ -517,6 +600,10 @@ export function RuntimesSection() {
               aria-label="Override project runtime settings"
             />
           </div>
+        ) : null}
+
+        {selectedProjectPath ? (
+          <CodeWorkspaceSyncField key={selectedProjectPath} projectPath={selectedProjectPath} />
         ) : null}
       </div>
 

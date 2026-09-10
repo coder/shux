@@ -104,6 +104,33 @@ describe("LocalBaseRuntime.resolvePath", () => {
 });
 
 describe("LocalBaseRuntime.exec PATH handling", () => {
+  it("canonicalizes pathEnv values with file I/O semantics (tilde and product home)", async () => {
+    const xumRoot = await fs.mkdtemp(path.join(os.tmpdir(), "xum-root-"));
+    const originalRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumRoot;
+    try {
+      const runtime = new TestLocalRuntime();
+      const stream = await runtime.exec('printf "%s\\n%s" "$XUM_TEST_PATH" "$XUM_TEST_HOME"', {
+        cwd: os.tmpdir(),
+        pathEnv: { XUM_TEST_PATH: "~/runtime-path", XUM_TEST_HOME: "~/.xum/plans" },
+        timeout: 5,
+      });
+      await stream.stdin.close();
+
+      expect(await readStreamAsString(stream.stdout)).toBe(
+        `${path.join(os.homedir(), "runtime-path")}\n${path.join(xumRoot, "plans")}`
+      );
+      expect(await stream.exitCode).toBe(0);
+    } finally {
+      if (originalRoot === undefined) {
+        delete process.env.XUM_ROOT;
+      } else {
+        process.env.XUM_ROOT = originalRoot;
+      }
+      await fs.rm(xumRoot, { recursive: true, force: true });
+    }
+  });
+
   it("strips mux browser shims and leaked browser env from child shells", async () => {
     const runtime = new TestLocalRuntime();
     const tempBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-path-probe-"));

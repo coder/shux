@@ -46,7 +46,7 @@ describe("ensureGitInfoExclude", () => {
       encoding: "utf8",
     }).trim();
     const exclude = await readFile(path.join(repo, excludePath), "utf8");
-    expect(exclude.match(/^\/\.mux\/user-attachments\/$/gm)).toHaveLength(1);
+    expect(exclude.match(/^\/\.xum\/user-attachments\/$/gm)).toHaveLength(1);
   });
 
   test("uses a git-root-relative pattern for subdirectory workspaces", async () => {
@@ -69,7 +69,7 @@ describe("ensureGitInfoExclude", () => {
       encoding: "utf8",
     }).trim();
     const exclude = await readFile(path.join(repo, excludePath), "utf8");
-    expect(exclude).toContain("/packages/app/.mux/user-attachments/");
+    expect(exclude).toContain("/packages/app/.xum/user-attachments/");
   });
 
   test("reports non-git directories without writing an exclude file", async () => {

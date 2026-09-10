@@ -344,9 +344,9 @@ export class StreamTranslator {
     event: Extract<WorkspaceChatMessage, { type: "message" }>,
     isReplayPhase: boolean
   ): UserMessageForwarding {
-    // Agent skill snapshots are synthetic context injections (<agent-skill ...>)
+    // Agent skill and MCP prompt snapshots are synthetic context injections
     // and should never be surfaced to ACP clients as user-visible text.
-    if (event.metadata?.agentSkillSnapshot != null) {
+    if (event.metadata?.agentSkillSnapshot != null || event.metadata?.mcpPromptSnapshot != null) {
       return { kind: "suppress" };
     }
 
@@ -357,8 +357,8 @@ export class StreamTranslator {
       return { kind: "suppress" };
     }
 
-    const agentSkillCommand = extractAgentSkillRawCommand(event.metadata);
-    if (agentSkillCommand == null) {
+    const rawCommand = extractRawCommand(event.metadata);
+    if (rawCommand == null) {
       return { kind: "parts" };
     }
 
@@ -366,7 +366,7 @@ export class StreamTranslator {
     // transformed backend prompt so resumed transcripts remain user-readable.
     return {
       kind: "raw-command",
-      rawCommand: agentSkillCommand,
+      rawCommand,
     };
   }
 
@@ -464,7 +464,7 @@ export class StreamTranslator {
         return null;
       }
 
-      // `todo_write` is Mux's canonical execution-plan surface. Mirror it into
+      // `todo_write` is Xum's canonical execution-plan surface. Mirror it into
       // ACP `sessionUpdate: "plan"` so editors can render native plan UIs.
       const entries = parseTodoWritePlanEntries(rawInput);
       if (entries == null) {
@@ -630,7 +630,7 @@ export class StreamTranslator {
   clearSession(sessionId: string): void {
     assert(sessionId.trim().length > 0, "clearSession: sessionId must be non-empty");
 
-    // ACP currently has no explicit session/close notification. When Mux evicts
+    // ACP currently has no explicit session/close notification. When Xum evicts
     // inactive sessions (idle timeout/LRU), proactively clear message/tool-call
     // bookkeeping so long-lived editor connections cannot accumulate stale state.
     const scopedPrefix = `${sessionId}${SESSION_SCOPED_TOOL_KEY_DELIMITER}`;
@@ -678,9 +678,7 @@ export class StreamTranslator {
   }
 }
 
-function extractAgentSkillRawCommand(
-  metadata: MessageMetadataWithFrontendFields | undefined
-): string | null {
+function extractRawCommand(metadata: MessageMetadataWithFrontendFields | undefined): string | null {
   if (metadata == null) {
     return null;
   }
@@ -698,7 +696,9 @@ function extractRawCommandFromFrontendMetadata(frontendMetadata: unknown): strin
     return null;
   }
 
-  if (frontendMetadata.type !== "agent-skill") {
+  // "normal" can carry rawCommand for transformed MCP prompts and one-shot
+  // overrides, so replay the authored command as the desktop transcript does.
+  if (frontendMetadata.type !== "agent-skill" && frontendMetadata.type !== "normal") {
     return null;
   }
 

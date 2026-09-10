@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   supportsAnthropicCache,
   applyCacheControl,
+  getAnthropicCacheTtl,
   createCachedSystemMessage,
   createOpenAICachedSystemMessage,
   openaiExplicitPromptCachingAvailable,
@@ -50,6 +51,82 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("google:gemini-2.0")).toBe(false);
       expect(supportsAnthropicCache("openrouter:meta-llama/llama-3.1")).toBe(false);
       expect(supportsAnthropicCache("mux-gateway:openai/gpt-5.2")).toBe(false);
+    });
+
+    // Coder gateway instances: the wire comes from instance metadata, not the
+    // instance name. Custom-named Anthropic instances must get cache markers;
+    // cross-typed canonical names must not.
+    it("resolves Coder gateway instances through their metadata type", () => {
+      const config = {
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [
+            { name: "prod-anthropic", type: "anthropic" },
+            { name: "anthropic", type: "openai-compat" },
+          ],
+        },
+      };
+      expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("coder:anthropic/gpt-5", config)).toBe(false);
+      // Without metadata, the name === type default applies.
+      expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5")).toBe(true);
+      expect(supportsAnthropicCache("coder:unknown-instance/model", config)).toBe(false);
+    });
+
+    it("classifies custom providers by their API format", () => {
+      const config = {
+        zen: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "anthropic-messages" as const,
+        },
+        zap: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-responses" as const,
+        },
+        zim: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-compatible" as const,
+        },
+      };
+
+      expect(supportsAnthropicCache("zen:claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("zap:gpt-5", config)).toBe(false);
+      expect(supportsAnthropicCache("zim:claude-opus-4-5", config)).toBe(false);
+    });
+
+    // ZDR: disableBetaFeatures must reject cache eligibility itself — the
+    // provider fetch wrapper only skips injecting markers, it never strips
+    // ones these helpers already serialized.
+    it("rejects all Anthropic-wire routes when disableBetaFeatures is set", () => {
+      const config = {
+        anthropic: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          disableBetaFeatures: true,
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-anthropic", type: "anthropic" }],
+        },
+      };
+      expect(supportsAnthropicCache("anthropic:claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5", config)).toBe(false);
     });
   });
 
@@ -341,6 +418,28 @@ describe("cacheStrategy", () => {
       ).toBe(true);
     });
 
+    it("accepts a request-level Chat Completions wire format that falls back to the API key", () => {
+      // Stored config prefers OAuth and leaves wireFormat unset; the request selects
+      // Chat Completions, which Codex OAuth cannot serve, so the API key is used.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(true);
+      // The stored wire format wins over the request-level value.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-5.6-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true, wireFormat: "responses" }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(false);
+    });
+
     it("rejects when the providers config view is unavailable", () => {
       expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", null)).toBe(
         false
@@ -607,5 +706,21 @@ describe("cacheStrategy", () => {
       // A recreated tool is a different object; sanity-check the marker rode along on the copy.
       expect(result.task).not.toBe(taskTool);
     });
+  });
+});
+
+describe("getAnthropicCacheTtl", () => {
+  it("recovers a valid ttl from merged provider options", () => {
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "1h" } } })).toBe("1h");
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "5m" } } })).toBe("5m");
+  });
+
+  it("returns undefined for missing or malformed shapes", () => {
+    expect(getAnthropicCacheTtl(undefined)).toBeUndefined();
+    expect(getAnthropicCacheTtl({})).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: "1h" })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: "1h" } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "2h" } } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: 300 } } })).toBeUndefined();
   });
 });

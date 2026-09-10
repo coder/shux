@@ -9,13 +9,17 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  CURRENT_ETL_SEMANTICS_VERSION,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   parseWorkspaceFromDisk,
   readPersistedWorkspaceHeadSignature,
+  readStoredEtlSemanticsVersion,
   readStoredPricingFingerprint,
   rebuildAll,
   statSessionChatHistory,
+  storeEtlSemanticsVersion,
   storePricingFingerprint,
 } from "./etl";
 import {
@@ -28,12 +32,23 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 
 const SUBAGENT_TRANSCRIPTS_DIR_NAME = "subagent-transcripts";
 
+// Pre-tool_name table shape: strips every column added by
+// EVENTS_COLUMN_MIGRATIONS_SQL so migration tests replay the real upgrade
+// path (ALTERs append columns in migration-list order).
 const CREATE_EVENTS_TABLE_WITHOUT_TOOL_NAME_SQL = CREATE_EVENTS_TABLE_SQL.replace(
   "\n  tool_name TEXT,",
   ""
 )
-  .replace("\n  tool_name TEXT", "")
+  .replace("\n  requested_model VARCHAR,", "")
+  .replace("\n  refused_models_json VARCHAR", "")
   .replace(",\n)", "\n)");
+
+// Pre-refusal-columns table shape (tool_name already migrated): the upgrade
+// path current installs take when the refusal-downgrade columns land.
+const CREATE_EVENTS_TABLE_WITHOUT_REFUSAL_COLUMNS_SQL = CREATE_EVENTS_TABLE_SQL.replace(
+  ",\n  requested_model VARCHAR,\n  refused_models_json VARCHAR",
+  ""
+);
 
 const tempDirsToClean: string[] = [];
 const duckDbHandlesToClose: Array<{ instance: DuckDBInstance; conn: DuckDBConnection }> = [];
@@ -79,6 +94,8 @@ function makeAssistantLine(
     ttftMs?: number;
     providerMetadata?: Record<string, unknown>;
     toolModelUsages?: unknown[];
+    modelFallback?: unknown;
+    partial?: boolean;
   } = {}
 ): string {
   return JSON.stringify({
@@ -97,6 +114,8 @@ function makeAssistantLine(
       ...(opts.ttftMs != null ? { ttftMs: opts.ttftMs } : {}),
       ...(opts.providerMetadata != null ? { providerMetadata: opts.providerMetadata } : {}),
       ...(opts.toolModelUsages != null ? { toolModelUsages: opts.toolModelUsages } : {}),
+      ...(opts.modelFallback != null ? { modelFallback: opts.modelFallback } : {}),
+      ...(opts.partial != null ? { partial: opts.partial } : {}),
     },
   });
 }
@@ -290,7 +309,7 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, createMissingSessionsDir());
 
-    expect(result).toEqual({ workspacesIngested: 0 });
+    expect(result).toEqual({ workspacesIngested: 0, failedWorkspaceIds: new Set() });
     expect(getSqlStatements(runMock)).toEqual([
       "BEGIN TRANSACTION",
       "DELETE FROM events",
@@ -340,8 +359,30 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, sessionsDir, {});
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result.workspacesIngested).toBe(1);
     expect(await queryEventCount(conn)).toBe(1);
+  });
+
+  test("reports metadata-stage failures so the sweep preserves already-appended rows", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+
+    // Chat parses and appends fine, but the unreadable sidecar (a directory)
+    // throws in ingestHeadlessUsage before the watermark write.
+    const workspaceDir = path.join(sessionsDir, "ws-meta-fail");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await writeChatJsonl(workspaceDir, [makeUserLine(), makeAssistantLine()]);
+    await fs.mkdir(path.join(workspaceDir, "headless-usage.jsonl"));
+
+    const result = await rebuildAll(conn, sessionsDir, {});
+
+    expect(result.failedWorkspaceIds).toEqual(new Set(["ws-meta-fail"]));
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
+
+    // The post-rebuild sweep runs with exactly this failure set; the
+    // watermark-less rows must survive it.
+    expect(await deleteCorruptAnalyticsRows(conn, result.failedWorkspaceIds)).toBe(0);
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
   });
 });
 
@@ -414,7 +455,13 @@ describe("appendEvents", () => {
     const freshConn = await createTestConn();
     const migratedConn = await createTestConn({
       createEventsTableSql: CREATE_EVENTS_TABLE_WITHOUT_TOOL_NAME_SQL,
-      postCreateEventsSql: ["ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT"],
+      // Mirror EVENTS_COLUMN_MIGRATIONS_SQL order so the migrated physical
+      // column order matches a fresh table (the appender relies on it).
+      postCreateEventsSql: [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
+      ],
     });
     const sessionDir = await createTempSessionDir();
     const workspaceId = "ws-tool-column-order";
@@ -475,6 +522,242 @@ describe("appendEvents", () => {
       },
     ]);
     expect(migratedRows).toEqual(freshRows);
+  });
+
+  test("keeps downgrade columns aligned across fresh and refusal-column-migrated tables", async () => {
+    const freshConn = await createTestConn();
+    const migratedConn = await createTestConn({
+      createEventsTableSql: CREATE_EVENTS_TABLE_WITHOUT_REFUSAL_COLUMNS_SQL,
+      postCreateEventsSql: [
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+        "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
+      ],
+    });
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-column-order";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    const parsed = await parseWorkspaceFromDisk(workspaceId, sessionDir, {});
+    expect(parsed).not.toBeNull();
+    assert(
+      parsed,
+      "downgrade column-order test expected parseWorkspaceFromDisk to parse workspace"
+    );
+
+    await appendEvents(freshConn, parsed.events);
+    await appendEvents(migratedConn, parsed.events);
+
+    const selectedSql =
+      "SELECT model, tool_name, requested_model, refused_models_json FROM events WHERE workspace_id = ?";
+    const freshRows = await queryRows(freshConn, selectedSql, [workspaceId]);
+    const migratedRows = await queryRows(migratedConn, selectedSql, [workspaceId]);
+
+    expect(freshRows).toEqual([
+      {
+        model: "openai:gpt-4",
+        tool_name: null,
+        requested_model: "anthropic:fable-1",
+        refused_models_json: '["anthropic:fable-1"]',
+      },
+    ]);
+    expect(migratedRows).toEqual(freshRows);
+  });
+
+  test("populates downgrade columns on the main turn row only", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", "openai:gpt-4-mini"],
+        },
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: 1_700_000_000_025,
+            model: "anthropic:fable-1",
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+        ],
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT tool_name, model, requested_model, refused_models_json, input_tokens, total_cost_usd FROM events WHERE workspace_id = ? ORDER BY tool_name NULLS FIRST",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(2);
+    // Main turn row: answering model + downgrade metadata.
+    expect(rows[0].tool_name).toBeNull();
+    expect(rows[0].model).toBe("openai:gpt-4");
+    expect(rows[0].requested_model).toBe("anthropic:fable-1");
+    expect(rows[0].refused_models_json).toBe('["anthropic:fable-1","openai:gpt-4-mini"]');
+    // Refusal hop row: zero-usage refusals still produce a countable row,
+    // with downgrade metadata left NULL (main-row-only semantics).
+    expect(rows[1].tool_name).toBe("model_fallback_refusal");
+    expect(rows[1].model).toBe("anthropic:fable-1");
+    expect(rows[1].requested_model).toBeNull();
+    expect(rows[1].refused_models_json).toBeNull();
+    expect(parseInteger(rows[1].input_tokens, "hop input_tokens")).toBe(0);
+    expect(Number(rows[1].total_cost_usd)).toBe(0);
+
+    // Delete+reinsert idempotency holds for downgrade rows.
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+    expect(await queryEventCount(conn, workspaceId)).toBe(2);
+  });
+
+  test("malformed modelFallback yields NULL downgrade columns without dropping the row", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-malformed";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Non-record modelFallback.
+      makeAssistantLine({ sequence: 1, modelFallback: "bogus" }),
+      // Wrong field types / empty refusedModels after string filtering.
+      makeAssistantLine({
+        sequence: 2,
+        modelFallback: { requestedModel: 42, refusedModels: ["anthropic:fable-1"] },
+      }),
+      makeAssistantLine({
+        sequence: 3,
+        modelFallback: { requestedModel: "anthropic:fable-1", refusedModels: [17, null] },
+      }),
+      // Partially malformed arrays are rejected wholesale: dropping bad hops
+      // would emit a truncated chain that reads as valid history.
+      makeAssistantLine({
+        sequence: 4,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", 42],
+        },
+      }),
+      makeAssistantLine({
+        sequence: 5,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", "  "],
+        },
+      }),
+      // ModelFallbackRecord invariant violation: the requested model must be
+      // the first refused entry, so a mismatched chain is corrupted history.
+      makeAssistantLine({
+        sequence: 6,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:other-model"],
+        },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(6);
+    for (const row of rows) {
+      expect(row.requested_model).toBeNull();
+      expect(row.refused_models_json).toBeNull();
+    }
+  });
+
+  test("interrupted (partial) fallback turns do not count as answered downgrades", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-partial";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Valid downgrade record, but the turn committed as an interrupted
+      // partial: billed attempt, not an answered downgrade.
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        partial: true,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, requested_model, refused_models_json FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe("openai:gpt-4"); // usage still ingested
+    expect(rows[0].requested_model).toBeNull();
+    expect(rows[0].refused_models_json).toBeNull();
+  });
+
+  test("events.model uses the shared attribution key for coder and gateway identities", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-attribution-key";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Coder route: answered main row and tool row must key by the pinned
+      // metadata identity so they group with headless sidecar rows (which
+      // recordHeadlessUsageLocked already writes canonically).
+      makeAssistantLine({
+        sequence: 1,
+        model: "coder:prod/claude-opus-4-5",
+        metadataModel: "anthropic:claude-opus-4-5",
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: 1_700_000_000_025,
+            model: "coder:prod/claude-opus-4-5",
+            metadataModel: "anthropic:claude-opus-4-5",
+            usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          },
+        ],
+      }),
+      // Gateway route canonicalizes; coder without a pinned identity keeps
+      // its raw (only durable) key.
+      makeAssistantLine({ sequence: 2, model: "mux-gateway:anthropic/claude-opus-4-5" }),
+      makeAssistantLine({ sequence: 3, model: "coder:unmapped/some-model" }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, tool_name FROM events WHERE workspace_id = ? ORDER BY model, tool_name NULLS FIRST",
+      [workspaceId]
+    );
+    expect(rows.map((row) => [row.model, row.tool_name])).toEqual([
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", "model_fallback_refusal"],
+      ["coder:unmapped/some-model", null],
+    ]);
   });
 
   test("emits one assistant row plus one row per tool model usage with inherited context", async () => {
@@ -1216,7 +1499,7 @@ describe("ingestArchivedSubagentTranscripts", () => {
 
     const result = await rebuildAll(conn, sessionsDir);
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result).toEqual({ workspacesIngested: 1, failedWorkspaceIds: new Set() });
     expect(await queryEventCount(conn)).toBe(2);
     expect(await queryEventCount(conn, parentWorkspaceId)).toBe(1);
     expect(await queryEventCount(conn, childWorkspaceId)).toBe(1);
@@ -1405,6 +1688,35 @@ describe("headless usage ingestion", () => {
     // and does not disturb chat-derived rows.
     await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
     expect(await queryEventCount(conn, workspaceId)).toBe(3);
+  });
+
+  test("ingests zero-usage refused_stream sidecar rows as countable refusal events", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-refused-ws";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+    await writeHeadlessUsageJsonl(sessionDir, [
+      // Terminal refusal the provider billed nothing for: the row must still
+      // exist so refusal counts include zero-usage refusals.
+      makeHeadlessLine({ source: "refused_stream", inputTokens: 0, outputTokens: 0 }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    const refusedRows = await queryRows(
+      conn,
+      "SELECT tool_name, model, input_tokens, output_tokens, total_cost_usd FROM events WHERE workspace_id = ? AND tool_name = 'headless:refused_stream'",
+      [workspaceId]
+    );
+    expect(refusedRows).toHaveLength(1);
+    expect(refusedRows[0].model).toBe("anthropic:claude-sonnet-4-20250514");
+    expect(parseInteger(refusedRows[0].input_tokens, "input_tokens")).toBe(0);
+    expect(parseInteger(refusedRows[0].output_tokens, "output_tokens")).toBe(0);
+    expect(Number(refusedRows[0].total_cost_usd)).toBe(0);
+
+    // Delete+reinsert idempotency holds for refused_stream rows.
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(2); // 1 chat + 1 refused
   });
 
   test("clears stale headless rows when the sidecar disappears", async () => {
@@ -1632,5 +1944,178 @@ describe("pricing fingerprint", () => {
     // Idempotent upsert: storing again keeps a single row with the same value.
     await storePricingFingerprint(conn);
     expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
+  });
+});
+
+describe("etl semantics version", () => {
+  test("round-trips through ingest_meta and starts unset", async () => {
+    const conn = await createTestConn();
+
+    // Missing on pre-upgrade DBs: the sync check treats null as changed and
+    // schedules the one-time backfill rebuild (see decideSyncPlan tests).
+    expect(await readStoredEtlSemanticsVersion(conn)).toBeNull();
+
+    await storeEtlSemanticsVersion(conn);
+    expect(await readStoredEtlSemanticsVersion(conn)).toBe(CURRENT_ETL_SEMANTICS_VERSION);
+  });
+
+  test("full rebuild backfills downgrade columns from pre-existing chat.jsonl", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+    const workspaceDir = path.join(sessionsDir, "ws-backfill");
+    await fs.mkdir(workspaceDir);
+    // Historical committed downgrade turn written before this feature existed.
+    await writeChatJsonl(workspaceDir, [
+      makeUserLine(),
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    await rebuildAll(conn, sessionsDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ? AND tool_name IS NULL",
+      ["ws-backfill"]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].requested_model).toBe("anthropic:fable-1");
+    expect(rows[0].refused_models_json).toBe('["anthropic:fable-1"]');
+  });
+});
+
+describe("deleteCorruptAnalyticsRows", () => {
+  async function seedWatermark(conn: DuckDBConnection, workspaceId: string): Promise<void> {
+    await conn.run(
+      "INSERT INTO ingest_watermarks (workspace_id, last_sequence, last_modified) VALUES (?, ?, ?)",
+      [workspaceId, 1, 1]
+    );
+  }
+
+  test("deletes corrupt rows while keeping healthy rows", async () => {
+    const conn = await createTestConn();
+
+    // Migrated legacy IDs are `${projectBasename}-${workspaceBasename}` with
+    // no length limit (up to 2x NAME_MAX + 1 = 511 chars) and must survive.
+    const legacyId = `${"p".repeat(255)}-${"w".repeat(255)}`;
+    // Custom-provider model IDs have no schema max length; an extremely long
+    // model on an otherwise-healthy row must never be deletion evidence.
+    const longModel = `custom:${"m".repeat(2000)}`;
+
+    for (const workspaceId of ["ws-healthy", legacyId, "ws-long-model", "parent-healthy"]) {
+      await seedWatermark(conn, workspaceId);
+    }
+
+    for (const [workspaceId, model, cost] of [
+      ["ws-healthy", "anthropic:claude-haiku-4-5", 1.0],
+      [legacyId, "anthropic:claude-haiku-4-5", 2.0],
+      ["ws-long-model", longModel, 3.0],
+      // Large-batch phantom: concatenated identifiers exceed the length caps.
+      ["x".repeat(2000), "anthropic:claude-haiku-4-5".repeat(100), 0.05],
+      // Small-batch phantom: two concatenated 10-char workspace IDs stay far
+      // under the length caps but can never match a real watermark.
+      ["aaaaabbbbbcccccddddd", "openai:gpt-5.6-solopenai:gpt-5.6-sol", 0.05],
+    ] as const) {
+      await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+        workspaceId,
+        model,
+        cost,
+      ]);
+    }
+
+    for (const [parent, child] of [
+      ["parent-healthy", "child-healthy"],
+      // A rollup may outlive its removed child workspace; only the parent
+      // must be a known workspace.
+      ["parent-healthy", "child-removed"],
+      ["p".repeat(2000), "child-corrupt"],
+      // Small-batch phantom parent: unknown to watermarks.
+      ["par-aaaaapar-bbbbb", "child-x"],
+    ] as const) {
+      await conn.run(
+        `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+         VALUES (?, ?, ?)`,
+        [parent, child, "openai:gpt-5.6-sol"]
+      );
+    }
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(4);
+
+    const eventRows = await queryRows(
+      conn,
+      "SELECT workspace_id FROM events ORDER BY LENGTH(workspace_id)"
+    );
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-healthy" },
+      { workspace_id: "ws-long-model" },
+      { workspace_id: legacyId },
+    ]);
+    const rollupRows = await queryRows(
+      conn,
+      "SELECT child_workspace_id FROM delegation_rollups ORDER BY child_workspace_id"
+    );
+    expect(rollupRows).toEqual([
+      { child_workspace_id: "child-healthy" },
+      { child_workspace_id: "child-removed" },
+    ]);
+
+    // Idempotent: nothing left to delete.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
+  });
+
+  test("exempts failed-ingest workspaces from watermark evidence but not length evidence", async () => {
+    const conn = await createTestConn();
+
+    // A poison record makes this workspace's ingest throw before its
+    // watermark write on every retry; its real partial rows must survive
+    // the post-sync sweep or the workspace's spend disappears permanently.
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "ws-failed-ingest",
+      "anthropic:claude-haiku-4-5",
+      1.0,
+    ]);
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+       VALUES (?, ?, ?)`,
+      ["ws-failed-ingest", "child-a", "openai:gpt-5.6-sol"]
+    );
+    // Length evidence is structural corruption regardless of exemption.
+    await conn.run(
+      "INSERT INTO events (workspace_id, parent_workspace_id, model) VALUES (?, ?, ?)",
+      ["ws-failed-ingest", "x".repeat(2000), "anthropic:claude-haiku-4-5"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn, new Set(["ws-failed-ingest"]))).toBe(1);
+
+    const eventRows = await queryRows(conn, "SELECT workspace_id, model FROM events");
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-failed-ingest", model: "anthropic:claude-haiku-4-5" },
+    ]);
+    expect(await queryRows(conn, "SELECT child_workspace_id FROM delegation_rollups")).toEqual([
+      { child_workspace_id: "child-a" },
+    ]);
+
+    // A later pass without the exemption treats the same rows as orphans.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
+  });
+
+  test("keeps rollups whose legacy agent_type is arbitrarily long", async () => {
+    const conn = await createTestConn();
+    await seedWatermark(conn, "parent-legacy");
+
+    // Legacy metadata and rollup entries accept unbounded agent types, so
+    // agent_type length alone is never corruption evidence.
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, agent_type, model)
+       VALUES (?, ?, ?, ?)`,
+      ["parent-legacy", "child-a", "t".repeat(2000), "openai:gpt-5.6-sol"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
   });
 });

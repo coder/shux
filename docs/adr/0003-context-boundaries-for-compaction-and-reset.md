@@ -11,11 +11,11 @@ Accepted
 
 ## Context
 
-Mux needs two ways to start a new active conversation context without treating all persisted transcript history the same way. Compaction summarizes earlier history into provider-visible content, while `/clear --soft` should preserve earlier transcript history but keep it out of future provider requests.
+Xum needs two ways to start a new active conversation context without treating all persisted transcript history the same way. Compaction summarizes earlier history into provider-visible content, while `/clear --soft` should preserve earlier transcript history but keep it out of future provider requests.
 
 ## Decision
 
-Mux will model both compaction and context reset as kinds of Context Boundary. A Compaction Boundary carries a provider-visible summary of earlier transcript history. A Context Reset Boundary is visible transcript structure but is provider-invisible: it preserves earlier Transcript History while starting a new Active Conversation Context.
+Xum will model both compaction and context reset as kinds of Context Boundary. A Compaction Boundary carries a provider-visible summary of earlier transcript history. A Context Reset Boundary is visible transcript structure but is provider-invisible: it preserves earlier Transcript History while starting a new Active Conversation Context.
 
 `/clear` remains a destructive Hard Clear. `/clear --soft` performs a Context Reset, clearing agent carryover state and creating a Context Reset Boundary only when the current context window contains provider-eligible messages. Repeated or empty context resets are no-op successes.
 

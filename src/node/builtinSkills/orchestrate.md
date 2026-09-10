@@ -18,7 +18,7 @@ Coordinate implementation by delegating investigation + coding to sub-agents, th
 - **Do not do broad repo investigation here.** If you need context, spawn an `explore` sub-agent with a narrow prompt to preserve your context window for coordination.
 - **Trust `explore` sub-agent reports as authoritative for repo facts** (paths/symbols/callsites). Do not redo the same investigation yourself; only re-check if a report is ambiguous or contradicts other evidence. For correctness claims, an `explore` report counts as having read the referenced files.
 - **`bash` is for orchestration only:** `git` / `gh` repo coordination, targeted post-apply verification, and waiting on PR review/CI. Do not use `bash` for file reads/writes, manual code editing, or broad repo exploration. If a direct verification check fails due to a code issue, delegate the fix to `exec` instead of patching it yourself.
-- **Never read or scan session storage** (`~/.mux/sessions/**`, `~/.mux/sessions/subagent-patches/**`). Treat session storage as internal. Access patches only through `task_apply_git_patch`.
+- **Never read or scan session storage** (`~/.xum/sessions/**`, `~/.xum/sessions/subagent-patches/**`). Treat session storage as internal. Access patches only through `task_apply_git_patch`.
 - **Do not call `propose_plan`** from this workflow conductor. If a complex subtask needs more shape before implementation, either decompose it with one or more `explore` tasks and write a richer brief for `exec`, or model an explicit workflow-owned `agentId: "plan"` step followed by a separate `exec` step.
 
 ## Long-horizon work: prefer a durable workflow
@@ -100,7 +100,7 @@ Example dependency chain (schema download → generation):
 
 1. Identify a batch of independent subtasks.
 2. Spawn one `exec` sub-agent task per subtask with `run_in_background: true`.
-3. If you can do useful setup work while they run, do it; when you are ready to integrate, call `task_await` for the pending task IDs. If no parent-side work remains, end the turn after recording task IDs; Mux will wake this workspace as each background task reaches a terminal state.
+3. If you can do useful setup work while they run, do it; when you are ready to integrate, call `task_await` for the pending task IDs. If no parent-side work remains, end the turn after recording task IDs; Xum will wake this workspace as each background task reaches a terminal state.
 4. For each successful implementation task, integrate patches **one at a time**:
    - Treat every successful child task with a `taskId` as pending patch integration, whether the completion arrived inline from `task` or later from `task_await`.
    - Complete each dry-run + real-apply pair before starting the next patch. Applying one patch changes `HEAD`, which can invalidate later dry-run results.
@@ -121,7 +121,7 @@ Example dependency chain (schema download → generation):
 
 ## Background readiness monitors
 
-For PR/CI readiness that can continue after your turn ends, prefer bounded monitor tasks over parent-side polling. Read `background-monitors`, then launch independent monitors with `task({ run_in_background: true })` for CI/checks, mergeability, review arrival, or deployment health. Each monitor should poll internally with a deadline and call `agent_report` only on convergence, failure, state transition, or timeout. Use `bash({ run_in_background: true, monitor: ... })` only for line-oriented shell output watchers (dev-server logs, watch tests, compiler errors), not for GitHub/API polling.
+For PR/CI readiness that can continue after your turn ends, prefer bounded monitor tasks over parent-side polling. Read `background-monitors`, then launch independent monitors with `task({ run_in_background: true })` for CI/checks, mergeability, review arrival, or deployment health. Each monitor should poll internally with a deadline and call `agent_report` only on convergence, failure, state transition, or timeout. Use `bash({ run_in_background: true, monitor: ... })` only for line-oriented shell output watchers (dev-server logs, watch tests, compiler errors), not for GitHub/API polling; a monitored bash also wakes the owner when the process settles (exit, kill, timeout) unless `wake_on_exit: false`, the monitor was retired by `max_events`, or the task was explicitly cancelled via `task_stop`.
 
 ## Gate loop (verification)
 

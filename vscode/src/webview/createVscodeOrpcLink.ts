@@ -1,5 +1,5 @@
 import type { ClientContext, ClientLink, ClientOptions } from "@orpc/client";
-import assert from "mux/common/utils/assert";
+import assert from "xum/common/utils/assert";
 
 import type { OrpcResponse, OrpcStreamData, OrpcStreamEnd, OrpcStreamError } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";

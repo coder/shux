@@ -26,7 +26,7 @@ async function trustProject(muxRoot: string, repo: string): Promise<void> {
     .quiet();
 }
 
-describe("mux workflow CLI helpers", () => {
+describe("xum workflow CLI helpers", () => {
   test("rejects ambiguous structured args modes", async () => {
     expect(
       await getRejectedMessage(parseWorkflowArgs({ argsJson: "{}", argsFile: "args.json" }))
@@ -78,6 +78,82 @@ describe("mux workflow CLI helpers", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  // The CLI root owns an Effect runtime (createCoreServices). Its cleanup must
+  // close the supervised fiber scope before the session-level disposers and
+  // release the runtime after the background processes are terminated, mirroring
+  // ServiceContainer.dispose(); the debug shutdown lines pin that order.
+  test("CLI run closes the AppFiberScope first and disposes the AppRuntime last", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-runtime");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "echo.js"),
+      `export default function workflow() { return { reportMarkdown: "ok" }; }
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo.js --dir ${repo}`
+        .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
+        .nothrow()
+        .quiet();
+
+    expect(result.exitCode).toBe(0);
+    const output = result.stdout.toString() + result.stderr.toString();
+    const scopeClosedAt = output.indexOf("[shutdown] AppFiberScope closed");
+    const terminateAllAt = output.indexOf("BackgroundProcessManager.terminateAll() called");
+    const runtimeDisposedAt = output.indexOf("[shutdown] AppRuntime disposed");
+    expect(scopeClosedAt).toBeGreaterThan(output.indexOf("[startup] AppRuntime built"));
+    expect(terminateAllAt).toBeGreaterThan(scopeClosedAt);
+    expect(runtimeDisposedAt).toBeGreaterThan(terminateAllAt);
+  });
+
+  // Regression: headless `xum workflow` must initialize PolicyService and thread
+  // it through the core service graph like the desktop wiring. Without it, a
+  // stored credential for a provider that MUX_POLICY_FILE / Xum Governor now
+  // denies would remain usable from workflow-owned agents. The agent task must
+  // fail closed before any provider network call (the configured API key is fake).
+  test("CLI run enforces MUX_POLICY_FILE provider denials", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-policy");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(muxRoot, "providers.jsonc"),
+      JSON.stringify({ anthropic: { apiKey: "fake-key-policy-test" } }),
+      "utf-8"
+    );
+    const policyPath = path.join(muxRoot, "policy.json");
+    await fs.writeFile(
+      policyPath,
+      JSON.stringify({ policy_format_version: "0.1", provider_access: [{ id: "openai" }] }),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(repo, "workflows", "policy-denied.js"),
+      `export default async function workflow({ agent }) { return await agent("say hi", { id: "hello" }); }
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/policy-denied.js --model anthropic:claude-opus-5 --dir ${repo}`
+        .env({ ...process.env, MUX_ROOT: muxRoot, MUX_POLICY_FILE: policyPath })
+        .nothrow()
+        .quiet();
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout.toString() + result.stderr.toString()).toContain(
+      "Provider anthropic is not allowed by policy"
+    );
+  });
+
   test("CLI run reports an actionable trust error for untrusted project workflows", async () => {
     using tmp = new DisposableTempDir("workflow-cli-untrusted");
     const repo = path.join(tmp.path, "repo");
@@ -124,7 +200,7 @@ describe("mux workflow CLI helpers", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr.toString()).toContain(
-      "mux workflow currently supports only local runtime"
+      "xum workflow currently supports only local runtime"
     );
   });
 

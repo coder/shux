@@ -11,6 +11,11 @@ describe("shouldShowModelInSettings", () => {
     expect(shouldShowModelInSettings(KNOWN_MODELS.GPT_53_CODEX_SPARK.id, true)).toBe(true);
   });
 
+  test("shows OAuth-required Codex model without OAuth when a gateway route is configured", () => {
+    expect(shouldShowModelInSettings(KNOWN_MODELS.GPT_53_CODEX_SPARK.id, false, true)).toBe(true);
+    expect(shouldShowModelInSettings(KNOWN_MODELS.GPT_53_CODEX_SPARK.id, false, false)).toBe(false);
+  });
+
   test("shows GPT-5.5 when OpenAI OAuth is not configured", () => {
     expect(shouldShowModelInSettings(KNOWN_MODELS.GPT.id, false)).toBe(true);
   });
@@ -25,10 +30,6 @@ describe("shouldShowModelInSettings", () => {
 
   test("keeps gpt-5.3-codex visible without OAuth", () => {
     expect(shouldShowModelInSettings(KNOWN_MODELS.GPT_53_CODEX.id, false)).toBe(true);
-  });
-
-  test("keeps non-required OpenAI models visible without OAuth", () => {
-    expect(shouldShowModelInSettings(KNOWN_MODELS.GPT.id, false)).toBe(true);
   });
 });
 

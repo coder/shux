@@ -108,21 +108,21 @@ export const EXPANDED_PROJECTS_KEY = "expandedProjects";
 export const WORKSPACE_DRAFTS_BY_PROJECT_KEY = "workspaceDraftsByProject";
 
 /**
- * LocalStorage keys for Mux Gateway routing preferences (global).
+ * LocalStorage keys for Xum Gateway routing preferences (global).
  *
  * Note: localStorage is origin-scoped (includes port), so these values are also
- * mirrored into ~/.mux/config.json for portability across server ports.
+ * mirrored into ~/.xum/config.json for portability across server ports.
  */
 export const GATEWAY_MODELS_KEY = "gateway-models"; // enabled model IDs (canonical)
 export const GATEWAY_ENABLED_KEY = "gateway-enabled"; // global on/off toggle
 
 /**
- * Storage key for runtime enablement settings (shared via ~/.mux/config.json).
+ * Storage key for runtime enablement settings (shared via ~/.xum/config.json).
  */
 export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
 
 /**
- * Storage key for global default runtime selection (shared via ~/.mux/config.json).
+ * Storage key for global default runtime selection (shared via ~/.xum/config.json).
  */
 export const DEFAULT_RUNTIME_KEY = "defaultRuntime";
 
@@ -228,6 +228,14 @@ export function getInputKey(workspaceId: string): string {
  */
 export function getPinnedTodoExpandedKey(workspaceId: string): string {
   return `pinnedTodoExpanded:${workspaceId}`;
+}
+
+/**
+ * Get the localStorage key for the sub-agent chat decoration expansion state.
+ * Format: "subAgentTasksExpanded:{workspaceId}"
+ */
+export function getSubAgentTasksExpandedKey(workspaceId: string): string {
+  return `subAgentTasksExpanded:${workspaceId}`;
 }
 
 /**
@@ -517,6 +525,77 @@ export function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig 
 }
 
 /**
+ * Terminal badge overlay configuration (global)
+ * Scroll-fixed workspace/tab watermark rendered above the terminal canvas,
+ * similar to iTerm2 badges. Stores: { enabled, template, position, opacity, fontSize }
+ */
+export const TERMINAL_BADGE_CONFIG_KEY = "terminalBadgeConfig";
+
+export const TERMINAL_BADGE_POSITIONS = [
+  "top-left",
+  "top-right",
+  "bottom-left",
+  "bottom-right",
+] as const;
+export type TerminalBadgePosition = (typeof TERMINAL_BADGE_POSITIONS)[number];
+
+export interface TerminalBadgeConfig {
+  enabled: boolean;
+  /** Supports {workspace}, {tab}, and {project} tokens. */
+  template: string;
+  position: TerminalBadgePosition;
+  /** 0-1 */
+  opacity: number;
+  fontSize: number;
+}
+
+export const DEFAULT_TERMINAL_BADGE_CONFIG: TerminalBadgeConfig = {
+  enabled: false,
+  template: "{workspace} · {tab}",
+  position: "top-right",
+  opacity: 0.4,
+  fontSize: 16,
+};
+
+function isTerminalBadgePosition(value: unknown): value is TerminalBadgePosition {
+  return (
+    typeof value === "string" && TERMINAL_BADGE_POSITIONS.includes(value as TerminalBadgePosition)
+  );
+}
+
+export function normalizeTerminalBadgeConfig(value: unknown): TerminalBadgeConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_TERMINAL_BADGE_CONFIG;
+  }
+
+  const record = value as {
+    enabled?: unknown;
+    template?: unknown;
+    position?: unknown;
+    opacity?: unknown;
+    fontSize?: unknown;
+  };
+  const enabled = record.enabled === true;
+  const template =
+    typeof record.template === "string" ? record.template : DEFAULT_TERMINAL_BADGE_CONFIG.template;
+  const position = isTerminalBadgePosition(record.position)
+    ? record.position
+    : DEFAULT_TERMINAL_BADGE_CONFIG.position;
+  const opacityNumber = Number(record.opacity);
+  const opacity =
+    Number.isFinite(opacityNumber) && opacityNumber > 0 && opacityNumber <= 1
+      ? opacityNumber
+      : DEFAULT_TERMINAL_BADGE_CONFIG.opacity;
+  const fontSizeNumber = Number(record.fontSize);
+  const fontSize =
+    Number.isFinite(fontSizeNumber) && fontSizeNumber > 0
+      ? fontSizeNumber
+      : DEFAULT_TERMINAL_BADGE_CONFIG.fontSize;
+
+  return { enabled, template, position, opacity, fontSize };
+}
+
+/**
  * Tutorial state storage key (global)
  * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true, review?: true } }
  */
@@ -663,6 +742,19 @@ export const LEFT_SIDEBAR_COLLAPSED_KEY = "sidebarCollapsed";
  * Format: "sidebarAgeGrouping"
  */
 export const SIDEBAR_AGE_GROUPING_KEY = "sidebarAgeGrouping";
+
+/**
+ * When true, show all sidebar chats in one list instead of project folders.
+ * Format: "sidebarFlatMode" (boolean, default false)
+ */
+export const SIDEBAR_FLAT_MODE_KEY = "sidebarFlatMode";
+
+/**
+ * Hide sub-agent rows in the left sidebar and summarize their activity on
+ * parent rows instead.
+ * Format: "sidebarHideSubAgents" (boolean, default false)
+ */
+export const SIDEBAR_HIDE_SUBAGENTS_KEY = "sidebarHideSubAgents";
 
 /**
  * Left sidebar width

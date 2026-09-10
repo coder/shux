@@ -1,32 +1,32 @@
 ---
 title: Terminal Benchmarking
-description: Run Terminal-Bench benchmarks with the Mux adapter
+description: Run Terminal-Bench benchmarks with the Xum adapter
 ---
 
-Mux ships with a headless adapter for [Terminal-Bench](https://www.tbench.ai/). The adapter runs the Electron backend without opening a window and exercises it through the same IPC paths we use in integration tests. This page documents how to launch benchmarks from the repository tree.
+Xum ships with a headless adapter for [Terminal-Bench](https://www.tbench.ai/). The adapter runs the Electron backend without opening a window and exercises it through the same IPC paths we use in integration tests. This page documents how to launch benchmarks from the repository tree.
 
 ## Prerequisites
 
 - Docker must be installed and running. Terminal-Bench executes each task inside a dedicated Docker container.
 - `uv` is available in the nix `devShell` (provided via `flake.nix`), or install it manually from [docs.astral.sh/uv](https://docs.astral.sh/uv/).
-- Standard provider API keys (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) should be exported so Mux can stream responses.
+- Standard provider API keys (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) should be exported so Xum can stream responses.
 
 Optional environment overrides:
 
 | Variable              | Purpose                                                                       | Default                                |
 | --------------------- | ----------------------------------------------------------------------------- | -------------------------------------- |
-| `MUX_AGENT_REPO_ROOT` | Path copied into each task container                                          | repo root inferred from the agent file |
-| `MUX_TRUNK`           | Branch checked out when preparing the project                                 | `main`                                 |
-| `MUX_WORKSPACE_ID`    | Workspace identifier used inside Mux                                          | `mux-bench`                            |
-| `MUX_MODEL`           | Preferred model (supports `provider/model` syntax)                            | `anthropic/claude-sonnet-4-5`          |
-| `MUX_THINKING_LEVEL`  | Reasoning level (`OFF`, `LOW`, `MED`, `HIGH`, `MAX`)                          | `HIGH`                                 |
-| `MUX_MODE`            | Starting mode (`plan` or `exec`)                                              | `exec`                                 |
-| `MUX_RUNTIME`         | Runtime type (`local`, `worktree`, or `ssh <host>`)                           | `worktree`                             |
-| `MUX_TIMEOUT_MS`      | Legacy timeout marker forwarded to runner logs; Harbor enforces task timeouts | unset                                  |
-| `MUX_PROVIDERS_FILE`  | Host path to `providers.jsonc` copied into each sandbox                       | unset (use env vars only)              |
-| `MUX_CONFIG_ROOT`     | Location for Mux session data inside the container                            | `/root/.mux`                           |
-| `MUX_APP_ROOT`        | Path where the Mux sources are staged                                         | `/opt/mux-app`                         |
-| `MUX_PROJECT_PATH`    | Explicit project directory inside the task container                          | auto-detected from common paths        |
+| `XUM_AGENT_REPO_ROOT` | Path copied into each task container                                          | repo root inferred from the agent file |
+| `XUM_TRUNK`           | Branch checked out when preparing the project                                 | `main`                                 |
+| `XUM_WORKSPACE_ID`    | Workspace identifier used inside Xum                                          | `mux-bench`                            |
+| `XUM_MODEL`           | Preferred model (supports `provider/model` syntax)                            | `anthropic/claude-sonnet-4-5`          |
+| `XUM_THINKING_LEVEL`  | Reasoning level (`OFF`, `LOW`, `MED`, `HIGH`, `MAX`)                          | `HIGH`                                 |
+| `XUM_MODE`            | Starting mode (`plan` or `exec`)                                              | `exec`                                 |
+| `XUM_RUNTIME`         | Runtime type (`local`, `worktree`, or `ssh <host>`)                           | `worktree`                             |
+| `XUM_TIMEOUT_MS`      | Legacy timeout marker forwarded to runner logs; Harbor enforces task timeouts | unset                                  |
+| `XUM_PROVIDERS_FILE`  | Host path to `providers.jsonc` copied into each sandbox                       | unset (use env vars only)              |
+| `XUM_CONFIG_ROOT`     | Location for Xum session data inside the container                            | `/root/.mux`                           |
+| `XUM_APP_ROOT`        | Path where the Xum sources are staged                                         | `/opt/mux-app`                         |
+| `XUM_PROJECT_PATH`    | Explicit project directory inside the task container                          | auto-detected from common paths        |
 
 ## Running Terminal-Bench
 
@@ -37,18 +37,18 @@ All commands below should be run from the repository root.
 ```bash
 uvx terminal-bench run \
   --dataset terminal-bench-core==0.1.1 \
-  --agent-import-path benchmarks.terminal_bench.mux_agent:MuxAgent \
+  --agent-import-path benchmarks.terminal_bench.mux_agent:XumAgent \
   --n-tasks 1
 ```
 
-This downloads the Terminal-Bench runner, copies the Mux sources into the container, and validates the adapter against the first task only. Use this before attempting a full sweep.
+This downloads the Terminal-Bench runner, copies the Xum sources into the container, and validates the adapter against the first task only. Use this before attempting a full sweep.
 
 ### Full dataset
 
 ```bash
 uvx terminal-bench run \
   --dataset terminal-bench-core==0.1.1 \
-  --agent-import-path benchmarks.terminal_bench.mux_agent:MuxAgent
+  --agent-import-path benchmarks.terminal_bench.mux_agent:XumAgent
 ```
 
 Results (pass/fail, token usage, wall-clock) are printed at the end of the run. Terminal-Bench also writes per-task logs under the current working directory; review them when diagnosing failures.
@@ -68,14 +68,14 @@ Use `TB_CONCURRENCY=<n>` to control `--n-concurrent` (number of concurrently run
 
 The adapter lives in `benchmarks/terminal_bench/mux_agent.py`. For each task it:
 
-1. Copies the Mux repository (package manifests + `src/`) into `/tmp/mux-app` inside the container.
+1. Copies the Xum repository (package manifests + `src/`) into `/tmp/mux-app` inside the container.
 2. Ensures Bun exists, then runs `bun install --frozen-lockfile`.
-3. Launches `mux run` (`src/cli/run.ts`) to prepare workspace metadata and stream the instruction, storing state under `MUX_CONFIG_ROOT` (default `/root/.mux`).
+3. Launches `xum run` (`src/cli/run.ts`) to prepare workspace metadata and stream the instruction, storing state under `XUM_CONFIG_ROOT` (default `/root/.mux`).
 
-`MUX_MODEL` accepts either the Mux colon form (`anthropic:claude-sonnet-4-5`) or the Terminal-Bench slash form (`anthropic/claude-sonnet-4-5`); the adapter normalises whichever you provide.
+`XUM_MODEL` accepts either the Xum colon form (`anthropic:claude-sonnet-4-5`) or the Terminal-Bench slash form (`anthropic/claude-sonnet-4-5`); the adapter normalises whichever you provide.
 
 ## Troubleshooting
 
 - **`command not found: bun`** – ensure the container can reach Bun’s install script, or pre-install Bun in your base image. The adapter aborts if the install step fails.
-- **Workspace creation errors** – set `MUX_PROJECT_PATH` to the project directory inside the task container if auto-discovery misses it.
+- **Workspace creation errors** – set `XUM_PROJECT_PATH` to the project directory inside the task container if auto-discovery misses it.
 - **Task timeouts** – pass `--n-tasks 1` while iterating on fixes, or set `TB_TIMEOUT=180` when using `make benchmark-terminal`. The runner intentionally avoids GNU `timeout` so Harbor can classify task limits as `AgentTimeoutError`.

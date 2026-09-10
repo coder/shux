@@ -1,8 +1,8 @@
 # @coder/mux-chat-components
 
-Shared chat UI from Mux, published for reuse in mux.md.
+Shared chat UI from Xum, published for reuse in mux.md.
 
-**Principle:** this package re-exports Mux’s existing chat renderer implementation (messages, tools, markdown, diff rendering) to avoid a parallel rendering stack.
+**Principle:** this package re-exports Xum’s existing chat renderer implementation (messages, tools, markdown, diff rendering) to avoid a parallel rendering stack.
 
 ## Usage
 
@@ -43,7 +43,7 @@ createReadOnlyChatHostContext({ jsonRawView: "supported" });
 
 ## Styling
 
-Mux uses Tailwind + CSS variables for theming.
+Xum uses Tailwind + CSS variables for theming.
 
 This package ships a minimal CSS variable set for 4 themes (dark/light/solarized-dark/solarized-light):
 

@@ -2,6 +2,7 @@ import type { Toast } from "./ChatInputToast";
 import { SolutionLabel } from "./ChatInputToast";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { SendMessageError as SendMessageErrorType } from "@/common/types/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -221,7 +222,7 @@ export const createErrorToast = (error: SendMessageErrorType): Toast => {
         solution: (
           <>
             <SolutionLabel>Solution:</SolutionLabel>
-            Upgrade mux to use this workspace, or delete it and create a new one.
+            Upgrade {XUM_PRODUCT_NAME} to use this workspace, or delete it and create a new one.
           </>
         ),
       };

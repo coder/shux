@@ -1,7 +1,7 @@
 /**
  * Browser/server mode backend URL helpers.
  *
- * When Mux is served behind a path-based app proxy (e.g. Coder with subdomain=false),
+ * When Xum is served behind a path-based app proxy (e.g. Coder with subdomain=false),
  * the app is mounted under a prefix like:
  *
  *   /@user/<workspace>/apps/<slug>

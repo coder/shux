@@ -570,7 +570,7 @@ export class CoderSSHRuntime extends SSHRuntime {
   }
 
   /**
-   * Delete workspace: removes SSH files AND deletes Coder workspace (if Mux-managed).
+   * Delete workspace: removes SSH files AND deletes Coder workspace (if Xum-managed).
    *
    * IMPORTANT: Only delete the Coder workspace once we're confident mux will commit
    * the deletion. In the non-force path, WorkspaceService.remove() aborts and keeps
@@ -867,7 +867,7 @@ export class CoderSSHRuntime extends SSHRuntime {
     }
 
     // Create parent directory for workspace (git clone won't create it)
-    // This must happen after ensureMuxCoderSSHConfig() so SSH is configured
+    // This must happen after ensureXumCoderSSHConfig() so SSH is configured
     initLogger.logStep("Preparing workspace directory...");
     const parentDir = path.posix.dirname(params.workspacePath);
     const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {

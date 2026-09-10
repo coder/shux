@@ -1,11 +1,8 @@
 /**
- * Shared mux:// deep link payload types.
- *
- * This lives in common so desktop main/preload/renderer can agree on semantics
- * without importing any Electron-only code.
+ * Shared xum:// deep-link payload types. The legacy mux:// scheme normalizes to
+ * this same shape so compatibility stays at the parsing/registration boundary.
  */
-
-export interface MuxDeepLinkPayload {
+export interface DeepLinkPayload {
   type: "new_chat";
 
   /**

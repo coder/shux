@@ -229,7 +229,7 @@ describe("ACP ToolRouter", () => {
       success: true,
       output: "Background process started with ID: bg-123",
       exitCode: 0,
-      note: "ACP delegated background terminals cannot be managed via task_await/task_terminate yet.",
+      note: "ACP delegated background terminals cannot be managed via task_await/task_stop yet.",
     });
     expect("taskId" in (result as Record<string, unknown>)).toBe(false);
     expect("backgroundProcessId" in (result as Record<string, unknown>)).toBe(false);

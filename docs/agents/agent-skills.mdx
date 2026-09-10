@@ -7,20 +7,20 @@ description: Share reusable workflows and references with skills
 
 Agent Skills are reusable, file-based “playbooks” that you can share across projects or keep workspace-local.
 
-Mux follows the Agent Skills specification and exposes skills to models in two steps:
+Xum follows the Agent Skills specification and exposes skills to models in two steps:
 
-1. **Index in the system prompt**: Mux lists available skills (name + description).
+1. **Index in the system prompt**: Xum lists available skills (name + description).
 2. **Tool-based loading**: the agent calls tools to load a full skill when needed.
 
 Skills help you practice progressive disclosure, where the LLM sees only the necessary context to complete
 the task at hand.
 
-The easiest way to invoke a skill in Mux is to use the `/<skill-name>` slash command. For example:
-`/mux-docs suggest tool hooks for this project`.
+The easiest way to invoke a skill in Xum is to use the `/<skill-name>` slash command. For example:
+`/xum-docs suggest tool hooks for this project`.
 
 You can find a list of community-maintained, curated skills at [skills.sh](https://skills.sh/).
 
-You can easily add those skills to your Mux instance with:
+You can easily add those skills to your Xum instance with:
 
 ```bash
 npx skills add https://github.com/anthropics/skills --skill frontend-design
@@ -28,48 +28,62 @@ npx skills add https://github.com/anthropics/skills --skill frontend-design
 
 ## Where skills live
 
-Mux discovers skills from five roots:
+Xum discovers skills from these locations:
 
-- **Workspace-local**: `.mux/skills/<skill-name>/SKILL.md` (in the workspace working directory)
-- **Workspace-local (cross-tool)**: `.agents/skills/<skill-name>/SKILL.md` (in the workspace working directory)
-- **Global (Mux-specific)**: `~/.mux/skills/<skill-name>/SKILL.md`
+- **Project**: `.xum/skills/<skill-name>/SKILL.md`
+- **Project (cross-tool)**: `.agents/skills/<skill-name>/SKILL.md`
+- **Global (Xum-specific)**: `~/.xum/skills/<skill-name>/SKILL.md`
 - **Universal (cross-tool)**: `~/.agents/skills/<skill-name>/SKILL.md`
-- **Built-in**: shipped with Mux
+- **Built-in**: shipped with Xum
 
-If a skill exists in multiple locations, the precedence order is:
-**workspace-local (`.mux/skills`) > workspace-local (`.agents/skills`) > global (`~/.mux/skills`) > universal (`~/.agents/skills`) > built-in**.
+For a workspace that executes in a subproject, Xum checks the working directory and each parent directory through the checkout root. It never searches above the checkout. A nearer project definition wins over a farther one; within the same directory, `.xum/skills` wins over `.agents/skills`.
 
-Built-in skills behave like any other skill for precedence purposes: you can override them by creating a skill with the same name in any higher-precedence workspace-local or global root.
+Legacy `.mux/skills` directories remain readable after `.xum/skills` at the same directory level. New and updated project skills are written only to `.xum/skills`.
+
+After project skills, the remaining precedence order is **global (`~/.xum/skills`) > universal (`~/.agents/skills`) > built-in**. Built-in skills behave like any other skill for precedence purposes, so any project or global skill with the same name overrides them.
 
 <Info>
-  Mux reads skills using the active workspace runtime. For SSH workspaces, skills are read from the
+  Xum reads skills using the active workspace runtime. For SSH workspaces, skills are read from the
   remote host.
 </Info>
 
 ### Claude Code compatibility (experiment)
 
-Many repositories already ship skills in Claude Code's directories. Enable the **Claude skills compatibility** experiment (Settings → Experiments) to also discover skills from:
+Many repositories already ship skills in Claude Code's directories. Enable the **Claude compatibility** experiment (Settings → Experiments) to also discover skills from:
 
 - **Workspace-local**: `.claude/skills/<skill-name>/SKILL.md`
 - **Global**: `~/.claude/skills/<skill-name>/SKILL.md`
 
-Compat roots have the lowest precedence within their scope (`.mux/skills` > `.agents/skills` > `.claude/skills`, and likewise for the global roots), and they are read-only: Mux never writes or deletes skills in `.claude` directories. Skills that package Mux workflow scripts are not discovered from `.claude` roots.
+Within the same directory, compat roots have the lowest precedence (`.xum/skills` > `.agents/skills` > `.claude/skills`); a nearer directory still wins over a farther one. The global roots use the same convention order. Compat roots are read-only: Xum never writes or deletes skills in `.claude` directories. Skills that package Xum workflow scripts are not discovered from `.claude` roots.
 
 ### Agent Plugins (experiment)
 
 Enable the **Agent Plugins** experiment (Settings → Experiments) to also discover skills packaged in [Agent Plugins 1.0.0](https://agent-plugins.org) directories — a plugin is a directory with a `plugin.json` manifest plus an optional `skills/` folder. Plugins are discovered from:
 
-- **Workspace-local**: `.mux/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
-- **Global**: `~/.mux/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
+- **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
+- **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers-experiment).
+
+Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`). The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.
+
+Installed rows show imported-of-available counts. For a managed, present plugin, choose **Add components** (or **Add Plugin Components…** in the command palette) to import more from its locked installed version without fetching the remote. Previously imported components are checked and read-only. Select additions and confirm, or cancel without changing anything. If the installed version changes during review, the inventory refreshes and you must select again. Removing imports is not supported by this flow.
+
+Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
+
+<Warning>
+  Import selection controls discovery, not filesystem access: skipped files remain in the plugin
+  directory and can still be read. It is not a filesystem sandbox. Older Xum versions may ignore the
+  selection field and expose every component. Losing the install registry also loses selection; the
+  remaining directory cannot be distinguished from an unmanaged plugin and may expose everything.
+</Warning>
 
 ## Skill layout
 
 A skill is a directory named after the skill:
 
 ```text
-.mux/skills/
+.xum/skills/
   my-skill/
     SKILL.md
     references/
@@ -81,12 +95,12 @@ Skill directory names must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` (1–64 chars).
 ## `SKILL.md` format
 
 `SKILL.md` must start with YAML frontmatter delimited by `---` on its own line.
-Mux enforces a 1MB maximum file size for `SKILL.md`.
+Xum enforces a 1MB maximum file size for `SKILL.md`.
 
 Required fields:
 
 - `name`: must match the directory name
-- `description`: short summary shown in Mux’s skills index
+- `description`: short summary shown in Xum’s skills index
 
 Optional fields:
 
@@ -94,12 +108,12 @@ Optional fields:
 - `compatibility`
 - `metadata` (string key/value map)
 - `disable-model-invocation` (boolean) — set to `true` to omit a skill from the system prompt index (see [Unadvertised skills](#unadvertised-skills) below). This spelling is shared with other agent tools such as Claude Code, so portable skills work unchanged.
-- `advertise` (boolean) — Mux-specific equivalent: `advertise: false` behaves like `disable-model-invocation: true`. If both are set, the opt-out wins.
+- `advertise` (boolean) — Xum-specific equivalent: `advertise: false` behaves like `disable-model-invocation: true`. If both are set, the opt-out wins.
 - `user-invocable` (boolean) — set to `false` to hide a skill from user-facing invocation surfaces (see [Controlling who invokes a skill](#controlling-who-invokes-a-skill)).
 - `argument-hint` (string) — short hint describing the arguments a skill expects (for example `[issue-number]`), shown next to the skill in invocation UIs (see [Skill arguments](#skill-arguments)).
 - `when_to_use` (string) — extra model-facing guidance appended to the skill’s entry in the skills index. The kebab-case spelling `when-to-use` is also accepted; the underscore spelling wins if both are set.
 
-Mux ignores unknown frontmatter keys (for example `allowed-tools`).
+Xum ignores unknown frontmatter keys (for example `allowed-tools`).
 
 ## Controlling who invokes a skill
 
@@ -114,18 +128,18 @@ Combining them makes a **reference-only** skill: it is neither indexed for the m
 
 ### Unadvertised skills
 
-By default, Mux _advertises_ skills by listing them in the system prompt’s `<agent-skills>` index.
+By default, Xum _advertises_ skills by listing them in the system prompt’s `<agent-skills>` index.
 
-Set `disable-model-invocation: true` (or the Mux-specific `advertise: false`) in the frontmatter to exclude a skill from that index. Unadvertised skills:
+Set `disable-model-invocation: true` (or the Xum-specific `advertise: false`) in the frontmatter to exclude a skill from that index. Unadvertised skills:
 
 - **Are not listed** in the system prompt (reducing token overhead)
 - **Can still be invoked** via `/{skill-name}` slash command or `agent_skill_read({ name: "skill-name" })`
-- **Still appear** in Mux’s UI lists (for example `/` slash suggestions) and in ACP clients’ command lists
+- **Still appear** in Xum’s UI lists (for example `/` slash suggestions) and in ACP clients’ command lists
 - **Are useful for**: skills meant only for sub-agents, advanced users, or internal orchestration
 
 ### Example: `deep-review` skill
 
-The Mux repository includes an unadvertised `deep-review` skill that encourages aggressive use of sub-agents to produce excellent code reviews (correctness, tests, consistency, UX, performance). Invoke it with `/deep-review` when you want a thorough, parallelized review. This skill is defined in `.mux/skills/deep-review/SKILL.md`.
+The Xum repository includes an unadvertised `deep-review` skill that encourages aggressive use of sub-agents to produce excellent code reviews (correctness, tests, consistency, UX, performance). Invoke it with `/deep-review` when you want a thorough, parallelized review. This skill is defined in `.xum/skills/deep-review/SKILL.md`.
 
 {/* BEGIN DEEP_REVIEW_SKILL */}
 
@@ -221,7 +235,7 @@ Use this rubric to avoid blind spots:
 
 ## Skill arguments
 
-Slash invocations can carry arguments after the skill name, for example `/fix-issue 123 high`. If the skill body contains placeholders, Mux substitutes them before the model sees the skill:
+Slash invocations can carry arguments after the skill name, for example `/fix-issue 123 high`. If the skill body contains placeholders, Xum substitutes them before the model sees the skill:
 
 - `$ARGUMENTS` — the full argument text (`123 high`)
 - `$1` … `$9` — whitespace-tokenized positional arguments (`$1` is `123`); absent positions become empty strings
@@ -275,7 +289,7 @@ Rules and limits:
 
 - Slash command invocation supports only a single skill as the first token (for example `/{skill-name}` or `/{skill-name} ...`).
 - Skill bodies may be truncated when injected to avoid accidental mega-prompts.
-- `allowed-tools` is not enforced by Mux (it is tolerated in frontmatter, but ignored).
+- `allowed-tools` is not enforced by Xum (it is tolerated in frontmatter, but ignored).
 
 ## Further reading
 

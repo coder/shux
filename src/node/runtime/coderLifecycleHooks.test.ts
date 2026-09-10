@@ -167,6 +167,102 @@ describe("createCoderArchiveHook", () => {
     expect(service.deleteWorkspace).toHaveBeenCalledTimes(0);
   });
 
+  it("refuses a model-driven stop while remote spawn records may hold a surviving job", async () => {
+    const service = createCoderServiceMocks();
+    const probe = mock(() => Promise.resolve(Ok(true)));
+    const hook = createCoderArchiveHook({
+      coderService: service.coderService,
+      getArchiveBehavior: () => "stop",
+      hasUnsettledRemoteBackgroundJobs: probe,
+    });
+
+    const result = await hook({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+      refuseStopUnderUnverifiedRemoteJobs: true,
+    });
+
+    expect(expectError(result)).toContain("still be running");
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(service.stopWorkspace).toHaveBeenCalledTimes(0);
+  });
+
+  it("fails closed on model-driven stops when the remote probe cannot verify absence", async () => {
+    const service = createCoderServiceMocks();
+    const hookWithFailingProbe = createCoderArchiveHook({
+      coderService: service.coderService,
+      getArchiveBehavior: () => "stop",
+      hasUnsettledRemoteBackgroundJobs: () => Promise.resolve(Err("ssh unreachable")),
+    });
+    const failed = await hookWithFailingProbe({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+      refuseStopUnderUnverifiedRemoteJobs: true,
+    });
+    expect(expectError(failed)).toContain("Cannot verify");
+
+    // No probe wired at all is equally unverifiable.
+    const hookWithoutProbe = createCoderArchiveHook({
+      coderService: service.coderService,
+      getArchiveBehavior: () => "stop",
+    });
+    const unverifiable = await hookWithoutProbe({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+      refuseStopUnderUnverifiedRemoteJobs: true,
+    });
+    expect(expectError(unverifiable)).toContain("Cannot verify");
+    expect(service.stopWorkspace).toHaveBeenCalledTimes(0);
+  });
+
+  it("stops after a clear model-driven probe and skips probing entirely for stopped or user-driven archives", async () => {
+    const probe = mock(() => Promise.resolve(Ok(false)));
+    const service = createCoderServiceMocks();
+    const hook = createCoderArchiveHook({
+      coderService: service.coderService,
+      getArchiveBehavior: () => "stop",
+      hasUnsettledRemoteBackgroundJobs: probe,
+    });
+
+    // Clear probe: the stop proceeds.
+    const cleared = await hook({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+      refuseStopUnderUnverifiedRemoteJobs: true,
+    });
+    expect(cleared.success).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(service.stopWorkspace).toHaveBeenCalledTimes(1);
+
+    // User-driven archive (flag unset): the escape hatch never probes.
+    const userDriven = await hook({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+    });
+    expect(userDriven.success).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    // Already-stopped workspace: no job can be running, so no probe and no stop.
+    const stoppedService = createCoderServiceMocks({
+      getWorkspaceStatus: mock<
+        (workspaceName: string, options?: { timeoutMs?: number }) => Promise<WorkspaceStatusResult>
+      >(() => Promise.resolve({ kind: "ok", status: "stopped" })),
+    });
+    const stoppedHook = createCoderArchiveHook({
+      coderService: stoppedService.coderService,
+      getArchiveBehavior: () => "stop",
+      hasUnsettledRemoteBackgroundJobs: probe,
+    });
+    const skipped = await stoppedHook({
+      workspaceId: "ws",
+      workspaceMetadata: createSshCoderMetadata(),
+      refuseStopUnderUnverifiedRemoteJobs: true,
+    });
+    expect(skipped.success).toBe(true);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(stoppedService.stopWorkspace).toHaveBeenCalledTimes(0);
+  });
+
   it("deletes a dedicated Coder workspace when archive behavior is delete", async () => {
     const service = createCoderServiceMocks();
     const hook = createCoderArchiveHook({

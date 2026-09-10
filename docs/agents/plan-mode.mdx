@@ -19,20 +19,20 @@ Plan mode lets you review and refine the agent's approach before any code change
 
 ## External Edit Detection
 
-When you edit the plan file externally and send a message, Mux automatically detects the changes and informs the agent with a diff. This uses a timestamp-based polling approach:
+When you edit the plan file externally and send a message, Xum automatically detects the changes and informs the agent with a diff. This uses a timestamp-based polling approach:
 
 1. **State Tracking**: When `propose_plan` runs, it records the plan file's content and modification time.
-2. **Change Detection**: Before each LLM query, Mux checks if the file's mtime has changed.
-3. **Diff Injection**: If modified, Mux computes a diff and injects it into the context so the agent sees exactly what changed.
+2. **Change Detection**: Before each LLM query, Xum checks if the file's mtime has changed.
+3. **Diff Injection**: If modified, Xum computes a diff and injects it into the context so the agent sees exactly what changed.
 
-This means you can make edits in your preferred editor, return to Mux, send a message, and the agent will incorporate your changes.
+This means you can make edits in your preferred editor, return to Xum, send a message, and the agent will incorporate your changes.
 
 ## Plan File Location
 
-Plans are stored in a dedicated directory under your Mux home:
+Plans are stored in a dedicated directory under your Xum home:
 
 ```
-~/.mux/plans/<project>/<workspace-name>.md
+~/.xum/plans/<project>/<workspace-name>.md
 ```
 
 Notes:
@@ -71,7 +71,7 @@ The `propose_plan` tool call in chat includes:
 ## Customizing Plan Mode Behavior
 
 Use [scoped `Mode:` instructions](/agents/instruction-files#mode-prompts) to customize how the
-agent behaves in plan mode. Add the following to `.mux/AGENTS.md` (or `~/.mux/AGENTS.md`):
+agent behaves in plan mode. Add the following to `.xum/AGENTS.md` (or `~/.xum/AGENTS.md`):
 
 ```markdown
 ## Mode: Plan
@@ -88,7 +88,7 @@ When planning:
 Plan mode is also available via the CLI:
 
 ```bash
-mux run --mode plan "Design a caching strategy for the API"
+xum run --mode plan "Design a caching strategy for the API"
 ```
 
 See [CLI documentation](/guides/cli) for more options.

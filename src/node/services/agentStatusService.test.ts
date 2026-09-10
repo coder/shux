@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
@@ -51,13 +51,18 @@ describe("AgentStatusService", () => {
       (
         workspaceId: string,
         status: unknown,
-        options?: { skipIfRecencyAdvancedSince?: number | null }
+        options?: { skipIfRecencyAdvancedSince?: number | null; inputHash?: string | null }
       ) => Promise<{ recency: number } | null>
     >
   >;
   let getAllSnapshotsMock: ReturnType<
     typeof mock<() => Promise<Map<string, ActivitySnapshotForTest>>>
   >;
+  let getSidebarStatusInputHashMock: ReturnType<
+    typeof mock<(workspaceId: string) => Promise<string | null>>
+  >;
+  /** workspaceId → inputHash persisted with the current sidebar status. */
+  let sidebarSlot: Map<string, string | null>;
   let getSnapshotMock: ReturnType<
     typeof mock<(workspaceId: string) => Promise<{ recency: number } | null>>
   >;
@@ -113,7 +118,7 @@ describe("AgentStatusService", () => {
 
     mockConfig = {
       loadConfigOrDefault: mock(() => projectsConfig),
-      getSessionDir: historyHandle.config.getSessionDir.bind(historyHandle.config),
+      sessionsDir: historyHandle.config.sessionsDir,
     } as unknown as Config;
 
     emitWorkspaceActivityMock = mock(() => undefined);
@@ -123,17 +128,33 @@ describe("AgentStatusService", () => {
       emitWorkspaceActivity: emitWorkspaceActivityMock,
     } as unknown as WorkspaceService;
 
-    setSidebarStatusMock = mock((_workspaceId: string, _status: unknown, _options?: unknown) =>
-      Promise.resolve({ recency: 0 })
+    // Stateful fake for the shared status slot: mirrors the real service,
+    // where the reader returns a hash only while a live status backs it. The
+    // dedup recheck depends on this coupling, so a plain null-returning mock
+    // would wrongly invalidate every persisted settle.
+    sidebarSlot = new Map();
+    setSidebarStatusMock = mock(
+      (workspaceId: string, status: unknown, options?: { inputHash?: string | null }) => {
+        if (status) {
+          sidebarSlot.set(workspaceId, options?.inputHash ?? null);
+        } else {
+          sidebarSlot.delete(workspaceId);
+        }
+        return Promise.resolve({ recency: 0 });
+      }
     );
     // Default: no snapshots → no workspaces are streaming → idle intervals.
     // Tests that exercise the active intervals override this per-test.
     getAllSnapshotsMock = mock(() => Promise.resolve(new Map<string, ActivitySnapshotForTest>()));
     getSnapshotMock = mock((_workspaceId: string) => Promise.resolve(null));
+    getSidebarStatusInputHashMock = mock((workspaceId: string) =>
+      Promise.resolve(sidebarSlot.get(workspaceId) ?? null)
+    );
     mockExtensionMetadata = {
       setSidebarStatus: setSidebarStatusMock,
       getAllSnapshots: getAllSnapshotsMock,
       getSnapshot: getSnapshotMock,
+      getSidebarStatusInputHash: getSidebarStatusInputHashMock,
     } as unknown as ExtensionMetadataService;
 
     mockTokenizer = {
@@ -865,7 +886,9 @@ describe("AgentStatusService", () => {
 
     expect(generateSpy).toHaveBeenCalledTimes(1);
     expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
-    expect(setSidebarStatusMock.mock.calls[0][2]).toEqual({ skipIfRecencyAdvancedSince: 100 });
+    const persistOptions = setSidebarStatusMock.mock.calls[0][2];
+    expect(persistOptions?.skipIfRecencyAdvancedSince).toBe(100);
+    expect(typeof persistOptions?.inputHash).toBe("string");
     expect(emitWorkspaceActivityMock).not.toHaveBeenCalled();
   });
 
@@ -923,16 +946,225 @@ describe("AgentStatusService", () => {
       const skipped = await svc.setSidebarStatus(
         "ws",
         { emoji: "🛠️", message: "Old status" },
-        { skipIfRecencyAdvancedSince: 100 }
+        { skipIfRecencyAdvancedSince: 100, inputHash: "hash-of-stale-input" }
       );
       const after = await svc.getSnapshot("ws");
 
       expect(skipped).toBeNull();
       expect(after?.todoStatus).toBeUndefined();
       expect(after?.recency).toBe(200);
+      // The hash must only record actually-persisted statuses: a skipped
+      // write must not seed a post-restart dedup hit for a status that
+      // never reached the sidebar.
+      expect(await svc.getSidebarStatusInputHash("ws")).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // Restart-rehydration tests use a real ExtensionMetadataService on disk so
+  // the dedup hash persisted by one service instance is visible to a
+  // "restarted" one (fresh AgentStatusService + fresh metadata service over
+  // the same file), mirroring a server restart.
+  async function withRestartableMetadata(
+    fn: (ctx: {
+      metadataPath: string;
+      newInstance: () => AgentStatusServiceInternals;
+    }) => Promise<void>
+  ): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), "mux-agent-status-restart-"));
+    try {
+      const metadataPath = join(dir, "metadata.json");
+      await fn({
+        metadataPath,
+        newInstance: () => {
+          mockExtensionMetadata = new ExtensionMetadataService(metadataPath);
+          return getInternals(createService());
+        },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("restart: skips regeneration when the persisted hash matches the unchanged transcript", async () => {
+    // A server restart wipes the in-memory dedup state. Without the persisted
+    // seed, every restart regenerated the status for every non-empty
+    // workspace — even chats idle for months (cost scales as restarts ×
+    // workspaces × users, and churns status wording).
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Same history after a restart: the persisted hash must satisfy dedup.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("restart: regenerates when history changed while down, then settles on the new hash", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Initial request")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      await historyHandle.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("u2", "user", "Pivot while the server was down")
+      );
+
+      // Stale persisted hash misses dedup → regenerate. observedRecency
+      // matches the on-disk recency (0, seeded by setSidebarStatus) so the
+      // atomic recency-advance check doesn't drop the persist.
+      await newInstance().runForWorkspace(workspaceId, 0);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+
+      // The regenerated status persisted its own hash: the next restart skips.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("restart: legacy metadata with a status but no hash regenerates once, then settles", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Chat from an older build")
+    );
+
+    await withRestartableMetadata(async ({ metadataPath, newInstance }) => {
+      // Metadata written by a build that predates sidebarStatusInputHash:
+      // status present, hash absent. Must self-heal without migration.
+      writeFileSync(
+        metadataPath,
+        JSON.stringify({
+          version: 1,
+          workspaces: {
+            [workspaceId]: {
+              recency: 100,
+              streaming: false,
+              lastModel: null,
+              lastThinkingLevel: null,
+              agentStatus: null,
+              todoStatus: { emoji: "🛠️", message: "Pre-upgrade status" },
+            },
+          },
+        })
+      );
+
+      // No persisted hash → falls through to the regenerate path once.
+      await newInstance().runForWorkspace(workspaceId, 100);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // The regenerated status recorded its hash → the next restart skips.
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("restart: does not dedup against a hash orphaned by a todo-path clear", async () => {
+    // Codex review: setTodoStatus(null) clears the shared todoStatus slot
+    // without touching the persisted hash. The orphaned hash must not
+    // suppress regeneration after a restart, or the sidebar stays blank
+    // until the transcript changes.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Todo path clears the slot (e.g. stream stopped with an empty todo list).
+      await mockExtensionMetadata.setTodoStatus(workspaceId, null, false);
+
+      await newInstance().runForWorkspace(workspaceId, 0);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test("regenerates when another writer clears the status slot behind a settled hash", async () => {
+    // Codex review rounds 2-3: setTodoStatus(null) can clear the shared
+    // todoStatus slot at any time after we settled by persisting — including
+    // between the scheduler's snapshot read and the dedup check. The dedup
+    // branch must confirm the persisted hash still exists at the skip
+    // decision, or the sidebar stays blank on an unchanged transcript.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
+
+    // Status still present: normal dedup skip.
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // Slot cleared by the todo path: the settled hash must drop and the
+    // same transcript must regenerate on the very next consideration.
+    sidebarSlot.delete(workspaceId);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("an empty status slot does not retrigger placeholder-settled transcripts", async () => {
+    // Placeholder settles never persisted a status, so "slot has no status"
+    // is their steady state, not an invalidation signal. Rechecking them
+    // would re-call the model on the same placeholder-producing transcript
+    // every tick and burn provider budget.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "kick off a task")
+    );
+
+    generateSpy.mockResolvedValueOnce(
+      Ok({
+        status: { emoji: "💤", message: "Awaiting next task" },
+        modelUsed: "anthropic:claude-haiku-4-5",
+      })
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("restart: persisted hash folds the streaming bit so an idle restart regenerates", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "kick off a long task")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      // Status generated mid-stream: hash covers transcript + streaming=true.
+      await newInstance().runForWorkspace(workspaceId, null, true);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Restart with the workspace now idle (ExtensionMetadataService clears
+      // stale streaming flags at startup): same transcript bytes, but the
+      // tense guidance changed, so the persisted hash must not dedup.
+      await newInstance().runForWorkspace(workspaceId, 0, false);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
   });
 
   test("rejects generic placeholder messages and advances dedup so we don't loop", async () => {

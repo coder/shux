@@ -2,7 +2,7 @@
 /**
  * PROTOTYPE — throwaway diagnostic for OpenAI Responses transport behavior.
  *
- * Question: do gpt-5.5-pro Responses calls fail only through Mux/AI SDK wiring,
+ * Question: do gpt-5.5-pro Responses calls fail only through Xum/AI SDK wiring,
  * or also through direct HTTP / WebSocket calls? Keep all output sanitized: this
  * probe never prints provider bodies or raw exception text because the observed
  * failure mode can include binary-looking bytes.

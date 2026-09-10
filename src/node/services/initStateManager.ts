@@ -17,7 +17,7 @@ export interface TimedLine {
 
 /**
  * Persisted state for init hooks.
- * Stored in ~/.mux/sessions/{workspaceId}/init-status.json
+ * Stored in ~/.xum/sessions/{workspaceId}/init-status.json
  */
 export interface InitStatus {
   status: "running" | "success" | "error";
@@ -216,7 +216,7 @@ export class InitStateManager extends EventEmitter {
   }
 
   /**
-   * Signal that the .mux/init hook is starting.
+   * Signal that the .xum/init hook is starting.
    * This marks the transition from runtime provisioning to hook execution so
    * waitForInit() can start the 5-minute timeout at the right time.
    */
@@ -303,7 +303,7 @@ export class InitStateManager extends EventEmitter {
 
     // Persist FIRST - ensures file exists before in-memory state shows completion
     await this.store.persist(workspaceId, stateToPerist, {
-      // If WorkspaceService.remove() cleared init state, do not recreate ~/.mux/sessions/<id>/
+      // If WorkspaceService.remove() cleared init state, do not recreate ~/.xum/sessions/<id>/
       shouldWrite: () => this.store.hasState(workspaceId),
     });
 
@@ -465,7 +465,7 @@ export class InitStateManager extends EventEmitter {
       });
 
       // Intentional: provisioning (Coder/devcontainer/etc.) can be long-running, so we
-      // avoid timeouts until .mux/init begins. The wait is still interruptible via
+      // avoid timeouts until .xum/init begins. The wait is still interruptible via
       // abortSignal or workspace deletion (clearInMemoryState).
       const phase = state.phase ?? "runtime_setup";
       if (phase === "runtime_setup") {

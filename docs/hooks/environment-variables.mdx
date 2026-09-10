@@ -9,29 +9,31 @@ The following environment variables are available in all agent bash tool executi
 
 | Variable             | Description                                                                                                                   |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces. |
-| `MUX_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                 |
-| `MUX_WORKSPACE_NAME` | Name of the workspace (typically the branch name)                                                                             |
-| `MUX_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                               |
-| `MUX_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                         |
-| `MUX_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                               |
+| `XUM_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces. |
+| `XUM_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                 |
+| `XUM_WORKSPACE_NAME` | Name of the workspace (typically the branch name)                                                                             |
+| `XUM_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                               |
+| `XUM_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                         |
+| `XUM_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                               |
+
+Matching `MUX_*` names remain accepted aliases. When both are set, the `XUM_*` value wins. See [Mux compatibility](/reference/mux-compatibility).
 
 ## Usage Example
 
 ```bash
 #!/usr/bin/env bash
 
-echo "Project: $MUX_PROJECT_PATH"
-echo "Runtime: $MUX_RUNTIME"
-echo "Workspace: $MUX_WORKSPACE_NAME"
-echo "Model: $MUX_MODEL_STRING"
-echo "Thinking: $MUX_THINKING_LEVEL"
-echo "Costs: \$${MUX_COSTS_USD:-0.00}"
+echo "Project: $XUM_PROJECT_PATH"
+echo "Runtime: $XUM_RUNTIME"
+echo "Workspace: $XUM_WORKSPACE_NAME"
+echo "Model: $XUM_MODEL_STRING"
+echo "Thinking: $XUM_THINKING_LEVEL"
+echo "Costs: \$${XUM_COSTS_USD:-0.00}"
 
 # Runtime-specific behavior
-if [ "$MUX_RUNTIME" = "ssh" ]; then
+if [ "$XUM_RUNTIME" = "ssh" ]; then
   echo "Running on SSH remote"
-elif [ "$MUX_RUNTIME" = "docker" ]; then
+elif [ "$XUM_RUNTIME" = "docker" ]; then
   echo "Running in Docker container"
 else
   echo "Running locally"

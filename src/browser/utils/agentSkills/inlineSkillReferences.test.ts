@@ -56,6 +56,12 @@ describe("extractInlineSkillReferenceCandidates", () => {
     ]);
   });
 
+  test("extracts normalized MCP prompt references with underscores", () => {
+    expect(extractInlineSkillReferenceCandidates("Use $mcp__coder__review")).toEqual([
+      { skillName: "mcp__coder__review", startIndex: 4, endIndex: 23 },
+    ]);
+  });
+
   test("keeps duplicate parser candidates", () => {
     expect(extractInlineSkillReferenceCandidates("$tdd $tdd")).toEqual([
       { skillName: "tdd", startIndex: 0, endIndex: 4 },

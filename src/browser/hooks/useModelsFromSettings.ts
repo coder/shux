@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react";
 import { readPersistedString, usePersistedState } from "./usePersistedState";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
@@ -8,21 +8,18 @@ import { useRouting } from "./useRouting";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useAPI } from "@/browser/contexts/API";
 import { isValidProvider } from "@/common/constants/providers";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
-import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import { isGatewayModelAccessibleForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import {
   getExplicitGatewayPrefix,
   normalizeSelectedModel,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
-import { isModelAvailable } from "@/common/routing";
-import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
+import { isModelAvailable, resolveRoute } from "@/common/routing";
+import type { EffectivePolicy, ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 
-import {
-  isGatewayModelAccessibleFromAuthoritativeCatalog,
-  isProviderModelAccessibleFromAuthoritativeCatalog,
-} from "@/common/utils/providers/gatewayModelCatalog";
+import { isProviderModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
 const BUILT_IN_MODELS: string[] = Object.values(KNOWN_MODELS).map((m) => m.id);
@@ -76,9 +73,9 @@ function isSupportedSettingsProvider(
   }
 
   const info = providerConfig[provider];
-  // Custom OpenAI-compatible providers accept arbitrary model IDs, but unknown strings
+  // Custom providers accept arbitrary model IDs, but unknown strings
   // should not create provider settings entries.
-  return info?.isCustom === true && isCustomOpenAICompatibleProviderConfig(info);
+  return info?.isCustom === true && isCustomProviderConfig(info);
 }
 
 export function filterHiddenModels(models: string[], hiddenModels: string[]): string[] {
@@ -103,6 +100,51 @@ function dedupeKeepFirst(models: string[]): string[] {
 export function getSuggestedModels(config: ProvidersConfigMap | null): string[] {
   const customModels = getCustomModels(config);
   return dedupeKeepFirst([...customModels, ...BUILT_IN_MODELS]);
+}
+
+/**
+ * The OpenAI auth gates in this hook apply to the direct route only. A gateway
+ * route (mux-gateway, openrouter, ...) supplies its own credentials, so the
+ * user's OpenAI auth state must not hide, or warn about, models the gateway
+ * serves. For a model with no active route, resolveRoute falls back to direct,
+ * which keeps the gate in place.
+ */
+function resolvesToDirectOpenAI(
+  modelId: string,
+  routePriority: string[],
+  routeOverrides: Record<string, string>,
+  isConfigured: (provider: string) => boolean,
+  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+): boolean {
+  return (
+    resolveRoute(modelId, routePriority, routeOverrides, isConfigured, isGatewayModelAccessible)
+      .routeProvider === "openai"
+  );
+}
+
+/**
+ * Policy check on the identity the backend enforces. createModel resolves the
+ * route first and then checks `isModelAllowed(routeProvider, routeModelId)`,
+ * so a policy that lists only a gateway permits a canonical model whose active
+ * route is that gateway. A model with no active route resolves to direct and is
+ * checked under its canonical identity.
+ */
+function isModelAllowedByPolicyOnActiveRoute(
+  policy: EffectivePolicy | null,
+  modelId: string,
+  routePriority: string[],
+  routeOverrides: Record<string, string>,
+  isConfigured: (provider: string) => boolean,
+  isGatewayModelAccessible: (gateway: string, modelId: string) => boolean
+): boolean {
+  const route = resolveRoute(
+    modelId,
+    routePriority,
+    routeOverrides,
+    isConfigured,
+    isGatewayModelAccessible
+  );
+  return isModelAllowedByPolicy(policy, `${route.routeProvider}:${route.routeModelId}`);
 }
 
 export function getDefaultModel(): string {
@@ -165,9 +207,13 @@ export function useModelsFromSettings() {
     [persistModelPrefs, setDefaultModel]
   );
 
-  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(HIDDEN_MODELS_KEY, [], {
-    listener: true,
-  });
+  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(
+    HIDDEN_MODELS_KEY,
+    DEFAULT_HIDDEN_MODELS,
+    {
+      listener: true,
+    }
+  );
 
   const isConfigured = useCallback(
     (provider: string) =>
@@ -177,8 +223,8 @@ export function useModelsFromSettings() {
 
   const isGatewayModelAccessible = useCallback(
     (gateway: string, modelId: string) =>
-      isGatewayModelAccessibleFromAuthoritativeCatalog(gateway, modelId, config?.[gateway]?.models),
-    [config]
+      isGatewayModelAccessibleForUi(effectivePolicy, config, gateway, modelId),
+    [config, effectivePolicy]
   );
 
   const isAuthoritativeProviderModelAccessible = useCallback(
@@ -193,7 +239,9 @@ export function useModelsFromSettings() {
       return isProviderModelAccessibleFromAuthoritativeCatalog(
         provider,
         providerModelId,
-        config?.[provider]?.models
+        config?.[provider]?.models,
+        config?.[provider]?.discoveredModels,
+        config?.[provider]?.removedModels
       );
     },
     [config]
@@ -209,7 +257,25 @@ export function useModelsFromSettings() {
   const openaiApiKeySet = config === null ? null : config.openai?.apiKeySet === true;
   const codexOauthSet = config === null ? null : config.openai?.codexOauthSet === true;
 
-  const requiresCodexOauth = (modelId: string) => isCodexOauthRequiredModel(modelId, config);
+  const isAllowedByPolicyOnActiveRoute = (modelId: string) =>
+    isModelAllowedByPolicyOnActiveRoute(
+      effectivePolicy,
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      isGatewayModelAccessible
+    );
+
+  const requiresCodexOauth = (modelId: string) =>
+    isCodexOauthRequiredModel(modelId, config) &&
+    resolvesToDirectOpenAI(
+      modelId,
+      routePriority,
+      routeOverrides,
+      isConfigured,
+      isGatewayModelAccessible
+    );
 
   const providerHiddenModels = useMemo(() => {
     if (config == null) {
@@ -298,21 +364,42 @@ export function useModelsFromSettings() {
               )
           );
 
+    const allowedByPolicy = (modelId: string) =>
+      isModelAllowedByPolicyOnActiveRoute(
+        effectivePolicy,
+        modelId,
+        routePriority,
+        routeOverrides,
+        isConfigured,
+        isGatewayModelAccessible
+      );
     if (config == null) {
-      return effectivePolicy
-        ? providerFiltered.filter((m) => isModelAllowedByPolicy(effectivePolicy, m))
-        : providerFiltered;
+      return effectivePolicy ? providerFiltered.filter(allowedByPolicy) : providerFiltered;
     }
     const hasOpenaiApiKey = openaiApiKeySet === true;
     const hasCodexOauth = codexOauthSet === true;
 
-    // OpenAI model gating:
+    // OpenAI model gating (direct route only; see resolvesToDirectOpenAI):
     // - API key + OAuth: allow everything.
     // - API key only: hide models that require OAuth.
     // - OAuth only: show only models routable via OAuth.
     // - Neither: hide models that require OAuth (status quo).
+    // providerFiltered already guarantees an active route, so the resolved
+    // route is the real one rather than the direct fallback.
     const next = providerFiltered.filter((modelId) => {
       if (!modelId.startsWith("openai:")) {
+        return true;
+      }
+
+      if (
+        !resolvesToDirectOpenAI(
+          modelId,
+          routePriority,
+          routeOverrides,
+          isConfigured,
+          isGatewayModelAccessible
+        )
+      ) {
         return true;
       }
 
@@ -327,7 +414,7 @@ export function useModelsFromSettings() {
       return !isCodexOauthRequiredModel(modelId, config);
     });
 
-    return effectivePolicy ? next.filter((m) => isModelAllowedByPolicy(effectivePolicy, m)) : next;
+    return effectivePolicy ? next.filter(allowedByPolicy) : next;
   }, [
     config,
     hiddenModels,
@@ -383,9 +470,14 @@ export function useModelsFromSettings() {
     [api, config, refresh, effectivePolicy]
   );
 
+  // Hidden-model preferences use the gateway-preserving identity: model lists
+  // surface explicit gateway entries raw (e.g. coder:openai/<model>), and
+  // filterHiddenModels/ModelsSection compare exact strings. Name-only
+  // canonicalization would persist openai:<model> instead — leaving the
+  // gateway entry visible while hiding the distinct direct model.
   const hideModel = useCallback(
     (modelString: string) => {
-      const canonical = normalizeToCanonical(modelString).trim();
+      const canonical = normalizeSelectedModel(modelString).trim();
       if (!canonical) {
         return;
       }
@@ -405,7 +497,7 @@ export function useModelsFromSettings() {
 
   const unhideModel = useCallback(
     (modelString: string) => {
-      const canonical = normalizeToCanonical(modelString).trim();
+      const canonical = normalizeSelectedModel(modelString).trim();
       if (!canonical) {
         return;
       }
@@ -436,5 +528,6 @@ export function useModelsFromSettings() {
     openaiApiKeySet,
     codexOauthSet,
     requiresCodexOauth,
+    isAllowedByPolicyOnActiveRoute,
   };
 }

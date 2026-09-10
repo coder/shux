@@ -1,13 +1,13 @@
 ---
 title: Install
-description: Download and install Mux for macOS, Linux, and Windows
+description: Download and install Xum for macOS, Linux, and Windows
 ---
 
 ## Downloads
 
 ### Release Builds
 
-<Card title="Download Mux" icon="download" href="https://github.com/coder/mux/releases">
+<Card title="Download Xum" icon="download" href="https://github.com/coder/mux/releases">
   Download pre-built binaries from the releases page.
 </Card>
 
@@ -40,7 +40,7 @@ To download:
    - Intel Mac: `macos-dmg-x64`
    - Apple Silicon: `macos-dmg-arm64`
 2. Open the DMG file
-3. Drag Mux to Applications folder
+3. Drag Xum to Applications folder
 4. Open the app normally
 
 The app is code-signed and notarized by Apple, so it will open without security warnings.
@@ -48,8 +48,8 @@ The app is code-signed and notarized by Apple, so it will open without security 
 #### Linux
 
 1. Download the AppImage file
-2. Make it executable: `chmod +x Mux-*.AppImage`
-3. Run it: `./Mux-*.AppImage`
+2. Make it executable: `chmod +x xum-*.AppImage`
+3. Run it: `./xum-*.AppImage`
 
 #### Windows
 
@@ -58,12 +58,12 @@ _(alpha)_
 Prerequisites:
 
 - Install **Git for Windows** (includes Git Bash). **WSL is not supported.**
-- Restart Mux after installing Git for Windows.
+- Restart Xum after installing Git for Windows.
 
-1. Download the installer exe from [releases](https://github.com/coder/mux/releases) (e.g., `mux-x.x.x-x64.exe`)
+1. Download the installer exe from [releases](https://github.com/coder/mux/releases) (e.g., `xum-x.x.x-x64-win.exe`)
 2. Run the installer
 3. Follow the installation prompts
-4. Launch Mux from the Start menu or desktop shortcut
+4. Launch Xum from the Start menu or desktop shortcut
 
 <Warning>
   Windows support is currently in alpha. Please [report any
@@ -78,26 +78,28 @@ Prerequisites:
 </Warning>
 
 1. After installing, open Terminal
-2. Run: `xattr -cr /Applications/Mux.app`
-3. Run: `codesign --force --deep --sign - /Applications/Mux.app`
+2. Run: `xattr -cr /Applications/xum.app`
+3. Run: `codesign --force --deep --sign - /Applications/xum.app`
 4. Now you can open the app normally
 
 ## CLI via npm
 
-The Mux CLI can also be run directly via `npx` without installing the desktop app:
+The Xum CLI can also be run directly via `npx` without installing the desktop app:
 
 ```bash
 # Run agent tasks
-npx mux run "Fix the failing tests"
+npx @coder/xum run "Fix the failing tests"
 
 # Start the server for remote/mobile access
-npx mux server --port 3000
+npx @coder/xum server --port 3000
 ```
 
 Or install globally:
 
 ```bash
-npm install -g mux
+npm install -g @coder/xum
 ```
+
+The legacy `mux` package and command forward to the matching Xum release during the transition. See [Mux compatibility](/reference/mux-compatibility) for storage, environment-variable, and downgrade details.
 
 This is ideal for CI/CD pipelines and scripted automation. See the [CLI documentation](/reference/cli) for all available commands and options.

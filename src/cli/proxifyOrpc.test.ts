@@ -143,6 +143,28 @@ describe("proxifyOrpc CLI help output", () => {
     expect(zodDefOptions?.description).toContain("model: string");
   });
 
+  test("enhanced schema preserves the Standard Schema validator", async () => {
+    const r = router();
+    const proxied = proxifyOrpc(r, { baseUrl: "http://localhost:8080" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+    const resumeStream = (proxied as any).workspace?.resumeStream;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+    const inputSchema = resumeStream?.["~orpc"]?.inputSchema;
+
+    // oRPC validates call inputs via schema["~standard"].validate. Zod keeps
+    // `~standard` non-enumerable, so the enhancement clone used to drop it and
+    // every enhanced procedure crashed at call time ("reading 'validate'").
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+    const standard = inputSchema?.["~standard"];
+    expect(standard).toBeDefined();
+    // The validator must actually run and flag invalid input.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
+    const result = await standard.validate({});
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    expect(result.issues).toBeDefined();
+  });
+
   test("JSON Schema for options includes description", () => {
     const r = router();
     const proxied = proxifyOrpc(r, { baseUrl: "http://localhost:8080" });

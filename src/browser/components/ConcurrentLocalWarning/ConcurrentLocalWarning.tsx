@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useSyncExternalStore } from "react";
+import React, { useRef, useSyncExternalStore } from "react";
 import { AlertTriangle } from "lucide-react";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -16,106 +16,86 @@ interface ConcurrentLocalWarningProps {
 }
 
 /**
- * Returns the name of another local-project workspace that is actively streaming in the same
- * project directory, or null when there is no conflicting local stream to warn about.
+ * Counts unrelated local agents sharing this checkout, without cycling their identities.
  */
-export function useConcurrentLocalStreamingWorkspaceName(
-  props: ConcurrentLocalWarningProps
-): string | null {
+export function useConcurrentLocalAgentCount(props: ConcurrentLocalWarningProps): number {
   const isLocalProject = isLocalProjectRuntime(props.runtimeConfig);
   const { workspaceMetadata } = useWorkspaceContext();
   const store = useWorkspaceStoreRaw();
 
-  const otherLocalWorkspaceIds = useMemo(() => {
-    if (!isLocalProject) {
-      return [];
-    }
+  // Sub-agents share their family's checkout intentionally, not as competing local agents.
+  const rootWorkspaceId =
+    workspaceMetadata.get(props.workspaceId)?.rootWorkspaceId ?? props.workspaceId;
+  const otherLocalWorkspaces = Array.from(workspaceMetadata.values()).filter(
+    (meta) =>
+      isLocalProject &&
+      meta.projectPath === props.projectPath &&
+      isLocalProjectRuntime(meta.runtimeConfig) &&
+      (meta.rootWorkspaceId ?? meta.id) !== rootWorkspaceId
+  );
 
-    const result: string[] = [];
-    for (const [id, meta] of workspaceMetadata) {
-      if (id === props.workspaceId) {
-        continue;
-      }
-      if (meta.projectPath !== props.projectPath) {
-        continue;
-      }
-      if (!isLocalProjectRuntime(meta.runtimeConfig)) {
-        continue;
-      }
-      result.push(id);
-    }
-    return result;
-  }, [isLocalProject, props.projectPath, props.workspaceId, workspaceMetadata]);
-
-  const streamingWorkspaceName = useSyncExternalStore(
+  const streamingCount = useSyncExternalStore(
     (listener) => {
-      const unsubscribers = otherLocalWorkspaceIds.map((id) => store.subscribeKey(id, listener));
+      const unsubscribers = otherLocalWorkspaces.map((meta) =>
+        store.subscribeKey(meta.id, listener)
+      );
       return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
     },
-    () => {
-      for (const id of otherLocalWorkspaceIds) {
+    () =>
+      otherLocalWorkspaces.filter((meta) => {
         try {
-          const state = store.getWorkspaceSidebarState(id);
-          if (state.canInterrupt) {
-            const meta = workspaceMetadata.get(id);
-            return meta?.name ?? id;
-          }
+          return store.getWorkspaceSidebarState(meta.id).canInterrupt;
         } catch {
           // Workspace may not be registered yet, skip.
+          return false;
         }
-      }
-      return null;
-    },
-    () => null
+      }).length,
+    () => 0
   );
-  const lastStreamingWorkspaceNameRef = useRef(streamingWorkspaceName);
-  if (streamingWorkspaceName !== null) {
-    lastStreamingWorkspaceNameRef.current = streamingWorkspaceName;
-  }
+  const scope = JSON.stringify([
+    rootWorkspaceId,
+    props.projectPath,
+    otherLocalWorkspaces.map((meta) => meta.id).sort(),
+  ]);
+  const heldCount = useRef({ scope, count: streamingCount });
+  if (streamingCount > 0) heldCount.current = { scope, count: streamingCount };
   const { displayPhase } = useWorkspaceStreamingStatusPhase(
-    streamingWorkspaceName === null ? null : "streaming"
+    streamingCount > 0 ? "streaming" : null
   );
 
-  // Activity snapshots can hand off through a brief idle frame between adjacent stream phases.
-  // Hold the last concrete workspace name for the same transition window used by sidebar status,
-  // so the warning does not blink while the underlying agent is still visibly working elsewhere.
-  return displayPhase === null ? null : lastStreamingWorkspaceNameRef.current;
+  // Hold brief handoffs, but clear immediately when eligibility changes rather than
+  // carrying a stale warning into another family, project, or isolated checkout.
+  return displayPhase && heldCount.current.scope === scope ? heldCount.current.count : 0;
 }
 
 interface ConcurrentLocalWarningViewProps {
-  streamingWorkspaceName: string;
+  agentCount: number;
   className?: string;
 }
-
-export const ConcurrentLocalWarningView: React.FC<ConcurrentLocalWarningViewProps> = (props) => {
-  return (
-    <div
-      role="status"
-      className={cn("text-muted flex h-6 items-center gap-2 text-xs leading-none", props.className)}
-    >
-      <AlertTriangle aria-hidden="true" className="text-warning size-3.5 shrink-0" />
-      <span className="min-w-0 truncate">
-        <span className="text-foreground font-medium">{props.streamingWorkspaceName}</span> is also
-        running in this project directory — agents may interfere
-      </span>
-    </div>
-  );
-};
 
 export const ConcurrentLocalWarningDecoration: React.FC<ConcurrentLocalWarningViewProps> = (
   props
 ) => {
   const columnWidthClass = useChatDockColumnWidthClass();
-
   return (
     <div
       className={cn("bg-surface-primary", CHAT_DOCK_GUTTER_CLASS)}
       data-component="ConcurrentLocalWarningDecoration"
     >
-      <ConcurrentLocalWarningView
-        streamingWorkspaceName={props.streamingWorkspaceName}
-        className={cn(columnWidthClass, props.className)}
-      />
+      <div
+        role="status"
+        className={cn(
+          "text-muted flex h-6 items-center gap-2 text-xs leading-none",
+          columnWidthClass,
+          props.className
+        )}
+      >
+        <AlertTriangle aria-hidden="true" className="text-warning size-3.5 shrink-0" />
+        <span className="counter-nums min-w-0 truncate">
+          {props.agentCount} other local agent{props.agentCount === 1 ? "" : "s"} running — may
+          interfere
+        </span>
+      </div>
     </div>
   );
 };

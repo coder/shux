@@ -1,10 +1,14 @@
+import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import assert from "@/common/utils/assert";
 import {
+  EXPERIMENT_IDS,
+  EXPERIMENTS_WRITE_TIMEOUT_MS,
   EXPERIMENTS,
   isExperimentSupportedOnPlatform,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { getMuxHome } from "@/common/constants/paths";
+import { getXumHome } from "@/common/constants/paths";
 import type { TelemetryService } from "@/node/services/telemetryService";
 
 import * as fs from "fs/promises";
@@ -22,11 +26,76 @@ interface ExperimentsFile {
   overrides?: Record<string, boolean>;
 }
 
-const OVERRIDES_FILE_NAME = "feature_flags.json";
+export const EXPERIMENT_OVERRIDES_FILE_NAME = "feature_flags.json";
 const OVERRIDES_FILE_VERSION = 1;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** Parse the persisted overrides file contents (shared by the service and CLI reads). */
+async function readOverridesFile(filePath: string): Promise<{
+  overrides: Map<ExperimentId, boolean>;
+  /** True when the persisted file already carries the enabled legacy
+   * exclusive mirror (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). */
+  hasLegacyPtcMirror: boolean;
+}> {
+  const overrides = new Map<ExperimentId, boolean>();
+  let hasLegacyPtcMirror = false;
+  try {
+    const raw = await fs.readFile(filePath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (!isRecord(parsed) || parsed.version !== OVERRIDES_FILE_VERSION) {
+      return { overrides, hasLegacyPtcMirror };
+    }
+
+    const persisted = parsed.overrides;
+    if (!isRecord(persisted)) {
+      return { overrides, hasLegacyPtcMirror };
+    }
+
+    for (const [key, value] of Object.entries(persisted)) {
+      if (!(key in EXPERIMENTS) || typeof value !== "boolean") {
+        continue;
+      }
+
+      overrides.set(key as ExperimentId, value);
+    }
+
+    // Legacy alias (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): an enabled exclusive toggle
+    // must keep PTC on after upgrade — filtering it like an ordinary unknown
+    // key would silently turn the user's PTC posture off. `true` wins over an
+    // explicit ptc:false because the old build's exclusive flag activated the
+    // exclusive posture regardless of the supplement flag.
+    if (persisted[LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID] === true) {
+      overrides.set(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
+      hasLegacyPtcMirror = true;
+    }
+  } catch {
+    // Ignore missing/corrupt overrides
+  }
+  return { overrides, hasLegacyPtcMirror };
+}
+
+/**
+ * One-shot read of a persisted experiment override for standalone CLIs
+ * (debug/workflow) that run without an ExperimentsService instance. Applies
+ * the same file format and platform-support semantics as the service.
+ */
+export async function readPersistedExperimentEnabled(
+  experimentId: ExperimentId,
+  options?: { xumHome?: string; platform?: NodeJS.Platform }
+): Promise<boolean> {
+  assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
+
+  if (!isExperimentSupportedOnPlatform(experimentId, options?.platform ?? process.platform)) {
+    return false;
+  }
+
+  const xumHome = options?.xumHome ?? getXumHome();
+  const { overrides } = await readOverridesFile(path.join(xumHome, EXPERIMENT_OVERRIDES_FILE_NAME));
+  return overrides.get(experimentId) === true;
 }
 
 /**
@@ -38,22 +107,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export class ExperimentsService {
   private readonly telemetryService: TelemetryService;
-  private readonly muxHome: string;
+  private readonly xumHome: string;
   private readonly overridesFilePath: string;
   private readonly platform: NodeJS.Platform;
 
-  private readonly overrides = new Map<ExperimentId, boolean>();
+  private overrides = new Map<ExperimentId, boolean>();
 
   private initialized = false;
+  private initialization: Promise<void> | undefined;
 
   constructor(options: {
     telemetryService: TelemetryService;
-    muxHome?: string;
+    xumHome?: string;
     platform?: NodeJS.Platform;
   }) {
     this.telemetryService = options.telemetryService;
-    this.muxHome = options.muxHome ?? getMuxHome();
-    this.overridesFilePath = path.join(this.muxHome, OVERRIDES_FILE_NAME);
+    this.xumHome = options.xumHome ?? getXumHome();
+    this.overridesFilePath = path.join(this.xumHome, EXPERIMENT_OVERRIDES_FILE_NAME);
     this.platform = options.platform ?? process.platform;
   }
 
@@ -61,20 +131,23 @@ export class ExperimentsService {
     return isExperimentSupportedOnPlatform(experimentId, this.platform);
   }
 
-  async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
+  initialize(): Promise<void> {
+    return (this.initialization ??= this.initializeOnce());
+  }
 
-    await this.loadOverridesFromDisk();
+  private async initializeOnce(): Promise<void> {
+    try {
+      await this.withOverridesLock(async (lease) => {
+        const needsLegacyPtcMirrorRewrite = await this.loadOverridesFromDisk();
+        if (needsLegacyPtcMirrorRewrite) {
+          await lease.assertStillOwned();
+          await this.writeOverridesToDisk();
+        }
+      });
+    } catch {
+      // Startup is best effort; explicit mutations below must report failed persistence.
+    }
     this.initialized = true;
-
-    for (const [experimentId, enabled] of this.overrides) {
-      this.telemetryService.setFeatureFlagVariant(
-        experimentId,
-        this.isExperimentSupported(experimentId) ? enabled : null
-      );
-    }
   }
 
   /**
@@ -83,6 +156,7 @@ export class ExperimentsService {
    */
   async getOverrides(): Promise<Partial<Record<ExperimentId, boolean>>> {
     await this.ensureInitialized();
+    await this.withOverridesLock(() => this.loadOverridesFromDisk());
 
     const result: Partial<Record<ExperimentId, boolean>> = {};
     for (const [experimentId, enabled] of this.overrides) {
@@ -106,15 +180,29 @@ export class ExperimentsService {
     await this.ensureInitialized();
     assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
 
-    if (!this.isExperimentSupported(experimentId) || enabled == null) {
-      this.overrides.delete(experimentId);
-      this.telemetryService.setFeatureFlagVariant(experimentId, null);
-    } else {
-      this.overrides.set(experimentId, enabled);
-      this.telemetryService.setFeatureFlagVariant(experimentId, enabled);
-    }
+    await this.withOverridesLock(async (lease) => {
+      // Merge the individual mutation into current disk state. A stale sibling
+      // changing an unrelated flag must never restore withdrawn Design consent.
+      const { overrides: next } = await readOverridesFile(this.overridesFilePath);
+      const value = this.isExperimentSupported(experimentId) ? enabled : null;
+      if (value == null) next.delete(experimentId);
+      else next.set(experimentId, value);
+      await lease.assertStillOwned();
+      await this.writeOverridesToDisk(next);
+      // A successful acknowledgement means the change survives a restart.
+      this.adoptOverrides(next);
+    });
+  }
 
-    await this.writeOverridesToDisk();
+  private async withOverridesLock<T>(
+    operation: (lease: ProcessFileLock) => Promise<T>
+  ): Promise<T> {
+    await using lease = await acquireProcessFileLock({
+      lockPath: `${this.overridesFilePath}.lock`,
+      timeoutMs: EXPERIMENTS_WRITE_TIMEOUT_MS,
+      label: "experiment overrides",
+    });
+    return await operation(lease);
   }
 
   /**
@@ -142,49 +230,46 @@ export class ExperimentsService {
     assert(this.initialized, "ExperimentsService failed to initialize");
   }
 
-  private async loadOverridesFromDisk(): Promise<void> {
-    try {
-      const raw = await fs.readFile(this.overridesFilePath, "utf-8");
-      const parsed = JSON.parse(raw) as unknown;
-
-      if (!isRecord(parsed) || parsed.version !== OVERRIDES_FILE_VERSION) {
-        return;
-      }
-
-      const overrides = parsed.overrides;
-      if (!isRecord(overrides)) {
-        return;
-      }
-
-      for (const [key, value] of Object.entries(overrides)) {
-        if (!(key in EXPERIMENTS) || typeof value !== "boolean") {
-          continue;
-        }
-
-        this.overrides.set(key as ExperimentId, value);
-      }
-    } catch {
-      // Ignore missing/corrupt overrides
-    }
+  /** Returns true when the persisted file enables PTC without the legacy
+   * downgrade mirror and needs a rewrite (see initialize). */
+  private async loadOverridesFromDisk(): Promise<boolean> {
+    const { overrides, hasLegacyPtcMirror } = await readOverridesFile(this.overridesFilePath);
+    this.adoptOverrides(overrides);
+    return overrides.get(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) === true && !hasLegacyPtcMirror;
   }
 
-  private async writeOverridesToDisk(): Promise<void> {
-    try {
-      const overrides: NonNullable<ExperimentsFile["overrides"]> = {};
-      for (const [experimentId, enabled] of this.overrides) {
-        overrides[experimentId] = enabled;
+  private adoptOverrides(next: Map<ExperimentId, boolean>): void {
+    // Disk reconciliation also changes telemetry, including removed overrides.
+    for (const id of new Set([...this.overrides.keys(), ...next.keys()])) {
+      if (this.overrides.get(id) !== next.get(id)) {
+        this.telemetryService.setFeatureFlagVariant(
+          id,
+          this.isExperimentSupported(id) ? (next.get(id) ?? null) : null
+        );
       }
-
-      const payload: ExperimentsFile = {
-        version: OVERRIDES_FILE_VERSION,
-        experiments: {},
-        overrides,
-      };
-
-      await fs.mkdir(this.muxHome, { recursive: true });
-      await writeFileAtomic(this.overridesFilePath, JSON.stringify(payload, null, 2), "utf-8");
-    } catch {
-      // Ignore persistence failures
     }
+    this.overrides = next;
+  }
+
+  private async writeOverridesToDisk(state = this.overrides): Promise<void> {
+    const overrides: NonNullable<ExperimentsFile["overrides"]> = {};
+    for (const [experimentId, enabled] of state) {
+      overrides[experimentId] = enabled;
+    }
+    // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): mirror an enabled PTC
+    // onto the pre-merge exclusive key so an older build keeps the exclusive
+    // posture instead of interpreting a bare ptc:true as supplement mode.
+    if (overrides[EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] === true) {
+      overrides[LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID] = true;
+    }
+
+    const payload: ExperimentsFile = {
+      version: OVERRIDES_FILE_VERSION,
+      experiments: {},
+      overrides,
+    };
+
+    await fs.mkdir(this.xumHome, { recursive: true });
+    await writeFileAtomic(this.overridesFilePath, JSON.stringify(payload, null, 2), "utf-8");
   }
 }

@@ -1,7 +1,7 @@
 import { defaultConfig } from "@/node/config";
 import { PlatformPaths } from "@/common/utils/paths";
 import * as fs from "fs";
-import { getMuxSessionsDir } from "@/common/constants/paths";
+import { getXumSessionsDir } from "@/common/constants/paths";
 
 export function listWorkspacesCommand() {
   const config = defaultConfig.loadConfigOrDefault();
@@ -47,7 +47,7 @@ export function listWorkspacesCommand() {
   }
 
   console.log("\n=== Sessions Directory ===\n");
-  const sessionsDir = getMuxSessionsDir();
+  const sessionsDir = getXumSessionsDir();
   if (fs.existsSync(sessionsDir)) {
     const sessions = fs.readdirSync(sessionsDir);
     console.log(`Sessions in ${sessionsDir}:`);

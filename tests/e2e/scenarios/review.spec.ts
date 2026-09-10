@@ -22,6 +22,7 @@ test("review scenario", async ({ ui, page }) => {
   await ui.chat.clickActionButton("Edit");
   await ui.chat.sendMessage(MOCK_REVIEW_PROMPTS.SHOW_ONBOARDING_DOC);
   await ui.chat.expectTranscriptContains("Found it. Here’s the quick-start summary:");
+  await ui.chat.expectTurnSettled();
 
   await ui.chat.sendMessage("/clear");
   // Confirm the destructive action in the modal

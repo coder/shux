@@ -29,7 +29,7 @@ describe("MuxGatewaySessionExpiredDialog", () => {
 
     await waitFor(() => {
       expect(view.getByText(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE)).toBeTruthy();
-      expect(view.getByText("Login to mux gateway")).toBeTruthy();
+      expect(view.getByText("Login to Xum Gateway")).toBeTruthy();
       expect(view.getByText("Cancel")).toBeTruthy();
     });
   });
@@ -67,10 +67,10 @@ describe("MuxGatewaySessionExpiredDialog", () => {
       window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED));
 
       await waitFor(() => {
-        expect(view.getByText("Login to mux gateway")).toBeTruthy();
+        expect(view.getByText("Login to Xum Gateway")).toBeTruthy();
       });
 
-      fireEvent.click(view.getByText("Login to mux gateway"));
+      fireEvent.click(view.getByText("Login to Xum Gateway"));
 
       await waitFor(() => {
         expect(openedUrl).toBe("about:blank");
@@ -93,15 +93,15 @@ describe("MuxGatewaySessionExpiredDialog", () => {
       window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED));
 
       await waitFor(() => {
-        expect(view.getByText("Login to mux gateway")).toBeTruthy();
+        expect(view.getByText("Login to Xum Gateway")).toBeTruthy();
       });
 
-      fireEvent.click(view.getByText("Login to mux gateway"));
+      fireEvent.click(view.getByText("Login to Xum Gateway"));
 
       await waitFor(() => {
         expect(view.getByText("Popup blocked - please allow popups and try again.")).toBeTruthy();
         expect(view.getByText(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE)).toBeTruthy();
-        expect(view.getByText("Login to mux gateway")).toBeTruthy();
+        expect(view.getByText("Login to Xum Gateway")).toBeTruthy();
       });
     } finally {
       window.open = originalOpen;

@@ -26,7 +26,9 @@ describe("useWorkspaceLastUserPrompt", () => {
     let snapshot = { displayed: null, historyEpoch: 1, isCaughtUp: caughtUp };
 
     spyOn(store, "getWorkspaceLastUserPromptSnapshot").mockImplementation(() => snapshot);
-    const fetchPrompt = mock(() => Promise.resolve("prompt from disk"));
+    const fetchPrompt = mock(() =>
+      Promise.resolve({ text: "prompt from disk", messageId: "prompt-from-disk" })
+    );
     spyOn(store, "fetchLastUserPromptFromHistory").mockImplementation(fetchPrompt);
 
     return {

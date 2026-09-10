@@ -4,7 +4,9 @@ import {
   hasInterruptedStream,
   isEligibleForAutoRetry,
   isNonRetryableSendError,
+  isNonRetryableStreamError,
   isPreTokenInterruptedUserTurn,
+  isProviderConfigFixableError,
   PENDING_STREAM_START_GRACE_PERIOD_MS,
 } from "./retryEligibility";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -93,6 +95,53 @@ describe("getLastNonDecorativeMessage", () => {
     ];
 
     expect(getLastNonDecorativeMessage(messages)).toBeUndefined();
+  });
+});
+
+describe("context budget retry suppression", () => {
+  it("does not automatically retry either a preflight refusal or a terminal budget block", () => {
+    expect(isNonRetryableSendError({ type: "context_budget_exceeded" })).toBe(true);
+    expect(isNonRetryableSendError({ type: "context_budget_blocked" })).toBe(true);
+    expect(isNonRetryableStreamError({ type: "context_budget_blocked" })).toBe(true);
+    expect(
+      isEligibleForAutoRetry([
+        userMessage(),
+        streamErrorMessage({ errorType: "context_budget_blocked" }),
+      ])
+    ).toBe(false);
+    expect(
+      isEligibleForAutoRetry([userMessage(), streamErrorMessage({ errorType: "network" })])
+    ).toBe(true);
+  });
+});
+
+describe("terminal budget rejection barriers", () => {
+  it("does not skip a rejected user tail to revive older interrupted work", () => {
+    const messages = [
+      assistantMessage({ isPartial: true }),
+      userMessage({ contextBudgetRejected: true }),
+    ];
+    expect(hasInterruptedStream(messages)).toBe(false);
+    expect(isEligibleForAutoRetry(messages)).toBe(false);
+    expect(isPreTokenInterruptedUserTurn(messages.at(-1), { reason: "user", at: 1 })).toBe(false);
+    expect(
+      hasInterruptedStream([
+        ...messages,
+        userMessage({ id: "next", historyId: "next", historySequence: 3 }),
+      ])
+    ).toBe(true);
+  });
+
+  it("does not advertise a live retry action for a terminal context-budget error", () => {
+    expect(
+      hasInterruptedStream([
+        userMessage(),
+        streamErrorMessage({ errorType: "context_budget_blocked" }),
+      ])
+    ).toBe(false);
+    expect(
+      hasInterruptedStream([userMessage(), streamErrorMessage({ errorType: "network" })])
+    ).toBe(true);
   });
 });
 
@@ -444,6 +493,46 @@ describe("isEligibleForAutoRetry", () => {
       const justSent = Date.now() - (PENDING_STREAM_START_GRACE_PERIOD_MS - 500);
       expect(isEligibleForAutoRetry(messages, justSent)).toBe(false);
     });
+  });
+});
+
+describe("isProviderConfigFixableError", () => {
+  const fixableStreamErrors = ["authentication", "quota"];
+  const fixableSendErrors = ["api_key_not_found", "oauth_not_connected", "provider_disabled"];
+
+  for (const type of fixableStreamErrors) {
+    it(`flags non-retryable stream error ${type} as config-fixable`, () => {
+      expect(isNonRetryableStreamError({ type })).toBe(true);
+      expect(isProviderConfigFixableError(type)).toBe(true);
+    });
+  }
+
+  for (const type of fixableSendErrors) {
+    it(`flags non-retryable send error ${type} as config-fixable`, () => {
+      expect(isNonRetryableSendError({ type })).toBe(true);
+      expect(isProviderConfigFixableError(type)).toBe(true);
+    });
+  }
+
+  for (const type of [
+    "network",
+    "server_error",
+    "rate_limit",
+    "unknown",
+    "context_exceeded",
+    "model_refusal",
+    "aborted",
+    "runtime_not_ready",
+    "model_not_found",
+    "agent_resolution",
+  ]) {
+    it(`does not flag ${type} as config-fixable`, () => {
+      expect(isProviderConfigFixableError(type)).toBe(false);
+    });
+  }
+
+  it("flags agent_resolution as non-retryable (deterministic strict contract failure)", () => {
+    expect(isNonRetryableStreamError({ type: "agent_resolution" })).toBe(true);
   });
 });
 

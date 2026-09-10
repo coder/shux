@@ -13,7 +13,6 @@ import {
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
-
 const DESKTOP_TOOL_NAMES = [
   "desktop_screenshot",
   "desktop_move_mouse",
@@ -73,6 +72,8 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-fable-5", true],
     ["claude-mythos-5", true],
     // Two-segment IDs at/after the 4.6 cutoff.
+    ["claude-fable-5-1", true],
+    ["claude-mythos-5-1", true],
     ["claude-sonnet-4-6", true],
     ["claude-opus-4-6", true],
     ["claude-opus-4-8", true],
@@ -122,6 +123,42 @@ describe("getToolsForModel", () => {
       initStateManager
     );
     expect(toolsWithReport.agent_report).toBeDefined();
+  });
+
+  test("only includes family messaging tools when enableFamilyMessaging=true", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+
+    // A plain sub-agent session (agent_report on, no RLM spawn stamp) must not see
+    // the family messaging tools.
+    const toolsWithout = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWithout.task_message_parent).toBeUndefined();
+    expect(toolsWithout.task_message_sibling).toBeUndefined();
+
+    const toolsWith = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+        enableFamilyMessaging: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWith.task_message_parent).toBeDefined();
+    expect(toolsWith.task_message_sibling).toBeDefined();
   });
 
   test("includes heartbeat only when the heartbeat service and experiment are configured", async () => {
@@ -758,5 +795,21 @@ describe("getToolsForModel", () => {
 
     const toolNames = Object.keys(tools);
     expect(toolNames).toEqual([...toolNames].sort((a, b) => a.localeCompare(b)));
+  });
+
+  test("includes web_fetch in the runtime toolset", async () => {
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
+      "ws-1",
+      createInitStateManager()
+    );
+
+    expect(tools.web_fetch).toBeDefined();
   });
 });

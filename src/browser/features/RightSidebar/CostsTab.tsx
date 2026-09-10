@@ -6,7 +6,9 @@ import {
   getTotalCost,
   type ChatUsageDisplay,
 } from "@/common/utils/tokens/usageAggregator";
-import { normalizeToCanonical, formatModelStringForDisplay } from "@/common/utils/ai/models";
+import { formatModelStringForDisplay } from "@/common/utils/ai/models";
+import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
@@ -26,6 +28,7 @@ interface CostsTabProps {
 
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
+  const { config: providersConfig } = useProvidersConfig();
   const [viewMode, setViewMode] = usePersistedState<ViewMode>("costsTab:viewMode", "session");
 
   // Session usage for cost calculation
@@ -44,7 +47,16 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
     const merged = new Map<string, ChatUsageDisplay>(Object.entries(usage.sessionByModel ?? {}));
     const liveModel = usage.liveCostUsage?.model;
     if (usage.liveCostUsage && liveModel) {
-      const key = normalizeToCanonical(liveModel);
+      // Same ledger key as the backend and WorkspaceStore deltas: live Coder
+      // usage keys on the stream's request-pinned metadata identity
+      // (liveMetadataModel) — re-resolving the raw coder:<instance>/<model>
+      // against a mid-stream-refreshed providers config could re-key or
+      // split the row from the backend's bucket. Non-Coder models keep the
+      // canonical normalizeUsageModelKey.
+      const key =
+        liveModel.startsWith("coder:") && usage.liveMetadataModel
+          ? usage.liveMetadataModel
+          : normalizeUsageModelKey(liveModel, providersConfig);
       const existing = merged.get(key);
       merged.set(
         key,

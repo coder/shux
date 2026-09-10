@@ -214,6 +214,28 @@ describe("context boundary helpers", () => {
     ).toBe(false);
     expect(hasProviderEligibleMessages([createMuxMessage("u1", "user", "after")])).toBe(true);
   });
+
+  it("optionally counts reasoning while excluding rejected payloads and reset markers", () => {
+    const reasoning = createMuxMessage("thinking", "assistant", "");
+    reasoning.parts = [{ type: "reasoning", text: "Preserved thinking" }];
+    expect(hasProviderEligibleMessages([reasoning])).toBe(false);
+    expect(hasProviderEligibleMessages([reasoning], { preserveReasoningOnly: true })).toBe(true);
+    for (const metadata of [
+      { contextBudgetRejected: true as const },
+      { contextBoundaryKind: "reset" as const },
+    ]) {
+      expect(
+        hasProviderEligibleMessages([{ ...reasoning, metadata }], {
+          preserveReasoningOnly: true,
+        })
+      ).toBe(false);
+    }
+    expect(
+      hasProviderEligibleMessages([createMuxMessage("empty", "assistant", "")], {
+        preserveReasoningOnly: true,
+      })
+    ).toBe(false);
+  });
 });
 
 describe("sliceMessagesFromLatestCompactionBoundary", () => {

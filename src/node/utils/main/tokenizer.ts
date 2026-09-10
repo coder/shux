@@ -1,3 +1,4 @@
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import CRC32 from "crc-32";
 import { LRUCache } from "lru-cache";
@@ -22,12 +23,12 @@ export interface Tokenizer {
 const APPROX_ENCODING = "approx-4";
 
 function shouldUseApproxTokenizer(): boolean {
-  // MUX_FORCE_REAL_TOKENIZER=1 overrides approx mode (for tests that need real tokenization)
-  // MUX_APPROX_TOKENIZER=1 enables fast approximate mode (default in Jest)
-  if (process.env.MUX_FORCE_REAL_TOKENIZER === "1") {
+  // XUM_FORCE_REAL_TOKENIZER=1 overrides approx mode (for tests that need real tokenization)
+  // XUM_APPROX_TOKENIZER=1 enables fast approximate mode (default in Jest)
+  if (resolveXumEnvironmentValue("FORCE_REAL_TOKENIZER", process.env) === "1") {
     return false;
   }
-  return process.env.MUX_APPROX_TOKENIZER === "1";
+  return resolveXumEnvironmentValue("APPROX_TOKENIZER", process.env) === "1";
 }
 
 function approximateCount(text: string): number {
@@ -202,9 +203,11 @@ export function loadTokenizerModules(
 
 export async function getTokenizerForModel(
   modelString: string,
-  metadataModelOverride?: string
+  metadataModelOverride?: string,
+  // Bypass only the performance approximation; provider-family fallback encodings still apply.
+  options?: { requireRealEncoding?: boolean }
 ): Promise<Tokenizer> {
-  if (shouldUseApproxTokenizer()) {
+  if (!options?.requireRealEncoding && shouldUseApproxTokenizer()) {
     return getApproxTokenizer();
   }
 

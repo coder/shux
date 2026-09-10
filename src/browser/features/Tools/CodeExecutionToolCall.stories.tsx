@@ -7,6 +7,7 @@ import type {
   NestedToolCall,
 } from "@/browser/features/Tools/Shared/codeExecutionTypes";
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 
 const meta = {
   ...lightweightMeta,
@@ -127,6 +128,45 @@ function GallerySection(props: {
  * SyntaxHighlighting stories into a single snapshot to conserve the snapshot
  * budget while preserving each distinct visual state.
  */
+/** 1x1 red PNG for carrier-attachment preview stories. */
+const RED_DOT_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+/**
+ * Stripped nested attach_file output as the PTC bridge records it: bytes are
+ * replaced with stub markers because the real attachment rides the carrier.
+ * The nested card must suppress these (no broken preview/download beside the
+ * working carrier render below).
+ */
+const strippedNestedAttachFile = [
+  {
+    toolCallId: "nested-attach-1",
+    toolName: "attach_file",
+    input: { path: "board.png" },
+    output: {
+      type: "content",
+      value: [
+        { type: "text", text: "Attached board.png" },
+        { type: "media", data: MEDIA_DATA_STUB, mediaType: "image/png", filename: "board.png" },
+        {
+          type: "media",
+          data: MEDIA_DATA_STUB,
+          mediaType: "application/pdf",
+          filename: "report.pdf",
+        },
+        {
+          type: "display_file",
+          data: DISPLAY_DATA_STUB,
+          mediaType: "text/markdown",
+          filename: "notes.md",
+          providerOptions: { mux: { displayOnly: true, size: 38 } },
+        },
+      ],
+    },
+    state: "output-available" as const,
+  },
+];
+
 export const Gallery: Story = {
   render: () => (
     <StoryShell>
@@ -138,6 +178,41 @@ export const Gallery: Story = {
             result: completedResult,
             status: "completed",
             nestedCalls: completedNestedCalls,
+          }}
+        />
+        <GallerySection
+          label="Completed (carrier attachments: image, PDF, display-only file; nested stub cards suppressed)"
+          cardProps={{
+            args: { code: `await mux.attach_file({ path: "board.png" });` },
+            nestedCalls: strippedNestedAttachFile,
+            result: {
+              success: true,
+              result: { attached: true },
+              toolCalls: [
+                { toolName: "attach_file", args: { path: "board.png" }, duration_ms: 12 },
+              ],
+              consoleOutput: [],
+              duration_ms: 30,
+              attachments: [
+                { type: "media", data: RED_DOT_PNG, mediaType: "image/png", filename: "board.png" },
+                // PDF: the image gallery refuses it, so it must render as a
+                // download card instead of disappearing.
+                {
+                  type: "media",
+                  data: "JVBERi0xLjQK",
+                  mediaType: "application/pdf",
+                  filename: "report.pdf",
+                },
+                {
+                  type: "display_file",
+                  data: "IyBOb3RlcwoKQ2FycmllZCBkaXNwbGF5LW9ubHkgbWFya2Rvd24u",
+                  mediaType: "text/markdown",
+                  filename: "notes.md",
+                  providerOptions: { mux: { displayOnly: true, size: 38 } },
+                },
+              ],
+            },
+            status: "completed",
           }}
         />
         <GallerySection

@@ -37,11 +37,9 @@ describe("Model one-shot (/<model> message)", () => {
         await app.chat.expectInputValue("");
 
         // Verify the mock AI router received the correct model
-        const modelResult = app.env.services.aiService.debugGetLastMockModel(app.workspaceId);
-        expect(modelResult.success).toBe(true);
-        if (modelResult.success) {
-          expect(modelResult.data).toBe(expectedModelId);
-        }
+        expect(
+          app.env.services.aiService.mockAiStreamPlayer?.debugGetLastModel(app.workspaceId)
+        ).toBe(expectedModelId);
 
         // Verify the ModelSelector UI didn't change (preference not persisted)
         const modelSelectorAfter = await app.chat.getModelSelectorText();

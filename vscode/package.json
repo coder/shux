@@ -1,7 +1,7 @@
 {
   "name": "mux",
-  "displayName": "mux",
-  "description": "Open mux workspaces directly from VS Code",
+  "displayName": "Xum",
+  "description": "Open xum workspaces directly from VS Code",
   "version": "0.1.0",
   "publisher": "coder",
   "icon": "icon.png",
@@ -15,6 +15,7 @@
     "Other"
   ],
   "keywords": [
+    "xum",
     "mux",
     "workspace",
     "remote",
@@ -33,22 +34,22 @@
     "commands": [
       {
         "command": "mux.openWorkspace",
-        "title": "mux: Open Workspace"
+        "title": "xum: Open Workspace"
       },
       {
         "command": "mux.configureConnection",
-        "title": "mux: Configure Connection"
+        "title": "xum: Configure Connection"
       },
       {
         "command": "mux.debugConnection",
-        "title": "mux: Debug Connection"
+        "title": "xum: Debug Connection"
       }
     ],
     "viewsContainers": {
       "secondarySidebar": [
         {
           "id": "muxSecondary",
-          "title": "mux",
+          "title": "xum",
           "icon": "icon.png"
         }
       ]
@@ -63,7 +64,7 @@
       ]
     },
     "configuration": {
-      "title": "mux",
+      "title": "xum",
       "properties": {
         "mux.connectionMode": {
           "type": "string",
@@ -74,13 +75,13 @@
           ],
           "default": "auto",
           "scope": "machine",
-          "description": "How the mux VS Code extension connects to mux (prefer server, require server, or use local files)."
+          "description": "How the xum VS Code extension connects to xum (prefer server, require server, or use local files)."
         },
         "mux.serverUrl": {
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Override the mux server URL (leave empty to auto-discover). Example: http://127.0.0.1:3000"
+          "description": "Override the xum server URL (leave empty to auto-discover). Example: http://127.0.0.1:3000"
         }
       }
     }
@@ -106,4 +107,3 @@
   "license": "AGPL-3.0-only",
   "packageManager": "bun@1.1.42"
 }
-

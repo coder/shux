@@ -87,7 +87,7 @@ export const VoiceInputButton: React.FC<VoiceInputButtonProps> = (props) => {
           </>
         ) : notConfigured ? (
           <>
-            Voice input requires a Mux Gateway login or an OpenAI API key.
+            Voice input requires a Xum Gateway login or an OpenAI API key.
             <br />
             Configure in Settings → Providers.
           </>

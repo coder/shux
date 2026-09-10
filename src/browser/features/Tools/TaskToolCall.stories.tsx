@@ -2,7 +2,12 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { waitFor, within } from "@storybook/test";
 import type { ReactNode } from "react";
 import { TaskApplyGitPatchToolCall } from "@/browser/features/Tools/TaskApplyGitPatchToolCall";
-import { TaskToolCall } from "@/browser/features/Tools/TaskToolCall";
+import {
+  TaskRemoveToolCall,
+  TaskRetitleToolCall,
+  TaskStopToolCall,
+  TaskToolCall,
+} from "@/browser/features/Tools/TaskToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 
 const meta = {
@@ -31,7 +36,7 @@ export const TaskWorkflowStates: Story = {
         args={{
           subagent_type: "explore",
           prompt: "Analyze the frontend React components in src/browser/",
-          title: "Frontend analysis",
+          title: "Frontend Reviewer",
           run_in_background: true,
         }}
         result={{
@@ -48,13 +53,53 @@ export const TaskWorkflowStates: Story = {
         args={{
           subagent_type: "exec",
           prompt: "Run linting on src/node/ and summarize the findings.",
-          title: "Backend linting",
+          title: "Backend Auditor",
           run_in_background: true,
         }}
         result={{
           status: "queued",
           taskId: "task-be-002",
           note: "Task is queued and will start shortly.",
+        }}
+        status="completed"
+      />
+    </ToolStoryShell>
+  ),
+};
+
+/** simplified persistent-child lifecycle operations */
+export const TaskLifecycleOperations: Story = {
+  render: () => (
+    <ToolStoryShell>
+      <TaskRetitleToolCall
+        args={{ task_id: "lifecycle-auditor", title: "Simplicity Auditor" }}
+        result={{
+          status: "retitled",
+          taskId: "lifecycle-auditor",
+          title: "Simplicity Auditor",
+        }}
+        status="completed"
+      />
+      <TaskStopToolCall
+        args={{ task_ids: ["react-expert", "api-expert"] }}
+        result={{
+          results: [
+            { status: "stopped", taskId: "react-expert", stoppedTaskIds: ["react-expert"] },
+            { status: "already_inactive", taskId: "api-expert" },
+          ],
+        }}
+        status="completed"
+      />
+      <TaskRemoveToolCall
+        args={{ task_ids: ["obsolete-reviewer"] }}
+        result={{
+          results: [
+            {
+              status: "removed",
+              taskId: "obsolete-reviewer",
+              workspaceId: "obsolete-reviewer",
+            },
+          ],
         }}
         status="completed"
       />
@@ -150,7 +195,7 @@ export const TaskNarrowLongModelId: Story = {
         args={{
           subagent_type: "explore",
           prompt: "Analyze the frontend React components in src/browser/",
-          title: "Frontend analysis",
+          title: "Frontend Reviewer",
           run_in_background: true,
         }}
         result={{

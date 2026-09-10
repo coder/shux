@@ -42,7 +42,7 @@ export function ChatInputDecoration(props: ChatInputDecorationProps) {
         className={cn(
           // Use a fixed collapsed row height so every decoration reads with the
           // same top/bottom breathing room regardless of icon/text mix.
-          "group flex h-6 items-center gap-2 text-xs leading-none transition-colors",
+          "group mobile-touch-row flex h-6 items-center gap-2 text-xs leading-none transition-colors",
           columnWidthClass,
           props.summaryClassName
         )}

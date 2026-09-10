@@ -5,18 +5,33 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamAbortEventSchema,
+  StreamEndEventSchema,
+  ToolCallStartEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
+  ToolCallEndEvent,
   ToolCallExecutionStartEvent,
+  ToolCallStartEvent,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
+import type { MuxMessage } from "@/common/types/message";
+import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import {
+  StreamManager,
+  type ModelFallbackPrepareOptions,
+  type TurnEngineEvent,
+  type TurnCompletion,
+  type TurnExecutionOptions,
+} from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
+  RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "./thinkingOverride";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
@@ -34,15 +49,23 @@ import * as modelStatsModule from "@/common/utils/tokens/modelStats";
 import { SessionUsageService } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { closeScopeBounded } from "./di/appRuntime";
+import { Effect, Scope } from "effect";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
 import { countTokens } from "@/node/utils/main/tokenizer";
+import * as tokenizer from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
+import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { AIService } from "./aiService";
+import { InitStateManager } from "./initStateManager";
+import { ProviderService } from "./providerService";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
   return {
@@ -56,7 +79,6 @@ function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
 }
 
 // Skip integration tests if TEST_INTEGRATION is not set
-const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 // Validate API keys before running tests
 if (shouldRunIntegrationTests()) {
@@ -65,10 +87,15 @@ if (shouldRunIntegrationTests()) {
 
 // Real HistoryService backed by a temp directory (created fresh per test)
 let historyService: HistoryService;
+let historyConfig: Awaited<ReturnType<typeof createTestHistoryService>>["config"];
 let historyCleanup: () => Promise<void>;
 
 beforeEach(async () => {
-  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+  ({
+    historyService,
+    config: historyConfig,
+    cleanup: historyCleanup,
+  } = await createTestHistoryService());
 });
 
 afterEach(async () => {
@@ -103,6 +130,21 @@ function createExecStreamForTests(): ExecStream {
 const TEST_STREAM_MODEL_ID = KNOWN_MODELS.SONNET.id;
 const TEST_USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+/** Base startStream options; scenarios override only what they assert. */
+function testStartOptions(
+  overrides: Partial<TurnExecutionOptions> &
+    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "model">
+): TurnExecutionOptions {
+  return {
+    messages: [{ role: "user", content: "hello" }],
+    modelString: "openai:gpt-4.1-mini",
+    historySequence: 1,
+    system: "system",
+    runtime: LOCAL_TEST_RUNTIME,
+    ...overrides,
+  };
+}
 
 type ProcessStreamWithCleanupForTests = (
   workspaceId: string,
@@ -211,6 +253,7 @@ function createStreamInfoForTests(
     lastPartTimestamp: now,
     toolCompletionTimestamps: new Map<string, number>(),
     pendingWorkflowRunAttachments: new Map<string, unknown>(),
+    pendingNestedCalls: new Map<string, unknown[]>(),
     pendingToolExecutionStarts: new Map<string, number>(),
     model,
     metadataModel: overrides.metadataModel ?? model,
@@ -230,10 +273,64 @@ function createStreamInfoForTests(
     didRetryPreviousResponseIdAtStep: false,
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
+    stepStartIndices: [0],
     stepTracker: {},
     ...overrides,
   };
 }
+
+function createWorkflowRunRecordForTests(runId: string, workspaceId: string): WorkflowRunRecord {
+  return {
+    id: runId,
+    workspaceId,
+    workflow: {
+      name: "deep-research",
+      description: "test workflow",
+      scope: "project",
+      executable: true,
+    },
+    source: "export default function workflow() { return { reportMarkdown: 'x'.repeat(64) }; }",
+    sourceHash: "sha256:test",
+    args: {},
+    status: "running",
+    createdAt: "2026-05-29T00:00:00.000Z",
+    updatedAt: "2026-05-29T00:00:01.000Z",
+    events: [],
+    steps: [],
+  };
+}
+
+describe("StreamManager - event sink rejection containment", () => {
+  test("a rejecting async event sink does not become an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const streamManager = new StreamManager(historyService, undefined, undefined, () =>
+        Promise.reject(new Error("sink boom"))
+      );
+      const emitTurnEvent = getPrivateMethodForTests<(event: TurnEngineEvent) => void>(
+        streamManager,
+        "emitTurnEvent"
+      );
+      emitTurnEvent.call(streamManager, {
+        type: "workflow-run-attached",
+        workspaceId: "sink-rejection-workspace",
+        messageId: "sink-rejection-message",
+        toolCallId: "sink-rejection-call",
+        runId: "wfr_sink",
+        timestamp: Date.now(),
+      });
+      // A macrotask so an uncontained rejection would surface before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});
 
 describe("StreamManager - workflow run attachments", () => {
   test("persists attached workflow run metadata to partial immediately", async () => {
@@ -280,6 +377,67 @@ describe("StreamManager - workflow run attachments", () => {
     });
   });
 
+  test("persists workflow attachments onto nested kernel tool calls", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "workflow-nested-attachment-workspace";
+    const messageId = "workflow-nested-attachment-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-1",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-workflow-1",
+              toolName: "workflow_run",
+              // Kernel bounding replaced the launch args with a marker; the
+              // attachment is the only durable run identity for this call.
+              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const attached = await streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
+      messageId,
+      toolCallId: "nested-workflow-1",
+      runId: "wfr_nested",
+      // The live event carries the full run record (large source/args),
+      // exactly what kernel bounding keeps out of the nested record.
+      run: createWorkflowRunRecordForTests("wfr_nested", workspaceId),
+      timestamp: timestamp + 1,
+    });
+
+    expect(attached).toBe(true);
+    const partial = await historyService.readPartial(workspaceId);
+    const part = partial?.parts[0];
+    if (part?.type !== "dynamic-tool") {
+      throw new Error("Expected code_execution tool part in persisted partial");
+    }
+    // Identity only: persisting the run record (source, args) would bypass the
+    // kernel record caps via partial.json.
+    expect(part.nestedCalls?.[0]?.workflowRun).toEqual({
+      runId: "wfr_nested",
+      timestamp: timestamp + 1,
+    });
+    // The attachment landed on the nested record, not the pending map.
+    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+  });
+
   test("persists workflow attachments that arrive before the tool part", async () => {
     const streamManager = new StreamManager(historyService);
     const workspaceId = "workflow-attachment-race-workspace";
@@ -315,7 +473,7 @@ describe("StreamManager - workflow run attachments", () => {
     >(streamManager, "appendPartAndEmit");
 
     const replayedAttachments: WorkflowRunAttachedEvent[] = [];
-    streamManager.on("workflow-run-attached", (event: WorkflowRunAttachedEvent) => {
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event: WorkflowRunAttachedEvent) => {
       replayedAttachments.push(event);
     });
 
@@ -357,6 +515,322 @@ describe("StreamManager - workflow run attachments", () => {
   });
 });
 
+describe("StreamManager - nested kernel call race and replay", () => {
+  test("buffers nested events that beat the parent part and persists them (with run identity) on merge", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-race-workspace";
+    const messageId = "nested-race-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    // execute() wins the race: nested start arrives before the parent part exists.
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-start",
+      callId: "nested-race-workflow",
+      toolName: "workflow_run",
+      args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+      parentToolCallId: "code-exec-race",
+      startTime: timestamp,
+    });
+
+    // The workflow attachment lands while the nested record is still buffered.
+    const attached = await streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
+      messageId,
+      toolCallId: "nested-race-workflow",
+      runId: "wfr_race_nested",
+      run: createWorkflowRunRecordForTests("wfr_race_nested", workspaceId),
+      timestamp: timestamp + 1,
+    });
+    expect(attached).toBe(true);
+    // Nothing persisted yet: the parent part has not landed.
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+    const appendPartAndEmit = getPrivateMethodForTests<
+      (
+        workspaceId: string,
+        streamInfo: Record<string, unknown>,
+        part: CompletedMessagePart,
+        schedulePartialWrite?: boolean
+      ) => Promise<void>
+    >(streamManager, "appendPartAndEmit");
+    // The renderer dropped the original raced events, so the merge must
+    // re-deliver them once the parent part exists.
+    const reEmittedStarts: ToolCallStartEvent[] = [];
+    const reEmittedAttachments: WorkflowRunAttachedEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => reEmittedStarts.push(event));
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) =>
+      reEmittedAttachments.push(event)
+    );
+    await appendPartAndEmit.call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      {
+        type: "dynamic-tool",
+        toolCallId: "code-exec-race",
+        toolName: "code_execution",
+        input: { code: "mux.workflow_run({...})" },
+        state: "input-available",
+        timestamp: timestamp + 2,
+      },
+      false
+    );
+    const reEmittedStart = reEmittedStarts.find((e) => e.toolCallId === "nested-race-workflow");
+    expect(reEmittedStart?.parentToolCallId).toBe("code-exec-race");
+    expect(reEmittedAttachments.some((e) => e.toolCallId === "nested-race-workflow")).toBe(true);
+
+    const partial = await historyService.readPartial(workspaceId);
+    const part = partial?.parts[0];
+    if (part?.type !== "dynamic-tool") {
+      throw new Error("Expected code_execution tool part in persisted partial");
+    }
+    expect(part.nestedCalls).toHaveLength(1);
+    expect(part.nestedCalls?.[0]?.toolCallId).toBe("nested-race-workflow");
+    // Run identity only (no run record), same bound as the direct attach path.
+    expect(part.nestedCalls?.[0]?.workflowRun).toEqual({
+      runId: "wfr_race_nested",
+      timestamp: timestamp + 1,
+    });
+    // Both holding areas were consumed.
+    expect((streamInfo.pendingNestedCalls as Map<string, unknown>).size).toBe(0);
+    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+  });
+
+  test("replays persisted nested calls (start, attachment, end) with the parent part", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-workspace";
+    const messageId = "nested-replay-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-replay",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-replay-workflow",
+              toolName: "workflow_run",
+              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+              state: "output-available",
+              output: { __kernelBounded: true, runId: "wfr_replay", status: "running" },
+              timestamp: timestamp + 1,
+              workflowRun: { runId: "wfr_replay", timestamp: timestamp + 2 },
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const starts: ToolCallStartEvent[] = [];
+    const attachments: WorkflowRunAttachedEvent[] = [];
+    const ends: ToolCallEndEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) => attachments.push(event));
+    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
+
+    await streamManager.replayStream(workspaceId);
+
+    const nestedStart = starts.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedStart?.parentToolCallId).toBe("code-exec-replay");
+    expect(nestedStart?.replay).toBe(true);
+    const nestedAttach = attachments.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedAttach?.runId).toBe("wfr_replay");
+    const nestedEnd = ends.find((e) => e.toolCallId === "nested-replay-workflow");
+    expect(nestedEnd?.parentToolCallId).toBe("code-exec-replay");
+  });
+
+  test("incremental replay notices a nested call that completed while disconnected", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-completion-workspace";
+    const messageId = "nested-replay-completion-message";
+    const timestamp = Date.now();
+    const makeStreamInfo = (completedAt: number) =>
+      createStreamInfoForTests({
+        messageId,
+        lastPartialWriteTime: timestamp,
+        toolCompletionTimestamps: new Map([["nested-completed-workflow", completedAt]]),
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "code-exec-completion",
+            toolName: "code_execution",
+            input: { code: "mux.workflow_run({...})" },
+            state: "input-available",
+            timestamp,
+            nestedCalls: [
+              {
+                toolCallId: "nested-completed-workflow",
+                toolName: "workflow_run",
+                input: {},
+                state: "output-available",
+                output: { runId: "wfr_done" },
+                // Start predates the cursor; only the completion is fresh.
+                timestamp,
+              },
+            ],
+          },
+        ],
+      });
+    const cursor = timestamp + 50;
+
+    // Completed after the cursor: the parent must replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 100));
+    const starts: ToolCallStartEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(true);
+
+    // Completed before the cursor: nothing fresh, no replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 10));
+    starts.length = 0;
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(false);
+  });
+
+  test("emitNestedToolEvent records nested completion timestamps", () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-completion-record-workspace";
+    const messageId = "nested-completion-record-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-ts",
+          toolName: "code_execution",
+          input: {},
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-ts",
+              toolName: "bash",
+              input: {},
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-end",
+      callId: "nested-ts",
+      toolName: "bash",
+      args: {},
+      parentToolCallId: "code-exec-ts",
+      startTime: timestamp,
+      endTime: timestamp + 5,
+      result: { ok: true },
+    });
+
+    expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
+      timestamp + 5
+    );
+  });
+
+  test("incremental replay keeps a parent whose only fresh activity is nested", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-cursor-workspace";
+    const messageId = "nested-replay-cursor-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-cursor",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          // Parent part predates the reconnect cursor...
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-cursor-workflow",
+              toolName: "workflow_run",
+              input: {},
+              state: "input-available",
+              // ...but the nested workflow started after it.
+              timestamp: timestamp + 100,
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const starts: ToolCallStartEvent[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+
+    await streamManager.replayStream(workspaceId, { afterTimestamp: timestamp + 50 });
+
+    expect(starts.some((e) => e.toolCallId === "nested-cursor-workflow")).toBe(true);
+  });
+});
+
+describe("StreamManager - nested tool call normalization", () => {
+  test("normalizes zero-arg nested calls to {} for the persisted record and the wire event", () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-normalize-workspace";
+    const messageId = "nested-normalize-message";
+    const timestamp = Date.now();
+    const parts: CompletedMessagePart[] = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "parent-1",
+        toolName: "code_execution",
+        input: { code: "mux.linear_list_teams()" },
+        state: "input-available",
+        timestamp,
+      },
+    ];
+    const streamInfo = createStreamInfoForTests({ messageId, parts });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const events: unknown[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-start", (event: unknown) => events.push(event));
+
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-start",
+      callId: "nested-1",
+      toolName: "linear_list_teams",
+      // Zero-argument guest call: JSON cannot represent undefined, so both the
+      // persisted record and the wire event must carry {} instead.
+      args: undefined,
+      parentToolCallId: "parent-1",
+      startTime: timestamp,
+    });
+
+    const parentPart = parts[0] as { nestedCalls?: Array<{ input?: unknown }> };
+    expect(parentPart.nestedCalls).toHaveLength(1);
+    expect(parentPart.nestedCalls?.[0]?.input).toEqual({});
+
+    // The live event must survive oRPC output validation (args key required).
+    expect(events).toHaveLength(1);
+    expect(ToolCallStartEventSchema.safeParse(events[0]).success).toBe(true);
+    expect((events[0] as { args?: unknown }).args).toEqual({});
+  });
+});
+
 describe("StreamManager - tool execution start timing", () => {
   test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", () => {
     const streamManager = new StreamManager(historyService);
@@ -383,9 +857,13 @@ describe("StreamManager - tool execution start timing", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     const events: ToolCallExecutionStartEvent[] = [];
-    streamManager.on("tool-call-execution-start", (event: ToolCallExecutionStartEvent) => {
-      events.push(event);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-execution-start",
+      (event: ToolCallExecutionStartEvent) => {
+        events.push(event);
+      }
+    );
 
     const handleToolExecutionStart = getPrivateMethodForTests<
       (workspaceId: string, messageId: string, toolCallId: string) => void
@@ -415,9 +893,13 @@ describe("StreamManager - tool execution start timing", () => {
     getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
 
     const events: ToolCallExecutionStartEvent[] = [];
-    streamManager.on("tool-call-execution-start", (event: ToolCallExecutionStartEvent) => {
-      events.push(event);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-execution-start",
+      (event: ToolCallExecutionStartEvent) => {
+        events.push(event);
+      }
+    );
 
     // execute() wins the race: no part yet, so the start is parked as pending.
     const handleToolExecutionStart = getPrivateMethodForTests<
@@ -459,7 +941,7 @@ describe("StreamManager - tool execution start timing", () => {
 });
 
 describe("StreamManager - createTempDirForStream", () => {
-  test("creates ~/.mux-tmp/<token> under the runtime's home", async () => {
+  test("creates ~/.xum-tmp/<token> under the runtime's home", async () => {
     using home = new DisposableTempDir("stream-home");
 
     const prevHome = process.env.HOME;
@@ -478,7 +960,7 @@ describe("StreamManager - createTempDirForStream", () => {
       // StreamManager normalizes Windows paths to forward slashes.
       const normalizedHomePath = home.path.replace(/\\/g, "/");
       expect(resolved.startsWith(normalizedHomePath)).toBe(true);
-      expect(resolved).toContain(`/.mux-tmp/${token}`);
+      expect(resolved).toContain(`/.xum-tmp/${token}`);
 
       const stat = await fs.stat(resolved);
       expect(stat.isDirectory()).toBe(true);
@@ -524,11 +1006,856 @@ describe("StreamManager - cleanupStreamTempDir", () => {
   });
 });
 
+describe("StreamManager - stream resource scope", () => {
+  function createLifecycleStreamManagerForTests(fullStreamParts: unknown[]): {
+    streamManager: StreamManager;
+    cleanupCalls: string[];
+  } {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createStreamResult", () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield* fullStreamParts;
+        })()
+      )
+    );
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/phase10-scope-tempdir")
+    );
+    const cleanupCalls: string[] = [];
+    Reflect.set(streamManager, "cleanupStreamTempDir", (_runtime: unknown, dir: string) => {
+      cleanupCalls.push(dir);
+    });
+    return { streamManager, cleanupCalls };
+  }
+
+  async function runLifecycleStreamForTests(
+    streamManager: StreamManager,
+    workspaceId: string
+  ): Promise<void> {
+    const messageId = `${workspaceId}-msg`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected stream to start");
+    }
+    await result.data.completion;
+    // Let the fire-and-forget scope close settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  test("releases the temp dir exactly once when the stream completes", async () => {
+    // The temp-dir release finalizer is owned by the stream's resource scope:
+    // ownership transfers from startStream to processStreamWithCleanup at
+    // registration, and Scope.close must run the release on natural
+    // completion without double-releasing across the two cleanup paths.
+    const { streamManager, cleanupCalls } = createLifecycleStreamManagerForTests([
+      { type: "text-delta", text: "hello" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+
+    await runLifecycleStreamForTests(streamManager, "scope-release-once-workspace");
+
+    expect(cleanupCalls).toEqual(["/tmp/phase10-scope-tempdir"]);
+  });
+
+  test("interrupts a pending debounced partial write when the stream ends", async () => {
+    // A debounced partial flush scheduled during streaming is tied to the
+    // stream's resource scope. Once the stream ends, the pending flush must be
+    // interrupted with the scope — a late write would resurrect partial state
+    // for a dead stream. The debounce sleeps on the injected runner's
+    // TestClock, so "later" is a virtual-time adjust, not a real wait.
+    const testRunner = makeTestEffectRunner();
+    try {
+      const workspaceId = "scope-debounce-interrupt-workspace";
+      const streamManager = new StreamManager(
+        historyService,
+        undefined,
+        undefined,
+        undefined,
+        testRunner.runner
+      );
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      Reflect.set(streamManager, "createTempDirForStream", () =>
+        Promise.resolve("/tmp/phase10-scope-tempdir")
+      );
+      Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+
+      const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+      const streamInfoForTests = () =>
+        workspaceStreams.get(workspaceId) as
+          | { lastPartialWriteTime?: number; partialWriteFiber?: unknown }
+          | undefined;
+
+      let debounceArmedBeforeFinish = false;
+      Reflect.set(streamManager, "createStreamResult", () =>
+        createStreamResultForTests(
+          (async function* () {
+            // First delta writes immediately (lastPartialWriteTime starts at 0).
+            yield { type: "text-delta", text: "first" };
+            // Wait until that write stamps the throttle clock so the second
+            // delta deterministically lands inside the throttle window.
+            while ((streamInfoForTests()?.lastPartialWriteTime ?? 0) === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            yield { type: "text-delta", text: "second" };
+            // The consumer fully processed the second delta before pulling the
+            // next part, and the debounce arms synchronously.
+            debounceArmedBeforeFinish = streamInfoForTests()?.partialWriteFiber != null;
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      );
+      const writePartialSpy = spyOn(historyService, "writePartial");
+
+      const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+      if (typeof throttleMs !== "number") {
+        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+      }
+
+      await runLifecycleStreamForTests(streamManager, workspaceId);
+
+      expect(debounceArmedBeforeFinish).toBe(true);
+      const writesAtStreamEnd = writePartialSpy.mock.calls.length;
+      await testRunner.adjust(throttleMs * 2);
+      // A flush that survived the scope close would settle on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
+    } finally {
+      await testRunner.dispose();
+    }
+  });
+
+  test("a debounced partial write arms a real setTimeout through the default runner", async () => {
+    // Default-runner smoke: with nothing injected the debounce sleeps on
+    // Effect's default clock, i.e. a real setTimeout. Intercepting the timer
+    // registration (as the RetryManager smoke does) keeps this deterministic:
+    // no wall-clock window that a loaded host could overrun.
+    const realSetTimeout = globalThis.setTimeout;
+    const timers: Array<{ delayMs: number; fire: () => void }> = [];
+    const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number
+    ) => {
+      if (typeof handler !== "function") {
+        throw new Error("debounce smoke only supports function timer handlers");
+      }
+      timers.push({ delayMs: timeout ?? 0, fire: handler as () => void });
+      return timers.length as unknown as ReturnType<typeof setTimeout>;
+    }) as unknown as typeof setTimeout);
+    try {
+      const streamManager = new StreamManager(historyService);
+      const workspaceId = "default-runner-debounce-workspace";
+      const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+      if (typeof throttleMs !== "number") {
+        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+      }
+      // A write just happened: the whole throttle window is still ahead.
+      const streamInfo = createStreamInfoForTests({ lastPartialWriteTime: Date.now() });
+      getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+      const schedulePartialWrite = getPrivateMethodForTests<
+        (workspaceId: string, streamInfo: Record<string, unknown>) => Promise<void>
+      >(streamManager, "schedulePartialWrite");
+      const writePartialSpy = spyOn(historyService, "writePartial");
+
+      await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
+      expect(streamInfo.partialWriteFiber).toBeDefined();
+      expect(writePartialSpy).not.toHaveBeenCalled();
+      // Exactly one timer, for the remaining throttle window.
+      expect(timers).toHaveLength(1);
+      expect(timers[0].delayMs).toBeGreaterThan(0);
+      expect(timers[0].delayMs).toBeLessThanOrEqual(throttleMs);
+
+      timers[0].fire();
+      setTimeoutSpy.mockRestore();
+      // The flush's Effect.promise settles asynchronously.
+      const deadline = Date.now() + 2_000;
+      while (writePartialSpy.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+      }
+      expect(writePartialSpy).toHaveBeenCalledTimes(1);
+      expect(streamInfo.partialWriteFiber).toBeUndefined();
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
+  test("runs the partial-write debounce on the injected runner's clock", async () => {
+    // The debounce fiber must sleep on the injected EffectRunner (the app
+    // runtime's clock in production), not the global runtime: a TestClock
+    // runner fires the flush only when the test clock advances.
+    const testRunner = makeTestEffectRunner();
+    try {
+      const streamManager = new StreamManager(
+        historyService,
+        undefined,
+        undefined,
+        undefined,
+        testRunner.runner
+      );
+      expect(streamManager.effectRunner).toBe(testRunner.runner);
+      const workspaceId = "runner-debounce-workspace";
+      // Inside the throttle window, so the write is debounced rather than immediate.
+      const streamInfo = createStreamInfoForTests({ lastPartialWriteTime: Date.now() });
+      getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+      const schedulePartialWrite = getPrivateMethodForTests<
+        (workspaceId: string, streamInfo: Record<string, unknown>) => Promise<void>
+      >(streamManager, "schedulePartialWrite");
+      const writePartialSpy = spyOn(historyService, "writePartial");
+      const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+      if (typeof throttleMs !== "number") {
+        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+      }
+
+      await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
+      expect(streamInfo.partialWriteFiber).toBeDefined();
+      // Real time passes; the virtual clock has not, so nothing flushes.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(writePartialSpy).not.toHaveBeenCalled();
+
+      await testRunner.adjust(throttleMs);
+      // The flush's Effect.promise settles on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(writePartialSpy).toHaveBeenCalledTimes(1);
+      expect(streamInfo.partialWriteFiber).toBeUndefined();
+    } finally {
+      await testRunner.dispose();
+    }
+  });
+});
+
+describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
+  type StreamAbortEvent = Extract<TurnEngineEvent, { type: "stream-abort" }>;
+
+  /**
+   * A manager whose streams are supervised by `engineScope` (the app runtime's
+   * AppFiberScope in production). `fullStream` receives the stream's own
+   * AbortSignal so scenarios can model a provider that stops on abort — or one
+   * that ignores it.
+   */
+  function createSupervisedStreamManagerForTests(
+    fullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown>,
+    options: { supervised: boolean } = { supervised: true }
+  ) {
+    const engineScope = Scope.makeUnsafe("parallel");
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(
+      historyService,
+      undefined,
+      undefined,
+      (event) => {
+        events.push(event);
+      },
+      undefined,
+      options.supervised ? engineScope : undefined
+    );
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) =>
+        createStreamResultForTests(fullStream(abortController.signal))
+    );
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/wave4-supervisor-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+    return { streamManager, events, engineScope };
+  }
+
+  async function startSupervisedStreamForTests(
+    streamManager: StreamManager,
+    workspaceId: string,
+    historySequence = 1
+  ) {
+    const messageId = `${workspaceId}-msg-${historySequence}`;
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        historySequence,
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected stream to start");
+    }
+    return result.data;
+  }
+
+  /** Yields one delta, then blocks until the stream's AbortSignal fires (a well-behaved provider). */
+  function flowingThenBlockedStream(signal: AbortSignal): AsyncGenerator<unknown, void, unknown> {
+    return (async function* () {
+      yield { type: "text-delta", text: "hello" };
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    })();
+  }
+
+  async function waitForPartialText(workspaceId: string, text: string): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const partial = await historyService.readPartial(workspaceId);
+      if (
+        partial?.parts.some((part) => part.type === "text" && part.text.includes(text)) === true
+      ) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`partial for ${workspaceId} never contained ${JSON.stringify(text)}`);
+  }
+
+  function terminalEvents(events: TurnEngineEvent[]): TurnEngineEvent[] {
+    return events.filter((event) => ["stream-end", "stream-abort", "error"].includes(event.type));
+  }
+
+  test("closing the engine scope aborts a flowing stream as 'system', commits its partial and settles it", async () => {
+    const workspaceId = "supervised-flowing-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const writePartialSpy = spyOn(historyService, "writePartial");
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+    expect(streamManager.isStreaming(workspaceId)).toBe(true);
+
+    // What ServiceContainer.dispose() does at step 2: interrupt + await.
+    await closeScopeBounded(engineScope);
+
+    // The finalizer routed through the user-stop path: the streamed text was
+    // flushed (with usage stamping) before the abort was delivered ...
+    const lastWrite = writePartialSpy.mock.calls.at(-1)?.[1];
+    expect(lastWrite?.parts.some((part) => part.type === "text" && part.text === "hello")).toBe(
+      true
+    );
+    // ... exactly one terminal event, an involuntary backend abort, no stream-end ...
+    const terminal = terminalEvents(events);
+    expect(terminal.map((event) => event.type)).toEqual(["stream-abort"]);
+    expect((terminal[0] as StreamAbortEvent).abortReason).toBe("system");
+    // ... and the turn handle plus the registry were settled before the close resolved.
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
+  test.each([
+    "tokenization",
+    "sink-sync",
+    "sink-async",
+    "preflush",
+    "processing",
+    "usage",
+    "soft-tokenization",
+    "soft-preflush",
+    "soft-usage",
+  ] as const)("abort completion survives %s failure", async (failure) => {
+    const workspaceId = `abort-failure-${failure}`;
+    const soft = failure.startsWith("soft-");
+    const failureKind = failure.replace("soft-", "");
+    const releaseBoundary = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      (signal) =>
+        (async function* () {
+          yield { type: "reasoning-delta", text: "unfinished reasoning" };
+          providerEntered.resolve();
+          if (soft) {
+            await releaseBoundary.promise;
+            yield { type: "text-end" };
+          }
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => resolve(), { once: true })
+            );
+          }
+        })(),
+      { supervised: false }
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await providerEntered.promise;
+    const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+      string,
+      unknown
+    >;
+    const usage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+    streamInfo.cumulativeUsage = usage;
+    const processingPromise = streamInfo.processingPromise as Promise<void>;
+    const abortController = streamInfo.abortController as AbortController;
+    const countTokensSpy = spyOn(tokenizer, "countTokens");
+    const flush = getPrivateMethodForTests<(...args: never[]) => Promise<void>>(
+      streamManager,
+      "flushPartialWrite"
+    );
+    let outcome: TurnCompletion | undefined;
+    const observed = handle.completion.then((value) => {
+      outcome = value;
+    });
+    try {
+      if (failureKind === "tokenization") {
+        countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+      } else if (failureKind === "sink-sync" || failureKind === "sink-async") {
+        streamManager.setEventSink((event) => {
+          events.push(event);
+          if (event.type !== "stream-abort") return;
+          if (failureKind === "sink-sync") throw new Error("synchronous sink failure");
+          return Promise.reject(new Error("asynchronous sink failure"));
+        });
+      } else if (failureKind === "preflush") {
+        Reflect.set(streamManager, "flushPartialWrite", () => {
+          Reflect.set(streamManager, "flushPartialWrite", flush);
+          return Promise.reject(new Error("pre-cancel flush failure"));
+        });
+      } else if (failureKind === "usage") {
+        Reflect.set(streamManager, "recordSessionUsage", () =>
+          Promise.reject(new Error("usage attribution unavailable"))
+        );
+      } else {
+        // A teardown failure after the provider exits rejects the processing join.
+        streamInfo.processingPromise = processingPromise.then(() => {
+          throw new Error("processing teardown failure");
+        });
+      }
+      expect(
+        (await streamManager.stopStream(workspaceId, { abortReason: "user", soft })).success
+      ).toBe(true);
+      if (soft) {
+        releaseBoundary.resolve();
+        await processingPromise;
+        await streamInfo.cancelPromise;
+      }
+      // stop intentionally does not await sink delivery; drain its settlement microtasks.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(outcome).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: {
+          messageId: handle.messageId,
+          metadata: { usage },
+        },
+      });
+      await observed;
+      expect(abortController.signal.aborted).toBe(true);
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+      expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    } finally {
+      countTokensSpy.mockRestore();
+      Reflect.set(streamManager, "flushPartialWrite", flush);
+      abortController.abort();
+      releaseBoundary.resolve();
+      await processingPromise;
+    }
+  });
+
+  test.each(["interrupt", "edit", "raw-listener", "partial-commit"] as const)(
+    "%s finishes and publishes its abort despite cancellation bookkeeping failure",
+    async (scenario) => {
+      const workspaceId = `session-abort-failure-${scenario}`;
+      const providerEntered = Promise.withResolvers<void>();
+      const replacementEntered = Promise.withResolvers<void>();
+      let providerCalls = 0;
+      const { streamManager } = createSupervisedStreamManagerForTests(
+        (signal) =>
+          (async function* () {
+            yield { type: "text-delta", text: "retained partial" };
+            yield { type: "reasoning-delta", text: "unfinished reasoning" };
+            if (++providerCalls === 1) providerEntered.resolve();
+            else replacementEntered.resolve();
+            if (!signal.aborted)
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), { once: true })
+              );
+          })(),
+        { supervised: false }
+      );
+      const service = new AIService(
+        historyConfig,
+        historyService,
+        new InitStateManager(historyConfig),
+        new ProviderService(historyConfig),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        streamManager
+      );
+      let turns = 0;
+      spyOn(service, "streamMessage").mockImplementation(async () =>
+        Ok(await startSupervisedStreamForTests(streamManager, workspaceId, ++turns * 2 - 1))
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config: historyConfig,
+        historyService,
+        aiService: service,
+        streamManager,
+        captureEvents: true,
+      });
+      const countTokensSpy = spyOn(tokenizer, "countTokens");
+      const commitSpy = spyOn(historyService, "commitPartial");
+      const throwFromRawListener = () => {
+        throw new Error("raw abort subscriber failure");
+      };
+      const options = { model: "openai:gpt-4.1-mini", agentId: "exec" };
+      try {
+        await h.session.sendMessage("original", options);
+        await providerEntered.promise;
+        const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+          string,
+          unknown
+        >;
+        streamInfo.cumulativeUsage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+        if (scenario === "raw-listener") service.on("stream-abort", throwFromRawListener);
+        else if (scenario === "partial-commit")
+          commitSpy.mockRejectedValueOnce(new Error("disk unavailable"));
+        else countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const userId = history.data.find((message) => message.role === "user")!.id;
+        const result =
+          scenario === "edit"
+            ? await h.session.sendMessage("edited", { ...options, editMessageId: userId })
+            : await h.session.interruptStream();
+        expect(result.success).toBe(true);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toMatchObject([
+          { abortReason: "user", messageId: `${workspaceId}-msg-1` },
+        ]);
+        if (scenario !== "edit") {
+          expect(h.session.isBusy()).toBe(false);
+          const partial = await historyService.readPartial(workspaceId);
+          if (scenario === "partial-commit") expect(partial).not.toBeNull();
+          else expect(partial).toBeNull();
+          if (scenario !== "partial-commit") {
+            const committed = await historyService.getHistoryFromLatestBoundary(workspaceId);
+            if (!committed.success) throw new Error(committed.error);
+            expect(
+              committed.data.find((message) => message.role === "assistant")?.metadata?.usage
+            ).toMatchObject({ inputTokens: 120, outputTokens: 30 });
+          }
+          expect((await h.session.sendMessage("next", options)).success).toBe(true);
+        }
+        await replacementEntered.promise;
+        expect(providerCalls).toBe(2);
+        expect(h.session.isBusy()).toBe(true);
+      } finally {
+        service.off("stream-abort", throwFromRawListener);
+        countTokensSpy.mockRestore();
+        commitSpy.mockRestore();
+        await h.session.dispose();
+        await streamManager.stopStream(workspaceId, { abortReason: "system" });
+      }
+    }
+  );
+
+  test("a wedged provider (never yields, ignores abort) cannot pin the bounded close", async () => {
+    const workspaceId = "supervised-wedged-workspace";
+    const { streamManager, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        await new Promise<never>(() => undefined);
+        yield { type: "text-delta", text: "never" };
+      })()
+    );
+    await startSupervisedStreamForTests(streamManager, workspaceId);
+    expect(streamManager.isStreaming(workspaceId)).toBe(true);
+
+    // cleanupAbortedStream waits for the loop, which waits on the provider that
+    // never returns; the close must still resolve at the bound, and never reject.
+    const startedAt = Date.now();
+    await closeScopeBounded(engineScope, 100);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  test("a stream started after the engine scope closed is aborted immediately (fail-closed during shutdown)", async () => {
+    const workspaceId = "supervised-late-start-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    await closeScopeBounded(engineScope);
+
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("a cancel landing after the loop finished but before COMPLETED neither resurrects partial.json nor emits a second terminal event", async () => {
+    // The completion path deletes partial.json, then awaits updateHistory, and
+    // only then flips state to COMPLETED. A cancel (user stop or the shutdown
+    // supervisor) landing inside that window previously re-created partial.json
+    // (pre-abort flush + abort bookkeeping) and emitted stream-abort after
+    // stream-end. No engine scope here: this is the stopStream path itself.
+    const workspaceId = "cancel-after-loop-exit-workspace";
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      () =>
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "final answer" };
+          yield { type: "finish", finishReason: "stop" };
+        })(),
+      { supervised: false }
+    );
+    const finalWriteEntered = Promise.withResolvers<void>();
+    const releaseFinalWrite = Promise.withResolvers<void>();
+    const realUpdateHistory = historyService.updateHistory.bind(historyService);
+    const updateHistorySpy = spyOn(historyService, "updateHistory").mockImplementation(
+      async (targetWorkspaceId, message) => {
+        finalWriteEntered.resolve();
+        await releaseFinalWrite.promise;
+        return realUpdateHistory(targetWorkspaceId, message);
+      }
+    );
+    let completionObserved: Promise<void> | undefined;
+    let stopPromise: Promise<unknown> | undefined;
+    try {
+      const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+      let settled = false;
+      completionObserved = handle.completion.then(async () => {
+        settled = true;
+        // Dependent turns read immediately on completion, so final history must already exist.
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data.filter((message) => message.role === "assistant")).toMatchObject([
+          { parts: [{ type: "text", text: "final answer" }] },
+        ]);
+        expect(history.data[0].metadata?.partial).not.toBe(true);
+      });
+
+      await finalWriteEntered.promise;
+      stopPromise = streamManager.stopStream(workspaceId);
+      const beforeCommit = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(beforeCommit.success).toBe(true);
+      if (!beforeCommit.success) throw new Error(beforeCommit.error);
+      expect(beforeCommit.data[0].parts).toEqual([]);
+      expect(settled).toBe(false);
+      expect(terminalEvents(events)).toEqual([]);
+
+      releaseFinalWrite.resolve();
+      expect(await handle.completion).toMatchObject({ status: "completed" });
+      expect(await stopPromise).toEqual(Ok(undefined));
+      await completionObserved;
+
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-end"]);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      const assistantRows = history.data.filter((message) => message.role === "assistant");
+      expect(assistantRows).toHaveLength(1);
+      expect(assistantRows[0].metadata?.partial).not.toBe(true);
+      expect(
+        assistantRows[0].parts.some((part) => part.type === "text" && part.text === "final answer")
+      ).toBe(true);
+      expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    } finally {
+      releaseFinalWrite.resolve();
+      try {
+        await stopPromise;
+        await completionObserved;
+      } finally {
+        updateHistorySpy.mockRestore();
+      }
+    }
+  });
+
+  test("stopStream racing the engine-scope close produces exactly one stream-abort and one settle", async () => {
+    const workspaceId = "supervised-stop-vs-close-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+    let settleCount = 0;
+    void handle.completion.then(() => {
+      settleCount += 1;
+    });
+
+    // Both cancellers enter cancelStreamSafely in the same tick; the latch is
+    // taken synchronously, so the second joins the first's cleanup.
+    const stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
+    const closePromise = closeScopeBounded(engineScope);
+    await Promise.all([stopPromise, closePromise]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const aborts = events.filter(
+      (event): event is StreamAbortEvent => event.type === "stream-abort"
+    );
+    expect(aborts).toHaveLength(1);
+    // First canceller's reason wins (the user pressed stop before shutdown reached the stream).
+    expect(aborts[0].abortReason).toBe("user");
+    expect(terminalEvents(events)).toHaveLength(1);
+    expect(settleCount).toBe(1);
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("closing the engine scope while the turn-envelope write is pending cancels the STARTING stream inside the close", async () => {
+    // startStream registers the stream, then awaits onStreamConstructed (the
+    // durable turn-envelope write) before launching processing. Supervision
+    // starts at registration, so a shutdown landing inside that await cancels
+    // the STARTING stream through the same hard-interrupt path a user stop
+    // takes there — before closeScopeBounded resolves, not after teardown has
+    // moved on and the envelope write finally returns.
+    const workspaceId = "supervised-starting-window-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const messageId = `${workspaceId}-msg`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    let releaseEnvelope!: () => void;
+    const envelopeWritten = new Promise<void>((resolve) => {
+      releaseEnvelope = resolve;
+    });
+    const startPromise = streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        onStreamConstructed: () => envelopeWritten,
+      })
+    );
+    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+    const deadline = Date.now() + 5_000;
+    while (!workspaceStreams.has(workspaceId)) {
+      if (Date.now() > deadline) throw new Error("stream never registered");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await closeScopeBounded(engineScope);
+
+    // Cancelled inside the close: abort delivered, registry cleared, no
+    // stream-start ever emitted for it.
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect((terminalEvents(events)[0] as StreamAbortEvent).abortReason).toBe("system");
+    expect(workspaceStreams.size).toBe(0);
+
+    releaseEnvelope();
+    const result = await startPromise;
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("expected Ok");
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "system",
+    });
+    expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
+    expect(terminalEvents(events)).toHaveLength(1);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
+  test("a provider whose iterator rejects on abort is still recorded as an abort, not a failure", async () => {
+    // Some transports surface a cancellation as an iterator rejection rather
+    // than a clean close. The canceller owns the terminal bookkeeping, so the
+    // loop must not record that rejection as a provider failure — otherwise the
+    // lost-race guard would suppress the stream-abort and the partial commit.
+    const workspaceId = "abort-as-rejection-workspace";
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      (signal) =>
+        (async function* () {
+          yield { type: "text-delta", text: "hello" };
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) return resolve();
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          throw new Error("connection reset after abort");
+        })(),
+      { supervised: false }
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+
+    expect(await streamManager.stopStream(workspaceId, { abortReason: "user" })).toEqual(
+      Ok(undefined)
+    );
+
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("a resource finalizer defect cannot orphan a completed engine handle", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const workspaceId = "completion-finalizer-defect";
+    const { streamManager, events, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        yield { type: "text-delta", text: "completed answer" };
+        entered.resolve();
+        await release.promise;
+        yield { type: "finish", finishReason: "stop" };
+      })()
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await entered.promise;
+    const info = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as {
+      resourceScope: Scope.Closeable;
+    };
+    Effect.runSync(Scope.addFinalizer(info.resourceScope, Effect.die(new Error("cleanup defect"))));
+    release.resolve();
+    expect(await handle.completion).toMatchObject({ status: "completed" });
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-end"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    await closeScopeBounded(engineScope);
+  });
+
+  test("completed streams leave no supervisor residue: closing the scope after 50 completions aborts nothing", async () => {
+    const workspaceId = "supervised-residue-workspace";
+    const { streamManager, events, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        await Promise.resolve();
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", finishReason: "stop" };
+      })()
+    );
+    for (let i = 1; i <= 50; i++) {
+      const handle = await startSupervisedStreamForTests(streamManager, workspaceId, i);
+      expect(await handle.completion).toMatchObject({ status: "completed" });
+    }
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    expect(events.filter((event) => event.type === "stream-end")).toHaveLength(50);
+
+    await closeScopeBounded(engineScope);
+
+    expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+});
+
 describe("StreamManager - stopWhen configuration", () => {
-  type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
+  type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
     toolPolicy?: ToolPolicy;
+    onStepSettled?: TurnExecutionOptions["onStepSettled"];
+    modelString?: string;
+    tools?: Record<string, Tool>;
+    contextBudgetMemoryWritable?: boolean;
   }) => StopWhenCondition[];
 
   function buildStopWhenForTests(streamManager = new StreamManager(historyService)) {
@@ -550,7 +1877,7 @@ describe("StreamManager - stopWhen configuration", () => {
     return { steps: [{ toolResults: [{ toolName, output }] }] };
   }
 
-  test("returns step-cap and queued-message conditions with no policy", () => {
+  test("returns step-cap and queued-message conditions with no policy", async () => {
     let queued = false;
     const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
     expect(stopWhen).toHaveLength(3);
@@ -559,12 +1886,78 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(maxStepCondition({ steps: new Array(99999) })).toBe(false);
     expect(maxStepCondition({ steps: new Array(100000) })).toBe(true);
 
-    expect(queuedMessageCondition({ steps: [] })).toBe(false);
+    expect(await queuedMessageCondition({ steps: [] })).toBe(false);
     queued = true;
-    expect(queuedMessageCondition({ steps: [] })).toBe(true);
+    expect(await queuedMessageCondition({ steps: [] })).toBe(true);
     expect(requiredToolCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       false
     );
+  });
+
+  test.each(["warn", "rollover"] as const)(
+    "budget %s stops with only turn-end input queued and evaluates settled fallback usage",
+    async (decision) => {
+      const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
+        Promise.resolve(decision)
+      );
+      const sessionHistory = tool({ inputSchema: z.object({}) });
+      const [, stop] = buildStopWhenForTests()({
+        // The ordinary queue condition must be false; the budget decision itself stops the SDK.
+        hasQueuedMessages: (mode) => mode === "turn-end",
+        onStepSettled,
+        modelString: "anthropic:claude-sonnet-4-5",
+        tools: { session_history: sessionHistory },
+        contextBudgetMemoryWritable: true,
+      });
+      const providerMetadata = { anthropic: { cacheCreationInputTokens: 20 } };
+      expect(
+        await stop({
+          steps: [
+            {
+              usage: {
+                inputTokens: 90,
+                outputTokens: 10,
+                totalTokens: 100,
+                inputTokenDetails: { cacheReadTokens: 40 },
+                outputTokenDetails: { reasoningTokens: 3 },
+              },
+              providerMetadata,
+              toolResults: [
+                { toolName: "bash", output: "first sibling" },
+                { toolName: "file_read", output: "x".repeat(40_000) },
+              ],
+            },
+          ],
+        })
+      ).toBe(true);
+      expect(onStepSettled).toHaveBeenCalledTimes(1);
+      const settled = onStepSettled.mock.calls[0][0];
+      expect(settled).toMatchObject({
+        model: "anthropic:claude-sonnet-4-5",
+        usage: { inputTokens: 90, outputTokens: 10, cachedInputTokens: 40, reasoningTokens: 3 },
+        providerMetadata,
+        sessionHistoryAvailable: true,
+        memoryWritable: true,
+      });
+      expect(settled.toolResultChars).toBeGreaterThan(40_000);
+    }
+  );
+
+  test("successful required completion wins over rollover while a failed tool still evaluates budget", async () => {
+    const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
+      Promise.resolve("rollover")
+    );
+    const [, stop, required] = buildStopWhenForTests()({
+      onStepSettled,
+      modelString: TEST_STREAM_MODEL_ID,
+      toolPolicy: [{ regex_match: "agent_report", action: "require" }],
+    });
+    const success = stepsWithToolResult("agent_report", { success: true });
+    expect(await stop(success)).toBe(false);
+    expect(await required(success)).toBe(true);
+    expect(onStepSettled).not.toHaveBeenCalled();
+    expect(await stop(stepsWithToolResult("agent_report", { success: false }))).toBe(true);
+    expect(onStepSettled).toHaveBeenCalledTimes(1);
   });
 
   const requiredToolCases: Array<{
@@ -652,189 +2045,324 @@ describe("StreamManager - stopWhen configuration", () => {
     });
   }
 });
-describe("StreamManager - Anthropic cache TTL overrides", () => {
-  interface StreamRequestConfigForTests {
-    messages: ModelMessage[];
-    system?: string;
-    tools?: Record<string, Tool>;
-    providerOptions?: Record<string, unknown>;
-  }
-
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
-
-  test("applies anthropicCacheTtlOverride to manual cache markers without top-level cacheControl", () => {
-    const streamManager = new StreamManager(historyService);
-    const buildRequestConfig = Reflect.get(streamManager, "buildStreamRequestConfig") as
-      | BuildStreamRequestConfig
-      | undefined;
-
-    expect(typeof buildRequestConfig).toBe("function");
-    if (!buildRequestConfig) {
-      throw new Error("Expected StreamManager.buildStreamRequestConfig to exist");
-    }
-
-    const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
-    const modelString = KNOWN_MODELS.SONNET.id;
-    const providerOptions = {
-      anthropic: {
-        disableParallelToolUse: false,
-        sendReasoning: true,
+describe("StreamManager - refusal usage attribution", () => {
+  test("terminal refusal records the raw Coder identity, not the name-canonical form", async () => {
+    // Cross-typed instance {name: "openai", type: "anthropic"}: the refusal
+    // path must hand the RAW coder string to usage recording so
+    // normalizeUsageModelKey can resolve the instance type — the canonical
+    // openai:<claude> form would attribute Anthropic tokens to OpenAI.
+    const rawModel = "coder:openai/claude-opus-4-5";
+    const providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "openai", type: "anthropic" }],
       },
     };
-    const messages = applyCacheControl([{ role: "user", content: "hello" }], modelString, "1h");
-    const tools = {
-      readFile: tool({
-        description: "Read a file",
-        inputSchema: z.object({ path: z.string() }),
-        execute: () => Promise.resolve({ ok: true }),
-      }),
-      bash: tool({
-        description: "Run a command",
-        inputSchema: z.object({ command: z.string() }),
-        execute: () => Promise.resolve({ ok: true }),
-      }),
-    };
+    const recordedKeys: string[] = [];
+    const sessionUsageService = {
+      recordUsage: (_workspaceId: string, model: string) => {
+        recordedKeys.push(model);
+        return Promise.resolve();
+      },
+    } as unknown as SessionUsageService;
 
-    const request = buildRequestConfig(
-      model,
-      modelString,
-      messages,
-      "You are a helpful assistant",
-      undefined, // routeProvider
-      tools,
-      providerOptions,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      "1h"
+    const streamManager = new StreamManager(
+      historyService,
+      sessionUsageService,
+      () => providersConfig
     );
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
 
-    expect(request.system).toBeUndefined();
-    expect(request.providerOptions).toEqual(providerOptions);
-    expect(request.messages).toHaveLength(2);
-    expect(request.messages[0]).toEqual({
-      role: "system",
-      content: "You are a helpful assistant",
-      providerOptions: {
-        anthropic: {
-          cacheControl: {
-            type: "ephemeral",
-            ttl: "1h",
-          },
-        },
+    const streamInfo = {
+      model: rawModel,
+      metadataModel: "anthropic:claude-opus-4-5",
+      cumulativeUsage: { inputTokens: 1200, outputTokens: 30, totalTokens: 1230 },
+      cumulativeProviderMetadata: undefined,
+      initialMetadata: undefined,
+      stepStartIndices: [0],
+      parts: [],
+      toolModelUsages: [],
+      // No fallback chain: the terminal-refusal recording path runs.
+      modelFallback: undefined,
+    };
+
+    const outcome = await tryFallback.call(streamManager, "ws-refusal-raw", streamInfo, "refusal");
+    expect(outcome.kind).toBe("terminal");
+    // The ledger key resolved through instance metadata (type anthropic).
+    expect(recordedKeys).toEqual(["anthropic:claude-opus-4-5"]);
+  });
+
+  test("zero-usage refused attempt still records a zero-usage hop entry without touching the session ledger", async () => {
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
+
+    const toolModelUsages: Array<{ toolName: string; model: string; usage: unknown }> = [];
+    const streamInfo = {
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      // No billed usage anywhere: neither live-tracked nor via streamResult.
+      cumulativeUsage: undefined,
+      cumulativeProviderMetadata: undefined,
+      streamResult: { usage: Promise.resolve(undefined), finalStep: Promise.resolve(undefined) },
+      startTime: Date.now(),
+      initialMetadata: undefined,
+      stepStartIndices: [0],
+      parts: [],
+      toolModelUsages,
+      abortController: { signal: { aborted: false } },
+      softInterrupt: { pending: false },
+      // Empty chain: the hop is recorded, then the chain exhausts terminally.
+      modelFallback: {
+        options: { chain: [], prepare: mock(() => Promise.reject(new Error("unused"))) },
+        requestedModel: KNOWN_MODELS.SONNET.id,
+        refusedModels: [],
+        original: { maxOutputTokens: undefined },
       },
-    });
-    expect(request.messages[1]).toEqual(messages[0]);
+    };
 
-    const toolKeys = Object.keys(tools);
-    const firstToolKey = toolKeys[0];
-    const lastToolKey = toolKeys[toolKeys.length - 1];
-    expect(
-      (
-        request.tools?.[firstToolKey] as {
-          providerOptions?: {
-            anthropic?: {
-              cacheControl?: unknown;
-            };
-          };
-        }
-      ).providerOptions?.anthropic?.cacheControl
-    ).toBeUndefined();
-    expect(
-      (
-        request.tools?.[lastToolKey] as {
-          providerOptions?: {
-            anthropic?: {
-              cacheControl?: {
-                type?: string;
-                ttl?: string;
-              };
-            };
-          };
-        }
-      ).providerOptions?.anthropic?.cacheControl
-    ).toEqual({
-      type: "ephemeral",
-      ttl: "1h",
+    const outcome = await tryFallback.call(
+      streamManager,
+      "ws-zero-usage-hop",
+      streamInfo,
+      "refusal"
+    );
+    expect(outcome.kind).toBe("terminal");
+
+    // The refused attempt is durably recorded with explicit zero usage so
+    // analytics counts it, while the session cost ledger stays untouched.
+    expect(toolModelUsages).toHaveLength(1);
+    expect(toolModelUsages[0]).toMatchObject({
+      toolName: "model_fallback_refusal",
+      model: KNOWN_MODELS.SONNET.id,
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
     });
+    expect(recordUsage).not.toHaveBeenCalled();
+  });
+
+  test("refused attempt entries persist the attribution key, not the raw gateway identity", async () => {
+    // Sidecar refused_stream rows are keyed by recordHeadlessUsageLocked's
+    // canonical model; a raw mux-gateway identity on committed hop rows would
+    // split one model across two analytics buckets in the refusal queries.
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
+
+    const toolModelUsages: Array<{ toolName: string; model: string }> = [];
+    const streamInfo = {
+      model: "mux-gateway:anthropic/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      cumulativeUsage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      cumulativeProviderMetadata: { anthropic: {} },
+      startTime: Date.now(),
+      initialMetadata: undefined,
+      stepStartIndices: [0],
+      parts: [],
+      toolModelUsages,
+      abortController: { signal: { aborted: false } },
+      softInterrupt: { pending: false },
+      modelFallback: {
+        options: { chain: [], prepare: mock(() => Promise.reject(new Error("unused"))) },
+        requestedModel: "mux-gateway:anthropic/claude-opus-4-5",
+        refusedModels: [],
+        original: { maxOutputTokens: undefined },
+      },
+    };
+
+    const outcome = await tryFallback.call(streamManager, "ws-gateway-hop", streamInfo, "refusal");
+    expect(outcome.kind).toBe("terminal");
+    expect(toolModelUsages).toHaveLength(1);
+    expect(toolModelUsages[0]).toMatchObject({
+      toolName: "model_fallback_refusal",
+      model: "anthropic:claude-opus-4-5",
+    });
+  });
+
+  test("sidecar flatten labels refusal hops refused_stream and keeps the drop reason for other usage", async () => {
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _model: string,
+        _usage: unknown,
+        _providerMetadata: unknown,
+        _options: unknown
+      ) => Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordHeadlessUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const recordDropped = Reflect.get(streamManager, "recordDroppedPartialUsageInSidecar") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      usage: Record<string, number> | undefined,
+      providerMetadata: Record<string, unknown> | undefined,
+      analyticsSource: string,
+      streamUsageSource?: string
+    ) => Promise<void>;
+    expect(typeof recordDropped).toBe("function");
+
+    const streamInfo = {
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      toolModelUsages: [
+        {
+          toolName: "model_fallback_refusal",
+          timestamp: 1,
+          model: KNOWN_MODELS.SONNET.id,
+          metadataModel: KNOWN_MODELS.SONNET.id,
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        },
+        {
+          toolName: "task",
+          timestamp: 2,
+          model: KNOWN_MODELS.GPT.id,
+          metadataModel: KNOWN_MODELS.GPT.id,
+          usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 },
+        },
+      ],
+    };
+    const sourcesOf = () =>
+      recordHeadlessUsage.mock.calls.map(
+        (call) => (call[4] as { analyticsSource?: string }).analyticsSource
+      );
+
+    // Aborted turn with a prior refusal hop: the stream's own usage row keeps
+    // the abort label (default streamUsageSource), the hop is still a refusal,
+    // and unrelated tool usage keeps the drop reason.
+    await recordDropped.call(
+      streamManager,
+      "ws-flatten-aborted",
+      streamInfo,
+      { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      undefined,
+      "aborted_stream"
+    );
+    expect(sourcesOf()).toEqual(["aborted_stream", "refused_stream", "aborted_stream"]);
+
+    // Terminal-refusal error turn: the stream's own usage row is explicitly
+    // labeled refused_stream while non-refusal tool usage stays errored_stream.
+    recordHeadlessUsage.mockClear();
+    await recordDropped.call(
+      streamManager,
+      "ws-flatten-refused",
+      streamInfo,
+      { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      undefined,
+      "errored_stream",
+      "refused_stream"
+    );
+    expect(sourcesOf()).toEqual(["refused_stream", "refused_stream", "errored_stream"]);
+  });
+
+  test("ledger key uses the stream's pinned metadata identity when instance metadata is gone", async () => {
+    // A catalog refresh can remove/retag the instance while the turn is
+    // active: the LIVE config no longer resolves coder:prod/<claude>, so a
+    // live re-resolution would key the ledger under the raw string while
+    // createDisplayUsage priced with the pinned metadataModel — repricing
+    // would then strip the row. The stream's record-time metadataModel must
+    // key the ledger instead.
+    const rawModel = "coder:prod/claude-opus-4-5";
+    const recordedKeys: string[] = [];
+    const sessionUsageService = {
+      recordUsage: (_workspaceId: string, model: string) => {
+        recordedKeys.push(model);
+        return Promise.resolve();
+      },
+    } as unknown as SessionUsageService;
+
+    // Live config has NO metadata for the instance (removed mid-turn).
+    const streamManager = new StreamManager(historyService, sessionUsageService, () => ({}));
+    const recordSessionUsage = Reflect.get(streamManager, "recordSessionUsage") as (
+      workspaceId: string,
+      model: string,
+      usage: Record<string, number>,
+      providerMetadata: undefined,
+      logMessage: string,
+      logLevel: "warn" | "error",
+      streamInfo?: Record<string, unknown>
+    ) => Promise<void>;
+    expect(typeof recordSessionUsage).toBe("function");
+
+    await recordSessionUsage.call(
+      streamManager,
+      "ws-pinned-metadata",
+      rawModel,
+      { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+      undefined,
+      "test",
+      "warn",
+      { metadataModel: "anthropic:claude-opus-4-5" }
+    );
+    expect(recordedKeys).toEqual(["anthropic:claude-opus-4-5"]);
+  });
+
+  test("message metadata preserves the raw Coder identity", () => {
+    // WorkspaceStore live deltas and SessionUsageService history rebuilds
+    // re-key usage from metadata.model via normalizeUsageModelKey, which
+    // needs the raw identity to resolve the instance type — the canonical
+    // openai:<claude> form would accumulate under a second, wrongly priced
+    // key that diverges from the backend's ledger.
+    const streamManager = new StreamManager(historyService);
+    const buildPartial = Reflect.get(streamManager, "buildPartialAssistantMessage") as (
+      streamInfo: Record<string, unknown>,
+      options?: Record<string, unknown>
+    ) => MuxMessage;
+    expect(typeof buildPartial).toBe("function");
+
+    const message = buildPartial.call(streamManager, {
+      messageId: "msg-raw-coder",
+      historySequence: 3,
+      startTime: Date.now(),
+      model: "coder:openai/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      initialMetadata: undefined,
+      stepStartIndices: [0],
+      parts: [],
+      toolModelUsages: [],
+    });
+    expect(message.metadata?.model).toBe("coder:openai/claude-opus-4-5");
+    // Non-Coder gateway strings still canonicalize for display.
+    const canonicalMessage = buildPartial.call(streamManager, {
+      messageId: "msg-canonical",
+      historySequence: 4,
+      startTime: Date.now(),
+      model: "mux-gateway:anthropic/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      initialMetadata: undefined,
+      stepStartIndices: [0],
+      parts: [],
+      toolModelUsages: [],
+    });
+    expect(canonicalMessage.metadata?.model).toBe("anthropic:claude-opus-4-5");
   });
 });
 
-describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
-  interface StreamRequestConfigForTests {
-    messages: ModelMessage[];
-    system?: string | { role: string; content: string; providerOptions?: unknown };
-  }
-
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
-
+describe("StreamManager - fallback construction callbacks", () => {
   const eligibleProvidersConfig: ProvidersConfigMap = {
     openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
   };
-
-  const structuredSystem = {
-    role: "system",
-    content: "You are a helpful assistant",
-    providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } },
-  };
-
-  function buildRequestForRoute(
-    providersConfig: ProvidersConfigMap | null,
-    routeProvider: string | undefined,
-    modelString = "openai:gpt-5.6-luna"
-  ): StreamRequestConfigForTests {
-    const streamManager = new StreamManager(historyService, undefined, () => providersConfig);
-    const buildRequestConfig = getPrivateMethodForTests<BuildStreamRequestConfig>(
-      streamManager,
-      "buildStreamRequestConfig"
-    );
-    // .call: the transform reads this.getProvidersConfig for route eligibility.
-    return buildRequestConfig.call(
-      streamManager,
-      createTestLanguageModel(),
-      modelString,
-      [{ role: "user", content: "hello" }],
-      "You are a helpful assistant",
-      routeProvider
-    );
-  }
-
-  test("direct GPT-5.6 replaces the system string with a structured cached message", () => {
-    const request = buildRequestForRoute(eligibleProvidersConfig, "openai");
-
-    expect(request.system).toEqual(structuredSystem);
-    // Unlike the Anthropic transform, messages stay untouched (no prepend).
-    expect(request.messages).toEqual([{ role: "user", content: "hello" }]);
-  });
-
-  test("ineligible routes and endpoints preserve the original system string", () => {
-    // Missing route metadata (legacy/test-stub) fails closed.
-    expect(buildRequestForRoute(eligibleProvidersConfig, undefined).system).toBe(
-      "You are a helpful assistant"
-    );
-    // Gateway routes fail closed.
-    expect(buildRequestForRoute(eligibleProvidersConfig, "mux-gateway").system).toBe(
-      "You are a helpful assistant"
-    );
-    // Custom base URLs fail closed.
-    expect(
-      buildRequestForRoute(
-        {
-          openai: {
-            ...eligibleProvidersConfig.openai,
-            baseUrl: "https://proxy.example.com/v1",
-          },
-        },
-        "openai"
-      ).system
-    ).toBe("You are a helpful assistant");
-    // Non-GPT-5.6 models keep the plain string.
-    expect(buildRequestForRoute(eligibleProvidersConfig, "openai", "openai:gpt-5.2").system).toBe(
-      "You are a helpful assistant"
-    );
-  });
 
   // The fallback swap must evaluate the fallback's freshly-resolved route
   // (initialMetadataPatch.routeProvider), not the stale source metadata that
@@ -843,13 +2371,14 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     workspaceId: string;
     staleRouteProvider: string;
     initialMetadataPatch?: Record<string, unknown>;
+    onStreamConstructed?: () => Promise<void>;
+    failStreamConstruction?: boolean;
   }): Promise<Record<string, unknown>> {
     const streamManager = new StreamManager(
       historyService,
       undefined,
       () => eligibleProvidersConfig
     );
-    streamManager.on("error", () => undefined);
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
       countTokens: () => Promise.resolve(0),
@@ -860,15 +2389,18 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     await appendPartialAssistantForTests(options.workspaceId, messageId, historySequence);
     const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
 
-    const createStreamResult = mock(() =>
-      createStreamResultForTests(
+    const createStreamResult = mock(() => {
+      if (options.failStreamConstruction) {
+        throw new Error("stream construction failed for tests");
+      }
+      return createStreamResultForTests(
         (async function* () {
           await Promise.resolve();
           yield { type: "text-delta", text: "fallback answer" };
           yield { type: "finish", finishReason: "stop" };
         })()
-      )
-    );
+      );
+    });
     expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
 
     const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
@@ -882,6 +2414,9 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
           thinkingLevel: "off",
           ...(options.initialMetadataPatch
             ? { initialMetadataPatch: options.initialMetadataPatch }
+            : {}),
+          ...(options.onStreamConstructed
+            ? { onStreamConstructed: options.onStreamConstructed }
             : {}),
         })
       )
@@ -922,26 +2457,26 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     return streamInfo.request as Record<string, unknown>;
   }
 
-  test("fallback swap applies the cached system when the route patch resolves to direct OpenAI", async () => {
-    const request = await runRefusalFallbackForTests({
-      workspaceId: "gpt56-fallback-eligible-workspace",
-      staleRouteProvider: "mux-gateway",
-      initialMetadataPatch: { routedThroughGateway: false, routeProvider: "openai" },
-    });
-
-    expect(request.system).toEqual(structuredSystem);
-  });
-
-  test("fallback swap keeps the plain system string when the route patch omits the route", async () => {
-    // Stale source metadata says direct OpenAI, but the fallback prepare could
-    // not resolve a route — the transform must fail closed on the patch.
-    const request = await runRefusalFallbackForTests({
-      workspaceId: "gpt56-fallback-ineligible-workspace",
+  test("onStreamConstructed fires after successful construction, never on failure", async () => {
+    // Durable side effects hung on this callback (the superseding fallback
+    // turn envelope) must describe a stream that exists: called exactly once
+    // on success, not at all when createStreamResult throws.
+    const onSuccess = mock(() => Promise.resolve());
+    await runRefusalFallbackForTests({
+      workspaceId: "fallback-envelope-success-workspace",
       staleRouteProvider: "openai",
-      initialMetadataPatch: { routedThroughGateway: false },
+      onStreamConstructed: onSuccess,
     });
+    expect(onSuccess).toHaveBeenCalledTimes(1);
 
-    expect(request.system).toBe("You are a helpful assistant");
+    const onFailure = mock(() => Promise.resolve());
+    await runRefusalFallbackForTests({
+      workspaceId: "fallback-envelope-failure-workspace",
+      staleRouteProvider: "openai",
+      onStreamConstructed: onFailure,
+      failStreamConstruction: true,
+    });
+    expect(onFailure).not.toHaveBeenCalled();
   });
 });
 
@@ -966,7 +2501,7 @@ describe("StreamManager - sequential tool execution", () => {
     toolChoice?: { type: "tool"; toolName: string };
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1006,7 +2541,9 @@ describe("StreamManager - sequential tool execution", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1062,22 +2599,14 @@ describe("StreamManager - sequential tool execution", () => {
       steps: Promise.resolve([]),
     } as unknown as ReturnType<typeof aiSdk.streamText>);
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
-      [{ role: "user", content: "hello" }],
-      "system",
-      undefined, // routeProvider
+      modelString: KNOWN_MODELS.SONNET.id,
+      messages: [{ role: "user", content: "hello" }],
+      system: "system",
       tools,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      () => false,
-      undefined,
-      undefined
-    );
+      hasQueuedMessages: () => false,
+    });
     createStreamResult(request, new AbortController());
 
     expect(streamTextSpy).toHaveBeenCalledTimes(1);
@@ -1124,7 +2653,7 @@ describe("StreamManager - call settings overrides", () => {
     onChunk?: NonNullable<Parameters<typeof aiSdk.streamText>[0]["onChunk"]>;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1153,7 +2682,9 @@ describe("StreamManager - call settings overrides", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1170,21 +2701,14 @@ describe("StreamManager - call settings overrides", () => {
       };
     }
   ): StreamRequestConfigForTests {
-    return buildRequestConfig(
+    return buildRequestConfig({
       model,
       modelString,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      options.maxOutputTokens,
-      options.callSettingsOverrides,
-      undefined,
-      undefined,
-      undefined,
-      undefined
-    );
+      system: "system",
+      maxOutputTokens: options.maxOutputTokens,
+      callSettingsOverrides: options.callSettingsOverrides,
+    });
   }
 
   function setupStreamTextSpy() {
@@ -1272,23 +2796,7 @@ describe("StreamManager - call settings overrides", () => {
     const streamTextSpy = setupStreamTextSpy();
     const onChunk = mock(() => undefined);
 
-    const request = buildRequestConfig(
-      model,
-      modelString,
-      messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      onChunk,
-      undefined
-    );
+    const request = buildRequestConfig({ model, modelString, messages, system: "system", onChunk });
 
     createStreamResult(request, new AbortController());
 
@@ -1333,7 +2841,6 @@ describe("StreamManager - language model cleanup", () => {
     streamInfoOverrides?: Record<string, unknown>;
   }): Promise<void> {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("error", () => undefined);
     const historySequence = 1;
 
     await appendPartialAssistantForTests(params.workspaceId, params.messageId, historySequence);
@@ -1470,18 +2977,139 @@ describe("StreamManager - language model cleanup", () => {
     abortController.abort(new Error("pre-abort"));
 
     const result = await streamManager.startStream(
-      "cleanup-preabort-workspace",
-      [{ role: "user", content: "hello" }],
-      model,
-      "openai:gpt-4.1-mini",
-      1,
-      "system",
-      runtime,
-      "cleanup-preabort-message",
-      abortController.signal
+      testStartOptions({
+        workspaceId: "cleanup-preabort-workspace",
+        messageId: "cleanup-preabort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
     );
 
     expect(result.success).toBe(true);
+    expect(getCleanupCalls()).toBe(1);
+  });
+
+  test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
+    const streamManager = new StreamManager(historyService);
+    const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
+    const startEvents: unknown[] = [];
+    onTurnEngineEvent(streamManager, "stream-start", (event) => startEvents.push(event));
+
+    const workspaceId = "constructed-abort-workspace";
+    const replacementSentinel = { replacement: true };
+    const onStreamConstructed = async (): Promise<void> => {
+      // Hard interrupt racing the awaited envelope write: stopStream aborts
+      // the registered STARTING stream, awaits its placeholder
+      // processingPromise, and deletes the registration…
+      await streamManager.stopStream(workspaceId);
+      // …after which a replacement stream can occupy the workspace slot.
+      const streams = Reflect.get(streamManager, "workspaceStreams") as Map<string, unknown>;
+      streams.set(workspaceId, replacementSentinel);
+    };
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-abort-message",
+        model,
+        onStreamConstructed,
+      })
+    );
+
+    expect(result.success).toBe(true);
+    // The canceled stream must never start processing: stream-start after the
+    // abort would leave the UI stuck streaming with no abort/end to follow.
+    expect(startEvents).toHaveLength(0);
+    // The replacement registration survives (the canceled stream's cleanup
+    // must not delete another stream's slot).
+    const streams = Reflect.get(streamManager, "workspaceStreams") as Map<string, unknown>;
+    expect(streams.get(workspaceId)).toBe(replacementSentinel);
+    // The never-processed stream's model still gets cleaned up.
+    expect(getCleanupCalls()).toBe(1);
+  });
+
+  test("returning the startup envelope cannot bypass a held abort fence or emit a second startup abort", async () => {
+    const workspaceId = "envelope-abort-fence";
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      events.push(event);
+    });
+    const envelopeEntered = Promise.withResolvers<void>();
+    const envelopeRelease = Promise.withResolvers<void>();
+    const commitEntered = Promise.withResolvers<void>();
+    const commitRelease = Promise.withResolvers<void>();
+    const originalCommit = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementationOnce(async (...args) => {
+      commitEntered.resolve();
+      await commitRelease.promise;
+      return originalCommit(...args);
+    });
+    const pending = streamManager.beginStreamStart({ workspaceId });
+    const started = streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-fence",
+        model: createTestLanguageModel(),
+        abortSignal: pending.abortSignal,
+        onStreamConstructed: async () => {
+          envelopeEntered.resolve();
+          await envelopeRelease.promise;
+        },
+      })
+    );
+    await envelopeEntered.promise;
+    const stop = streamManager.stopStream(workspaceId, { abortReason: "user" });
+    await commitEntered.promise;
+    const secondStop = streamManager.stopStream(workspaceId, { abortReason: "system" });
+    let returned = false;
+    const observedStart = started.then(() => {
+      returned = true;
+    });
+    try {
+      envelopeRelease.resolve();
+      await envelopeRelease.promise;
+      await Promise.resolve();
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe("constructed-fence");
+      expect(returned).toBe(false);
+      commitRelease.resolve();
+      await Promise.all([stop, secondStop]);
+      const result = await started;
+      await observedStart;
+      if (!result.success) throw new Error("Expected aborted handle");
+      expect(await result.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+      });
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+    } finally {
+      envelopeRelease.resolve();
+      commitRelease.resolve();
+      pending.finish();
+      await Promise.all([started, stop, secondStop]);
+    }
+  });
+
+  test("throwing startup envelope cleanup preserves a replacement registration", async () => {
+    const workspaceId = "throwing-envelope-replacement";
+    const streamManager = new StreamManager(historyService);
+    const streams = getWorkspaceStreamsForTests(streamManager);
+    const replacement = createStreamInfoForTests({ messageId: "replacement" });
+    const { model, getCleanupCalls } = createCleanupModel("throwing-envelope");
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "old",
+        model,
+        onStreamConstructed: async () => {
+          await streamManager.stopStream(workspaceId);
+          streams.set(workspaceId, replacement);
+          throw new Error("envelope failure");
+        },
+      })
+    );
+    expect(result.success).toBe(false);
+    expect(streams.get(workspaceId)).toBe(replacement);
     expect(getCleanupCalls()).toBe(1);
   });
 
@@ -1494,20 +3122,320 @@ describe("StreamManager - language model cleanup", () => {
     expect(replaceCreateStreamResult).toBe(true);
 
     const result = await streamManager.startStream(
-      "cleanup-create-throw-workspace",
-      [{ role: "user", content: "hello" }],
-      model,
-      "openai:gpt-4.1-mini",
-      1,
-      "system",
-      runtime,
-      "cleanup-create-throw-message"
+      testStartOptions({
+        workspaceId: "cleanup-create-throw-workspace",
+        messageId: "cleanup-create-throw-message",
+        model,
+      })
     );
 
     expect(result.success).toBe(false);
     expect(getCleanupCalls()).toBe(1);
   });
 });
+
+describe("StreamManager - turn completion", () => {
+  function stubTokenTracker(streamManager: StreamManager): void {
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(),
+      countTokens: () => Promise.resolve(0),
+    });
+  }
+
+  /** Stream body that stays open until its turn abort controller fires. */
+  const hangUntilAbort = (_request: unknown, abortController: AbortController) =>
+    createStreamResultForTests(
+      (async function* () {
+        await new Promise<void>((resolve) => {
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        yield* [];
+      })()
+    );
+
+  async function startWithStreamResult(input: {
+    workspaceId: string;
+    messageId: string;
+    fullStream?: AsyncGenerator<unknown, void, unknown>;
+    createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
+    sink?: (event: TurnEngineEvent) => void | Promise<void>;
+    events?: TurnEngineEvent[];
+    systemMessageTokens?: number;
+  }) {
+    const streamManager = new StreamManager(
+      historyService,
+      undefined,
+      undefined,
+      input.sink ??
+        ((event) => {
+          input.events?.push(event);
+        })
+    );
+    stubTokenTracker(streamManager);
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      input.createStreamResult ?? (() => createStreamResultForTests(input.fullStream!))
+    );
+    await appendPartialAssistantForTests(input.workspaceId, input.messageId, 1);
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: input.workspaceId,
+        messageId: input.messageId,
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+        initialMetadata: { systemMessageTokens: input.systemMessageTokens },
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected stream to start");
+    return { streamManager, handle: result.data };
+  }
+
+  test("replacement and concurrent stops join the captured attempt's held commit", async () => {
+    const workspaceId = "held-commit-replacement";
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const terminals: TurnEngineEvent[] = [];
+    const originalCommit = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return originalCommit(...args);
+    });
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId,
+      messageId: "attempt-a",
+      events: terminals,
+      createStreamResult: (_request, controller) =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "durable interrupted answer" };
+            providerEntered.resolve();
+            if (!controller.signal.aborted)
+              await new Promise<void>((resolve) =>
+                controller.signal.addEventListener("abort", () => resolve(), { once: true })
+              );
+          })()
+        ),
+    });
+    await providerEntered.promise;
+    let stopped = false;
+    let replaced = false;
+    const userStop = streamManager.stopStream(workspaceId, { abortReason: "user" }).then(() => {
+      stopped = true;
+    });
+    await entered.promise;
+    const systemStop = streamManager.stopStream(workspaceId, {
+      abortReason: "system",
+      abandonPartial: true,
+    });
+    const replacement = streamManager
+      .startStream(
+        testStartOptions({
+          workspaceId,
+          messageId: "attempt-b",
+          historySequence: 2,
+          model: createTestLanguageModel(),
+          providedRuntimeTempDir: "",
+          onStreamConstructed: () => appendPartialAssistantForTests(workspaceId, "attempt-b", 2),
+        })
+      )
+      .then((result) => {
+        replaced = true;
+        return result;
+      });
+    try {
+      expect(stopped).toBe(false);
+      expect(replaced).toBe(false);
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe("attempt-a");
+      expect(terminals.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+      release.resolve();
+      await Promise.all([userStop, systemStop]);
+      expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
+      const next = await replacement;
+      expect(next.success).toBe(true);
+      expect(streamManager.getStreamInfo(workspaceId)?.messageId).toBe("attempt-b");
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.find((message) => message.id === "attempt-a")?.parts).toMatchObject([
+        { type: "text", text: "durable interrupted answer" },
+      ]);
+      expect(
+        terminals.filter(
+          (event) => event.type === "stream-abort" && event.messageId === "attempt-a"
+        )
+      ).toHaveLength(1);
+    } finally {
+      release.resolve();
+      await replacement;
+      await streamManager.stopStream(workspaceId, { abandonPartial: true });
+    }
+  });
+
+  test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
+    const streamManager = new StreamManager(historyService);
+    const model = createTestLanguageModel();
+    const failed = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-failure",
+        messageId: "prestart-failure-message",
+        model,
+        messages: [],
+      })
+    );
+    expect(failed.success).toBe(false);
+
+    const abortController = new AbortController();
+    abortController.abort();
+    const aborted = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-abort",
+        messageId: "prestart-abort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
+    );
+    expect(aborted.success).toBe(true);
+    if (!aborted.success) throw new Error("Expected aborted startup handle");
+    expect(await aborted.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
+  });
+
+  test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
+    const completedEvents: TurnEngineEvent[] = [];
+    const completed = await startWithStreamResult({
+      workspaceId: "completion-success-workspace",
+      messageId: "completion-success-message",
+      events: completedEvents,
+      fullStream: (async function* () {
+        await Promise.resolve();
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", finishReason: "stop" };
+      })(),
+    });
+    let completedSettlements = 0;
+    void completed.handle.completion.then(() => {
+      completedSettlements += 1;
+    });
+    expect(await completed.handle.completion).toMatchObject({ status: "completed" });
+    await Promise.resolve();
+    expect(completedEvents.at(-1)?.type).toBe("stream-end");
+    expect(completedSettlements).toBe(1);
+
+    const failedEvents: TurnEngineEvent[] = [];
+    const failed = await startWithStreamResult({
+      workspaceId: "completion-failure-workspace",
+      messageId: "completion-failure-message",
+      events: failedEvents,
+      fullStream: (async function* () {
+        await Promise.resolve();
+        throw new Error("provider failed");
+        yield* [];
+      })(),
+    });
+    let failedSettlements = 0;
+    void failed.handle.completion.then(() => {
+      failedSettlements += 1;
+    });
+    const failedCompletion = await failed.handle.completion;
+    expect(failedCompletion.status).toBe("failed");
+    expect(failedEvents.at(-1)?.type).toBe("error");
+    await failed.streamManager.stopStream("completion-failure-workspace");
+    await Promise.resolve();
+    expect(failedSettlements).toBe(1);
+
+    // Debug-injected failures reach the same terminal settlement path.
+    const debug = await startWithStreamResult({
+      workspaceId: "completion-debug-error-workspace",
+      messageId: "completion-debug-error-message",
+      createStreamResult: hangUntilAbort,
+    });
+    expect(
+      await debug.streamManager.debugTriggerStreamError(
+        "completion-debug-error-workspace",
+        "debug injected failure"
+      )
+    ).toBe(true);
+    expect(await debug.handle.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "debug injected failure" },
+    });
+  });
+
+  test("hard stop and completion wait for raw delivery after attempt persistence", async () => {
+    const workspaceId = "completion-abort-workspace";
+    const providerBlocked = Promise.withResolvers<void>();
+    const abortDeliveryEntered = Promise.withResolvers<void>();
+    const releaseAbortDelivery = Promise.withResolvers<void>();
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId,
+      messageId: "completion-abort-message",
+      systemMessageTokens: 733,
+      createStreamResult: (_request, controller) =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "interrupted answer" };
+            providerBlocked.resolve();
+            await new Promise<void>((resolve) => {
+              if (controller.signal.aborted) return resolve();
+              controller.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          })()
+        ),
+      sink: async (event) => {
+        if (event.type !== "stream-abort") return;
+        abortDeliveryEntered.resolve();
+        await releaseAbortDelivery.promise;
+        expect(await historyService.readPartial(workspaceId)).toBeNull();
+      },
+    });
+
+    let settled = false;
+    const completionObserved = handle.completion.then(async () => {
+      settled = true;
+      return {
+        history: await historyService.getHistoryFromLatestBoundary(workspaceId),
+        partial: await historyService.readPartial(workspaceId),
+      };
+    });
+    let stopPromise: Promise<unknown> | undefined;
+    try {
+      await providerBlocked.promise;
+      stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
+      await abortDeliveryEntered.promise;
+      expect(streamManager.isStreaming(workspaceId)).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect(streamManager.getStreamInfo(workspaceId, true)?.messageId).toBe(handle.messageId);
+      expect(settled).toBe(false);
+
+      releaseAbortDelivery.resolve();
+      expect(await handle.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        systemMessageTokens: 733,
+        streamAbort: { type: "stream-abort", workspaceId, messageId: handle.messageId },
+      });
+      expect(streamManager.getStreamInfo(workspaceId)).toBeUndefined();
+      const observed = await completionObserved;
+      expect(observed.partial).toBeNull();
+      expect(observed.history.success).toBe(true);
+      if (!observed.history.success) throw new Error(observed.history.error);
+      expect(observed.history.data).toMatchObject([
+        { id: handle.messageId, parts: [{ type: "text", text: "interrupted answer" }] },
+      ]);
+    } finally {
+      releaseAbortDelivery.resolve();
+      await (stopPromise ?? streamManager.stopStream(workspaceId));
+      await completionObserved;
+    }
+  });
+});
+
 describe("StreamManager - stripEncryptedContent", () => {
   test("strips encryptedContent from array output shape", () => {
     const output = [
@@ -1581,87 +3509,6 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
   beforeEach(() => {
     streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    streamManager.on("error", () => undefined);
-  });
-
-  // Integration test - requires API key and TEST_INTEGRATION=1
-  describeIntegration("with real API", () => {
-    test("should prevent concurrent streams for the same workspace", async () => {
-      const workspaceId = "test-workspace-concurrent";
-      const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const model = anthropic("claude-sonnet-4-5");
-
-      // Track when streams are actively processing
-      const streamStates: Record<string, { started: boolean; finished: boolean }> = {};
-      let firstMessageId: string | undefined;
-
-      streamManager.on("stream-start", (data: { messageId: string; historySequence: number }) => {
-        streamStates[data.messageId] = { started: true, finished: false };
-        if (data.historySequence === 1) {
-          firstMessageId = data.messageId;
-        }
-      });
-
-      streamManager.on("stream-end", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      streamManager.on("stream-abort", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      // Start first stream
-      const result1 = await streamManager.startStream(
-        workspaceId,
-        [{ role: "user", content: "Say hello and nothing else" }],
-        model,
-        KNOWN_MODELS.SONNET.id,
-        1,
-        "You are a helpful assistant",
-        runtime,
-        "test-msg-1",
-        undefined,
-        {}
-      );
-
-      expect(result1.success).toBe(true);
-
-      // Wait for first stream to actually start
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Start second stream - should cancel first
-      const result2 = await streamManager.startStream(
-        workspaceId,
-        [{ role: "user", content: "Say goodbye and nothing else" }],
-        model,
-        KNOWN_MODELS.SONNET.id,
-        2,
-        "You are a helpful assistant",
-        runtime,
-        "test-msg-2",
-        undefined,
-        {}
-      );
-
-      expect(result2.success).toBe(true);
-
-      // Wait for second stream to complete
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      // Verify: first stream should have been cancelled before second stream started
-      expect(firstMessageId).toBeDefined();
-      const trackedFirstMessageId = firstMessageId!;
-      expect(streamStates[trackedFirstMessageId]).toBeDefined();
-      expect(streamStates[trackedFirstMessageId].started).toBe(true);
-      expect(streamStates[trackedFirstMessageId].finished).toBe(true);
-
-      // Verify no streams are active after completion
-      expect(streamManager.isStreaming(workspaceId)).toBe(false);
-    }, 10000);
   });
 
   // Unit test - doesn't require API key
@@ -1734,22 +3581,8 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       streamManager,
       "createStreamAtomically",
       (
-        wsId: string,
-        streamToken: string,
-        _runtimeTempDir: string,
-        _runtime: unknown,
-        _messages: unknown,
-        _modelArg: unknown,
-        modelString: string,
-        abortController: AbortController,
-        _system: string,
-        historySequence: number,
-        _messageId: string,
-        _tools?: Record<string, unknown>,
-        initialMetadata?: Record<string, unknown>,
-        _providerOptions?: Record<string, unknown>,
-        _maxOutputTokens?: number,
-        _toolPolicy?: unknown
+        options: TurnExecutionOptions,
+        ctx: { streamToken: string; abortController: AbortController }
       ): WorkspaceStreamInfoStub => {
         operations.push("create");
 
@@ -1762,13 +3595,13 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
             usage: Promise.resolve(undefined),
             providerMetadata: Promise.resolve(undefined),
           },
-          abortController,
+          abortController: ctx.abortController,
           messageId: `test-${Math.random().toString(36).slice(2)}`,
-          token: streamToken,
+          token: ctx.streamToken,
           startTime: Date.now(),
-          model: modelString,
-          initialMetadata,
-          historySequence,
+          model: options.modelString,
+          initialMetadata: options.initialMetadata,
+          historySequence: options.historySequence,
           parts: [],
           lastPartialWriteTime: 0,
           partialWriteTimer: undefined,
@@ -1776,7 +3609,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
           processingPromise: Promise.resolve(),
         };
 
-        workspaceStreams.set(wsId, streamInfo);
+        workspaceStreams.set(options.workspaceId, streamInfo);
         return streamInfo;
       }
     );
@@ -1807,18 +3640,17 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     // Without mutex, these would interleave (ensure-start, ensure-start, ensure-start, ensure-end, ensure-end, ensure-end)
     // With mutex, they should be serialized (ensure-start, ensure-end, ensure-start, ensure-end, ensure-start, ensure-end)
     const promises = [1, 2, 3].map((sequence) =>
-      streamManager.startStream(
+      streamManager.startStream({
         workspaceId,
-        [{ role: "user", content: `test ${sequence}` }],
+        messages: [{ role: "user", content: `test ${sequence}` }],
         model,
-        KNOWN_MODELS.SONNET.id,
-        sequence,
-        "system",
+        modelString: KNOWN_MODELS.SONNET.id,
+        historySequence: sequence,
+        system: "system",
         runtime,
-        `test-msg-${sequence}`,
-        undefined,
-        {}
-      )
+        messageId: `test-msg-${sequence}`,
+        tools: {},
+      })
     );
 
     // Wait for all to complete (they will fail due to dummy API key, but that's ok)
@@ -1840,7 +3672,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     let processCalled = false;
     let streamStartEmitted = false;
 
-    streamManager.on("stream-start", () => {
+    onTurnEngineEvent(streamManager, "stream-start", () => {
       streamStartEmitted = true;
     });
 
@@ -1851,76 +3683,36 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       tempDirStartedResolve = resolve;
     });
 
-    const replaceTempDirResult = Reflect.set(
-      streamManager,
-      "createTempDirForStream",
-      (_streamToken: string, _runtime: unknown): Promise<string> => {
-        tempDirStartedResolve?.();
-        return new Promise((resolve) => {
-          abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
-            once: true,
-          });
-        });
-      }
-    );
-
-    if (!replaceTempDirResult) {
-      throw new Error("Failed to mock StreamManager.createTempDirForStream");
-    }
-
     let cleanupCalled = false;
-    const replaceCleanupResult = Reflect.set(
-      streamManager,
-      "cleanupStreamTempDir",
-      (..._args: unknown[]): void => {
-        cleanupCalled = true;
-      }
-    );
-
-    if (!replaceCleanupResult) {
-      throw new Error("Failed to mock StreamManager.cleanupStreamTempDir");
-    }
-
-    const replaceCreateResult = Reflect.set(
-      streamManager,
-      "createStreamAtomically",
-      (..._args: unknown[]): never => {
-        createCalled = true;
-        throw new Error("createStreamAtomically should not be called");
-      }
-    );
-
-    if (!replaceCreateResult) {
-      throw new Error("Failed to mock StreamManager.createStreamAtomically");
-    }
-
-    const replaceProcessResult = Reflect.set(
-      streamManager,
-      "processStreamWithCleanup",
-      (..._args: unknown[]): Promise<void> => {
-        processCalled = true;
-        return Promise.resolve();
-      }
-    );
-
-    if (!replaceProcessResult) {
-      throw new Error("Failed to mock StreamManager.processStreamWithCleanup");
-    }
-
-    const anthropic = createAnthropic({ apiKey: "dummy-key" });
-    const model = anthropic("claude-sonnet-4-5");
+    Reflect.set(streamManager, "createTempDirForStream", (): Promise<string> => {
+      tempDirStartedResolve?.();
+      return new Promise((resolve) => {
+        abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
+          once: true,
+        });
+      });
+    });
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => {
+      cleanupCalled = true;
+    });
+    Reflect.set(streamManager, "createStreamAtomically", (): never => {
+      createCalled = true;
+      throw new Error("createStreamAtomically should not be called");
+    });
+    Reflect.set(streamManager, "processStreamWithCleanup", (): Promise<void> => {
+      processCalled = true;
+      return Promise.resolve();
+    });
 
     const startPromise = streamManager.startStream(
-      workspaceId,
-      [{ role: "user", content: "test" }],
-      model,
-      KNOWN_MODELS.SONNET.id,
-      1,
-      "system",
-      runtime,
-      "test-msg-abort",
-      abortController.signal,
-      {}
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-abort",
+        model: createTestLanguageModel(),
+        runtime,
+        abortSignal: abortController.signal,
+        tools: {},
+      })
     );
 
     await tempDirStarted;
@@ -1928,12 +3720,95 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
 
     const result = await startPromise;
     expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
     expect(createCalled).toBe(false);
     expect(cleanupCalled).toBe(true);
     expect(processCalled).toBe(false);
     expect(streamStartEmitted).toBe(false);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
+});
+
+describe("StreamManager - exact step indices", () => {
+  test("persists exact tool-only step boundaries through successful completion", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "step-indices-workspace";
+    const messageId = "step-indices-message";
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          for (const toolCallId of ["first", "second"]) {
+            yield { type: "start-step" };
+            // An empty/repeated SDK start must not create duplicate indices.
+            yield { type: "start-step" };
+            yield { type: "tool-call", toolCallId, toolName: "bash", input: { script: "pwd" } };
+            yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
+            };
+          }
+          yield { type: "start-step" };
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      ),
+    });
+    await getProcessStreamWithCleanupForTests(streamManager).call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      1
+    );
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((row) => row.id === messageId);
+    expect(committed?.parts.map((part) => part.type)).toEqual(["dynamic-tool", "dynamic-tool"]);
+    expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
+    expect(streamInfo.stepStartIndices).toEqual([0, 1, 2]);
+  });
+
+  test.each([true, false])(
+    "retry reset preserves or discards step indices with parts: %s",
+    async (preserveParts) => {
+      const streamManager = new StreamManager(historyService);
+      const streamInfo = createStreamInfoForTests({
+        parts: [{ type: "text", text: "preserved", timestamp: 1 }],
+        stepStartIndices: [0, 1, 3],
+      });
+      const reset = getPrivateMethodForTests<
+        (
+          workspaceId: string,
+          streamInfo: unknown,
+          options: { preserveParts: boolean }
+        ) => Promise<void>
+      >(streamManager, "resetStreamStateForRetry");
+      await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts });
+      expect(streamInfo.stepStartIndices).toEqual(preserveParts ? [0, 1] : [0]);
+      expect(streamInfo.currentStepStartIndex).toBe(preserveParts ? 1 : 0);
+      const buildPartial = getPrivateMethodForTests<(streamInfo: unknown) => MuxMessage>(
+        streamManager,
+        "buildPartialAssistantMessage"
+      );
+      const partial = buildPartial.call(streamManager, streamInfo);
+      expect(partial.metadata?.stepStartPartIndices).toEqual(preserveParts ? [0] : []);
+      await historyService.writePartial("step-reset-workspace", partial);
+      expect(
+        (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
+      ).toEqual(preserveParts ? [0] : []);
+    }
+  );
 });
 
 describe("StreamManager - empty stream completions", () => {
@@ -1944,10 +3819,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2030,10 +3905,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2103,10 +3978,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2169,10 +4044,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2226,10 +4101,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2309,7 +4184,6 @@ describe("StreamManager - empty stream completions", () => {
 
   test("zero-output refusal finishReason survives commit when usage is unavailable", async () => {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("error", () => undefined);
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -2363,6 +4237,74 @@ describe("StreamManager - empty stream completions", () => {
     expect(committed?.metadata?.errorType).toBeUndefined();
   });
 
+  test("zero-usage terminal refusal reaches the sidecar as refused_stream without touching the session ledger", async () => {
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _model: string,
+        _usage: unknown,
+        _providerMetadata: unknown,
+        _options: unknown
+      ) => Promise.resolve(undefined)
+    );
+    const sessionUsageService = {
+      recordUsage,
+      recordHeadlessUsage,
+    } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+
+    const workspaceId = "refusal-zero-usage-sidecar-workspace";
+    const messageId = "refusal-zero-usage-sidecar-message";
+    const historySequence = 1;
+
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+    const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
+    const startTime = Date.now() - 250;
+    const streamInfo = createStreamInfoForTests({
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+      ),
+      messageId,
+      startTime,
+      lastPartTimestamp: startTime,
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      historySequence,
+      initialMetadata: { agentId: "plan" },
+      runtime,
+    });
+
+    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+
+    // A refusal the provider billed nothing for is still a refusal: exactly
+    // one refused_stream analytics record with explicit zero usage…
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]?.[0]).toBe(workspaceId);
+    expect(recordHeadlessUsage.mock.calls[0]?.[2]).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    });
+    expect(recordHeadlessUsage.mock.calls[0]?.[4]).toMatchObject({
+      analyticsSource: "refused_stream",
+      skipSessionLedger: true,
+    });
+    // …and no zero-cost noise in the session cost ledger.
+    expect(recordUsage).not.toHaveBeenCalled();
+  });
+
   test("refusal finish after partial output fails visibly when no fallback is configured", async () => {
     const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
       Promise.resolve(undefined)
@@ -2384,10 +4326,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data);
     });
 
@@ -2447,8 +4389,10 @@ describe("StreamManager - empty stream completions", () => {
     expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
     expect(recordHeadlessUsage.mock.calls[0]?.[0]).toBe(workspaceId);
     expect(recordHeadlessUsage.mock.calls[0]?.[2]).toMatchObject({ inputTokens: 3 });
+    // Terminal refusals are labeled refused_stream (not errored_stream) so
+    // analytics can distinguish refusals from generic stream errors.
     expect(recordHeadlessUsage.mock.calls[0]?.[4]).toMatchObject({
-      analyticsSource: "errored_stream",
+      analyticsSource: "refused_stream",
       skipSessionLedger: true,
     });
 
@@ -2481,8 +4425,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -2634,8 +4578,8 @@ describe("StreamManager - empty stream completions", () => {
       parts?: Array<{ type: string; text?: string; toolName?: string }>;
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -2771,8 +4715,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -2864,10 +4808,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => streamEndEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => streamEndEvents.push(data));
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -2948,8 +4892,8 @@ describe("StreamManager - empty stream completions", () => {
       };
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3088,8 +5032,8 @@ describe("StreamManager - empty stream completions", () => {
       parts?: Array<{ type: string; text?: string; toolName?: string }>;
     }> = [];
 
-    streamManager.on("error", (data) => errorEvents.push(data));
-    streamManager.on("stream-end", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
       streamEndEvents.push(data as (typeof streamEndEvents)[number]);
     });
 
@@ -3228,6 +5172,12 @@ describe("StreamManager - empty stream completions", () => {
     expect(
       streamEnd?.parts?.map((part) => (part.type === "text" ? part.text : part.toolName))
     ).toEqual(["partial answer", "bash", "second fallback answer"]);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((row) => row.id === messageId)?.metadata?.stepStartPartIndices
+    ).toEqual([0, 2]);
   });
 
   test("refusal fallback chain exhaustion fails terminally as model_refusal", async () => {
@@ -3248,10 +5198,10 @@ describe("StreamManager - empty stream completions", () => {
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
-    streamManager.on("stream-end", (data) => streamEndEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => streamEndEvents.push(data));
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -3352,8 +5302,10 @@ describe("StreamManager - empty stream completions", () => {
     expect(sidecarCalls[1]?.[1]).toBe(fallbackModel);
     expect(sidecarCalls[1]?.[2]).toMatchObject({ inputTokens: 10 });
     for (const call of sidecarCalls) {
+      // Both flattened entries are refused fallback hops, so they carry the
+      // refusal-specific analytics label rather than the generic drop reason.
       expect(call?.[4]).toMatchObject({
-        analyticsSource: "errored_stream",
+        analyticsSource: "refused_stream",
         skipSessionLedger: true,
       });
     }
@@ -3363,7 +5315,7 @@ describe("StreamManager - empty stream completions", () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
 
@@ -3440,7 +5392,7 @@ describe("StreamManager - empty stream completions", () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
-    streamManager.on("error", (data) => {
+    onTurnEngineEvent(streamManager, "error", (data) => {
       errorEvents.push(data as { messageId: string; error: string; errorType?: string });
     });
 
@@ -3602,13 +5554,12 @@ describe("StreamManager - TTFT metadata persistence", () => {
   }) {
     const streamManager = params.streamManager ?? new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    streamManager.on("error", () => undefined);
 
     if (params.onStreamStart) {
-      streamManager.on("stream-start", params.onStreamStart);
+      onTurnEngineEvent(streamManager, "stream-start", params.onStreamStart);
     }
     if (params.onStreamEnd) {
-      streamManager.on("stream-end", params.onStreamEnd);
+      onTurnEngineEvent(streamManager, "stream-end", params.onStreamEnd);
     }
 
     const replaceTokenTrackerResult = Reflect.set(streamManager, "tokenTracker", {
@@ -4182,6 +6133,7 @@ describe("StreamManager - previousResponseId recovery", () => {
       stepTracker: { latestMessages: stepMessages },
       didRetryPreviousResponseIdAtStep: false,
       currentStepStartIndex: 1,
+      stepStartIndices: [0, 1, 2],
       request: {
         model,
         messages: [{ role: "user", content: "original" }],
@@ -4231,6 +6183,7 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(retried).toBe(true);
     expect(streamInfo.parts).toHaveLength(1);
     expect(streamInfo.didRetryPreviousResponseIdAtStep).toBe(true);
+    expect(streamInfo.stepStartIndices).toEqual([0, 1]);
     expect(streamInfo.request.messages as ModelMessage[]).toBe(stepMessages);
 
     const openaiOptions = streamInfo.request.providerOptions as {
@@ -4322,7 +6275,6 @@ describe("StreamManager - replayStream", () => {
   function createReplayStreamManager(): StreamManager {
     const streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests.
-    streamManager.on("error", () => undefined);
     return streamManager;
   }
 
@@ -4350,17 +6302,21 @@ describe("StreamManager - replayStream", () => {
     const streamManager = createReplayStreamManager();
 
     let sawStreamStart = false;
-    streamManager.on("stream-start", (event: { replay?: boolean | undefined }) => {
+    onTurnEngineEvent(streamManager, "stream-start", (event: { replay?: boolean | undefined }) => {
       sawStreamStart = true;
       expect(event.replay).toBe(true);
     });
     const workspaceId = "ws-replay-snapshot";
 
     const deltas: string[] = [];
-    streamManager.on("stream-delta", (event: { delta: string; replay?: boolean | undefined }) => {
-      expect(event.replay).toBe(true);
-      deltas.push(event.delta);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "stream-delta",
+      (event: { delta: string; replay?: boolean | undefined }) => {
+        expect(event.replay).toBe(true);
+        deltas.push(event.delta);
+      }
+    );
 
     const streamInfo = {
       state: "streaming",
@@ -4403,7 +6359,8 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-tool-filter";
 
     const replayedToolEnds: string[] = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-end",
       (event: { replay?: boolean | undefined; toolCallId: string }) => {
         expect(event.replay).toBe(true);
@@ -4459,7 +6416,8 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-exec-start";
 
     const replayedToolStarts: Array<{ toolCallId: string; executionStartedAt?: number }> = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-start",
       (event: {
         replay?: boolean | undefined;
@@ -4520,26 +6478,11 @@ describe("StreamManager - replayStream", () => {
     const streamManager = createReplayStreamManager();
 
     const workspaceId = "ws-replay-usage";
-    const usageEvents: Array<{
-      replay?: boolean;
-      usage: { inputTokens: number; outputTokens: number; totalTokens: number };
-      providerMetadata?: Record<string, unknown>;
-      cumulativeUsage: { inputTokens: number; outputTokens: number; totalTokens: number };
-      cumulativeProviderMetadata?: Record<string, unknown>;
-    }> = [];
+    const usageEvents: Array<Extract<TurnEngineEvent, { type: "usage-delta" }>> = [];
 
-    streamManager.on(
-      "usage-delta",
-      (event: {
-        replay?: boolean;
-        usage: { inputTokens: number; outputTokens: number; totalTokens: number };
-        providerMetadata?: Record<string, unknown>;
-        cumulativeUsage: { inputTokens: number; outputTokens: number; totalTokens: number };
-        cumulativeProviderMetadata?: Record<string, unknown>;
-      }) => {
-        usageEvents.push(event);
-      }
-    );
+    onTurnEngineEvent(streamManager, "usage-delta", (event) => {
+      usageEvents.push(event);
+    });
 
     setReplayStreamInfo(streamManager, workspaceId, {
       state: "streaming",
@@ -4583,7 +6526,7 @@ describe("StreamManager - replayStream", () => {
     const workspaceId = "ws-replay-usage-incremental";
     const usageEvents: Array<{ replay?: boolean }> = [];
 
-    streamManager.on("usage-delta", (event: { replay?: boolean }) => {
+    onTurnEngineEvent(streamManager, "usage-delta", (event: { replay?: boolean }) => {
       usageEvents.push(event);
     });
 
@@ -4622,7 +6565,9 @@ describe("StreamManager - getStreamInfo", () => {
       model: "claude-sonnet-4",
       historySequence: 1,
       startTime: 4_321,
-      initialMetadata: {},
+      initialMetadata: { systemMessageTokens: 2_048 },
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
       parts: [],
       toolCompletionTimestamps: new Map<string, number>(),
     });
@@ -4631,6 +6576,11 @@ describe("StreamManager - getStreamInfo", () => {
 
     expect(streamInfo?.messageId).toBe("msg-starting");
     expect(streamInfo?.startTime).toBe(4_321);
+    expect(streamInfo?.initialMetadata?.systemMessageTokens).toBe(2_048);
+    expect(streamInfo?.currentStepStartIndex).toBe(0);
+    expect(streamInfo?.stepStartIndices).toEqual([0]);
+    streamInfo?.stepStartIndices.push(5);
+    expect(streamManager.getStreamInfo(workspaceId)?.stepStartIndices).toEqual([0]);
   });
 });
 
@@ -4660,6 +6610,19 @@ describe("StreamManager - categorizeError", () => {
     });
 
     expect(categorizeErrorForTests(retryError)).toBe("model_not_found");
+  });
+
+  test("classifies OpenAI 404 model_not_found by error code", () => {
+    const apiError = createApiCallErrorForTests({
+      message: "The model `gpt-nonexistent` does not exist or you do not have access to it.",
+      statusCode: 404,
+      responseBody:
+        '{"error":{"message":"The model `gpt-nonexistent` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}',
+      isRetryable: false,
+      data: { error: { type: "invalid_request_error", code: "model_not_found" } },
+    });
+
+    expect(categorizeErrorForTests(apiError)).toBe("model_not_found");
   });
 
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [
@@ -4733,38 +6696,66 @@ describe("StreamManager - categorizeError", () => {
     });
   }
 });
-describe("StreamManager - ask_user_question Partial Persistence", () => {
-  // Note: The ask_user_question tool blocks waiting for user input.
-  // If the app restarts during that wait, the partial must be persisted.
-  // The fix (flush partial immediately for ask_user_question) is verified
-  // by the code path in processStreamWithCleanup's tool-call handler:
-  //
-  //   if (part.toolName === "ask_user_question") {
-  //     await this.flushPartialWrite(workspaceId, streamInfo);
-  //   }
-  //
-  // Full integration test would require mocking the entire streaming pipeline.
-  // Instead, we verify the StreamManager has the expected method signature.
-
-  test("flushPartialWrite is a callable method", () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Verify the private method exists and is callable
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const flushMethod = Reflect.get(streamManager, "flushPartialWrite");
-    expect(typeof flushMethod).toBe("function");
-  });
-});
-
 describe("StreamManager - stopStream", () => {
+  test("aborts a pending startup with its reserved identity", async () => {
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      events.push(event);
+    });
+    const startup = streamManager.beginStreamStart({
+      workspaceId: "pending-workspace",
+      acpPromptId: "prompt-1",
+    });
+
+    const result = await streamManager.stopStream("pending-workspace", {
+      abandonPartial: true,
+      abortReason: "user",
+    });
+    startup.finish();
+
+    expect(result.success).toBe(true);
+    expect(startup.abortSignal.aborted).toBe(true);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "stream-abort",
+      workspaceId: "pending-workspace",
+      messageId: startup.syntheticMessageId,
+      abortReason: "user",
+      abandonPartial: true,
+      acpPromptId: "prompt-1",
+    });
+  });
+
+  test("routes mock lifecycle operations through the engine", async () => {
+    const streamManager = new StreamManager(historyService);
+    const stop = mock(() => Promise.resolve());
+    const replayStream = mock(() => Promise.resolve());
+    streamManager.setMockStreamLifecycle({
+      isStreaming: (workspaceId) => workspaceId === "mock-workspace",
+      stop,
+      replayStream,
+    });
+
+    expect(streamManager.isStreaming("mock-workspace")).toBe(true);
+    expect((await streamManager.stopStream("mock-workspace")).success).toBe(true);
+    await streamManager.replayStream("mock-workspace", { afterTimestamp: 10 });
+
+    expect(stop).toHaveBeenCalledWith("mock-workspace", undefined);
+    expect(replayStream).toHaveBeenCalledWith("mock-workspace");
+  });
+
   test("emits stream-abort when stopping non-existent stream", async () => {
     const streamManager = new StreamManager(historyService);
 
     // Track emitted events
     const abortEvents: Array<{ workspaceId: string; messageId: string }> = [];
-    streamManager.on("stream-abort", (data: { workspaceId: string; messageId: string }) => {
-      abortEvents.push(data);
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "stream-abort",
+      (data: { workspaceId: string; messageId: string }) => {
+        abortEvents.push(data);
+      }
+    );
 
     // Stop a stream that doesn't exist (simulates interrupt before stream-start)
     const result = await streamManager.stopStream("test-workspace");
@@ -4798,7 +6789,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
 
   test("stamps cumulative usage on the partial so committed history rows stay billable", async () => {
     const streamManager = new StreamManager(historyService);
-    streamManager.on("stream-abort", () => undefined);
     const workspaceId = "abort-usage-workspace";
     const messageId = "abort-usage-message";
     await appendPartialAssistantForTests(workspaceId, messageId, 1);
@@ -4809,8 +6799,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
     );
     await cleanupAborted.call(streamManager, workspaceId, createAbortStreamInfo(messageId), "user");
 
-    const partial = await historyService.readPartial(workspaceId);
-    expect(partial?.metadata?.partial).toBe(true);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    if (!history.success) throw new Error(history.error);
+    const partial = history.data.find((message) => message.id === messageId);
     expect(partial?.metadata?.usage).toEqual({
       inputTokens: 120,
       outputTokens: 30,
@@ -4826,6 +6818,92 @@ describe("StreamManager - aborted stream usage persistence", () => {
     });
   });
 
+  test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {
+    const streamManager = new StreamManager(historyService);
+    const effectiveModel = "coder:acme/opus";
+    const pinnedMetadataModel = "anthropic:claude-opus-4-1";
+    const abort = Promise.withResolvers<unknown>();
+    onTurnEngineEvent(streamManager, "stream-abort", (event) => abort.resolve(event));
+    const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
+      streamManager,
+      "cleanupAbortedStream"
+    );
+    await cleanupAborted.call(
+      streamManager,
+      "fallback-abort",
+      {
+        ...createAbortStreamInfo("fallback-message"),
+        model: effectiveModel,
+        metadataModel: pinnedMetadataModel,
+      },
+      "system"
+    );
+    const event = StreamAbortEventSchema.parse(await abort.promise);
+    expect(event.metadata?.model).toBe(effectiveModel);
+    expect(event.metadata?.metadataModel).toBe(pinnedMetadataModel);
+    expect(event.metadata?.usage?.inputTokens).toBe(120);
+  });
+
+  test.each(["commit-err", "commit-throw", "delete-err", "delete-throw"] as const)(
+    "abort settles once and retains recovery data on %s",
+    async (failure) => {
+      const workspaceId = `partial-finalize-${failure}`;
+      const messageId = "partial-owner";
+      const info = createAbortStreamInfo(messageId);
+      await historyService.writePartial(workspaceId, {
+        id: messageId,
+        role: "assistant",
+        parts: [{ type: "text", text: "recover me" }],
+        metadata: { historySequence: 1 },
+      });
+      const events: TurnEngineEvent[] = [];
+      const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+        events.push(event);
+      });
+      const abandon = failure.startsWith("delete");
+      if (abandon) {
+        const deletion = spyOn(historyService, "deletePartialIfMessageIdMatches");
+        if (failure.endsWith("throw"))
+          deletion.mockRejectedValueOnce(new Error("disk unavailable"));
+        else deletion.mockResolvedValueOnce(Err("disk unavailable"));
+      } else {
+        const commit = spyOn(historyService, "commitPartial");
+        if (failure.endsWith("throw")) commit.mockRejectedValueOnce(new Error("disk unavailable"));
+        else commit.mockResolvedValueOnce(Err("disk unavailable"));
+      }
+      const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
+        streamManager,
+        "cleanupAbortedStream"
+      );
+      await cleanupAborted.call(streamManager, workspaceId, info, "user", abandon);
+      expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ abortReason: "user", messageId });
+      expect(await historyService.readPartial(workspaceId)).not.toBeNull();
+    }
+  );
+
+  test("identity-checked partial finalization preserves a replacement and empty startup cannot drop it", async () => {
+    const workspaceId = "partial-identity";
+    await historyService.writePartial(workspaceId, {
+      id: "replacement",
+      role: "assistant",
+      parts: [{ type: "text", text: "replacement answer" }],
+      metadata: { historySequence: 1 },
+    });
+    expect((await historyService.commitPartial(workspaceId, "old")).success).toBe(true);
+    expect((await historyService.deletePartialIfMessageIdMatches(workspaceId, "old")).success).toBe(
+      true
+    );
+    const streamManager = new StreamManager(historyService);
+    await streamManager.stopStream(workspaceId, { abandonPartial: true });
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("replacement");
+    expect((await historyService.commitPartial(workspaceId, "replacement")).success).toBe(true);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data[0]?.id).toBe("replacement");
+  });
+
   test("routes tool-only aborted usage to the headless sidecar (commit would drop it)", async () => {
     // Esc while a tool is still running: the partial's only part is an
     // input-available tool call, which commitPartial refuses to commit —
@@ -4834,7 +6912,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-tool-only-workspace";
 
       const usage = { inputTokens: 500, outputTokens: 0, totalTokens: 500 };
@@ -4869,7 +6946,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
       );
       await cleanupAborted.call(streamManager, workspaceId, streamInfo, "user");
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const records = (await fs.readFile(sidecarPath, "utf-8"))
         .trim()
         .split("\n")
@@ -4893,7 +6973,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-commit-worthy-workspace";
       await appendPartialAssistantForTests(workspaceId, "abort-commit-worthy-message", 1);
 
@@ -4908,11 +6987,18 @@ describe("StreamManager - aborted stream usage persistence", () => {
         "user"
       );
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       expect(existsSync(sidecarPath)).toBe(false);
-      // Usage still reaches history via the partial (asserted in the test above).
-      const partial = await hs.readPartial(workspaceId);
-      expect(partial?.metadata?.usage).toBeDefined();
+      const history = await hs.getLastMessages(workspaceId, 10);
+      if (!history.success) throw new Error(history.error);
+      expect(
+        history.data.find((message) => message.id === "abort-commit-worthy-message")?.metadata
+          ?.usage
+      ).toBeDefined();
+      expect(await hs.readPartial(workspaceId)).toBeNull();
     } finally {
       await cleanup();
     }
@@ -4926,7 +7012,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("error", () => undefined);
       const workspaceId = "error-nondurable-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 0, totalTokens: 900 };
@@ -4952,7 +7037,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
         errorType: "empty_output",
       });
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -4973,7 +7061,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("error", () => undefined);
       const workspaceId = "error-commit-worthy-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 40, totalTokens: 940 };
@@ -4999,7 +7086,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
         errorType: "stream_truncated",
       });
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -5023,7 +7113,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      streamManager.on("stream-abort", () => undefined);
       const workspaceId = "abort-abandon-workspace";
       const messageId = "abort-abandon-message";
 
@@ -5043,7 +7132,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
       const partial = await hs.readPartial(workspaceId);
       expect(partial).toBeNull();
       // … but the billed usage still reaches analytics via the sidecar.
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -5069,7 +7161,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     toolSearchState?: ToolSearchStreamState;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -5103,7 +7195,9 @@ describe("StreamManager - tool search activeTools scoping", () => {
     }
 
     return {
-      buildRequestConfig,
+      // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
+      // cache-marker eligibility; a detached Reflect.get reference loses `this`.
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5196,24 +7290,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
       activatedToolNames: new Set(),
     };
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      toolSearchState
-    );
+      system: "system",
+      toolSearchState,
+    });
 
     // Same reference, not a copy. tool_catalog_search.execute mutations must be
     // visible to prepareStep.
@@ -5229,14 +7312,19 @@ describe("StreamManager - mid-turn thinking override", () => {
     providerOptions?: Record<string, unknown>;
     thinkingOverrideState?: ActiveTurnThinkingOverride;
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+    onStepMessages?: (stepMessages: ModelMessage[]) => void;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => OverrideRequestForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => OverrideRequestForTests;
   type CreateStreamResult = (
     request: OverrideRequestForTests,
     abortController: AbortController
   ) => unknown;
-  type CapturedPrepareStep = (options: { messages: ModelMessage[] }) => Promise<
+  type CapturedPrepareStep = (options: {
+    messages: ModelMessage[];
+    stepNumber?: number;
+  }) => Promise<
     | {
         messages?: ModelMessage[];
         activeTools?: string[];
@@ -5253,7 +7341,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     createStreamResult: CreateStreamResult;
   } {
     const buildRequestConfig = Reflect.get(streamManager, "buildStreamRequestConfig") as
-      | ((...args: unknown[]) => OverrideRequestForTests)
+      | ((input: Record<string, unknown>) => OverrideRequestForTests)
       | undefined;
     const createStreamResultMethod = Reflect.get(streamManager, "createStreamResult") as
       | CreateStreamResult
@@ -5264,7 +7352,7 @@ describe("StreamManager - mid-turn thinking override", () => {
       throw new Error("Expected StreamManager private helpers to exist");
     }
     return {
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5378,16 +7466,6 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
-  test("stays byte-identical to the feature-off behavior when no override state exists", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { createStreamResult } = getRequestHelpers(streamManager);
-    const streamTextSpy = setupStreamTextSpy();
-
-    createStreamResult({ model, messages, system: "system" }, new AbortController());
-    const prepareStep = capturePrepareStep(streamTextSpy);
-    expect(await prepareStep({ messages })).toBeUndefined();
-  });
-
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {
     const streamManager = new StreamManager(historyService);
     const { buildRequestConfig, createStreamResult } = getRequestHelpers(streamManager);
@@ -5397,50 +7475,26 @@ describe("StreamManager - mid-turn thinking override", () => {
     const rebuild: RebuildProviderOptionsForThinkingLevel = () => null;
 
     // Without the closure, an absent providerOptions stays absent (no behavior change).
-    const plainRequest = buildRequestConfig(
+    const plainRequest = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined, // tools
-      undefined, // providerOptions
-      undefined, // maxOutputTokens
-      undefined, // callSettingsOverrides
-      undefined, // toolPolicy
-      undefined, // hasQueuedMessages
-      undefined, // headers
-      undefined, // anthropicCacheTtlOverride
-      undefined, // onChunk
-      undefined, // onStepMessages
-      undefined // toolSearchState
-    );
+      system: "system",
+    });
     expect(plainRequest.providerOptions).toBeUndefined();
 
     // With the closure, undefined normalizes to a mutable object whose identity
     // is exactly what streamText() captures — otherwise in-place mutation at
     // prepareStep time would be unobservable to the SDK's per-step merge.
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined,
-      undefined,
-      undefined, // providerOptions intentionally absent
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined, // onToolExecutionStart
-      state,
-      rebuild
-    );
+      system: "system",
+      // providerOptions intentionally absent
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel: rebuild,
+    });
     expect(request.providerOptions).toEqual({});
     expect(request.thinkingOverrideState).toBe(state);
     expect(request.rebuildProviderOptionsForThinkingLevel).toBe(rebuild);

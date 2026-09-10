@@ -31,9 +31,6 @@ export const ModelParametersByModelSchema = z.record(
   ModelParameterOverridesSchema
 );
 
-export type ModelParameterOverrides = z.infer<typeof ModelParameterOverridesSchema>;
-export type StandardModelParameterOverrides = z.infer<typeof StandardModelParameterOverridesSchema>;
-
 // Downstream type for call settings forwarding — derived from AI SDK CallSettings
 export type ResolvedCallSettingsOverrides = Partial<
   Pick<

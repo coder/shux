@@ -18,6 +18,7 @@ import {
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
   TERMINAL_FONT_CONFIG_KEY,
   TRANSCRIPT_DENSITIES,
   TRANSCRIPT_DENSITY_KEY,
@@ -34,6 +35,7 @@ import {
   getThinkingLevelKey,
   getTrunkBranchKey,
   normalizeEditorConfig,
+  normalizeTerminalBadgeConfig,
   normalizeTerminalFontConfig,
   type BashCollapsedSummaryMode,
   type LaunchBehavior,
@@ -68,6 +70,7 @@ const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
   UI_THEME_KEY,
   TRANSCRIPT_DENSITY_KEY,
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
   TERMINAL_FONT_CONFIG_KEY,
   EDITOR_CONFIG_KEY,
   VIM_ENABLED_KEY,
@@ -262,6 +265,14 @@ export function applyStoredUserPreference(
     return pruneUserPreferences(next);
   }
 
+  if (key === TERMINAL_BADGE_CONFIG_KEY) {
+    if (!isRecord(value)) {
+      return removeStoredUserPreference(next, key);
+    }
+    ensureAppearance(next).terminalBadgeConfig = normalizeTerminalBadgeConfig(value);
+    return pruneUserPreferences(next);
+  }
+
   if (key === EDITOR_CONFIG_KEY) {
     if (!isRecord(value)) {
       return removeStoredUserPreference(next, key);
@@ -452,6 +463,7 @@ export function removeStoredUserPreference(
   else if (key === BASH_COLLAPSED_SUMMARY_MODE_KEY)
     delete next.appearance?.bashCollapsedSummaryMode;
   else if (key === TERMINAL_FONT_CONFIG_KEY) delete next.appearance?.terminalFontConfig;
+  else if (key === TERMINAL_BADGE_CONFIG_KEY) delete next.appearance?.terminalBadgeConfig;
   else if (key === EDITOR_CONFIG_KEY) delete next.appearance?.editorConfig;
   else if (key === VIM_ENABLED_KEY) delete next.appearance?.vimEnabled;
   else if (key === LAUNCH_BEHAVIOR_KEY) delete next.navigation?.launchBehavior;
@@ -512,6 +524,8 @@ export function entriesFromUserPreferences(
     });
   if (appearance?.terminalFontConfig !== undefined)
     entries.push({ key: TERMINAL_FONT_CONFIG_KEY, value: appearance.terminalFontConfig });
+  if (appearance?.terminalBadgeConfig !== undefined)
+    entries.push({ key: TERMINAL_BADGE_CONFIG_KEY, value: appearance.terminalBadgeConfig });
   if (appearance?.editorConfig !== undefined)
     entries.push({ key: EDITOR_CONFIG_KEY, value: appearance.editorConfig });
   if (appearance?.vimEnabled !== undefined)

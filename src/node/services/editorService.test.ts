@@ -2,13 +2,32 @@ import { describe, expect, test } from "bun:test";
 import type { Config } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EditorService } from "./editorService";
+import type { WorkspaceService } from "./workspaceService";
+
+const emptyConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
+  getAllWorkspaceMetadata: () => Promise.resolve([]),
+};
+
+const externalEditorOpenRecorder = {
+  recordExternalEditorOpenForLaunch: () =>
+    Promise.resolve({
+      success: true as const,
+      data: { rollbackAfterFailedLaunch: () => Promise.resolve() },
+    }),
+} satisfies Pick<WorkspaceService, "recordExternalEditorOpenForLaunch">;
+
+function createEditorService(config: Pick<Config, "getAllWorkspaceMetadata">): EditorService {
+  return new EditorService(config, externalEditorOpenRecorder);
+}
 
 describe("EditorService", () => {
   test("rejects non-custom editors (renderer must use deep links)", async () => {
-    const editorService = new EditorService({} as Config);
+    const editorService = createEditorService(emptyConfig);
 
-    const result = await editorService.openInEditor("ws1", "/tmp", {
-      editor: "vscode",
+    const result = await editorService.openInEditor({
+      workspaceId: "ws1",
+      targetPath: "/tmp",
+      editorConfig: { editor: "vscode" },
     });
 
     expect(result.success).toBe(false);
@@ -30,13 +49,14 @@ describe("EditorService", () => {
 
     const mockConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
       getAllWorkspaceMetadata: () => Promise.resolve([workspace]),
-    } as unknown as Pick<Config, "getAllWorkspaceMetadata">;
+    };
 
-    const editorService = new EditorService(mockConfig as Config);
+    const editorService = createEditorService(mockConfig);
 
-    const result = await editorService.openInEditor("ws1", "/tmp", {
-      editor: "custom",
-      customCommand: "definitely-not-a-command",
+    const result = await editorService.openInEditor({
+      workspaceId: "ws1",
+      targetPath: "/tmp",
+      editorConfig: { editor: "custom", customCommand: "definitely-not-a-command" },
     });
 
     expect(result.success).toBe(false);
@@ -58,13 +78,14 @@ describe("EditorService", () => {
 
     const mockConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
       getAllWorkspaceMetadata: () => Promise.resolve([workspace]),
-    } as unknown as Pick<Config, "getAllWorkspaceMetadata">;
+    };
 
-    const editorService = new EditorService(mockConfig as Config);
+    const editorService = createEditorService(mockConfig);
 
-    const result = await editorService.openInEditor("ws1", "/tmp", {
-      editor: "custom",
-      customCommand: '"unterminated',
+    const result = await editorService.openInEditor({
+      workspaceId: "ws1",
+      targetPath: "/tmp",
+      editorConfig: { editor: "custom", customCommand: '"unterminated' },
     });
 
     expect(result.success).toBe(false);

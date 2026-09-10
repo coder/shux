@@ -1,3 +1,4 @@
+import * as path from "path";
 import {
   shouldRunIntegrationTests,
   createTestEnvironment,
@@ -18,7 +19,6 @@ import {
 import { createStreamCollector } from "../streamCollector";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
 import { isInitOutput, isInitEnd, isInitStart } from "@/common/orpc/types";
-import * as path from "path";
 import * as os from "os";
 import * as fs from "fs/promises";
 import { exec } from "child_process";
@@ -341,7 +341,10 @@ describeIntegration("Workspace init hook", () => {
         await waitForInitComplete(env, workspaceId, 5000);
 
         // Verify init-status.json exists on disk
-        const initStatusPath = path.join(env.config.getSessionDir(workspaceId), "init-status.json");
+        const initStatusPath = path.join(
+          path.join(env.config.sessionsDir, workspaceId),
+          "init-status.json"
+        );
         const statusExists = await fs
           .access(initStatusPath)
           .then(() => true)

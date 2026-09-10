@@ -3,7 +3,7 @@ title: Dev Container Runtime
 description: Run agents in containers defined by devcontainer.json
 ---
 
-Dev Container runtime runs each workspace in a container built from your project's [devcontainer.json](https://containers.dev/implementors/json_reference/). If your project already uses dev containers for VS Code or other editors, Mux can use the same configuration.
+Dev Container runtime runs each workspace in a container built from your project's [devcontainer.json](https://containers.dev/implementors/json_reference/). If your project already uses dev containers for VS Code or other editors, Xum can use the same configuration.
 
 ## Requirements
 
@@ -13,7 +13,7 @@ Dev Container runtime runs each workspace in a container built from your project
 
 ## How it works
 
-1. Mux creates a git worktree on the host machine
+1. Xum creates a git worktree on the host machine
 2. Runs `devcontainer up` to build/start the container
 3. Commands execute inside the container via `devcontainer exec`
 4. Deleting the workspace stops the container and removes the worktree
@@ -22,7 +22,7 @@ Dev Container runtime runs each workspace in a container built from your project
 
 Select Dev Container in the workspace creation UI. If your project has multiple configs, choose one from the dropdown.
 
-Mux searches these locations:
+Xum searches these locations:
 
 - `.devcontainer.json`
 - `.devcontainer/devcontainer.json`
@@ -38,8 +38,15 @@ Like the [Docker runtime](/runtime/docker), you can check "Share credentials" to
 
 ## Filesystem layout
 
-Worktrees live on the host at `~/.mux/src/<project>/<workspace>`. The container mounts this directory (location inside the container depends on your devcontainer.json `workspaceFolder`).
+Worktrees live on the host at `~/.xum/src/<project>/<workspace>`. The Dev Container CLI mounts the worktree at `/workspaces/<name>` by default, and Xum automatically translates workspace paths between the host and container.
+
+If other tools or scripts require absolute host paths, you can configure both sides to use the same path:
+
+```json
+"workspaceFolder": "${localWorkspaceFolder}",
+"workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind"
+```
 
 ## Notes
 
-- The Dev Container runtime button only appears if Mux finds a `devcontainer.json` in the project.
+- The Dev Container runtime button only appears if Xum finds a `devcontainer.json` in the project.

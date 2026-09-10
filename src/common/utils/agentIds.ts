@@ -51,11 +51,8 @@ export function resolvePersistedAgentId(
   return resolvePersistedAgentIdCandidates(value)[0] ?? fallback;
 }
 
-function normalizePersistedAgentCandidate(value: unknown): string | undefined {
+export function normalizePersistedAgentCandidate(value: unknown): string | undefined {
   const normalized = normalizeAgentId(value, "");
-  if (normalized.length === 0) {
-    return undefined;
-  }
   return AgentIdSchema.safeParse(normalized).success ? normalized : undefined;
 }
 

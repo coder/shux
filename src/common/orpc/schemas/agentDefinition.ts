@@ -24,7 +24,7 @@ const AgentDefinitionSubagentSchema = z
     workflow_runnable: z.boolean().optional(),
     // Instructions appended when this agent runs as a subagent (child workspace)
     append_prompt: z.string().min(1).optional(),
-    // When true, do not run the project's .mux/init hook for this sub-agent.
+    // When true, do not run the project's .xum/init hook for this sub-agent.
     // NOTE: This skips only the hook execution, not runtime provisioning (e.g. SSH sync, Docker setup).
     skip_init_hook: z.boolean().optional(),
   })
@@ -103,6 +103,8 @@ export const AgentDefinitionDescriptorSchema = z
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
+    // Agent Plugins: contributing plugin name (absent for non-plugin agents)
+    pluginName: z.string().min(1).optional(),
   })
   .strict();
 
@@ -112,5 +114,14 @@ export const AgentDefinitionPackageSchema = z
     scope: AgentDefinitionScopeSchema,
     frontmatter: AgentDefinitionFrontmatterSchema,
     body: z.string(),
+    /**
+     * Exact source identity of the winning candidate: "built-in" for embedded
+     * definitions, otherwise the discovery root the file was read from (per-plugin
+     * agents dirs are unique per plugin). Scope alone is not a provenance
+     * identifier — project files and project plugins both report "project" — so
+     * strict explicit-agent sends pin this to detect a different definition
+     * taking over the same id between launch validation and streaming.
+     */
+    source: z.string().optional(),
   })
   .strict();

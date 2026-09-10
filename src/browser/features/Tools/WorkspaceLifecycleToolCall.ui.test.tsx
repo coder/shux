@@ -50,6 +50,8 @@ describe("summarizeOutcomeGroups", () => {
   > = {
     archived: "settled",
     already_archived: "settled",
+    unarchived: "settled",
+    already_unarchived: "settled",
     deleted_worktree: "settled",
     already_transcript_only: "settled",
     removed: "settled",

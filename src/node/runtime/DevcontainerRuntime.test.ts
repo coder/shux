@@ -61,9 +61,12 @@ describe("DevcontainerRuntime.stat", () => {
     });
     const abortController = new AbortController();
 
-    await runtime.stat("/container-only/file.txt", abortController.signal);
+    await runtime.stat("relative/file.txt", abortController.signal);
 
     expect(runtime.execOptions?.abortSignal).toBe(abortController.signal);
+    expect(runtime.execOptions?.pathEnv).toEqual({
+      XUM_INTERNAL_FILE_PATH: "relative/file.txt",
+    });
   });
 });
 
@@ -108,18 +111,6 @@ describe("DevcontainerRuntime.resolvePath", () => {
   it("passes absolute paths through", async () => {
     const runtime = createRuntime({});
     expect(await runtime.resolvePath("/tmp/test")).toBe("/tmp/test");
-  });
-});
-
-describe("DevcontainerRuntime.quoteForContainer", () => {
-  function quoteForContainer(runtime: DevcontainerRuntime, filePath: string): string {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
-    return (runtime as any).quoteForContainer(filePath);
-  }
-
-  it("uses $HOME expansion for tilde paths", () => {
-    const runtime = createRuntime({});
-    expect(quoteForContainer(runtime, "~/.mux")).toBe('"$HOME/.mux"');
   });
 });
 
@@ -179,6 +170,42 @@ describe("DevcontainerRuntime.resolveHostPathForMounted", () => {
     expect(resolveHostPathForMounted(runtime, filePath)).toBe(filePath);
   });
 });
+describe("DevcontainerRuntime exec path translation", () => {
+  function mapPathForExec(runtime: DevcontainerRuntime, filePath: string): string {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
+    return (runtime as any).mapPathForExec(filePath);
+  }
+
+  it("maps workspace roots and nested paths into the container", () => {
+    const runtime = createRuntime({
+      remoteWorkspaceFolder: "/workspaces/project",
+      currentWorkspacePath: "/home/user/xum/project/branch",
+    });
+
+    expect(mapPathForExec(runtime, "/home/user/xum/project/branch")).toBe("/workspaces/project");
+    expect(mapPathForExec(runtime, "/home/user/xum/project/branch/nested/file")).toBe(
+      "/workspaces/project/nested/file"
+    );
+  });
+
+  it("keeps paths outside the workspace unchanged", () => {
+    const runtime = createRuntime({
+      remoteWorkspaceFolder: "/workspaces/project",
+      currentWorkspacePath: "/home/user/xum/project/branch",
+    });
+
+    expect(mapPathForExec(runtime, "/tmp/other")).toBe("/tmp/other");
+  });
+
+  it("keeps paths unchanged when the container workspace is unknown", () => {
+    const runtime = createRuntime({ currentWorkspacePath: "/home/user/xum/project/branch" });
+
+    expect(mapPathForExec(runtime, "/home/user/xum/project/branch/nested/file")).toBe(
+      "/home/user/xum/project/branch/nested/file"
+    );
+  });
+});
+
 describe("DevcontainerRuntime.mapHostPathToContainer", () => {
   // Access the private method for testing
   function mapHostPathToContainer(runtime: DevcontainerRuntime, hostPath: string): string | null {

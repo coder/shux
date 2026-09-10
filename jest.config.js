@@ -23,7 +23,6 @@ module.exports = {
     // lottie-web probes canvas on import, which crashes in happy-dom/jsdom
     "^lottie-react$": "<rootDir>/tests/__mocks__/lottieReactMock.js",
     "^chalk$": "<rootDir>/tests/__mocks__/chalk.js",
-    "^jsdom$": "<rootDir>/tests/__mocks__/jsdom.js",
     // Mock static assets for full App rendering
     "\\.css$": "<rootDir>/tests/__mocks__/styleMock.js",
     "\\.txt$": "<rootDir>/tests/__mocks__/textMock.js",
@@ -45,6 +44,12 @@ module.exports = {
     "node_modules/(?!\\.pnpm)(?!.*)",
   ],
   maxWorkers,
+  // Integration suites leak memory across test files (app harnesses, DuckDB analytics
+  // workers), so a long-lived worker accumulates heap until it dies at V8's ~4GB cap
+  // ("Jest worker ran out of memory and crashed", PR #3939 CI run 32720490232). The
+  // fewer workers the budget selects, the more files each one runs and the sooner it
+  // crashes. Recycle any worker still holding >2GB when idle between test files.
+  workerIdleMemoryLimit: "2GB",
   // Force exit after tests complete to avoid hanging on lingering handles
   forceExit: true,
   // 10 minute timeout for integration tests, 10s for unit tests

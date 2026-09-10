@@ -3,11 +3,11 @@ title: SSH Runtime
 description: Run agents on remote hosts over SSH for security and performance
 ---
 
-Mux can run workspaces on a remote host over SSH. When configured, tool operations (file reads/edits, `bash`, etc.) execute on the remote machine.
+Xum can run workspaces on a remote host over SSH. When configured, tool operations (file reads/edits, `bash`, etc.) execute on the remote machine.
 
 ## Threat model
 
-Mux treats the remote host as potentially hostile. By default it does **not** forward your local keys or credentials.
+Xum treats the remote host as potentially hostile. By default it does **not** forward your local keys or credentials.
 
 The only data synced to the remote machine is:
 
@@ -30,7 +30,7 @@ The host field accepts anything you can pass to `ssh <host>`:
 - a username and hostname (for example `user@my-server.com`)
 - an alias from your `~/.ssh/config` (for example `my-server`)
 
-Mux delegates SSH configuration to your system `ssh` command, so advanced settings live in `~/.ssh/config`.
+Xum delegates SSH configuration to your system `ssh` command, so advanced settings live in `~/.ssh/config`.
 
 Example entry:
 
@@ -43,7 +43,7 @@ Host ovh-1
 ## Authentication
 
 <Info>
-  Mux delegates to `ssh`. This is an abbreviated reference of common ways `ssh` authenticates.
+  Xum delegates to `ssh`. This is an abbreviated reference of common ways `ssh` authenticates.
 </Info>
 
 ### Local default keys

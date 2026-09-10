@@ -22,9 +22,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Install xvfb
         run: |
+          if command -v Xvfb >/dev/null 2>&1 && command -v xvfb-run >/dev/null 2>&1; then
+            echo "Xvfb is already installed"
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y xvfb
       - uses: ./.github/actions/setup-playwright

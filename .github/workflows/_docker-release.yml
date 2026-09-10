@@ -23,15 +23,33 @@ on:
         default: false
 
 jobs:
-  docker-publish:
-    name: Build and Push Docker Image
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+  # The coder/shux -> coder/xum repo rename broke Depot's OIDC trust policy
+  # (matches owner/repo as a string), so a single `depot build` for
+  # linux/amd64,linux/arm64 fails with "permission_denied: Invalid token".
+  # Build each platform natively on its own runner instead: Depot still
+  # accelerates once its trust policy is updated, and buildx-fallback builds
+  # natively on the runner in the meantime. Per-arch native runners keep the
+  # fallback off QEMU emulation, which is critical for native modules like
+  # node-pty and ssh2. The push-manifest job stitches the per-arch digests
+  # into the final multi-arch tags.
+  build:
+    name: Build Image (${{ matrix.arch }})
+    runs-on: ${{ github.repository_owner == 'coder' && matrix.coder_runner || matrix.fallback_runner }}
     permissions:
       contents: read
       # OIDC token for Depot authentication (no static DEPOT_TOKEN needed)
       id-token: write
-      # Push to GitHub Container Registry
+      # Push per-arch images (by digest) to GitHub Container Registry
       packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            coder_runner: depot-ubuntu-22.04-16
+            fallback_runner: ubuntu-latest
+          - arch: arm64
+            coder_runner: depot-ubuntu-22.04-arm-16
+            fallback_runner: ubuntu-24.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -57,20 +75,94 @@ jobs:
             type=raw,value=latest,enable=${{ inputs.is_latest }}
             type=raw,value=nightly,enable=${{ inputs.is_latest_nightly }}
 
+      - name: Set up Docker Buildx
+        # Pushing by digest needs a docker-container builder when the Depot
+        # fallback runs `docker buildx build` locally.
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
       - name: Set up Depot CLI
         uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1.7.1
 
-      - name: Build and push multi-arch image
+      - name: Build and push by digest
+        id: build
         uses: depot/build-push-action@5f3b3c2e5a00f0093de47f657aeaefcedff27d18 # v1.17.0
         with:
           project: 3pmt6zbws4
           context: .
-          # Depot routes each platform to a native builder — no QEMU emulation.
-          # This is critical for native modules like node-pty and ssh2.
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Push by digest only; push-manifest applies the human-readable tags.
+          outputs: type=image,name=ghcr.io/coder/mux,push-by-digest=true,name-canonical=true,push=true
+          # Fall back to a native local build while the Depot trust policy
+          # still rejects the renamed repo; Depot acceleration resumes
+          # automatically once it is updated.
+          buildx-fallback: true
           build-args: |
             VERSION=${{ inputs.version }}
             RELEASE_TAG=${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  push-manifest:
+    name: Push Multi-Arch Manifest
+    needs: build
+    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      # Push the multi-arch manifest tags to GitHub Container Registry
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/coder/mux
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest,enable=${{ inputs.is_latest }}
+            type=raw,value=nightly,enable=${{ inputs.is_latest_nightly }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          # DOCKER_METADATA_OUTPUT_JSON is exported by metadata-action.
+          args=()
+          while IFS= read -r tag; do
+            args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest in *; do
+            args+=("ghcr.io/coder/mux@sha256:${digest}")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect manifest
+        env:
+          VERSION: ${{ inputs.version }}
+        run: docker buildx imagetools inspect "ghcr.io/coder/mux:${VERSION}"

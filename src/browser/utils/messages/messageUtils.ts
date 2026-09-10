@@ -28,15 +28,6 @@ export function getEditableUserMessageDraftContent(
   };
 }
 
-/**
- * Returns the text that should be placed into the ChatInput when editing a user message.
- */
-export function getEditableUserMessageText(
-  message: Extract<DisplayedMessage, { type: "user" }>
-): string {
-  return getEditableUserMessageDraftContent(message).text;
-}
-
 function stripRenderedReviews(content: string, reviews?: ReviewNoteDataForDisplay[]): string {
   if (!reviews || reviews.length === 0) {
     return content;

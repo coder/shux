@@ -12,6 +12,11 @@ describe("formatBucketLabel", () => {
     expect(result).toContain("23");
   });
 
+  test("keeps the hour in a localized hourly bucket", () => {
+    const result = formatBucketLabel("2026-02-23 14:00:00");
+    expect(result).toMatch(/Feb 23, 2:00 PM/);
+  });
+
   test("returns raw string for unparseable input", () => {
     expect(formatBucketLabel("not-a-date")).toBe("not-a-date");
   });

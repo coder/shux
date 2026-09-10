@@ -10,9 +10,10 @@ import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import type { JSONValue } from "@ai-sdk/provider";
+import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
 import type {
   XaiProviderOptions,
-  // Chat options alias does not include store; Responses options do (Grok 4.5 / ZDR).
+  // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
   XaiResponsesProviderOptions,
 } from "@ai-sdk/xai";
 import type { ProviderName } from "@/common/constants/providers";
@@ -26,13 +27,20 @@ import {
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
   getOpenAIReasoningEffort,
-  isGrok45Model,
+  isGrok46Model,
+  isGrokFrontierModel,
+  isGlm53Model,
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
 } from "@/common/types/thinking";
-import { isGeminiFlashThinkingLevelModelName } from "@/common/utils/thinking/policy";
+import {
+  isGeminiFlashMinimalRejectingModelName,
+  isGeminiFlashThinkingLevelModelName,
+} from "@/common/utils/thinking/policy";
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
+import { openaiServiceTierAvailable } from "./openaiProviderOptionsAvailability";
+import { openaiProModeAvailable } from "./proMode";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -41,6 +49,11 @@ import {
   resolveProviderOptionsNamespaceKey,
   supports1MContext,
 } from "./models";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
@@ -49,11 +62,61 @@ export { resolveProviderOptionsNamespaceKey } from "./models";
 export { openaiProModeAvailable } from "./proMode";
 
 /**
+ * Canonical model string for OPTION/HEADER building. Same as
+ * normalizeToCanonical, except Coder gateway strings
+ * (coder:<instance>/<model>) are translated to the WIRE origin derived from
+ * the instance's type. The request bytes for coder:prod-anthropic/<model> are
+ * Anthropic-shaped, so thinking, cache, and beta-header decisions must run
+ * against anthropic:<model> — keying them on the "coder" prefix silently
+ * drops them, diverging from the identical model on a default-named instance.
+ * Routing identity is NOT affected: only the builders in this module use this
+ * translation.
+ *
+ * The RAW Coder identity is inspected BEFORE generic normalization: a valid
+ * instance can use a canonical route name with a different type (e.g.
+ * {name: "openai", type: "anthropic"}), and normalizeToCanonical would
+ * rewrite coder:openai/<model> to openai:<model> from the name alone —
+ * emitting OpenAI options for an Anthropic-wire request. Metadata-aware wire
+ * resolution must win over the name convention (which it still falls back to
+ * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
+ * check: a custom provider named "coder" owns the prefix,
+ * and its model IDs must not get gateway wire treatment.
+ */
+function resolveOptionsCanonicalModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): string {
+  const colonIndex = modelString.indexOf(":");
+  if (colonIndex === -1) {
+    return normalizeToCanonical(modelString);
+  }
+  const prefix = modelString.slice(0, colonIndex);
+  const prefixEntry = providersConfig?.[prefix];
+  if (isCustomProviderConfig(prefixEntry)) {
+    // Custom providers (including ones shadowing built-in ids) speak the wire
+    // their providerType selects, so thinking/cache/header decisions must key
+    // on that origin. Generic chat-completions providers keep their own
+    // identity. Must mirror resolveAndCreateModel's wireProviderName remap.
+    const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
+    return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
+  }
+  if (prefix !== "coder") {
+    return normalizeToCanonical(modelString);
+  }
+  const wire = resolveCoderWireCanonicalModel(
+    modelString.slice(colonIndex + 1),
+    providersConfig?.coder
+  );
+  return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
+}
+
+/**
  * OpenRouter reasoning options
  * @see https://openrouter.ai/docs/use-cases/reasoning-tokens
  */
 interface OpenRouterReasoningOptions {
   [key: string]: JSONValue | undefined;
+  service_tier?: OpenAIResponsesProviderOptions["serviceTier"];
   reasoning?: {
     enabled?: boolean;
     exclude?: boolean;
@@ -65,7 +128,7 @@ interface OpenRouterReasoningOptions {
 
 type OpenAICompatibleGatewayProviderOptions = Pick<
   OpenAIResponsesProviderOptions,
-  "reasoningEffort"
+  "reasoningEffort" | "serviceTier"
 >;
 
 /**
@@ -78,7 +141,7 @@ interface MoonshotAIProviderOptions {
 }
 
 /**
- * xAI providerOptions payload. Chat models use XaiProviderOptions; Grok 4.5
+ * xAI providerOptions payload. Chat models use XaiProviderOptions; frontier Grok
  * Responses also accepts store (ZDR). Union keeps both families assignable.
  */
 type XaiBuiltProviderOptions = XaiProviderOptions & Pick<XaiResponsesProviderOptions, "store">;
@@ -92,6 +155,7 @@ type ProviderOptions =
   | { google: GoogleGenerativeAIProviderOptions }
   | { openrouter: OpenRouterReasoningOptions }
   | { moonshotai: MoonshotAIProviderOptions }
+  | { zai: ZaiLanguageModelChatOptions }
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
@@ -116,7 +180,14 @@ function resolveAnthropic1MCapabilityModel(
   const normalizedModel = normalizeToCanonical(modelString);
   return {
     normalizedModel,
-    capabilityModel: resolveModelForMetadata(normalizedModel, providersConfig ?? null),
+    // Metadata resolves from the RAW identity for Coder strings: name-based
+    // canonicalization rewrites cross-typed instances (coder:openai/x, type
+    // anthropic) to a direct-provider string before the instance metadata
+    // can map them to their real upstream.
+    capabilityModel: resolveModelForMetadata(
+      modelString.startsWith("coder:") ? modelString : normalizedModel,
+      providersConfig ?? null
+    ),
   };
 }
 
@@ -160,8 +231,16 @@ export function isAnthropic1MEffectivelyEnabled(
     return false;
   }
 
+  // providersConfig also flows into the gate itself: an unmappable Coder
+  // instance keeps its gateway-scoped string, and only the config-aware gate
+  // rejects it conclusively instead of name-normalizing it to anthropic:*.
   const { capabilityModel } = resolveAnthropic1MCapabilityModel(modelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
+  // Coder strings go through the gate RAW: getAnthropic1MContextMode resolves
+  // the instance conclusively AND rejects wires that cannot carry the
+  // anthropic-beta header (vercel/google-typed instances fronting Claude).
+  // The pre-resolved capabilityModel (anthropic:*) would bypass that wire gate.
+  const gateModel = modelString.startsWith("coder:") ? modelString : capabilityModel;
+  if (!supports1MContext(gateModel, providersConfig)) {
     return false;
   }
 
@@ -192,7 +271,7 @@ export function preserveAnthropic1MContextForFollowUp(
   }
 
   const { capabilityModel } = resolveAnthropic1MCapabilityModel(targetModelString, providersConfig);
-  if (!supports1MContext(capabilityModel)) {
+  if (!supports1MContext(capabilityModel, providersConfig)) {
     return muxProviderOptions;
   }
 
@@ -212,7 +291,7 @@ export function preserveAnthropic1MContextForFollowUp(
  * 1. Enable reasoning traces (transparency into model's thought process)
  * 2. Set reasoning level (control depth of reasoning based on task complexity)
  * 3. Enable parallel tool calls (allow concurrent tool execution)
- * 4. Keep provider-specific request knobs consistent with Mux's explicit history model
+ * 4. Keep provider-specific request knobs consistent with Xum's explicit history model
  *
  * @param modelString - Full model string (e.g., "anthropic:claude-opus-4-1")
  * @param thinkingLevel - Unified thinking level (must be pre-clamped via enforceThinkingPolicy)
@@ -244,7 +323,7 @@ export function buildProviderOptions(
   // agentSession.ts is the canonical enforcement point.
   const effectiveThinking = thinkingLevel;
   // Parse origin from normalized model string
-  const normalizedModel = normalizeToCanonical(modelString);
+  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig);
   const [origin, modelName] = normalizedModel.split(":", 2);
 
   if (!origin || !modelName) {
@@ -259,9 +338,25 @@ export function buildProviderOptions(
   const formatProvider =
     providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
 
+  // Fast mode follows the actual route/wire, not capability aliases or thinking.
+  const serviceTier = openaiServiceTierAvailable(modelString, {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  })
+    ? muxProviderOptions?.openai?.serviceTier
+    : undefined;
+
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.
-  const capabilityModel = resolveModelForMetadata(normalizedModel, providersConfig ?? null);
+  // Custom-provider model entries (mappedToModel aliases) live under the raw
+  // custom prefix; the wire-remapped identity above is only for namespace and
+  // payload-format selection, so metadata must resolve from the raw identity.
+  const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  const metadataModel = isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata])
+    ? modelString
+    : normalizedModel;
+  const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
 
@@ -279,7 +374,7 @@ export function buildProviderOptions(
 
   // Build Anthropic-specific options
   if (formatProvider === "anthropic") {
-    // Anthropic prompt caching is already applied on Mux's manual cache markers
+    // Anthropic prompt caching is already applied on Xum's manual cache markers
     // (cached system message, conversation tail, last tool) deeper in the
     // request pipeline. Do not also send top-level cacheControl here: the SDK
     // serializes it to a top-level cache_control block, which adds an extra
@@ -368,15 +463,17 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: the GPT-5.6 family maps ThinkingLevel "max" to the native
-    // "max" effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
+    // Model-aware: native-max models (the GPT-5.6 family and GPT-6 Astra, see
+    // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
+    // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
     // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
     // and Chat Completions, so both wire formats now preserve the selected level.
-    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium.
+    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium;
+    // Astra rejects "none", so its "off" clamps to "low".
     const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
 
-    // Mux always sends the latest conversation history explicitly. OpenAI's
+    // Xum always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.
     // Chaining it on top of explicit history double-counts prior turns and caused GPT-5.4
     // requests to hit context_exceeded far below the documented native window.
@@ -388,16 +485,22 @@ export function buildProviderOptions(
     const cacheScope = promptCacheScope ?? workspaceId;
     const promptCacheKey = cacheScope ? `mux-v1-${cacheScope}` : undefined;
 
-    const serviceTier = muxProviderOptions?.openai?.serviceTier;
     const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
     const store = muxProviderOptions?.openai?.store;
     const isResponses = wireFormat === "responses";
     const routeIsDirect = routeProvider == null || routeProvider === origin;
     const shouldUseProMode =
       isResponses &&
-      routeIsDirect &&
       reasoningMode === "pro" &&
-      openaiSupportsProMode(capabilityModel);
+      (routeIsDirect
+        ? openaiSupportsProMode(capabilityModel)
+        : routeProvider === "coder" &&
+          // The route-aware gate preserves scoped aliases without treating an
+          // alias's capability identity as the Coder instance's wire type.
+          openaiProModeAvailable(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider,
+          }));
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(capModelName);
 
@@ -421,8 +524,8 @@ export function buildProviderOptions(
           // Default to disabled; allow auto truncation for compaction to avoid context errors
           truncation: truncationMode,
           // Pro mode is a native Responses option in @ai-sdk/openai 4.0.11.
-          // Keep the existing direct-route capability gate because mux-gateway
-          // currently drops this provider option and Codex OAuth strips it.
+          // Direct OpenAI and Coder Responses forward it; mux-gateway drops
+          // this provider option and Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
@@ -436,7 +539,10 @@ export function buildProviderOptions(
           openaiExplicitPromptCachingAvailable(
             modelString,
             routeProvider,
-            providersConfig ?? null
+            providersConfig ?? null,
+            {
+              openaiWireFormat: wireFormat,
+            }
           ) && { promptCacheKey }),
         // Conditionally add reasoning configuration
         ...(reasoningEffort && {
@@ -469,8 +575,12 @@ export function buildProviderOptions(
 
     if (isGeminiFlashThinkingModel && effectiveThinking === "off") {
       // Gemini Flash chat models default to medium and do not support true thinking-off;
-      // send minimal explicitly so Mux's "off" setting means lowest-effort behavior.
-      thinkingConfig = { thinkingLevel: "minimal" };
+      // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
+      // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
+      // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
+      thinkingConfig = isGeminiFlashMinimalRejectingModelName(capBareModelName)
+        ? { includeThoughts: true, thinkingLevel: "low" }
+        : { thinkingLevel: "minimal" };
     } else if (effectiveThinking !== "off") {
       thinkingConfig = {
         includeThoughts: true,
@@ -513,6 +623,29 @@ export function buildProviderOptions(
     return {};
   }
 
+  // Build Z.ai-specific options
+  if (formatProvider === "zai") {
+    if (!isGlm53Model(capabilityModel)) {
+      return {};
+    }
+
+    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
+      effectiveThinking === "max"
+        ? "max"
+        : effectiveThinking === "high" || effectiveThinking === "xhigh"
+          ? "high"
+          : "low";
+    const options = {
+      zai: {
+        thinking: { type: "enabled" },
+        reasoningEffort,
+        toolStream: true,
+      },
+    } satisfies { zai: ZaiLanguageModelChatOptions };
+    log.debug("buildProviderOptions: Returning Z.ai options", options);
+    return options;
+  }
+
   // Build OpenRouter-specific options
   if (formatProvider === "openrouter") {
     // Kimi K3 always reasons and supports only the max reasoning effort. Send it
@@ -527,16 +660,19 @@ export function buildProviderOptions(
       thinkingLevel: effectiveThinking,
     });
 
-    // Only add reasoning config if thinking is enabled
-    if (reasoningEffort) {
+    // OpenRouter spreads this namespace directly into the HTTP body.
+    if (reasoningEffort || serviceTier != null) {
       const options = {
         openrouter: {
-          reasoning: {
-            enabled: true,
-            effort: reasoningEffort,
-            // Don't exclude reasoning content - we want to display it in the UI
-            exclude: false,
-          },
+          ...(serviceTier != null && { service_tier: serviceTier }),
+          ...(reasoningEffort && {
+            reasoning: {
+              enabled: true,
+              effort: reasoningEffort,
+              // Don't exclude reasoning content - we want to display it in the UI
+              exclude: false,
+            },
+          }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
@@ -558,10 +694,12 @@ export function buildProviderOptions(
       store,
       ...overrides
     } = muxProviderOptions?.xai ?? {};
-    const isGrok45 = isGrok45Model(capabilityModel);
-    const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrok45
+    const isGrokFrontier = isGrokFrontierModel(capabilityModel);
+    // Grok 4.6 supports native xhigh effort; Grok 4.5 tops out at high.
+    const topEffort = isGrok46Model(capabilityModel) ? "xhigh" : "high";
+    const reasoningEffort: XaiProviderOptions["reasoningEffort"] = isGrokFrontier
       ? effectiveThinking === "xhigh" || effectiveThinking === "max"
-        ? "high"
+        ? topEffort
         : effectiveThinking === "off"
           ? "low"
           : effectiveThinking
@@ -572,21 +710,21 @@ export function buildProviderOptions(
       returnCitations: true,
     };
 
-    // Grok 4.5 Responses: always prefer store=false.
-    // Mux already resends full history explicitly and persists encrypted reasoning
+    // Frontier Grok Responses: always prefer store=false.
+    // Xum already resends full history explicitly and persists encrypted reasoning
     // client-side, so server storage is unnecessary. Forcing store=false means ZDR
     // and non-ZDR orgs share one code path and one quality bar (no settings surface).
     // Explicit muxProviderOptions.xai.store still wins for tests/escapes.
-    const effectiveStore = isGrok45 ? (store ?? false) : store;
+    const effectiveStore = isGrokFrontier ? (store ?? false) : store;
 
     const options = {
       xai: {
         ...overrides,
         ...(reasoningEffort != null && { reasoningEffort }),
         ...(effectiveStore != null && { store: effectiveStore }),
-        // Grok 4.5 uses xAI's modern Responses tools; getToolsForModel translates
+        // Frontier Grok uses xAI's modern Responses tools; getToolsForModel translates
         // legacy Live Search settings instead of sending deprecated search_parameters.
-        ...(!isGrok45 && {
+        ...(!isGrokFrontier && {
           searchParameters: searchParameters ?? defaultSearchParameters,
         }),
       },
@@ -595,19 +733,27 @@ export function buildProviderOptions(
     return options;
   }
 
-  if (origin === "openai" && formatProvider !== origin) {
+  if (
+    (origin === "openai" && formatProvider !== origin) ||
+    (providerOptionsNamespaceKey === "github-copilot" && serviceTier != null)
+  ) {
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
-    // explicit-none support, so degrade GPT-5.6 "max" to xhigh (the pre-5.6 top
-    // effort) and "none" back to omission instead of risking a rejection.
-    const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    // explicit-none support, so degrade native-max models' (GPT-5.6 family, GPT-6
+    // Astra) "max" to xhigh (the pre-5.6 top effort) and GPT-5.6's "none" back to
+    // omission instead of risking a rejection.
+    // Explicit Copilot IDs gain the tier only; don't reinterpret their reasoning capabilities.
+    const nativeReasoningEffort =
+      origin === "openai"
+        ? getOpenAIReasoningEffort(effectiveThinking, capabilityModel)
+        : undefined;
     const reasoningEffort =
       nativeReasoningEffort === "max"
         ? "xhigh"
         : nativeReasoningEffort === "none"
           ? undefined
           : nativeReasoningEffort;
-    if (!reasoningEffort) {
+    if (!reasoningEffort && serviceTier == null) {
       log.debug(
         "buildProviderOptions: OpenAI-compatible gateway (thinking off, no provider options)",
         {
@@ -622,7 +768,8 @@ export function buildProviderOptions(
 
     const options = {
       "github-copilot": {
-        reasoningEffort,
+        ...(reasoningEffort && { reasoningEffort }),
+        ...(serviceTier != null && { serviceTier }),
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);
@@ -646,7 +793,11 @@ export function buildProviderOptions(
 /** Header value for Anthropic 1M context beta */
 export const ANTHROPIC_1M_CONTEXT_HEADER = "context-1m-2025-08-07";
 
-/** HTTP header sent on AI requests for workspace-level observability. */
+/**
+ * HTTP header sent on AI requests for workspace-level observability.
+ * The JS symbol can stay Xum-branded; the wire value remains X-Mux-Workspace-Id
+ * so mux-gateway and existing correlation pipelines keep matching.
+ */
 export const MUX_WORKSPACE_ID_HEADER = "X-Mux-Workspace-Id";
 
 const HTTP_HEADER_VALUE_SAFE_PATTERN = /^[\t\x20-\x7E\x80-\xFF]+$/;
@@ -688,7 +839,7 @@ export function buildRequestHeaders(
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
   }
 
-  const normalized = normalizeToCanonical(modelString);
+  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig);
   const [origin] = normalized.split(":", 2);
 
   // 1M context header — only when origin supports it AND route is passthrough (or direct)
@@ -698,6 +849,13 @@ export function buildRequestHeaders(
   if (
     origin === "anthropic" &&
     routePassesHeaders &&
+    // Wire origin gates WHICH header can be attached; capability is
+    // evaluated on the RAW identity. The wire-canonical string mangles
+    // metadata-divergent instances (coder:bedrock/anthropic.claude-* becomes
+    // anthropic:anthropic.claude-*, which the anchored Claude patterns
+    // reject), while the raw string resolves through the provider-type-aware
+    // metadata identity — matching the UI/compaction gates AND the raw-keyed
+    // per-model 1M intent toggles.
     isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig)
   ) {
     headers["anthropic-beta"] = ANTHROPIC_1M_CONTEXT_HEADER;

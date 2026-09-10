@@ -29,3 +29,10 @@ export function ensurePrivateDirSync(dirPath: string): void {
 export function isErrnoWithCode(error: unknown, code: string): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
+
+/** True for Node fs-style errors carrying a string errno code (EACCES, EIO, ...). */
+export function isErrnoException(error: unknown): boolean {
+  return Boolean(
+    error && typeof error === "object" && "code" in error && typeof error.code === "string"
+  );
+}

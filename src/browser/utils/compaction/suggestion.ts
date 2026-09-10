@@ -14,7 +14,7 @@ import {
   isGatewayModelAccessibleFromAuthoritativeCatalog,
   isProviderModelAccessibleFromAuthoritativeCatalog,
 } from "@/common/utils/providers/gatewayModelCatalog";
-import { getModelStats } from "@/common/utils/tokens/modelStats";
+import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
 
 export interface CompactionSuggestion {
   kind: "preferred" | "higher_context";
@@ -46,7 +46,9 @@ function buildIsGatewayModelAccessible(
     isGatewayModelAccessibleFromAuthoritativeCatalog(
       gateway,
       modelId,
-      providersConfig?.[gateway]?.models
+      providersConfig?.[gateway]?.models,
+      providersConfig?.[gateway]?.discoveredModels,
+      providersConfig?.[gateway]?.removedModels
     );
 }
 
@@ -54,7 +56,12 @@ function buildIsAuthoritativeProviderModelAccessible(
   providersConfig: ProvidersConfigMap | null
 ): (modelString: string) => boolean {
   return (modelString: string) => {
-    const normalized = normalizeToCanonical(modelString);
+    // Raw-first: a canonical-named Coder instance (coder:openai/<model>) must
+    // check the coder catalog, not the direct provider that name-only
+    // canonicalization would produce — the instance TYPE decides the upstream.
+    const normalized = modelString.startsWith("coder:")
+      ? modelString
+      : normalizeToCanonical(modelString);
     const colonIndex = normalized.indexOf(":");
     if (colonIndex <= 0 || colonIndex >= normalized.length - 1) {
       return true;
@@ -65,7 +72,9 @@ function buildIsAuthoritativeProviderModelAccessible(
     return isProviderModelAccessibleFromAuthoritativeCatalog(
       provider,
       providerModelId,
-      providersConfig?.[provider]?.models
+      providersConfig?.[provider]?.models,
+      providersConfig?.[provider]?.discoveredModels,
+      providersConfig?.[provider]?.removedModels
     );
   };
 }
@@ -90,7 +99,12 @@ export function getExplicitCompactionSuggestion(
     return null;
   }
 
-  const normalized = normalizeToCanonical(modelId);
+  // Raw-first: keep coder:<instance>/<model> identities intact so catalog,
+  // routing, and policy checks validate the Coder gateway entry itself. A
+  // cross-typed instance ({name:"openai", type:"anthropic"}) canonicalizes by
+  // NAME to the direct provider, so canonical-first checks would reject an
+  // available Coder compaction model (or validate an unrelated direct one).
+  const normalized = modelId.startsWith("coder:") ? modelId : normalizeToCanonical(modelId);
   const isConfigured = buildIsConfigured(options.providersConfig);
   const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
   const isAuthoritativeProviderModelAccessible = buildIsAuthoritativeProviderModelAccessible(
@@ -119,7 +133,9 @@ export function getExplicitCompactionSuggestion(
     return null;
   }
 
-  const stats = getModelStats(normalized);
+  // Metadata-aware stats: coder identities resolve through the instance type
+  // (and mappedToModel overrides) to their upstream catalog entry.
+  const stats = getModelStatsResolved(normalized, options.providersConfig);
 
   // Prefer a stable alias for built-in known models.
   const known = Object.values(KNOWN_MODELS).find((m) => m.id === normalized);

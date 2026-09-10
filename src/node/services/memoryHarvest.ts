@@ -161,6 +161,10 @@ async function writeInbox(args: {
   ctx: MemoryScopeContext;
   inboxPath: string;
   content: string;
+  /** r60: the inbox is WORKSPACE-scope — a write detached past the removal
+   * drain would recreate the deleted session directory. MemoryService
+   * re-checks this signal pre-commit inside its target mutation lock. */
+  abortSignal?: AbortSignal;
 }): Promise<void> {
   const existing = await args.memoryService.readFileWithSha(args.ctx, args.inboxPath);
   const expectedSha = existing.success ? existing.data.sha256 : null;
@@ -169,7 +173,8 @@ async function writeInbox(args: {
     args.inboxPath,
     args.content,
     expectedSha,
-    "agent"
+    "agent",
+    args.abortSignal
   );
   if (!result.success) {
     throw new Error(result.error.message);
@@ -180,10 +185,18 @@ async function deleteInboxIfPresent(args: {
   memoryService: MemoryService;
   ctx: MemoryScopeContext;
   inboxPath: string;
+  abortSignal?: AbortSignal;
 }): Promise<void> {
   const existing = await args.memoryService.readFileWithSha(args.ctx, args.inboxPath);
   if (!existing.success) return;
-  const result = await args.memoryService.deletePath(args.ctx, args.inboxPath, "agent");
+  const result = await args.memoryService.deletePath(
+    args.ctx,
+    args.inboxPath,
+    "agent",
+    undefined,
+    undefined,
+    args.abortSignal
+  );
   if (!result.success) {
     throw new Error(result.error);
   }
@@ -290,6 +303,7 @@ export async function runMemoryHarvest(args: {
       memoryService: args.memoryService,
       ctx: args.ctx,
       inboxPath,
+      abortSignal: args.abortSignal,
     });
   }
   if (streamErrors.length === 0 && accepted.length > 0) {
@@ -302,6 +316,7 @@ export async function runMemoryHarvest(args: {
         summary: args.summary,
         candidates: accepted,
       }),
+      abortSignal: args.abortSignal,
     });
   }
 

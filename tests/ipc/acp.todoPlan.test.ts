@@ -582,11 +582,11 @@ describe("ACP user message translation for agent skills", () => {
     const { translator, sessionUpdates } = createHarness();
 
     await forwardEvents(translator, [
-      makeUserMessage('<agent-skill name="mux-docs" scope="built-in">...</agent-skill>', {
+      makeUserMessage('<agent-skill name="xum-docs" scope="built-in">...</agent-skill>', {
         metadata: {
           synthetic: true,
           agentSkillSnapshot: {
-            skillName: "mux-docs",
+            skillName: "xum-docs",
             scope: "built-in",
             sha256: "abc123",
           },
@@ -602,12 +602,12 @@ describe("ACP user message translation for agent skills", () => {
 
     await forwardEvents(translator, [
       makeCaughtUp("live"),
-      makeUserMessage("Using skill mux-docs: what is mux?", {
+      makeUserMessage("Using skill xum-docs: what is mux?", {
         metadata: {
           muxMetadata: {
             type: "agent-skill",
-            rawCommand: "/mux-docs what is mux?",
-            skillName: "mux-docs",
+            rawCommand: "/xum-docs what is mux?",
+            skillName: "xum-docs",
             scope: "built-in",
           },
         },
@@ -621,13 +621,13 @@ describe("ACP user message translation for agent skills", () => {
     const { translator, sessionUpdates } = createHarness();
 
     await forwardEvents(translator, [
-      makeUserMessage("Using skill mux-docs: what is mux?", {
+      makeUserMessage("Using skill xum-docs: what is mux?", {
         replay: true,
         metadata: {
           muxMetadata: {
             type: "agent-skill",
-            rawCommand: "/mux-docs what is mux?",
-            skillName: "mux-docs",
+            rawCommand: "/xum-docs what is mux?",
+            skillName: "xum-docs",
             scope: "built-in",
           },
         },
@@ -635,7 +635,7 @@ describe("ACP user message translation for agent skills", () => {
     ]);
 
     expect(getUpdateKinds(sessionUpdates)).toEqual(["user_message_chunk"]);
-    expect(getUserTextChunks(sessionUpdates)).toEqual(["/mux-docs what is mux?"]);
+    expect(getUserTextChunks(sessionUpdates)).toEqual(["/xum-docs what is mux?"]);
   });
 
   it("suppresses live plain user text to avoid duplicating session/prompt input", async () => {

@@ -4,7 +4,8 @@ import {
   getOpenAIReasoningEffort,
   getThinkingDisplayLabel,
   getThinkingOptionLabel,
-  MAX_THINKING_INDEX,
+  isGpt6AstraModel,
+  openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   openaiSupportsProMode,
   parseThinkingInput,
@@ -33,6 +34,20 @@ describe("getThinkingDisplayLabel", () => {
     expect(getThinkingDisplayLabel("max", "openai:gpt-5.6-luna")).toBe("MAX");
     // Pre-5.6 OpenAI models keep the max -> XHIGH display.
     expect(getThinkingDisplayLabel("max", "openai:gpt-5.5-pro")).toBe("XHIGH");
+  });
+
+  test("returns MAX for max on GPT-6 Astra (native max effort), XHIGH for xhigh", () => {
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra")).toBe("MAX");
+    expect(getThinkingDisplayLabel("max", "mux-gateway:openai/gpt-6-astra")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "openai:gpt-6-astra")).toBe("XHIGH");
+    // Unpublished variants keep the legacy display.
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra-mini")).toBe("XHIGH");
+  });
+
+  test("returns XHIGH for xhigh on Grok 4.6 (native effort), MAX on Grok 4.5", () => {
+    expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.6")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "mux-gateway:xai/grok-4.6")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("xhigh", "xai:grok-4.5")).toBe("MAX");
   });
 
   test("returns MAX for xhigh/max when no model specified (default)", () => {
@@ -86,6 +101,36 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.61")).toBe(false);
   });
+
+  test("matches GPT-6 Astra including prefixed and dated variants", () => {
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("mux-gateway:openai/gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2026-09-30")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-20260930")).toBe(true);
+  });
+
+  test("does not extend the Astra matcher to named variants or other GPT-6 ids", () => {
+    expect(isGpt6AstraModel("openai:gpt-6-astra-mini")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-astra.1")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-astral")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-sol")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-5.6-sol")).toBe(false);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6")).toBe(false);
+  });
+
+  test("accepts only dated Astra snapshots, not numeric-prefixed qualifiers", () => {
+    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30")).toBe(true);
+    expect(isGpt6AstraModel("gpt-6-astra-20260930")).toBe(true);
+    // Numeric-prefixed qualifiers are not dated snapshots and must not inherit
+    // Astra's reasoning surface.
+    expect(isGpt6AstraModel("gpt-6-astra-2-mini")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026-preview")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30-preview")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026")).toBe(false);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2-mini")).toBe(false);
+  });
 });
 
 describe("openaiSupportsProMode", () => {
@@ -104,6 +149,20 @@ describe("openaiSupportsProMode", () => {
     expect(openaiSupportsProMode("openai:gpt-5.6-sol-mini")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.61")).toBe(false);
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
+  });
+
+  test("supports Astra and dated snapshots without enabling unpublished variants", () => {
+    for (const model of [
+      "openai:gpt-6-astra",
+      "mux-gateway:openai/gpt-6-astra",
+      "openai:gpt-6-astra-2026-09-03",
+      "gpt-6-astra-20260903",
+    ]) {
+      expect(openaiSupportsProMode(model)).toBe(true);
+    }
+    for (const model of ["gpt-6", "gpt-6-astra-mini", "gpt-6-astra-2026-preview"]) {
+      expect(openaiSupportsProMode(model)).toBe(false);
+    }
   });
 });
 
@@ -126,6 +185,21 @@ describe("getOpenAIReasoningEffort", () => {
   test("keeps the standard mapping for lower levels", () => {
     expect(getOpenAIReasoningEffort("high", "openai:gpt-5.6-sol")).toBe("high");
     expect(getOpenAIReasoningEffort("low", "openai:gpt-5.6-sol")).toBe("low");
+  });
+
+  test("gives GPT-6 Astra native max but clamps off to low (it rejects none)", () => {
+    expect(openaiRejectsDisabledReasoning("openai:gpt-6-astra")).toBe(true);
+    expect(openaiRejectsDisabledReasoning("openai:gpt-5.6-sol")).toBe(false);
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra")).toBe("max");
+    expect(getOpenAIReasoningEffort("xhigh", "openai:gpt-6-astra")).toBe("xhigh");
+    expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra")).toBe("low");
+    expect(getOpenAIReasoningEffort("off", "mux-gateway:openai/gpt-6-astra-2026-09-03")).toBe(
+      "low"
+    );
+    expect(getOpenAIReasoningEffort("medium", "mux-gateway:openai/gpt-6-astra")).toBe("medium");
+    // Unpublished variants keep the legacy mapping.
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra-mini")).toBe("xhigh");
+    expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra-mini")).toBeUndefined();
   });
 });
 
@@ -189,11 +263,5 @@ describe("parseThinkingInput", () => {
     expect(parseThinkingInput("  high  ")).toBe("high");
     // Numeric with whitespace returns a number
     expect(parseThinkingInput(" 2 ")).toBe(2);
-  });
-});
-
-describe("MAX_THINKING_INDEX", () => {
-  test("is 9 (generous upper bound for numeric indices)", () => {
-    expect(MAX_THINKING_INDEX).toBe(9);
   });
 });

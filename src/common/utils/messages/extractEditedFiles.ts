@@ -12,6 +12,87 @@ import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 interface FileEditToolOutput {
   success?: boolean;
   diff?: string;
+  /**
+   * Kernel-retained records bound oversized diffs at a hunk boundary at
+   * capture (see boundRetainedEditDiff in ptc/types.ts) and flag the loss
+   * here; it propagates to FileEditDiff.truncated so consumers know the
+   * combined diff is incomplete.
+   */
+  diffTruncated?: boolean;
+}
+
+/**
+ * One successful nested edit found inside a code_execution output. `diff` is
+ * present only for classic (non-kernel) PTC records, which retain the full
+ * tool result; kernel-compacted records keep args (so the path survives) but
+ * drop result contents, leaving nothing to rebuild a diff from.
+ */
+interface NestedEditRecord {
+  filePath: string;
+  diff?: string;
+  /** See FileEditToolOutput.diffTruncated. */
+  diffTruncated?: boolean;
+}
+
+/**
+ * Nested edit calls inside a code_execution part (exclusive PTC): file edits
+ * happen as nested xum.file_edit_* calls, so the outer part is named
+ * "code_execution" and the edits live in its output's toolCalls records.
+ * Mirrors collectNestedReadPaths in extractReadFiles.ts. Records are returned
+ * in chronological (execution) order.
+ */
+function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
+  if (typeof output !== "object" || output === null) return [];
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+
+  const records: NestedEditRecord[] = [];
+  for (const record of toolCalls as Array<Record<string, unknown>>) {
+    if (typeof record !== "object" || record === null) continue;
+    if (!FILE_EDIT_TOOL_NAMES.includes(record.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])) {
+      continue;
+    }
+    // Success = no error, and for kernel-compacted records ok !== false.
+    if (record.error !== undefined || record.ok === false) continue;
+    // History rows are untrusted persisted JSON: a malformed record can carry
+    // null (or a primitive) here, and compaction preparation plus
+    // post-compaction attachment tracking both run this extractor — one
+    // corrupt row must degrade to a skip, never a repeated throw.
+    if (
+      record.result !== undefined &&
+      (record.result === null || typeof record.result !== "object")
+    ) {
+      continue;
+    }
+    const result = record.result as FileEditToolOutput | undefined;
+    // Success must be POSITIVE, never inferred from absence: classic records
+    // retain the full result (edits resolve with {success: false} instead of
+    // throwing), and kernel-compacted result-less records always carry an
+    // explicit boolean ok — a malformed row with neither must not be
+    // reported by crash-safe tracking as a completed edit.
+    if (result === undefined && record.ok !== true) continue;
+    if (result !== undefined && result.success !== true) continue;
+    const filePath = extractToolFilePath(record.args);
+    if (!filePath) continue;
+    const rawDiff =
+      result !== undefined
+        ? (getToolOutputUiOnly(result)?.file_edit?.diff ?? result.diff)
+        : undefined;
+    // Untrusted persisted JSON again: a malformed row can carry a non-string
+    // diff (array/object) that would pass truthiness/length checks and then
+    // throw inside parsePatch/applyPatch on every compaction and recovery
+    // pass — admit strings only (the path-only edit record still counts).
+    const diff = typeof rawDiff === "string" ? rawDiff : undefined;
+    records.push({
+      filePath,
+      ...(diff !== undefined ? { diff } : {}),
+      // Propagated even when the bounded diff itself was dropped (no hunk
+      // fit): a later small edit to the same file must still surface as an
+      // incomplete combined diff, not a complete-looking one.
+      ...(result?.diffTruncated === true ? { diffTruncated: true } : {}),
+    });
+  }
+  return records;
 }
 
 /**
@@ -40,19 +121,35 @@ export function extractEditedFilePaths(messages: MuxMessage[]): string[] {
     const message = messages[i];
     if (message.role !== "assistant") continue;
 
-    for (const part of message.parts) {
+    // Parts are chronological too (successive SDK steps can each add a
+    // code_execution batch): walk them backward so a later execution's edits
+    // fill the MAX_EDITED_FILES cap before an earlier one's (mirrors
+    // extractReadFilePaths).
+    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
+      const part = message.parts[partIndex];
       if (part.type !== "dynamic-tool") continue;
+      if (part.state !== "output-available") continue;
+
+      if (part.toolName === "code_execution") {
+        // Nested edits that completed before a later failure still landed.
+        // Records are chronological; reverse them so this newest-first scan
+        // keeps the LATEST edits of a large batch under MAX_EDITED_FILES.
+        for (const record of collectNestedEditRecords(part.output).reverse()) {
+          if (!seen.has(record.filePath)) {
+            seen.add(record.filePath);
+            editedFiles.push(record.filePath);
+          }
+        }
+        continue;
+      }
+
       if (!FILE_EDIT_TOOL_NAMES.includes(part.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number]))
         continue;
-
-      // Only count successful edits (output-available with success)
-      if (part.state !== "output-available") continue;
 
       // Check if the tool result indicates success
       const output = part.output as { success?: boolean } | undefined;
       if (!output?.success) continue;
 
-      // Extract file path from input
       const filePath = extractToolFilePath(part.input);
       if (filePath && !seen.has(filePath)) {
         seen.add(filePath);
@@ -180,36 +277,75 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
   // Collect all diffs per file path in chronological order
   const diffsByPath = new Map<string, string[]>();
   const editOrder: string[] = []; // Track order of last edit per file
+  // Paths whose kernel-retained diff was hunk-truncated at capture: the
+  // combined diff is incomplete no matter how the combination goes.
+  const captureTruncatedPaths = new Set<string>();
+
+  // Update edit order (move to end if already exists).
+  const bumpRecency = (filePath: string): void => {
+    const idx = editOrder.indexOf(filePath);
+    if (idx !== -1) editOrder.splice(idx, 1);
+    editOrder.push(filePath);
+  };
+
+  const addDiff = (filePath: string, diff: string): void => {
+    if (!diffsByPath.has(filePath)) {
+      diffsByPath.set(filePath, []);
+    }
+    diffsByPath.get(filePath)!.push(diff);
+    bumpRecency(filePath);
+  };
 
   for (const message of messages) {
     if (message.role !== "assistant") continue;
 
     for (const part of message.parts) {
       if (part.type !== "dynamic-tool") continue;
+      if (part.state !== "output-available") continue;
+
+      if (part.toolName === "code_execution") {
+        // Classic PTC records retain the full nested result (including the
+        // diff); kernel-compacted records surface path-only edits whose diff
+        // contents did not survive compaction.
+        for (const record of collectNestedEditRecords(part.output)) {
+          if (record.diffTruncated === true) {
+            captureTruncatedPaths.add(record.filePath);
+          }
+          if (record.diff !== undefined && record.diff.length > 0) {
+            addDiff(record.filePath, record.diff);
+          } else if (record.diff === undefined) {
+            // A successful result-less (kernel-compacted) edit landed without
+            // any retained diff: diffs from the file's OTHER retained edits no
+            // longer describe the final content, so any surviving combined
+            // diff must surface as incomplete rather than complete-looking
+            // (r26 — mirrors the dropped-bounded-diff diffTruncated signal).
+            captureTruncatedPaths.add(record.filePath);
+            // It is also the file's LATEST edit: recency must move with it
+            // (r27), or a recently edited file still ranked by its older
+            // retained diff could fall off the MAX_EDITED_FILES cut entirely
+            // once enough other files were edited in between.
+            if (diffsByPath.has(record.filePath)) bumpRecency(record.filePath);
+          }
+        }
+        continue;
+      }
+
       if (!FILE_EDIT_TOOL_NAMES.includes(part.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number]))
         continue;
-      if (part.state !== "output-available") continue;
 
       const output = part.output as FileEditToolOutput | undefined;
       if (!output?.success) continue;
 
       const uiOnly = getToolOutputUiOnly(output);
-      const diff = uiOnly?.file_edit?.diff ?? output.diff;
-      if (!diff) continue;
+      const rawPartDiff = uiOnly?.file_edit?.diff ?? output.diff;
+      // Same untrusted-JSON guard as collectNestedEditRecords: strings only.
+      const diff = typeof rawPartDiff === "string" && rawPartDiff.length > 0 ? rawPartDiff : null;
+      if (diff === null) continue;
 
       const filePath = extractToolFilePath(part.input);
       if (!filePath) continue;
 
-      // Add diff to this file's list
-      if (!diffsByPath.has(filePath)) {
-        diffsByPath.set(filePath, []);
-      }
-      diffsByPath.get(filePath)!.push(diff);
-
-      // Update edit order (move to end if already exists)
-      const idx = editOrder.indexOf(filePath);
-      if (idx !== -1) editOrder.splice(idx, 1);
-      editOrder.push(filePath);
+      addDiff(filePath, diff);
     }
   }
 
@@ -221,7 +357,9 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
 
     const combined = combineDiffs(filePath, diffs);
     if (combined) {
-      results.push(combined);
+      results.push(
+        captureTruncatedPaths.has(filePath) ? { ...combined, truncated: true } : combined
+      );
     }
   }
 

@@ -1,3 +1,4 @@
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, test, mock, afterEach } from "bun:test";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
@@ -8,7 +9,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 // NOTE: These tests focus on the event wiring (tool-call-end -> callback).
 // The actual post-compaction state computation is covered elsewhere.
@@ -85,7 +86,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       },
     };
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
 
     await waitForCondition(() => {
       expect(onCompactionComplete).toHaveBeenCalledTimes(1);
@@ -109,17 +110,71 @@ describe("AgentSession post-compaction refresh trigger", () => {
       text: "The user prefers concise tests.",
     });
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(onCompactionComplete).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
+  });
+
+  test("reports failed compaction continuation dispatch to lifecycle consumers", async () => {
+    const workspaceId = "ws-compaction-follow-up-failure";
+    const { session, historyService, aiEmitter, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+    });
+    historyCleanup = cleanup;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("before-failed-follow-up", "user", "Preserve this context")
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("failed-follow-up-request", "user", "Please compact", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {
+            followUpContent: {
+              text: "Continue delegated work",
+              model: "openai:gpt-4o",
+              agentId: "exec",
+            },
+          },
+        },
+      })
+    );
+
+    const internals = session as unknown as {
+      activeCompactionRequest?: { id: string; modelString: string };
+      dispatchPendingFollowUp: () => Promise<boolean>;
+    };
+    internals.activeCompactionRequest = {
+      id: "failed-follow-up-request",
+      modelString: "openai:gpt-4o",
+    };
+    internals.dispatchPendingFollowUp = mock(() =>
+      Promise.reject(new Error("follow-up startup failed"))
+    );
+    const decision = session.waitForPendingCompactionCompletionDecision("failed-follow-up-summary");
+
+    void runSessionTerminalPolicy(session, aiEmitter, {
+      type: "stream-end",
+      workspaceId,
+      messageId: "failed-follow-up-summary",
+      metadata: { model: "openai:gpt-4o", agentId: "compact", finishReason: "stop" },
+      parts: [{ type: "text", text: "Compacted context" }],
+    } satisfies StreamEndEvent);
+
+    expect(await decision).toBe(false);
+    expect(internals.dispatchPendingFollowUp).toHaveBeenCalledTimes(1);
+    await session.dispose();
   });
 
   test("triggers callback on file_edit_* tool-call-end", async () => {
     const handlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         handlers.set(String(eventName), listener);
         return this;
@@ -148,8 +203,10 @@ describe("AgentSession post-compaction refresh trigger", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const onPostCompactionStateChange = mock(() => undefined);
@@ -199,6 +256,6 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(onPostCompactionStateChange).toHaveBeenCalledTimes(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

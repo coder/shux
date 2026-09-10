@@ -1,9 +1,15 @@
 import { fireEvent, userEvent, waitFor } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
-import { expandProjects } from "@/browser/stories/helpers/uiState";
+import {
+  clearWorkspaceSelection,
+  collapseRightSidebar,
+  expandProjects,
+} from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { LEFT_SIDEBAR_COLLAPSED_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 
 const PROJECT_PATH = "/home/user/projects/my-app";
 
@@ -78,9 +84,8 @@ export const ProjectRemovalDisabled: AppStory = {
   },
 };
 
-// Phase 1 visual contract: a variant group nested inside a sub-agent tree must
-// keep continuous connector rails through the group header (no gap above/below),
-// and expanded members render label-only rows ("frontend", "backend").
+// A best-of group nested inside a sub-agent tree must keep continuous connector rails
+// through the group header, and expanded members render as candidate rows.
 export const NestedTaskGroupConnectors: AppStory = {
   parameters: {
     pixel: { matrix: PIXEL_DUAL_THEME },
@@ -105,22 +110,22 @@ export const NestedTaskGroupConnectors: AppStory = {
             taskStatus: "running",
           }),
           createWorkspace({
-            id: "variant-frontend",
-            name: "task/variant-frontend",
+            id: "candidate-a",
+            name: "task/candidate-a",
             projectName,
             title: "Compare designs",
             parentWorkspaceId: "sub-backend",
             taskStatus: "running",
-            bestOf: { groupId: "vg-1", index: 0, total: 2, kind: "variants", label: "frontend" },
+            bestOf: { groupId: "best-of-1", index: 0, total: 2 },
           }),
           createWorkspace({
-            id: "variant-backend",
-            name: "task/variant-backend",
+            id: "candidate-b",
+            name: "task/candidate-b",
             projectName,
             title: "Compare designs",
             parentWorkspaceId: "sub-backend",
             taskStatus: "queued",
-            bestOf: { groupId: "vg-1", index: 1, total: 2, kind: "variants", label: "backend" },
+            bestOf: { groupId: "best-of-1", index: 1, total: 2 },
           }),
           // Lower sibling: the parent trunk must continue through the group header.
           createWorkspace({
@@ -135,7 +140,7 @@ export const NestedTaskGroupConnectors: AppStory = {
         expandProjects([PROJECT_PATH]);
         localStorage.setItem(
           "expandedTaskGroups",
-          JSON.stringify({ "task:sub-backend:vg-1": true })
+          JSON.stringify({ "task:sub-backend:best-of-1": true })
         );
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
@@ -146,8 +151,8 @@ export const NestedTaskGroupConnectors: AppStory = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     await waitFor(() => {
-      if (!canvasElement.querySelector('[data-testid="task-group-vg-1"]')) {
-        throw new Error("Variant group header not found");
+      if (!canvasElement.querySelector('[data-testid="task-group-best-of-1"]')) {
+        throw new Error("Best-of group header not found");
       }
     });
   },
@@ -257,22 +262,22 @@ export const WorkflowRunGroups: AppStory = {
             createdAt: new Date(Date.now() - 5 * 60_000).toISOString(),
           }),
           createWorkspace({
-            id: "var-a",
-            name: "task/var-a",
+            id: "candidate-review-a",
+            name: "task/candidate-review-a",
             projectName,
-            title: "Split review",
+            title: "Compare reviews",
             parentWorkspaceId: "ws-main",
             taskStatus: "queued",
-            bestOf: { groupId: "vg-2", index: 0, total: 2, kind: "variants", label: "frontend" },
+            bestOf: { groupId: "best-of-2", index: 0, total: 2 },
           }),
           createWorkspace({
-            id: "var-b",
-            name: "task/var-b",
+            id: "candidate-review-b",
+            name: "task/candidate-review-b",
             projectName,
-            title: "Split review",
+            title: "Compare reviews",
             parentWorkspaceId: "ws-main",
             taskStatus: "queued",
-            bestOf: { groupId: "vg-2", index: 1, total: 2, kind: "variants", label: "backend" },
+            bestOf: { groupId: "best-of-2", index: 1, total: 2 },
           }),
         ];
         expandProjects([PROJECT_PATH]);
@@ -290,14 +295,95 @@ export const WorkflowRunGroups: AppStory = {
       if (!named || !fallback) {
         throw new Error("Expected two workflow run group headers");
       }
-      // Active runs default to expanded: the completed claims task stays visible.
-      if (!canvasElement.querySelector('[aria-label="Select workspace Extract claims"]')) {
-        throw new Error("Expected expanded workflow run to show its completed member");
+      if (canvasElement.querySelector('[aria-label="Select workspace Extract claims"]')) {
+        throw new Error("Expected completed workflow members to stay out of the left sidebar");
+      }
+      if (!canvasElement.querySelector('[aria-label="Select workspace Verify claims"]')) {
+        throw new Error("Expected the active workflow member to remain visible");
       }
     });
   },
 };
 
+export const FlatChatList: AppStory = {
+  // The flat list replaces the whole sidebar layout, so validate the compact
+  // badge/truncation behavior at the phone width alongside the laptop capture.
+  globals: {
+    viewport: { value: "mobile2", isRotated: false },
+  },
+  parameters: {
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+        // Keep the sidebar visible at the phone width: no selected workspace
+        // (mobile shows the chat over the sidebar) and the sidebar expanded.
+        clearWorkspaceSelection();
+        collapseRightSidebar();
+        updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
+        const workspaces = [
+          createWorkspace({
+            id: "alpha-pinned",
+            name: "alpha-pinned",
+            title: "Pinned from a long project name",
+            projectName: "alpha-application-with-a-long-name",
+            pinnedAt: "2026-01-02T00:00:00.000Z",
+          }),
+          createWorkspace({
+            id: "beta-pinned",
+            name: "beta-pinned",
+            title: "Pinned beta chat",
+            projectName: "beta-service",
+            pinnedAt: "2026-01-01T00:00:00.000Z",
+          }),
+          createWorkspace({
+            id: "alpha-recent",
+            name: "alpha-recent",
+            title: "Recent alpha work",
+            projectName: "alpha-application-with-a-long-name",
+          }),
+          {
+            ...createWorkspace({
+              id: "scratch-flat",
+              name: "scratch-flat",
+              title: "Scratch idea",
+              projectName: "Scratch",
+              projectPath: "/home/user/.xum/scratch/scratch-flat",
+            }),
+            kind: "scratch" as const,
+          },
+        ];
+        const projects = groupWorkspacesByProject(workspaces);
+        const alphaPath = "/home/user/projects/alpha-application-with-a-long-name";
+        const betaPath = "/home/user/projects/beta-service";
+        const alphaConfig = projects.get(alphaPath);
+        const betaConfig = projects.get(betaPath);
+        if (alphaConfig) projects.set(alphaPath, { ...alphaConfig, color: "Blue" });
+        if (betaConfig) projects.set(betaPath, { ...betaConfig, color: "Green" });
+        return createMockORPCClient({ projects, workspaces });
+      }}
+    />
+  ),
+  // Contract: the flat list (badges) and the project management headers are
+  // actually on screen, so a viewport variant cannot silently snapshot the
+  // wrong UI (e.g. the sidebar hidden behind a selected chat on mobile).
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    await waitFor(() => {
+      if (!canvasElement.querySelector('[data-testid="workspace-project-badge-alpha-pinned"]')) {
+        throw new Error("Expected a project badge on a flat-list chat row");
+      }
+      if (
+        !canvasElement.querySelector(
+          'button[aria-label="Project options for alpha-application-with-a-long-name"]'
+        )
+      ) {
+        throw new Error("Expected project management headers below the flat list");
+      }
+    });
+  },
+};
 // Pinned chats sort by pinnedAt (user-reorderable), not by name or recency:
 // the pinned block deliberately renders as charlie, alpha, bravo while the
 // newest unpinned chat stays below the block.

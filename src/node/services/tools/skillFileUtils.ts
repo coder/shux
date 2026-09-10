@@ -27,7 +27,9 @@ export function isAbsolutePathAny(filePath: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(filePath);
 }
 
-function resolveSkillFilePath(
+// Exported for validateSkillWriteProposal (staging-time validation must run
+// the SAME lexical normalization as the write path, not a re-implementation).
+export function resolveSkillFilePath(
   skillDir: string,
   filePath: string
 ): {
@@ -165,6 +167,14 @@ export async function resolveContainedSkillFilePath(
 
 /**
  * Unified directory-scope validation for local skill operations (write / delete).
+ *
+ * SECURITY: mutations intentionally reject symlinked skills roots and skill
+ * directories even when the resolved target stays inside the containment root.
+ * Reads and discovery accept contained symlinks (agent_skill_list,
+ * agentSkillsService), but mutating through a symlink alias is exposed to
+ * check-to-use races and silently edits the link target owned by whoever
+ * installed the link (e.g. a skill package manager), so writes must address
+ * the real path instead.
  *
  * Checks (in order):
  * 1. Skills root is not a symlink.

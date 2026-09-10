@@ -71,7 +71,7 @@ function getRequestedAgentId(args: unknown): string | undefined {
 // mutating tools (file_edit_*, bash, config writes) and non-explore forked tasks — those always
 // take the exclusive write lock.
 //
-// This also covers parent-side tool hooks: when a repo configures `.mux/tool_pre`/`tool_post`/
+// This also covers parent-side tool hooks: when a repo configures `.xum/tool_pre`/`tool_post`/
 // `tool_hook`, those scripts wrap the task tool's execute and run in the parent checkout. Two
 // sibling explore task calls therefore run those hook scripts concurrently. That is the same
 // best-effort tradeoff as concurrent explore bash/exec, so the built-in task marker is preserved

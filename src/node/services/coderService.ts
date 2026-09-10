@@ -1,6 +1,6 @@
 /**
  * Service for interacting with the Coder CLI.
- * Used to create/manage Coder workspaces as SSH targets for Mux workspaces.
+ * Used to create/manage Coder workspaces as SSH targets for Xum workspaces.
  */
 import { ensureMuxCoderSSHConfigFile } from "@/node/runtime/muxSshConfigWriter";
 import { execAsync, execFileAsync } from "@/node/utils/disposableExec";
@@ -1407,7 +1407,7 @@ export class CoderService {
     const startTime = Date.now();
 
     // Safety: never delete Coder workspaces mux didn't create.
-    // Mux-created workspaces always use the mux- prefix.
+    // Xum-created workspaces always use the mux- prefix.
     if (!name.startsWith("mux-")) {
       log.warn("Refusing to delete Coder workspace without mux- prefix", { name });
       return Ok(undefined);

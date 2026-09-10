@@ -5,8 +5,12 @@ import { WORKFLOW_RESULT_MESSAGE_OPENING_SENTENCE } from "@/common/utils/workflo
 // Prompt producers and timeline classification share them so their wording cannot drift.
 export const BASH_MONITOR_WAKE_HEADINGS = {
   matched: "A background bash monitor matched output.",
-  lost: "Mux restarted and background bash monitors were lost.",
-  mixed: "Background bash monitor updates (including monitors lost to a Mux restart).",
+  lost: "Xum restarted and background bash monitors were lost.",
+  mixed: "Background bash monitor updates (including monitors lost to a Xum restart).",
+  // Do not reword existing headings above: persisted timeline rows classify by exact prefix.
+  exited: "A monitored background bash process finished.",
+  failed: "A background bash monitor failed at runtime.",
+  mixedRuntimeFailure: "Background bash monitor updates (including runtime monitor failures).",
 } as const;
 
 export const BACKGROUND_WORK_WAKE_OPENINGS = {

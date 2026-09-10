@@ -124,7 +124,5 @@ export const SessionTimingFileSchema = z.object({
 export type TimingAnomaly = z.infer<typeof TimingAnomalySchema>;
 export type ActiveStreamStats = z.infer<typeof ActiveStreamStatsSchema>;
 export type CompletedStreamStats = z.infer<typeof CompletedStreamStatsSchema>;
-export type ModelTimingStats = z.infer<typeof ModelTimingStatsSchema>;
-export type SessionTimingStats = z.infer<typeof SessionTimingStatsSchema>;
 export type WorkspaceStatsSnapshot = z.infer<typeof WorkspaceStatsSnapshotSchema>;
 export type SessionTimingFile = z.infer<typeof SessionTimingFileSchema>;

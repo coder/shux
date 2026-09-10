@@ -2,6 +2,7 @@ import React from "react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { cn } from "@/common/lib/utils";
 import { supports1MContext } from "@/common/utils/ai/models";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 
 interface Toggle1MContextProps {
   /** Model ID to check/toggle 1M context for */
@@ -17,10 +18,12 @@ interface Toggle1MContextProps {
  */
 export const Toggle1MContext: React.FC<Toggle1MContextProps> = (props) => {
   const { has1MContext, toggle1MContext } = useProviderOptions();
+  const { config: providersConfig } = useProvidersConfig();
 
   // 1M context is a runtime model capability, gated on the runtime model —
-  // not inherited through "Treat as" model mapping.
-  if (!supports1MContext(props.model)) return null;
+  // not inherited through "Treat as" model mapping. Coder gateway instances
+  // resolve through their instance type (the gateway is a transparent proxy).
+  if (!supports1MContext(props.model, providersConfig)) return null;
 
   const label = props.label ?? "1M context";
   const enabled = has1MContext(props.model);

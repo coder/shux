@@ -1,13 +1,19 @@
 import * as crypto from "crypto";
 import * as http from "http";
+import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
-import { auth, type OAuthClientProvider } from "@modelcontextprotocol/client";
+import {
+  auth,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/client";
 import type { Config } from "@/node/config";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { WindowService } from "@/node/services/windowService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { log } from "@/node/services/log";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -23,7 +29,6 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -102,6 +107,7 @@ interface OAuthFlowBase {
 
   /** PKCE verifier for this flow (set by the MCP SDK auth()). */
   codeVerifier: string | null;
+  discoveryState: OAuthDiscoveryState | undefined;
 
   timeout: ReturnType<typeof setTimeout>;
   cleanupTimeout: ReturnType<typeof setTimeout> | null;
@@ -337,10 +343,13 @@ async function fetchProtectedResourceScopes(url: URL): Promise<string[]> {
  * refused to use a stored refresh_token without them and instead invalidated
  * the tokens and demanded interactive re-login. The official SDK v2 ignores
  * these fields (it stamps `issuer` instead — see MCPOAuthTokens.issuer), but
- * we keep round-tripping them so downgrading Mux does not break token
+ * we keep round-tripping them so downgrading Xum does not break token
  * refresh after an app restart.
  */
-function parseAuthorizationServerBinding(value: Record<string, unknown>): {
+function parseAuthorizationServerBinding(value: {
+  authorization_server?: unknown;
+  token_endpoint?: unknown;
+}): {
   authorization_server?: string;
   token_endpoint?: string;
 } {
@@ -367,6 +376,26 @@ function parseAuthorizationServerBinding(value: Record<string, unknown>): {
   }
 
   return { authorization_server: authorizationServer, token_endpoint: tokenEndpoint };
+}
+
+interface AuthorizationServerBinding {
+  authorization_server: string;
+  token_endpoint: string;
+}
+
+// Discovery is where both legacy binding fields are available for downgrade-compatible saves (#3823).
+function deriveAuthorizationServerBinding(
+  state: OAuthDiscoveryState | undefined
+): AuthorizationServerBinding | undefined {
+  const tokenEndpoint = state?.authorizationServerMetadata?.token_endpoint;
+  if (!state?.authorizationServerUrl || !tokenEndpoint) {
+    return undefined;
+  }
+
+  return {
+    authorization_server: state.authorizationServerUrl,
+    token_endpoint: tokenEndpoint,
+  };
 }
 
 /**
@@ -596,6 +625,77 @@ export class McpOauthService {
     this.serverFlows.clear();
   }
 
+  async startDesktopFlowForApi(input: {
+    projectPath?: string;
+    serverName: string;
+    pendingServer?: MCPOAuthPendingServerConfig;
+  }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    return this.startDesktopFlow({
+      ...input,
+      projectPath: input.projectPath ?? this.config.rootDir,
+    });
+  }
+
+  async startServerFlowForApi(
+    input: {
+      projectPath?: string;
+      serverName: string;
+      pendingServer?: MCPOAuthPendingServerConfig;
+    },
+    headers?: IncomingHttpHeaders
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const projectPath = input.projectPath ?? this.config.rootDir;
+    const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
+    if (origin) {
+      try {
+        const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
+        return this.startServerFlow({ ...input, projectPath, redirectUri });
+      } catch {
+        // Fall back to Host header.
+      }
+    }
+
+    const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
+    const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
+    if (!host) {
+      return Err("Missing Host header");
+    }
+    const protoHeader = headers?.["x-forwarded-proto"];
+    const forwardedProto = typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
+    const proto = forwardedProto.length ? forwardedProto : "http";
+    const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
+    return this.startServerFlow({ ...input, projectPath, redirectUri });
+  }
+
+  async getProjectAuthStatus(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return { isLoggedIn: false, hasRefreshToken: false };
+    }
+    return this.getAuthStatus({ serverUrl: server.url });
+  }
+
+  async logoutProjectServer(input: {
+    projectPath: string;
+    serverName: string;
+  }): Promise<Result<void, string>> {
+    const servers = await this.mcpConfigService.listServers(
+      input.projectPath,
+      isProjectTrusted(this.config, input.projectPath)
+    );
+    const server = servers[input.serverName];
+    if (!server || server.transport === "stdio") {
+      return Ok(undefined);
+    }
+    return this.logout({ serverUrl: server.url });
+  }
   async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
@@ -839,6 +939,7 @@ export class McpOauthService {
       scope: await resolveOAuthScope(challenge),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
+      discoveryState: undefined,
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -983,6 +1084,7 @@ export class McpOauthService {
       scope: await resolveOAuthScope(challenge),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
+      discoveryState: undefined,
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1143,9 +1245,17 @@ export class McpOauthService {
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
+          legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
         });
       },
+      saveDiscoveryState: (state) => {
+        flow.discoveryState = state;
+      },
+      // The SDK compares this redirect-leg issuer with callback discovery before
+      // sending the authorization code and PKCE verifier to the token endpoint.
+      discoveryState: () => Promise.resolve(flow.discoveryState),
       redirectToAuthorization: (authorizationUrl) => {
         flow.authorizeUrl = authorizationUrl.toString();
         return Promise.resolve();
@@ -1161,7 +1271,7 @@ export class McpOauthService {
         return Promise.resolve(flow.codeVerifier);
       },
       invalidateCredentials: async (scope) => {
-        // "discovery" (SDK v2) refers to cached AS metadata, which Mux does
+        // "discovery" (SDK v2) refers to cached AS metadata, which Xum does
         // not persist; nothing to invalidate.
         if (scope === "discovery") {
           return;
@@ -1180,7 +1290,7 @@ export class McpOauthService {
           response_types: ["code"],
           grant_types: ["authorization_code", "refresh_token"],
           token_endpoint_auth_method: "none",
-          client_name: "Mux",
+          client_name: "Xum",
           scope: flow.scope,
         };
       },
@@ -1191,12 +1301,14 @@ export class McpOauthService {
         return Promise.resolve(flow.clientInformation ?? undefined);
       },
       saveClientInformation: async (clientInformation) => {
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         const next = clientInformation as unknown as MCPOAuthClientInformation;
         flow.clientInformation = next;
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
           clientInformation: next,
+          legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
         });
       },
       state: () => Promise.resolve(flow.flowId),
@@ -1207,16 +1319,25 @@ export class McpOauthService {
     serverUrl: string;
     serverName?: string;
   }): OAuthClientProvider {
+    let discoveryState: OAuthDiscoveryState | undefined;
+
     return {
       tokens: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.tokens as unknown as MCPOAuthTokens | undefined;
       },
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: input.serverUrl,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
+          legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
+      },
+      saveDiscoveryState: (state) => {
+        // Cache only for downgrade-compatible writes; read-back would change SDK discovery behavior.
+        discoveryState = state;
       },
       redirectToAuthorization: async () => {
         // Avoid any user-visible side effects during background tool calls.
@@ -1233,7 +1354,7 @@ export class McpOauthService {
       },
       codeVerifier: () => Promise.reject(new Error("PKCE verifier is not available")),
       invalidateCredentials: async (scope) => {
-        // "discovery" (SDK v2) refers to cached AS metadata, which Mux does
+        // "discovery" (SDK v2) refers to cached AS metadata, which Xum does
         // not persist; nothing to invalidate.
         if (scope === "discovery") {
           return;
@@ -1255,12 +1376,15 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.clientInformation as unknown as MCPOAuthClientInformation | undefined;
       },
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           clientInformation: clientInformation as unknown as MCPOAuthClientInformation,
+          legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
       },
     };
@@ -1298,7 +1422,7 @@ export class McpOauthService {
       renderOAuthCallbackHtml({
         title: result.success ? "Login complete" : "Login failed",
         message: result.success
-          ? "You can return to Mux. You may now close this tab."
+          ? "You can return to Xum. You may now close this tab."
           : result.error,
         success: result.success,
       })
@@ -1508,21 +1632,30 @@ export class McpOauthService {
     });
   }
 
-  private async saveTokens(input: { serverUrl: string; tokens: MCPOAuthTokens }): Promise<void> {
+  private async saveTokens(input: {
+    serverUrl: string;
+    tokens: MCPOAuthTokens;
+    legacyBinding?: AuthorizationServerBinding;
+  }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
       });
+      const serverMatches = normalizeServerUrlForComparison(creds.serverUrl) === input.serverUrl;
+      // Do not carry a legacy binding across defensive server URL replacement.
+      const legacyBinding =
+        input.legacyBinding ??
+        (serverMatches && creds.tokens ? parseAuthorizationServerBinding(creds.tokens) : undefined);
 
       // Defensive: Never keep tokens bound to a different URL.
-      if (normalizeServerUrlForComparison(creds.serverUrl) !== input.serverUrl) {
+      if (!serverMatches) {
         creds.clientInformation = undefined;
       }
 
       creds.serverUrl = input.serverUrl;
-      creds.tokens = input.tokens;
+      creds.tokens = { ...input.tokens, ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);
@@ -1532,6 +1665,7 @@ export class McpOauthService {
   private async saveClientInformation(input: {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
+    legacyBinding?: AuthorizationServerBinding;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
       const store = await this.ensureStoreLoadedLocked();
@@ -1539,9 +1673,16 @@ export class McpOauthService {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
       });
+      const serverMatches = normalizeServerUrlForComparison(creds.serverUrl) === input.serverUrl;
+      // Do not carry a legacy binding across defensive server URL replacement.
+      const legacyBinding =
+        input.legacyBinding ??
+        (serverMatches && creds.clientInformation
+          ? parseAuthorizationServerBinding(creds.clientInformation)
+          : undefined);
 
       // Defensive: Never keep client info bound to a different URL.
-      if (normalizeServerUrlForComparison(creds.serverUrl) !== input.serverUrl) {
+      if (!serverMatches) {
         creds.tokens = undefined;
       }
 
@@ -1554,7 +1695,7 @@ export class McpOauthService {
       }
 
       creds.serverUrl = input.serverUrl;
-      creds.clientInformation = input.clientInformation;
+      creds.clientInformation = { ...input.clientInformation, ...legacyBinding };
       creds.updatedAtMs = Date.now();
 
       await this.persistStoreLocked(store);
@@ -1620,7 +1761,7 @@ export class McpOauthService {
   }
 
   private async persistStoreLocked(store: McpOauthStoreFile): Promise<void> {
-    // Ensure ~/.mux exists.
+    // Ensure ~/.xum exists.
     await fsPromises.mkdir(this.config.rootDir, { recursive: true });
 
     await writeFileAtomic(this.storeFilePath, JSON.stringify(store, null, 2), {

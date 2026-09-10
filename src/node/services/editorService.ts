@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "child_process";
 import * as fsPromises from "fs/promises";
 import type { Config } from "@/node/config";
+import type { WorkspaceService } from "@/node/services/workspaceService";
 import { isDockerRuntime, isSSHRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
-import { sanitizeMuxChildEnv } from "@/node/runtime/childProcessEnv";
+import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
@@ -55,6 +56,14 @@ export interface EditorConfig {
   customCommand?: string;
 }
 
+export interface OpenInEditorInput {
+  workspaceId: string;
+  targetPath: string;
+  editorConfig: EditorConfig;
+}
+
+type ExternalEditorOpenRecorder = Pick<WorkspaceService, "recordExternalEditorOpenForLaunch">;
+
 /**
  * Service for opening workspaces in code editors.
  *
@@ -62,24 +71,34 @@ export interface EditorConfig {
  * This service is only responsible for spawning the user's custom editor command.
  */
 export class EditorService {
-  private readonly config: Config;
+  constructor(
+    private readonly config: Pick<Config, "getAllWorkspaceMetadata">,
+    private readonly externalEditorOpenRecorder: ExternalEditorOpenRecorder
+  ) {}
 
-  constructor(config: Config) {
-    this.config = config;
+  async openInEditor(
+    input: OpenInEditorInput
+  ): Promise<{ success: true; data: void } | { success: false; error: string }> {
+    // Detached editor processes cannot be tracked, so archive gating must record the open first.
+    const recorded = await this.externalEditorOpenRecorder.recordExternalEditorOpenForLaunch(
+      input.workspaceId
+    );
+    if (!recorded.success) {
+      return recorded;
+    }
+
+    const result = await this.launchEditor(input);
+    if (!result.success) {
+      // Pre-spawn failures must not leave a marker that permanently blocks later archives.
+      await recorded.data.rollbackAfterFailedLaunch();
+    }
+    return result;
   }
 
-  /**
-   * Open a path in the user's configured code editor.
-   *
-   * @param workspaceId - The workspace (used to determine runtime + validate constraints)
-   * @param targetPath - The path to open (workspace directory or specific file)
-   * @param editorConfig - Editor configuration from user settings
-   */
-  async openInEditor(
-    workspaceId: string,
-    targetPath: string,
-    editorConfig: EditorConfig
+  private async launchEditor(
+    input: OpenInEditorInput
   ): Promise<{ success: true; data: void } | { success: false; error: string }> {
+    const { workspaceId, targetPath, editorConfig } = input;
     try {
       if (editorConfig.editor !== "custom") {
         return {
@@ -137,10 +156,10 @@ export class EditorService {
         stdio: "ignore",
         shell: true,
         windowsHide: true,
-        // Strip mux-internal vars (e.g. CHROME_DESKTOP, our Linux desktop
-        // identity) so GUI editors don't inherit mux's window identity.
-        // sanitizeMuxChildEnv copies its input, so pass process.env directly.
-        env: sanitizeMuxChildEnv(process.env),
+        // Strip xum-internal vars (e.g. CHROME_DESKTOP, our Linux desktop
+        // identity) so GUI editors don't inherit xum's window identity.
+        // sanitizeXumChildEnv copies its input, so pass process.env directly.
+        env: sanitizeXumChildEnv(process.env),
       });
       child.unref();
 

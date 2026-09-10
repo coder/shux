@@ -209,7 +209,8 @@ export async function seedWorkspaceHistoryProfile(args: {
   const profileConfig = HISTORY_PROFILES[profile];
 
   const historyService = new HistoryService({
-    getSessionDir: (workspaceId: string) => path.join(demoProject.sessionsDir, workspaceId),
+    sessionsDir: demoProject.sessionsDir,
+    rootDir: path.dirname(demoProject.sessionsDir),
   });
 
   await fsPromises.writeFile(demoProject.historyPath, "", "utf-8");
@@ -299,7 +300,7 @@ export function parseHistoryProfilesFromEnv(rawProfiles: string | undefined): Hi
   );
   if (invalidProfile) {
     throw new Error(
-      `Invalid MUX_E2E_PERF_PROFILES entry "${invalidProfile}". Expected one of: ${HISTORY_PROFILE_NAMES.join(", ")}.`
+      `Invalid XUM_E2E_PERF_PROFILES entry "${invalidProfile}". Expected one of: ${HISTORY_PROFILE_NAMES.join(", ")}.`
     );
   }
 

@@ -35,6 +35,43 @@ describe("ProjectAddForm", () => {
     currentClientMock = {};
   });
 
+  test("creates a new git project and uses the backend response", async () => {
+    const createProject = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: {
+          normalizedPath: "/projects/backend-normalized",
+          projectConfig: { workspaces: [] },
+        },
+      })
+    );
+    currentClientMock = {
+      projects: {
+        getDefaultProjectDir: () => Promise.resolve("/projects"),
+        list: () => Promise.resolve([]),
+        create: createProject,
+      },
+    };
+    const onSuccess = mock(() => undefined);
+
+    const { getByText, getByPlaceholderText } = render(
+      <ProjectAddForm isOpen onSuccess={onSuccess} />
+    );
+
+    fireEvent.click(getByText("New project"));
+    const projectInput = getByPlaceholderText("my-new-project");
+    const user = userEvent.setup({ document: projectInput.ownerDocument });
+    await user.type(projectInput, "prototype");
+    fireEvent.click(getByText("Create Project"));
+
+    await waitFor(() =>
+      expect(createProject).toHaveBeenCalledWith({ projectPath: "prototype", initGit: true })
+    );
+    await waitFor(() =>
+      expect(onSuccess).toHaveBeenCalledWith("/projects/backend-normalized", { workspaces: [] })
+    );
+  });
+
   test("aborts in-flight clone when unmounted", async () => {
     let receivedSignal: AbortSignal | null = null;
 

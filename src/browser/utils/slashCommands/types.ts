@@ -11,6 +11,8 @@
 
 import type { ExperimentId } from "@/common/constants/experiments";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 
 export type ParsedCommand =
@@ -27,6 +29,7 @@ export type ParsedCommand =
   | { type: "clear"; mode: "hard" | "soft" }
   | { type: "compact"; maxOutputTokens?: number; continueMessage?: string; model?: string }
   | { type: "dream" }
+  | { type: "refine"; apply?: boolean }
   | { type: "fork"; startMessage?: string }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }
@@ -101,6 +104,9 @@ export interface SlashSuggestion {
 
 export interface SlashSuggestionContext extends SlashCommandVisibilityContext {
   agentSkills?: AgentSkillDescriptor[];
+  mcpPrompts?: MCPPromptDescriptor[];
+  /** Agent Plugins: manifest-contributed commands (name -> expansion). */
+  pluginCommands?: PluginSlashCommandDescriptor[];
 }
 
 export interface SuggestionDefinition {

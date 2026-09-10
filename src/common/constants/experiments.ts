@@ -1,3 +1,5 @@
+export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
+
 /**
  * Experiments System
  *
@@ -7,9 +9,8 @@
 
 export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
-  PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE: "programmatic-tool-calling-exclusive",
+  RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
-  EXEC_SUBAGENT_HARD_RESTART: "exec-subagent-hard-restart",
   MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
   AGENT_BROWSER: "agent-browser",
@@ -19,15 +20,59 @@ export const EXPERIMENT_IDS = {
   DYNAMIC_WORKFLOWS: "dynamic-workflows",
   MEMORY: "memory",
   MEMORY_HOT_SET: "memory-hot-set",
+  MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
   TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
+  CLAUDE_DESIGN_MCP: "claude-design-mcp",
   AGENT_PLUGINS: "agent-plugins",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   TIMELINE: "timeline",
+  CONTINUOUS_COMPACTION: "continuous-compaction",
+  TOKEN_BUDGET: "tokenBudget",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
+
+/**
+ * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
+ * before Programmatic Tool Calling became exclusive-only. Persistence layers
+ * (backend feature_flags.json, renderer localStorage) alias a stored `true`
+ * onto the merged PTC key on read and mirror the merged PTC value back onto
+ * this key on write, so upgrades keep the user's exclusive posture and a
+ * downgraded build runs exclusive mode instead of the removed (~2x cost)
+ * supplement mode.
+ */
+export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
+
+/**
+ * Read-side alias for persisted experiment-flag objects (camelCase form used
+ * by taskExperiments snapshots and startup-retry send options): a legacy
+ * exclusive `true` opted into exactly the posture merged PTC activates, so it
+ * wins even over an explicit `programmaticToolCalling: false`.
+ */
+export function aliasLegacyPtcExclusive<
+  T extends { programmaticToolCalling?: boolean; programmaticToolCallingExclusive?: boolean },
+>(
+  experiments: T | undefined
+): (Omit<T, "programmaticToolCalling"> & { programmaticToolCalling?: boolean }) | undefined {
+  if (experiments?.programmaticToolCallingExclusive !== true) return experiments;
+  if (experiments.programmaticToolCalling === true) return experiments;
+  return { ...experiments, programmaticToolCalling: true };
+}
+
+/**
+ * Write-side mirror for persisted experiment-flag objects: an enabled merged
+ * PTC also stamps the legacy exclusive key so a downgraded build runs the
+ * exclusive posture instead of reading bare PTC as the removed (~2x cost)
+ * supplement mode.
+ */
+export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling?: boolean }>(
+  experiments: T | undefined
+): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
+  if (experiments?.programmaticToolCalling !== true) return experiments;
+  return { ...experiments, programmaticToolCallingExclusive: true };
+}
 
 export interface ExperimentDefinition {
   id: ExperimentId;
@@ -52,17 +97,46 @@ export interface ExperimentDefinition {
  * Use Record<ExperimentId, ExperimentDefinition> to ensure exhaustive coverage.
  */
 export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
-    name: "Programmatic Tool Calling",
-    description: "Enable code_execution tool for multi-tool workflows in a sandboxed JS runtime",
+  [EXPERIMENT_IDS.TOKEN_BUDGET]: {
+    id: EXPERIMENT_IDS.TOKEN_BUDGET,
+    name: "Token-budget context windows",
+    description:
+      "Start fresh context windows instead of automatic summaries, with session_history for retrieval. Requires session_history; continuous compaction and RLM take precedence.",
+    enabledByDefault: false,
+    // Configured together with Continuous Compaction in Settings → General.
+    showInSettings: false,
+  },
+  [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: {
+    id: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+    name: "Claude Design MCP",
+    description:
+      "Optionally reuse Claude Code credentials read-only for Claude Design. Configure credential access separately in MCP settings; Claude Code owns login, consent, and refresh.",
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE,
-    name: "PTC Exclusive Mode",
-    description: "Replace all tools with code_execution (forces PTC usage)",
+  [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: {
+    id: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+    name: "Continuous Compaction",
+    description: "Compact older context between turns while preserving recent messages verbatim",
+    enabledByDefault: false,
+    showInSettings: false,
+  },
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
+    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+    name: "Programmatic Tool Calling",
+    description:
+      "Replace the standard toolset with a sandboxed code_execution tool; bridged tools are called as xum.<tool>(...) from JS",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Programmatic Tool Calling (flat flag, gated on the PTC
+  // parent at call sites; Settings nests it under the PTC toggle). Without a
+  // PTC flag the option is inert: code_execution is never assembled.
+  [EXPERIMENT_IDS.RLM]: {
+    id: EXPERIMENT_IDS.RLM,
+    name: "RLM Mode",
+    description:
+      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Requires Programmatic Tool Calling.",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -70,21 +144,14 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.CONFIGURABLE_BIND_URL,
     name: "Expose API server on LAN/VPN",
     description:
-      "Allow mux to listen on a non-localhost address so other devices on your LAN/VPN can connect. Anyone on your network with the auth token can access your mux API. HTTP only; use only on trusted networks (Tailscale recommended).",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART]: {
-    id: EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART,
-    name: "Exec sub-agent hard restart",
-    description: "Hard-restart exec sub-agents on context overflow",
+      "Allow Xum to listen on a non-localhost address so other devices on your LAN/VPN can connect. Anyone on your network with the auth token can access your Xum API. HTTP only; use only on trusted networks (Tailscale recommended).",
     enabledByDefault: false,
     showInSettings: true,
   },
   [EXPERIMENT_IDS.MUX_GOVERNOR]: {
     id: EXPERIMENT_IDS.MUX_GOVERNOR,
-    name: "Mux Governor",
-    description: "Remote policy delivery for enterprise Mux Governor service",
+    name: "Xum Governor",
+    description: "Remote policy delivery for enterprise Xum Governor service",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -144,6 +211,13 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   // site; Settings nests it under the Agent Memory toggle). Without it, memories
   // stay pull-based like skills: index advertised in the memory tool description,
   // contents fetched on demand.
+  [EXPERIMENT_IDS.MEMORY_INTUITION]: {
+    id: EXPERIMENT_IDS.MEMORY_INTUITION,
+    name: "Memory Intuition",
+    description: "Recall relevant memories with a bounded, read-only intuition agent",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
     id: EXPERIMENT_IDS.MEMORY_HOT_SET,
     name: "Memory Hot Set",
@@ -172,9 +246,9 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   },
   [EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT]: {
     id: EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT,
-    name: "Claude skills compatibility",
+    name: "Claude compatibility",
     description:
-      "Also discover Agent Skills from .claude/skills and ~/.claude/skills (read-only, lowest precedence within each scope)",
+      "Also read skills from .claude/skills and ~/.claude/skills, plus global instructions from ~/.claude/CLAUDE.md (read-only, lowest precedence)",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -182,7 +256,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.AGENT_PLUGINS,
     name: "Agent Plugins",
     description:
-      "Discover Agent Plugins (agent-plugins.org 1.0.0) from .mux/plugins, .agents/plugins, ~/.mux/plugins, and ~/.agents/plugins: plugin skills join skill discovery and plugin MCP servers appear disabled by default",
+      "Discover Agent Plugins (agent-plugins.org 1.0.0) from .xum/plugins, .agents/plugins, ~/.xum/plugins, and ~/.agents/plugins: plugin skills join skill discovery and plugin MCP servers appear disabled by default",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -259,6 +333,15 @@ export function getExperimentPlatformRestrictionLabel(
  */
 export function getExperimentKey(experimentId: ExperimentId): string {
   return `experiment:${experimentId}`;
+}
+
+/**
+ * localStorage key of the removed exclusive experiment (see
+ * LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). Kept out of getExperimentKey's
+ * signature so ordinary call sites can't target a removed experiment.
+ */
+export function getLegacyPtcExclusiveExperimentKey(): string {
+  return `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`;
 }
 
 /**

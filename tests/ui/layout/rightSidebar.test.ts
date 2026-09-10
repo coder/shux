@@ -133,6 +133,7 @@ describeIntegration("RightSidebar (UI)", () => {
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
     updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
     updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AGENT_BROWSER), null);
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), null);
     updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, null);
     updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
     updatePersistedState(getTerminalTitlesKey(workspaceId), null);
@@ -196,7 +197,7 @@ describeIntegration("RightSidebar (UI)", () => {
     return findSidebarTab(sidebar, "terminal:", 10_000);
   }
 
-  test("does not show the browser tab by default", async () => {
+  test("does not show browser or desktop tabs by default", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
       updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
@@ -205,7 +206,9 @@ describeIntegration("RightSidebar (UI)", () => {
     try {
       await waitFor(() => {
         const browserTab = sidebar.querySelector('[role="tab"][aria-controls*="browser"]');
+        const desktopTab = sidebar.querySelector('[role="tab"][aria-controls*="desktop"]');
         expect(browserTab).toBeNull();
+        expect(desktopTab).toBeNull();
       });
     } finally {
       await cleanup();

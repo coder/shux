@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -69,12 +70,14 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { PendingSendMessage } from "@/browser/features/Messages/PendingSendMessage";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import {
   ConcurrentLocalWarningDecoration,
-  useConcurrentLocalStreamingWorkspaceName,
+  useConcurrentLocalAgentCount,
 } from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
+import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
@@ -93,7 +96,6 @@ import {
   ChatDockSurface,
   useChatDockColumnWidthClass,
 } from "./chatDockColumn";
-import { resolveComposerControlFocusTarget } from "./composerControlFocus";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
@@ -364,7 +366,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
-  const concurrentLocalStreamingWorkspaceName = useConcurrentLocalStreamingWorkspaceName({
+  const concurrentLocalAgentCount = useConcurrentLocalAgentCount({
     workspaceId,
     projectPath,
     runtimeConfig,
@@ -383,7 +385,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // after the transcript is visible.
   const chatViewDataReady = useChatViewDataReady(workspaceId);
 
-  const { threshold: autoCompactionThreshold } = useAutoCompactionSettings(
+  const { threshold: autoCompactionThreshold, rolloverEnabled } = useAutoCompactionSettings(
     workspaceId,
     pendingModel
   );
@@ -466,6 +468,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
+    pendingSend,
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
@@ -727,21 +730,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerMouseDown, isComposerDockEvent]
   );
 
-  const handleComposerDockMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented || event.button !== 0) {
-      return;
-    }
-    const control = resolveComposerControlFocusTarget(event.target, composerDockRef.current);
-    if (!control) {
-      return;
-    }
-    // Suppressing the default keeps WebKit from walking focus up to the scrollport
-    // (see composerControlFocus); the control then takes focus the way it already
-    // does on Chromium.
-    event.preventDefault();
-    control.focus({ preventScroll: true });
-  };
-
   const handleTranscriptTouchMove = markUserScrollIntent;
 
   const handleTranscriptKeyDown = useCallback(
@@ -778,8 +766,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wake events should not interrupt navigation between human prompts.
-      if (message.type === "user" && message.bashMonitorWake == null) {
+      // Machine wakes and budget warnings should not interrupt navigation between human prompts.
+      if (
+        message.type === "user" &&
+        message.bashMonitorWake == null &&
+        message.agentPeerMessageTrigger == null &&
+        message.contextBudgetWarning == null
+      ) {
         userHistoryIds.push(message.historyId);
       }
     }
@@ -1010,7 +1003,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessage(undefined);
-  }, [setEditingMessage]);
+    // handleEditLastUserMessage disabled auto-scroll to keep the view centered
+    // on the edited message. Dismissing the edit hands scroll ownership back to
+    // the transcript tail; without this the view stays scrolled up until the
+    // user manually returns to the bottom.
+    jumpToBottom();
+  }, [jumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
@@ -1042,7 +1040,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       handleJumpToBottom();
 
       // Truncate history in backend
-      await api?.workspace.truncateHistory({ workspaceId, percentage });
+      const result = await api?.workspace.truncateHistory({ workspaceId, percentage });
+      // A partial failure (history already deleted but durable cleanup —
+      // e.g. sandbox kernel invalidation — failed) carries the only warning
+      // that cleared state may reappear after a restart. Throw so callers
+      // (slash command, dialogs) surface it instead of reporting success.
+      if (result && !result.success) {
+        throw new Error(result.error);
+      }
     },
     [workspaceId, handleJumpToBottom, api]
   );
@@ -1106,14 +1111,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       hasRenderableMessages: deferredMessages.length > 0,
       // Any mounted barrier (including waiting-on-monitor) counts: a cleared
       // transcript with an armed monitor must not flash placeholders under it.
-      shouldShowStreamingBarrier: shouldMountStreamingBarrier,
+      // A pending send is a live tail row for the same reason.
+      shouldShowStreamingBarrier: shouldMountStreamingBarrier || pendingSend !== null,
     });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
-    !shouldMountStreamingBarrier;
+    !shouldMountStreamingBarrier &&
+    pendingSend === null;
   const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
+    !isHydratingTranscript &&
+    !shouldShowStreamingBarrier &&
+    hasInterruptedStream &&
+    pendingSend === null;
   const isAutoRetryActive =
     workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
     workspaceState.autoRetryStatus?.type === "auto-retry-starting";
@@ -1168,6 +1178,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     lastRetryCandidateMessage != null &&
     interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   const transcriptTailItems: TranscriptTailStackItem[] = [];
+  if (pendingSend) {
+    transcriptTailItems.push(
+      createTranscriptTailStackItem({
+        key: "pending-send",
+        node: <PendingSendMessage message={pendingSend} />,
+      })
+    );
+  }
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
@@ -1437,10 +1455,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
                 chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
-                // `flex-1` pushes the dock to the scrollport bottom for short
-                // transcripts; `pb-[15px]` keeps the original gap between the last
-                // message and the composer.
-                "flex-1 pb-[15px]",
+                // Push the dock to the bottom for short transcripts without reserving
+                // loading space: cached replay overlays the dock edge, not transcript rows.
+                "flex-1",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
@@ -1460,7 +1477,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span>
                         Tip: Add a{" "}
                         <code className="bg-inline-code-dark-bg text-code-string rounded-[3px] px-1.5 py-0.5 font-mono text-[11px]">
-                          .mux/init
+                          .xum/init
                         </code>{" "}
                         hook to your project to run setup commands
                         <br />
@@ -1669,11 +1686,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               <ChatDockColumnProvider value={chatTranscriptFullWidth}>
                 <div
                   ref={composerDockRef}
-                  onMouseDown={handleComposerDockMouseDown}
                   data-testid="chat-composer-dock"
                   className="bg-surface-primary sticky bottom-0 z-10 mx-[-15px] break-normal whitespace-normal"
                   style={COMPOSER_DOCK_STYLE}
                 >
+                  {isHydratingTranscript &&
+                    !showTranscriptHydrationPlaceholder &&
+                    !shouldMountStreamingBarrier && (
+                      <div
+                        role="status"
+                        data-testid="transcript-loading-status"
+                        className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
+                      >
+                        <Skeleton
+                          variant="shimmer"
+                          className="bg-muted/30 block h-full w-full rounded-none"
+                        />
+                        <span className="sr-only">Loading messages...</span>
+                      </div>
+                    )}
                   {!autoScroll && (
                     <button
                       onClick={handleJumpToBottom}
@@ -1700,6 +1731,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       workspaceName={workspaceName}
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
+                      hasPendingSend={pendingSend !== null}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
@@ -1709,10 +1741,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       isCompacting={isCompacting}
                       shouldShowPinnedTodoList={shouldShowPinnedTodoList}
                       shouldShowReviewsBanner={shouldShowReviewsBanner}
-                      concurrentLocalStreamingWorkspaceName={concurrentLocalStreamingWorkspaceName}
+                      concurrentLocalAgentCount={concurrentLocalAgentCount}
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
+                      rolloverEnabled={rolloverEnabled}
                       contextSwitchWarning={contextSwitchWarning}
                       onContextSwitchCompact={handleContextSwitchCompact}
                       onContextSwitchDismiss={handleContextSwitchDismiss}
@@ -1772,8 +1805,8 @@ interface ChatInputPaneProps {
   workspaceName: string;
   /**
    * False until the chat view's one-commit reveal (transcript + decorations
-   * together). The decoration lane stays empty before that so a decoration
-   * can never mount after paint and shift the transcript.
+   * together). Async decorations stay hidden before that so they cannot
+   * mount after paint and shift the transcript.
    */
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
@@ -1781,13 +1814,15 @@ interface ChatInputPaneProps {
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
+  hasPendingSend: boolean;
   isTranscriptCaughtUp: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
-  concurrentLocalStreamingWorkspaceName: string | null;
+  concurrentLocalAgentCount: number;
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
+  rolloverEnabled: boolean;
   contextSwitchWarning: ContextSwitchWarning | null;
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
@@ -1854,6 +1889,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             usagePercentage={props.autoCompactionResult.usagePercentage}
             thresholdPercentage={props.autoCompactionResult.thresholdPercentage}
             isStreaming={props.canInterrupt}
+            rolloverEnabled={props.rolloverEnabled}
           />
         </ChatDockSurface>
       ),
@@ -1877,14 +1913,10 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   // message insert above a live tail row, so bottom-lock had to correct after layout and
   // visibly flashed while another local agent was active. Pin it with composer decorations
   // instead; new transcript rows no longer move the warning.
-  if (props.concurrentLocalStreamingWorkspaceName) {
+  if (props.concurrentLocalAgentCount) {
     addDecorationEntry({
       key: "concurrent-local-warning",
-      node: (
-        <ConcurrentLocalWarningDecoration
-          streamingWorkspaceName={props.concurrentLocalStreamingWorkspaceName}
-        />
-      ),
+      node: <ConcurrentLocalWarningDecoration agentCount={props.concurrentLocalAgentCount} />,
     });
   }
 
@@ -1894,6 +1926,14 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       node: <PinnedTodoList workspaceId={props.workspaceId} />,
     });
   }
+  addDecorationEntry({
+    key: "sub-agent-tasks",
+    // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
+    // The decoration is collapsed by default, so inactive task history is available without noise.
+    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
+    // retains observed workflow-run refs that must never leak into another chat's tray.
+    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
+  });
   addDecorationEntry({
     key: "background-processes",
     node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
@@ -1925,13 +1965,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // The decoration lane lives inside the in-flow sticky composer dock, so a
-  // decoration mounting/unmounting reflows the transcript clearance in the same
-  // layout pass; the bottom stays pinned via native anchoring plus the
-  // scrollport-children ResizeObserver in useAutoScroll. Until the one-commit
-  // reveal the lane renders empty: readiness is monotonic per mounted
-  // workspace, so this only ever delays the initial mount — it never unmounts
-  // visible decorations.
+  // Keep decorations in the in-flow composer dock so height changes reserve
+  // transcript clearance in the same layout pass.
 
   return (
     <>
@@ -1959,6 +1994,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         }
         isTranscriptCaughtUp={props.isTranscriptCaughtUp}
         isStreamStarting={props.isStreamStarting}
+        hasPendingSend={props.hasPendingSend}
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}

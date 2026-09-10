@@ -44,6 +44,7 @@ void mock.module("./Shared/ElapsedTimeDisplay", () => ({
   ),
 }));
 
+import { GenericToolCall } from "./GenericToolCall";
 import { getToolComponent } from "./Shared/getToolComponent";
 
 const workspaceTaskArgs = {
@@ -119,6 +120,17 @@ describe("TaskToolCall", () => {
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
+  });
+
+  test("renders legacy variants task calls generically", () => {
+    expect(
+      getToolComponent("task", {
+        subagent_type: "explore",
+        prompt: "Review ${variant}",
+        title: "Split review",
+        variants: ["frontend", "backend"],
+      })
+    ).toBe(GenericToolCall);
   });
 
   test("labels workspace tasks and opens their created workspace", () => {
@@ -629,6 +641,80 @@ describe("TaskAwaitToolCall", () => {
   });
 });
 
+const taskListArgs = { statuses: ["reported" as const, "interrupted" as const] };
+const TaskListToolCall = getToolComponent("task_list", taskListArgs);
+
+describe("TaskListToolCall", () => {
+  let originalWindow: typeof globalThis.window;
+  let originalDocument: typeof globalThis.document;
+
+  beforeEach(() => {
+    originalWindow = globalThis.window;
+    originalDocument = globalThis.document;
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  });
+
+  test("shows inactive child cleanup guidance when expanded", () => {
+    const note =
+      "Keep reusable roles, retitle stale role names with task_retitle, and remove obsolete children with task_remove.";
+    const view = render(
+      <TooltipProvider>
+        <TaskListToolCall args={taskListArgs} status="completed" result={{ tasks: [], note }} />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task_list"));
+    expect(view.getByText(note)).toBeDefined();
+  });
+});
+
+const taskRetitleArgs = { task_id: "child-task", title: "Simplicity Auditor" };
+const TaskRetitleToolCall = getToolComponent("task_retitle", taskRetitleArgs);
+
+describe("TaskRetitleToolCall", () => {
+  let originalWindow: typeof globalThis.window;
+  let originalDocument: typeof globalThis.document;
+
+  beforeEach(() => {
+    originalWindow = globalThis.window;
+    originalDocument = globalThis.document;
+    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
+    globalThis.document = globalThis.window.document;
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  });
+
+  test("shows the stable task ID and friendly role name", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskRetitleToolCall
+          args={taskRetitleArgs}
+          status="completed"
+          result={{ status: "retitled", taskId: "child-task", title: "Simplicity Auditor" }}
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("Simplicity Auditor")).toBeDefined();
+    fireEvent.click(view.getByText("task_retitle"));
+    expect(view.getByText("child-task")).toBeDefined();
+    expect(view.getByText("retitled")).toBeDefined();
+  });
+});
+
 const taskSendMessageArgs = {
   task_id: "child-task",
   message: "Use the corrected API shape.",
@@ -664,10 +750,225 @@ describe("TaskSendMessageToolCall", () => {
       </TooltipProvider>
     );
 
-    expect(view.getByText("queued")).toBeDefined();
-    fireEvent.click(view.getByText("task_send_message"));
+    expect(view.getByRole("status").textContent).toBe("Queued");
+    fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText("child-task")).toBeDefined();
     expect(view.getByText("Use the corrected API shape.")).toBeDefined();
+  });
+
+  test.each([
+    { status: "accepted", taskId: "child-task", targetRelation: "ancestor" },
+    { status: "reactivated", taskId: "child-task" },
+    { status: "queued", taskId: "child-task", targetRelation: "sibling" },
+    { status: "not_found", taskId: "child-task" },
+    { status: "invalid_scope", taskId: "child-task" },
+    { status: "not_active", taskId: "child-task", taskStatus: "reported", error: "Inactive peer" },
+    { status: "error", taskId: "child-task", error: "Delivery failed" },
+    { status: "refused", taskId: "child-task", reason: "Message already queued" },
+    { status: "rate_limited", taskId: "child-task", retryAfterMs: 1200 },
+  ] as const)("uses the delivery outcome instead of generic tool completion: $status", (result) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall args={taskSendMessageArgs} status="completed" result={result} />
+      </TooltipProvider>
+    );
+    const status = view.getByRole("status");
+    const sent = result.status === "accepted" || result.status === "reactivated";
+    expect(status.className.includes("text-success")).toBe(sent);
+    expect(status.className.includes("text-danger")).toBe(!sent && result.status !== "queued");
+    if (result.error != null) expect(view.getByRole("alert").textContent).toBe(result.error);
+    if (result.reason != null) expect(view.getByRole("alert").textContent).toBe(result.reason);
+    if (result.targetRelation != null)
+      expect(view.getByText(`To ${result.targetRelation}`)).toBeTruthy();
+    if (result.retryAfterMs != null) expect(view.getByText("Retry in 2s")).toBeTruthy();
+  });
+
+  test("shows transport failures even while collapsed", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="failed"
+          result={{ success: false, error: "Connection lost" }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Connection lost");
+    expect(
+      view.getByRole("button", { name: "Message to agent" }).getAttribute("aria-expanded")
+    ).toBe("false");
+  });
+
+  test("opens the recipient workspace without toggling the message", () => {
+    const workspace = createWorkspaceMetadata({ id: "child-task", title: "Reviewer" });
+    const select = mock(() => undefined);
+    workspaceContextMock = {
+      workspaceMetadata: new Map([[workspace.id, workspace]]),
+      setSelectedWorkspace: select,
+    };
+    try {
+      const view = render(
+        <TooltipProvider>
+          <TaskSendMessageToolCall
+            args={taskSendMessageArgs}
+            status="completed"
+            result={{ status: "reactivated", taskId: "child-task" }}
+          />
+        </TooltipProvider>
+      );
+      fireEvent.click(view.getByRole("button", { name: "child-task" }));
+      expect(select).toHaveBeenCalledWith(workspace);
+      expect(
+        view.getByRole("button", { name: "Message to Reviewer" }).getAttribute("aria-expanded")
+      ).toBe("false");
+    } finally {
+      workspaceContextMock = null;
+    }
+  });
+
+  test.each(
+    [
+      "legacy output",
+      42,
+      true,
+      [],
+      { status: "refused", reason: {} },
+      { status: "constructor" },
+    ].map((result) => ({ result }))
+  )("keeps malformed persisted message results renderable: %j", ({ result }) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").className).not.toContain("text-success");
+    fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
+    expect(view.getByText(taskSendMessageArgs.message)).toBeTruthy();
+  });
+
+  test("does not render unvalidated fields carried beside a transport error", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="failed"
+          result={{
+            success: false,
+            error: "Connection lost",
+            status: "refused",
+            reason: {},
+            targetRelation: {},
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Connection lost");
+  });
+
+  test.each(["accepted", "queued", "reactivated"] as const)(
+    "preserves hooked delivery outcome: %s",
+    (status) => {
+      const view = render(
+        <TooltipProvider>
+          <TaskSendMessageToolCall
+            args={taskSendMessageArgs}
+            status="completed"
+            result={Object.freeze({
+              status,
+              taskId: "child-task",
+              hook_output: "Post hook finished",
+              hook_duration_ms: 20,
+              hook_path: ".xum/tool_post",
+            })}
+          />
+        </TooltipProvider>
+      );
+      expect(view.getByRole("status").className).toContain(
+        status === "queued" ? "text-backgrounded" : "text-success"
+      );
+    }
+  );
+
+  test("shows bare pre-hook errors alongside their metadata", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            error: "Blocked by project hook",
+            hook_output: "Policy refused",
+            hook_path: ".xum/tool_pre",
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
+    expect(view.getByRole("status").className).toContain("text-danger");
+  });
+
+  test.each([null, undefined, { type: "json", value: null }].map((result) => ({ result })))(
+    "does not claim delivery for a missing completed result: %j",
+    ({ result }) => {
+      const view = render(
+        <TooltipProvider>
+          <TaskSendMessageToolCall args={taskSendMessageArgs} result={result} status="completed" />
+        </TooltipProvider>
+      );
+      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").textContent).toBe("Result unavailable");
+    }
+  );
+
+  test.each([
+    { status: "pending", label: "Pending" },
+    { status: "executing", label: "Sending…" },
+    { status: "failed", label: "Not sent" },
+    { status: "interrupted", label: "Interrupted" },
+  ] as const)("preserves lifecycle status without a result: $status", ({ status, label }) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall args={taskSendMessageArgs} result={null} status={status} />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").textContent).toBe(label);
+  });
+
+  test("accepts SDK-wrapped results with inner and outer hook metadata", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={Object.freeze({
+            type: "json",
+            value: Object.freeze({
+              ...{ status: "accepted", taskId: "child-task" },
+              hook_output: "Inner hook",
+            }),
+            hook_output: "Outer hook",
+            hook_path: ".xum/tool_post",
+          })}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").className).toContain("text-success");
+  });
+
+  test("shows SDK-wrapped blocking errors", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            type: "json",
+            value: { error: "Wrapped blocking error" },
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Wrapped blocking error");
   });
 });
 

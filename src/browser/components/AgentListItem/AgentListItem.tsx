@@ -12,17 +12,13 @@ import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { isEventFromDialogPortal, stopKeyboardPropagation } from "@/browser/utils/events";
 import {
-  isRunningOrStartingTaskStatus,
+  isSidebarSubAgentRunning,
   type AgentRowRenderMeta,
   type WorkspaceDelegatedActivity,
+  type WorkspaceSubAgentsSummary,
 } from "@/browser/utils/ui/workspaceFiltering";
 import assert from "@/common/utils/assert";
 import { cn } from "@/common/lib/utils";
-import {
-  TASK_GROUP_KIND,
-  getTaskGroupKindFromMetadata,
-  normalizeTaskGroupLabel,
-} from "@/common/utils/tools/taskGroups";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
@@ -41,7 +37,7 @@ import {
   type VisualState,
 } from "./StatusDot";
 
-import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipIfPresent } from "../Tooltip/Tooltip";
 import { Popover, PopoverContent, PopoverTrigger, PopoverAnchor } from "../Popover/Popover";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
 import {
@@ -52,6 +48,7 @@ import {
   type SubAgentConnectorLayout,
 } from "../sidebarItemLayout";
 import {
+  Bot,
   Trash2,
   Trash,
   EllipsisVertical,
@@ -64,7 +61,9 @@ import {
   ChevronDown,
   HeartPulse,
   Pin,
+  Workflow,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
@@ -106,6 +105,9 @@ interface AgentListItemBaseProps {
   isSelected: boolean;
   depth?: number;
   sectionId?: string;
+  // Stable primitives (not an object) so React Compiler can skip unchanged rows.
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
 }
 
 /** Props for regular (persisted) workspace items */
@@ -132,7 +134,15 @@ export interface AgentListItemProps extends AgentListItemBaseProps {
   /** Present when pinned rows in this list can be drag-reordered. */
   onPinnedReorderDrop?: (draggedId: string, targetId: string, edge: PinnedDropEdge) => void;
   rowRenderMeta?: AgentRowRenderMeta;
+  /** Live fallback used while task metadata is catching up to a still-running stream. */
+  isWorkspaceLiveActive?: boolean;
   delegatedActivity?: WorkspaceDelegatedActivity;
+  hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
+  /**
+   * Workflow name for an own active run, retained beyond worker lifetimes so
+   * a run between sequential steps (no live worker) stays labeled.
+   */
+  getWorkflowRunName?: (runId: string) => string | undefined;
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onSelectWorkspace: (selection: WorkspaceSelection) => void;
@@ -236,6 +246,95 @@ function formatDelegatedActivityText(activity: WorkspaceDelegatedActivity): stri
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
+const EMPTY_WORKFLOW_RUN_IDS: readonly string[] = [];
+/**
+ * Status line for a parent whose sub-agent rows are hidden, styled after the
+ * transcript's sub-agent decoration. Workflow and user-owned segments are both
+ * rendered when both have activity, since the hidden rows leave no other
+ * surface for either; the running family leads.
+ */
+function formatHiddenSubAgentsPresentation(
+  summary: WorkspaceSubAgentsSummary,
+  ownActiveWorkflowRunIds: readonly string[],
+  getWorkflowRunName?: (runId: string) => string | undefined
+): { icon: LucideIcon; text: string } | null {
+  // An own active run without a live worker (between sequential steps, or
+  // before its first worker spawns) is still in progress; count it as running
+  // so a concurrent run's workers cannot make it look finished while its rows
+  // are hidden.
+  const gapRunIds = ownActiveWorkflowRunIds.filter((runId) => !summary.workflowRunIds.has(runId));
+  const runningRunCount = summary.runningWorkflowRunCount + gapRunIds.length;
+
+  let workflowText: string | null = null;
+  if (runningRunCount > 0 || summary.queuedWorkflowRunCount > 0) {
+    // Queued-only runs must not read as running (parallelism limits can park
+    // every worker), mirroring the delegated-status running/queued split.
+    const hasRunningRun = runningRunCount > 0;
+    const verb = hasRunningRun ? "running" : "queued";
+    const runCount = hasRunningRun ? runningRunCount : summary.queuedWorkflowRunCount;
+    // When only gap runs are active, summary.workflowName may belong to a queued run.
+    // Only a single gap run has an unambiguous name.
+    const workflowName =
+      hasRunningRun && summary.runningWorkflowRunCount === 0
+        ? gapRunIds.length === 1
+          ? getWorkflowRunName?.(gapRunIds[0])
+          : undefined
+        : summary.workflowName;
+    // The lone running worker's title is the run's current step; counts only
+    // add signal once several workers or runs are in flight.
+    if (
+      hasRunningRun &&
+      runCount === 1 &&
+      summary.runningWorkflowAgentCount === 1 &&
+      summary.runningWorkflowStepTitle != null
+    ) {
+      const queuedSuffix =
+        summary.queuedWorkflowAgentCount > 0 ? ` · ${summary.queuedWorkflowAgentCount} queued` : "";
+      workflowText = `${workflowName ?? "Workflow"} · ${summary.runningWorkflowStepTitle}${queuedSuffix}`;
+    } else {
+      const base =
+        runCount === 1 ? `${workflowName ?? "Workflow"} ${verb}` : `${runCount} workflows ${verb}`;
+      const agentCount = hasRunningRun
+        ? summary.runningWorkflowAgentCount
+        : summary.queuedWorkflowAgentCount;
+      // Gap-only runs have no countable workers; skip the "(0 agents)" noise.
+      const agentSuffix =
+        agentCount > 0 ? ` (${agentCount} agent${agentCount === 1 ? "" : "s"})` : "";
+      const queuedSuffix =
+        hasRunningRun && summary.queuedWorkflowAgentCount > 0
+          ? ` · ${summary.queuedWorkflowAgentCount} queued`
+          : "";
+      workflowText = `${base}${agentSuffix}${queuedSuffix}`;
+    }
+  }
+
+  let subAgentText: string | null = null;
+  if (summary.runningSubAgentCount > 0) {
+    subAgentText = formatSubAgentCount(summary.runningSubAgentCount, "active");
+    if (summary.queuedSubAgentCount > 0) {
+      subAgentText += ` · ${summary.queuedSubAgentCount} queued`;
+    }
+  } else if (summary.queuedSubAgentCount > 0) {
+    subAgentText = formatSubAgentCount(summary.queuedSubAgentCount, "queued");
+  }
+
+  if (workflowText != null && subAgentText != null) {
+    // Running activity must not hide behind a queued-only family; ties keep
+    // the workflow first as the more specific signal.
+    const subAgentsLead = summary.runningSubAgentCount > 0 && runningRunCount === 0;
+    return subAgentsLead
+      ? { icon: Bot, text: `${subAgentText} · ${workflowText}` }
+      : { icon: Workflow, text: `${workflowText} · ${subAgentText}` };
+  }
+  if (workflowText != null) {
+    return { icon: Workflow, text: workflowText };
+  }
+  if (subAgentText != null) {
+    return { icon: Bot, text: subAgentText };
+  }
+  return null;
+}
+
 function formatWorkflowRunCount(count: number): string {
   assert(count > 0, "formatWorkflowRunCount requires a positive count");
   return count === 1 ? "Workflow running" : `${count} workflows running`;
@@ -246,13 +345,16 @@ function formatBashMonitorCount(count: number): string {
   return count === 1 ? "Watching background bash" : `Watching ${count} background bashes`;
 }
 
-function SidebarActivityIndicator(props: { text: string; testId: string }) {
+function SidebarActivityIndicator(props: { text: string; testId: string; icon?: LucideIcon }) {
+  const Icon = props.icon;
   return (
     <div
       className="text-muted flex min-w-0 items-center gap-1.5 text-xs leading-4"
       data-testid={props.testId}
     >
-      <span className="min-w-0 truncate">{props.text}</span>
+      {Icon != null && <Icon className="h-3 w-3 shrink-0" strokeWidth={1.8} aria-hidden="true" />}
+      {/* Activity texts embed live counts; tabular figures stop width jitter. */}
+      <span className="counter-nums min-w-0 truncate">{props.text}</span>
     </div>
   );
 }
@@ -372,7 +474,11 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
       role="button"
       tabIndex={0}
       aria-current={isSelected ? "true" : undefined}
-      aria-label={`Open workspace draft ${draft.draftNumber}`}
+      aria-label={
+        props.projectBadgeName != null
+          ? `Open workspace draft ${draft.draftNumber} (${props.projectBadgeName})`
+          : `Open workspace draft ${draft.draftNumber}`
+      }
       data-project-path={projectPath}
       data-draft-id={draft.draftId}
     >
@@ -391,6 +497,26 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           >
             {draft.title}
           </span>
+          {props.projectBadgeName != null && (
+            // The badge width cap can truncate hierarchical "Parent / Sub"
+            // names, so the shared tooltip keeps the full label reachable.
+            <TooltipIfPresent tooltip={props.projectBadgeName}>
+              <span
+                data-testid={`workspace-project-badge-draft-${draft.draftId}`}
+                className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                style={
+                  props.projectBadgeColor != null
+                    ? {
+                        backgroundColor: `${props.projectBadgeColor}20`,
+                        borderColor: `${props.projectBadgeColor}40`,
+                      }
+                    : undefined
+                }
+              >
+                {props.projectBadgeName}
+              </span>
+            </TooltipIfPresent>
+          )}
         </div>
         {hasPromptPreview && (
           <span
@@ -470,6 +596,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     sectionId,
     rowRenderMeta,
     delegatedActivity,
+    hiddenSubAgentsSummary,
+    getWorkflowRunName,
     completedChildrenExpanded,
     onToggleCompletedChildren,
     onSelectWorkspace,
@@ -512,17 +640,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
   // Display title (fallback to name for legacy workspaces without title)
   const workspaceTitle = metadata.title ?? metadata.name;
-  // Derive a short group label for grouped task children: explicit label for variants,
-  // alphabetical letter (A, B, C…) for best-of-n candidates.
-  const isBestOfCandidate =
-    metadata.bestOf != null &&
-    getTaskGroupKindFromMetadata(metadata.bestOf) !== TASK_GROUP_KIND.VARIANTS;
+  // Best-of children use a compact alphabetical candidate label (A, B, C…).
   const groupLabel =
-    metadata.bestOf != null
-      ? isBestOfCandidate
-        ? String.fromCharCode(65 + (metadata.bestOf.index ?? 0))
-        : normalizeTaskGroupLabel(metadata.bestOf.label)
-      : undefined;
+    metadata.bestOf != null ? String.fromCharCode(65 + (metadata.bestOf.index ?? 0)) : undefined;
   // D8: expanded group members drop a title that merely repeats the group
   // header; the remaining label must stay readable on its own, so bare best-of
   // letters render as "Candidate A". Custom titles still show (self-healing).
@@ -530,12 +650,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     props.taskGroupHeaderTitle !== undefined &&
     props.taskGroupHeaderTitle === workspaceTitle &&
     groupLabel !== undefined;
-  const memberOnlyLabel =
-    isBestOfCandidate && groupLabel !== undefined ? `Candidate ${groupLabel}` : groupLabel;
+  const memberOnlyLabel = groupLabel !== undefined ? `Candidate ${groupLabel}` : undefined;
   const displayTitle = suppressGroupMemberTitle
     ? (memberOnlyLabel ?? workspaceTitle)
     : groupLabel
-      ? `${groupLabel} · ${workspaceTitle}`
+      ? `${workspaceTitle}, scope ${groupLabel}`
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
   const isPinned = isWorkspacePinned(metadata);
@@ -643,6 +762,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     awaitingUserQuestion,
     isStarting,
     agentStatus,
+    activeWorkflowRunIds,
     activeWorkflowRunCount,
     activeBashMonitorCount,
     terminalActiveCount,
@@ -685,6 +805,18 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     // coordinator waiting on an armed monitor still surfaces the watching state.
     shouldShowBashMonitorStatus;
   const shouldShowDelegatedStatus = hasDelegatedStatusText && !hasOwnLiveStatusText && !hasError;
+  const hiddenSubAgentsPresentation = hiddenSubAgentsSummary
+    ? formatHiddenSubAgentsPresentation(
+        hiddenSubAgentsSummary,
+        activeWorkflowRunIds ?? EMPTY_WORKFLOW_RUN_IDS,
+        getWorkflowRunName
+      )
+    : null;
+  // With sub-agent rows hidden, the summary outranks the coordinator's own
+  // streaming/todo/bash-monitor status text (the status dot still shows own
+  // work). Questions, deletion, and errors still win.
+  const shouldShowHiddenSubAgentsStatus =
+    hiddenSubAgentsPresentation != null && !awaitingUserQuestion && !isRemoving && !hasError;
   const visualState = getVisualState({
     awaitingUserQuestion,
     isInitializing,
@@ -701,6 +833,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isSubAgentRow = rowRenderMeta?.rowKind === "subagent";
   const showsVisibleStatusDot = isStatusDotVisible(visualState, false, isSubAgentRow);
   const hasStatusText =
+    shouldShowHiddenSubAgentsStatus ||
     shouldShowDelegatedStatus ||
     Boolean(agentStatus) ||
     awaitingUserQuestion ||
@@ -772,7 +905,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         type: WORKSPACE_DRAG_TYPE,
         workspaceId,
         projectPath,
-        currentSectionId: sectionId,
+        // Flat rows render without the sectionId prop (no section indent), so
+        // fall back to the row's own sub-project scope; drop zones use this to
+        // treat same-section drops as no-ops.
+        currentSectionId: sectionId ?? metadata.subProjectPath,
         pinned: isPinned,
         pinnedReorderGroup: props.pinnedReorderGroup,
         // Extra fields for custom drag layer preview
@@ -788,6 +924,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       workspaceId,
       projectPath,
       sectionId,
+      metadata.subProjectPath,
       isDisabled,
       isPinned,
       props.pinnedReorderGroup,
@@ -935,15 +1072,21 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         aria-current={isSelected ? "true" : undefined}
         aria-expanded={canToggleCompletedChildren ? isCompletedChildrenExpanded : undefined}
         aria-keyshortcuts={canToggleCompletedChildren ? "ArrowRight ArrowLeft" : undefined}
-        aria-label={
-          isRemoving
-            ? `Deleting workspace ${displayTitle}`
+        aria-label={(() => {
+          // The explicit label overrides descendant badge text, so include the
+          // project identity whenever the badge is the only visible project cue.
+          const accessibleTitle =
+            props.projectBadgeName != null
+              ? `${displayTitle} (${props.projectBadgeName})`
+              : displayTitle;
+          return isRemoving
+            ? `Deleting workspace ${accessibleTitle}`
             : isInitializing
-              ? `Initializing workspace ${displayTitle}`
+              ? `Initializing workspace ${accessibleTitle}`
               : isArchiving
-                ? `Archiving workspace ${displayTitle}`
-                : `Select workspace ${displayTitle}`
-        }
+                ? `Archiving workspace ${accessibleTitle}`
+                : `Select workspace ${accessibleTitle}`;
+        })()}
         aria-describedby={secondaryStatusDescriptionId}
         aria-disabled={isDisabled}
         data-workspace-path={namedWorkspacePath}
@@ -1113,9 +1256,13 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                         : null
                     }
                     isPinned={isPinned}
-                    onArchiveChat={(anchorEl) => {
-                      void onArchiveWorkspace(workspaceId, anchorEl);
-                    }}
+                    onArchiveChat={
+                      isSubAgentRow
+                        ? null
+                        : (anchorEl) => {
+                            void onArchiveWorkspace(workspaceId, anchorEl);
+                          }
+                    }
                     onCloseMenu={() => ctxMenu.close()}
                   />
                   {!isSelected && !isUnread && (
@@ -1197,17 +1344,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 data-workspace-id={workspaceId}
               />
             ) : (
-              <div className="flex min-w-0 items-baseline gap-1">
-                {/* Group label (variant name or A/B/C letter) rendered as a non-shrinkable
-                    badge so it stays visible even when the sidebar is narrow.
-                    items-baseline keeps the 12px label on the same text baseline as the
-                    14px title so they look naturally aligned despite the size difference. */}
-                {groupLabel && !suppressGroupMemberTitle && (
-                  <span className="text-muted shrink-0 text-[12px] leading-6">{groupLabel}</span>
-                )}
+              <div className="flex min-w-0 items-baseline gap-1.5">
                 <span
                   className={cn(
-                    "min-w-0 flex-1 truncate text-left text-[14px] leading-6 transition-colors duration-200",
+                    "min-w-0 truncate text-left text-[14px] leading-6 transition-colors duration-200",
+                    groupLabel && !suppressGroupMemberTitle ? "max-w-[45%] shrink-0" : "flex-1",
                     !isDisabled && "cursor-pointer",
                     (isGeneratingTitle || isPendingAutoTitle) && "italic",
                     titleColorClass
@@ -1215,6 +1356,34 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
+                {props.projectBadgeName != null && (
+                  // The badge width cap can truncate hierarchical "Parent / Sub"
+                  // names, so the shared tooltip keeps the full label reachable.
+                  <TooltipIfPresent tooltip={props.projectBadgeName}>
+                    <span
+                      data-testid={`workspace-project-badge-${workspaceId}`}
+                      className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                      style={
+                        props.projectBadgeColor != null
+                          ? {
+                              backgroundColor: `${props.projectBadgeColor}20`,
+                              borderColor: `${props.projectBadgeColor}40`,
+                            }
+                          : undefined
+                      }
+                    >
+                      {props.projectBadgeName}
+                    </span>
+                  </TooltipIfPresent>
+                )}
+                {groupLabel && !suppressGroupMemberTitle && (
+                  <span
+                    data-testid={`workspace-scope-label-${workspaceId}`}
+                    className="text-muted min-w-0 flex-1 truncate text-[11px] leading-6"
+                  >
+                    scope: {groupLabel}
+                  </span>
+                )}
               </div>
             )}
 
@@ -1264,8 +1433,14 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
               ) : awaitingUserQuestion ? (
                 <div className="text-muted flex min-w-0 items-center gap-1.5 text-xs leading-4">
                   <MessageCircleQuestionMark className="h-3 w-3 shrink-0" strokeWidth={1.8} />
-                  <span className="min-w-0 truncate">Mux has a few questions</span>
+                  <span className="min-w-0 truncate">Xum has a few questions</span>
                 </div>
+              ) : shouldShowHiddenSubAgentsStatus && hiddenSubAgentsPresentation ? (
+                <SidebarActivityIndicator
+                  icon={hiddenSubAgentsPresentation.icon}
+                  text={hiddenSubAgentsPresentation.text}
+                  testId={`workspace-hidden-subagents-${workspaceId}`}
+                />
               ) : shouldShowDelegatedStatus && delegatedActivity ? (
                 <DelegatedActivityIndicator
                   workspaceId={workspaceId}
@@ -1316,7 +1491,9 @@ function AgentListItemInner(props: UnifiedAgentListItemProps) {
   if (rowMeta?.rowKind === "subagent") {
     // Connector geometry is driven by render metadata so visible siblings keep
     // consistent single/middle/last shapes as parents expand/collapse children.
-    const isElbowActive = isRunningOrStartingTaskStatus(props.metadata.taskStatus);
+    const isElbowActive = isSidebarSubAgentRunning(props.metadata, {
+      isWorkspaceLiveActive: () => props.isWorkspaceLiveActive === true,
+    });
     const connectorLayout = props.subAgentConnectorLayout ?? "default";
     const connectorDepth = props.depth ?? rowMeta.depth;
     const connectorRailX = getSubAgentParentRailX(connectorDepth, connectorLayout);

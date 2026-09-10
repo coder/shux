@@ -1,7 +1,9 @@
-import { describe, expect, it, beforeAll, afterAll } from "bun:test";
+import { describe, expect, it, beforeAll, afterAll, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
+import * as nodeFs from "fs";
+import { Readable } from "stream";
 import { LocalRuntime } from "./LocalRuntime";
 import type { InitLogger, RuntimeStatusEvent } from "./Runtime";
 
@@ -170,7 +172,7 @@ describe("LocalRuntime", () => {
           skipInitHook: true,
         });
         expect(result.success).toBe(true);
-        expect(logger.steps).toContain("Skipping .mux/init hook (disabled for this task)");
+        expect(logger.steps).toContain("Skipping .xum/init hook (disabled for this task)");
       }
 
       const skippedMarkerExists = await fs.access(markerPath).then(
@@ -226,7 +228,7 @@ describe("LocalRuntime", () => {
         trusted: false,
       });
       expect(result.success).toBe(true);
-      expect(logger.steps).toContain("Skipping .mux/init hook (project not trusted)");
+      expect(logger.steps).toContain("Skipping .xum/init hook (project not trusted)");
 
       const markerExists = await fs.access(markerPath).then(
         () => true,
@@ -394,6 +396,76 @@ describe("LocalRuntime", () => {
         expect(result).toBe(content);
       } finally {
         await fs.rm(muxDir, { recursive: true, force: true });
+      }
+    });
+
+    it("cancelling readFile destroys the underlying node stream (no fd leak)", async () => {
+      // r18: the old eager start loop had no cancel callback, so a cancelled
+      // wrapper (e.g. mux.load's byte ceiling on an oversized file) abandoned
+      // the inner reader and left the file handle open until GC.
+      const runtime = new LocalRuntime(testDir);
+      const testFile = path.join(testDir, "cancel-read-test.txt");
+      await fs.writeFile(testFile, "x".repeat(256 * 1024));
+
+      const realCreate = nodeFs.createReadStream;
+      let captured: nodeFs.ReadStream | undefined;
+      const spy = spyOn(nodeFs, "createReadStream").mockImplementation(((
+        ...args: Parameters<typeof nodeFs.createReadStream>
+      ) => {
+        const stream = realCreate(...args);
+        captured = stream;
+        return stream;
+      }) as typeof nodeFs.createReadStream);
+      try {
+        const reader = runtime.readFile(testFile).getReader();
+        await reader.read();
+        await reader.cancel();
+        expect(captured).toBeDefined();
+        // Reader cancellation must destroy the node stream (closing the fd).
+        expect(captured?.destroyed).toBe(true);
+      } finally {
+        spy.mockRestore();
+        await fs.rm(testFile, { force: true });
+      }
+    });
+
+    it("a caller abort unblocks a stalled readFile and errors the stream", async () => {
+      // r19: a FIFO or blocked network mount stalls before yielding enough
+      // bytes for consumer-side ceilings to cancel; only the caller's abort
+      // (kernel deadline / workspace removal) can unblock the pinned read.
+      const runtime = new LocalRuntime(testDir);
+      let destroyed = false;
+      const stalled = new Readable({
+        read() {
+          // Never pushes: models a FIFO with no writer.
+        },
+        destroy(err, cb) {
+          destroyed = true;
+          cb(err);
+        },
+      });
+      const spy = spyOn(nodeFs, "createReadStream").mockReturnValue(stalled as nodeFs.ReadStream);
+      try {
+        const abort = new AbortController();
+        const reader = runtime.readFile("stalled.fifo", abort.signal).getReader();
+        const pending = reader.read();
+        // Bounded check that the read is actually pinned before aborting.
+        const raced = await Promise.race([
+          pending.then(() => "settled"),
+          Bun.sleep(50).then(() => "pinned"),
+        ]);
+        expect(raced).toBe("pinned");
+
+        abort.abort();
+        try {
+          await pending;
+          expect.unreachable("Aborted read should error, not settle cleanly");
+        } catch (e) {
+          expect(String(e)).toContain("aborted");
+        }
+        expect(destroyed).toBe(true);
+      } finally {
+        spy.mockRestore();
       }
     });
 

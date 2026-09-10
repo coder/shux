@@ -6,13 +6,13 @@ description: Configure agent behavior with AGENTS.md files
 <Warning>
   **Breaking change (`Model:` scoped sections):** `Model:` directives are no longer parsed from
   shared `AGENTS.md`/`AGENT.md`/`CLAUDE.md` files — those headings now appear as ordinary markdown
-  to the agent. Move any `## Model: ...` sections into `.mux/AGENTS.md` (or `~/.mux/AGENTS.md`). See
+  to the agent. Move any `## Model: ...` sections into `.xum/AGENTS.md` (or `~/.xum/AGENTS.md`). See
   [Model Prompts](#model-prompts) for details.
 </Warning>
 
 ## Overview
 
-Mux layers instructions from multiple locations. At each location, Mux loads instructions from two
+Xum layers instructions from multiple locations. At each location, Xum loads instructions from two
 kinds of files:
 
 **Shared instruction files** — also read by other tools (Cursor, Claude Code, etc.):
@@ -21,61 +21,64 @@ kinds of files:
 2. `AGENT.md`
 3. `CLAUDE.md`
 
-Mux picks the first match. If found, it also appends `AGENTS.local.md` from the same directory
+Xum picks the first match. If found, it also appends `AGENTS.local.md` from the same directory
 (when present).
 
-**Mux-dedicated instruction files** — loaded alongside the shared file:
+**Xum-dedicated instruction files** — loaded alongside the shared file:
 
-- `<dir>/.mux/AGENTS.md` (+ optional `<dir>/.mux/AGENTS.local.md`)
+- `<dir>/.xum/AGENTS.md` (+ optional `<dir>/.xum/AGENTS.local.md`)
 
-Only the exact name `AGENTS.md` is supported inside `.mux/` — no `AGENT.md` or `CLAUDE.md`
-fallback. A directory may have only `.mux/AGENTS.md` and no shared file.
+Only the exact name `AGENTS.md` is supported inside `.xum/` — no `AGENT.md` or `CLAUDE.md`
+fallback. A directory may have only `.xum/AGENTS.md` and no shared file.
 
 ### Instruction locations
 
 Instructions are collected from (most general to most specific):
 
-1. `~/.mux/AGENTS.md` — global defaults (Mux-dedicated by construction)
-2. Workspace root — shared file + `<workspace>/.mux/AGENTS.md`
-3. Sub-project and each repo directory in multi-project workspaces — shared file + `.mux/AGENTS.md`
+1. `~/.claude/CLAUDE.md` when the **Claude compatibility** experiment is enabled
+2. `~/.xum/AGENTS.md` as native global defaults (Xum-dedicated by construction)
+3. Workspace root with its shared file and `<workspace>/.xum/AGENTS.md`
+4. Sub-project and each repo directory in multi-project workspaces with their shared file and `.xum/AGENTS.md`
+
+The Claude compatibility source has the lowest global precedence, so native `~/.xum` instructions always layer on top. Xum reads only the exact `~/.claude/CLAUDE.md` file: it does not probe `AGENTS.md`, `AGENT.md`, local variants, or a `.xum` subdirectory there, and it never writes to `~/.claude`. This file uses shared-file semantics, so `Model:` and `Mode:` headings remain ordinary markdown while `Tool:` sections still work.
 
 <Info>
-  Mux strips HTML-style markdown comments (`<!-- ... -->`) from instruction files before sending them
+  Xum strips HTML-style markdown comments (`<!-- ... -->`) from instruction files before sending them
   to the model. Use these comments for editor-only metadata—they will not reach the agent.
 </Info>
 
 ## Scoped instructions
 
-Mux supports **scoped instructions** that activate only in specific contexts. You define them using
+Xum supports **scoped instructions** that activate only in specific contexts. You define them using
 special headings:
 
 | Directive        | Where it works           | Effect                              |
 | ---------------- | ------------------------ | ----------------------------------- |
-| `Model: <regex>` | Mux-dedicated files only | Active for specific models          |
-| `Mode: <mode>`   | Mux-dedicated files only | Active for specific modes or agents |
+| `Model: <regex>` | Xum-dedicated files only | Active for specific models          |
+| `Mode: <mode>`   | Xum-dedicated files only | Active for specific modes or agents |
 | `Tool: <name>`   | All instruction sources  | Appended to a tool's description    |
 
-**Mux-dedicated sources** (checked in this priority order):
+**Xum-dedicated sources** (checked in this priority order):
 
-1. Agent definition body (`.mux/agents/<name>.md`)
-2. Workspace/project `.mux/AGENTS.md` files
-3. Global `~/.mux/AGENTS.md`
+1. Agent definition body (`.xum/agents/<name>.md`)
+2. Workspace/project `.xum/AGENTS.md` files
+3. Global `~/.xum/AGENTS.md`
 
 `Tool:` sections are honored in all of the above, plus in shared `AGENTS.md`/`AGENT.md`/`CLAUDE.md`
 files.
 
 <Note>
   `Agent:` scoped sections have been removed. Use [custom agent definitions](/agents) instead to
-  customize behavior per agent. `Mode:` sections are available, but only in Mux-dedicated files (see
+  customize behavior per agent. `Mode:` sections are available, but only in Xum-dedicated files (see
   [Mode Prompts](#mode-prompts) below).
 </Note>
 
 ### General Rules
 
 - **Precedence**: Scoped directives are checked in this order: agent definition →
-  workspace `.mux/AGENTS.md` → global `~/.mux/AGENTS.md`.
+  workspace `.xum/AGENTS.md` → global `~/.xum/AGENTS.md`.
 - **Concatenation**: For `Model:` and `Mode:` sections, **all** matching sections across
-  Mux-dedicated sources are concatenated and injected — it is not "first match wins."
+  Xum-dedicated sources are concatenated and injected — it is not "first match wins."
 - **Isolation**: Scoped sections are **stripped** from the general `<custom-instructions>` block.
   Their content is injected only where it belongs (e.g., into a specific tool's description or a
   special XML tag). `Model:` and `Mode:` sections in shared files are _not_ stripped — they remain
@@ -92,11 +95,11 @@ injected via a `<model-...>` tag.
 
 <Warning>
   `Model:` sections in shared `AGENTS.md`/`AGENT.md`/`CLAUDE.md` files are **no longer parsed**.
-  Move `## Model: ...` sections to `.mux/AGENTS.md` (or `~/.mux/AGENTS.md`).
+  Move `## Model: ...` sections to `.xum/AGENTS.md` (or `~/.xum/AGENTS.md`).
 </Warning>
 
-`Model:` is honored only in Mux-dedicated sources: agent definitions, `.mux/AGENTS.md` files, and
-`~/.mux/AGENTS.md`.
+`Model:` is honored only in Xum-dedicated sources: agent definitions, `.xum/AGENTS.md` files, and
+`~/.xum/AGENTS.md`.
 
 **Syntax**: `Model: <regex>`
 
@@ -104,7 +107,7 @@ injected via a `<model-...>` tag.
 - Use `/pattern/flags` for custom flags (e.g., `/openai:.*codex/i`).
 - Matching sections from multiple sources are **concatenated** (not first-match-wins).
 
-**Example** (in `.mux/AGENTS.md` or `~/.mux/AGENTS.md`):
+**Example** (in `.xum/AGENTS.md` or `~/.xum/AGENTS.md`):
 
 ```markdown
 ## Model: sonnet
@@ -121,8 +124,8 @@ Keep the todo list current every few minutes while a task is in flight.
 Scope instructions to a specific mode or custom agent. The matched content is injected via a
 `<mode-...>` tag.
 
-`Mode:` is honored only in Mux-dedicated sources: agent definitions, `.mux/AGENTS.md` files, and
-`~/.mux/AGENTS.md`.
+`Mode:` is honored only in Xum-dedicated sources: agent definitions, `.xum/AGENTS.md` files, and
+`~/.xum/AGENTS.md`.
 
 **Syntax**: `Mode: <mode>`
 
@@ -131,7 +134,7 @@ Scope instructions to a specific mode or custom agent. The matched content is in
   `Mode: plan` and `Mode: <its-name>` sections.
 - Matching sections from multiple sources are **concatenated** (not first-match-wins).
 
-**Example** (in `.mux/AGENTS.md`):
+**Example** (in `.xum/AGENTS.md`):
 
 ```markdown
 ## Mode: plan
@@ -148,7 +151,7 @@ Keep the todo list updated throughout the task.
 Customize how the AI uses specific tools by appending instructions to their descriptions.
 
 `Tool:` is honored in all instruction sources: shared `AGENTS.md`/`AGENT.md`/`CLAUDE.md`,
-`.mux/AGENTS.md`, and agent definitions.
+`.xum/AGENTS.md`, and agent definitions.
 
 **Syntax**: `Tool: <tool_name>`
 
@@ -178,14 +181,17 @@ Customize how the AI uses specific tools by appending instructions to their desc
 ## Practical layout
 
 ```
-~/.mux/
-  AGENTS.md          # Global instructions (Mux-dedicated)
+~/.claude/
+  CLAUDE.md          # Optional read-only compatibility source
+
+~/.xum/
+  AGENTS.md          # Native global instructions (Xum-dedicated)
   AGENTS.local.md    # Personal tweaks (gitignored)
 
 my-project/
   AGENTS.md          # Shared project instructions (read by all tools)
   AGENTS.local.md    # Personal tweaks (gitignored)
-  .mux/
-    AGENTS.md        # Mux-only instructions (Model:/Mode: directives go here)
-    AGENTS.local.md  # Personal Mux-only tweaks (gitignored)
+  .xum/
+    AGENTS.md        # Xum-only instructions (Model:/Mode: directives go here)
+    AGENTS.local.md  # Personal Xum-only tweaks (gitignored)
 ```

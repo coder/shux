@@ -2,6 +2,7 @@
  * Tests for provider options builder
  */
 
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -180,6 +181,18 @@ describe("buildProviderOptions - Anthropic", () => {
       // the summarized display flag.
       expect(anthropic.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic.effort).toBe("medium");
+      // Fable 5.1 rides the same Mythos-class wildcard matcher.
+      const anthropic51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-fable-5-1", "medium")
+      );
+      expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(anthropic51.effort).toBe("medium");
+      // Mythos 5.1 does too.
+      const mythos51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-mythos-5-1", "medium")
+      );
+      expect(mythos51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(mythos51.effort).toBe("medium");
     });
 
     test("omits thinking instead of sending disabled when off", () => {
@@ -187,6 +200,12 @@ describe("buildProviderOptions - Anthropic", () => {
       // omitting the field lets it default to adaptive. "off" can still reach here
       // when no thinking level was provided upstream (defaults to off).
       expect(buildProviderOptions("anthropic:claude-fable-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
     });
@@ -336,6 +355,249 @@ describe("buildProviderOptions - mappedToModel resolution", () => {
     );
 
     expect(result).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+});
+
+describe("Coder gateway-scoped models (wire-canonical option building)", () => {
+  // coder:<instance>/<model> strings that stay gateway-scoped (custom-named
+  // instances, non-canonical types) must build the same options/headers as
+  // the identical model on a default-named instance: the wire is derived
+  // from the instance's TYPE, not the "coder" prefix.
+  const coderProvidersConfig: ProvidersConfigMap = {
+    coder: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [
+        { name: "prod-anthropic", type: "anthropic" },
+        { name: "llm-proxy", type: "openai-compat" },
+      ],
+    },
+  };
+
+  test("custom-named anthropic instance gets Anthropic thinking options", () => {
+    const viaCustom = buildProviderOptions(
+      "coder:prod-anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    const viaDefault = buildProviderOptions(
+      "coder:anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(viaCustom).toEqual(viaDefault);
+    expect(viaCustom).toHaveProperty("anthropic");
+  });
+
+  test("openai-compat instance gets OpenAI-shaped options, not none", () => {
+    const options = buildProviderOptions(
+      "coder:llm-proxy/gpt-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(options).toHaveProperty("openai");
+  });
+
+  test("user-declared additionalProviders resolve the wire too", () => {
+    const options = buildProviderOptions(
+      "coder:wif-anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          additionalProviders: [{ name: "wif-anthropic", type: "anthropic" }],
+        },
+      },
+      "coder"
+    );
+    expect(options).toHaveProperty("anthropic");
+  });
+
+  test("unknown instance names build no options", () => {
+    const options = buildProviderOptions(
+      "coder:mystery/some-model",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(options).toEqual({});
+  });
+
+  test("custom-named anthropic instance gets the 1M beta header", () => {
+    const headers = buildRequestHeaders(
+      "coder:prod-anthropic/claude-sonnet-4-5",
+      { anthropic: { use1MContext: true } },
+      undefined,
+      coderProvidersConfig,
+      "coder"
+    );
+    expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+
+  test("bedrock-typed instance resolves 1M capability through its metadata identity", () => {
+    // The wire-canonical string mangles metadata-divergent instances
+    // (anthropic:anthropic.claude-* fails the anchored Claude patterns);
+    // capability must resolve from the raw identity via the instance type
+    // (bedrock:anthropic.claude-* → anthropic:claude-*), with intent keyed
+    // by the raw string like the UI's per-model toggles.
+    const config: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "bedrock", type: "bedrock" }],
+      },
+    };
+    const headers = buildRequestHeaders(
+      "coder:bedrock/anthropic.claude-sonnet-4-5",
+      {
+        anthropic: { use1MContextModels: ["coder:bedrock/anthropic.claude-sonnet-4-5"] },
+      },
+      undefined,
+      config,
+      "coder"
+    );
+    expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+  });
+
+  test("non-Anthropic wires never get the 1M beta header", () => {
+    // A vercel-typed instance maps Claude vendor models to anthropic:* for
+    // metadata, but speaks openai-chat on the wire: the anthropic-beta header
+    // cannot be carried, so 1M intent must not attach it.
+    const config: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "vercel", type: "vercel" }],
+      },
+    };
+    const headers = buildRequestHeaders(
+      "coder:vercel/anthropic/claude-sonnet-4-5",
+      {
+        anthropic: { use1MContextModels: ["coder:vercel/anthropic/claude-sonnet-4-5"] },
+      },
+      undefined,
+      config,
+      "coder"
+    );
+    expect(headers).toBeUndefined();
+  });
+
+  // Discovered metadata must win over the instance NAME: a valid instance can
+  // use a canonical route name with a different type, and normalizing the name
+  // before consulting metadata would emit options for the wrong wire.
+  describe("canonical-named instance with a different type", () => {
+    const crossTypedConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [
+          { name: "openai", type: "anthropic" },
+          { name: "anthropic", type: "openai-compat" },
+        ],
+      },
+    };
+
+    test("anthropic-typed instance named openai gets Anthropic options", () => {
+      const options = buildProviderOptions(
+        "coder:openai/claude-opus-4-5",
+        "high",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(options).toHaveProperty("anthropic");
+      expect(options).not.toHaveProperty("openai");
+    });
+
+    test("anthropic-typed instance named openai gets the 1M beta header", () => {
+      const headers = buildRequestHeaders(
+        "coder:openai/claude-sonnet-4-5",
+        { anthropic: { use1MContext: true } },
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(headers).toEqual({ "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER });
+    });
+
+    test("openai-compat-typed instance named anthropic gets OpenAI options", () => {
+      const options = buildProviderOptions(
+        "coder:anthropic/gpt-5",
+        "medium",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crossTypedConfig,
+        "coder"
+      );
+      expect(options).toHaveProperty("openai");
+      expect(options).not.toHaveProperty("anthropic");
+    });
+  });
+
+  test("custom OpenAI-compatible provider named coder shadows gateway wire treatment", () => {
+    const options = buildProviderOptions(
+      "coder:anthropic/claude-opus-4-5",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        coder: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          providerType: "openai-compatible",
+          baseUrl: "https://proxy.example.com/v1",
+        },
+      },
+      "coder"
+    );
+    // The string is the custom provider's identity; it must not be rewritten
+    // to anthropic:<model> by name convention or gateway metadata.
+    expect(options).not.toHaveProperty("anthropic");
   });
 });
 
@@ -511,6 +773,57 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai).toBeDefined();
       expect("serviceTier" in openai!).toBe(true);
       expect(openai!.serviceTier).toBe("auto");
+    });
+
+    test.each(["openai", "openai-compat", "google"])(
+      "uses the Coder instance type %s rather than OpenAI-shaped wire or mapped metadata",
+      (type) => {
+        const options = buildProviderOptions(
+          "coder:openai/custom",
+          "off",
+          undefined,
+          undefined,
+          { openai: { serviceTier: "priority" } },
+          undefined,
+          undefined,
+          {
+            openai: { apiKeySet: false, isConfigured: false, isEnabled: true },
+            coder: {
+              apiKeySet: false,
+              isConfigured: true,
+              isEnabled: true,
+              discoveredProviders: [{ name: "openai", type }],
+              models: [{ id: "openai/custom", mappedToModel: "openai:gpt-6-astra" }],
+            },
+          },
+          "coder"
+        );
+        const openai = getOpenAIOptions(options);
+        expect(openai).toBeDefined();
+        expect(openai?.serviceTier).toBe(type === "google" ? undefined : "priority");
+      }
+    );
+
+    test.each([false, true])("uses native route auth when codexOauthSet=%s", (codexOauthSet) => {
+      const options = buildProviderOptions(
+        "openai:gpt-6-astra",
+        "off",
+        undefined,
+        undefined,
+        { openai: { serviceTier: "priority" } },
+        undefined,
+        undefined,
+        {
+          openai: {
+            apiKeySet: !codexOauthSet,
+            codexOauthSet,
+            isEnabled: true,
+            isConfigured: true,
+          },
+        },
+        "openai"
+      );
+      expect(getOpenAIOptions(options)?.serviceTier).toBe(codexOauthSet ? undefined : "priority");
     });
 
     test("should include explicit non-auto serviceTier", () => {
@@ -791,6 +1104,65 @@ describe("buildProviderOptions - OpenAI", () => {
       });
     });
 
+    test.each(["auto", "default", "flex", "priority"] as const)(
+      "preserves Copilot service tier %s when thinking is off",
+      (serviceTier) => {
+        expect(
+          buildProviderOptions(
+            "openai:gpt-5.2",
+            "off",
+            undefined,
+            undefined,
+            { openai: { serviceTier } },
+            undefined,
+            undefined,
+            undefined,
+            "github-copilot"
+          )
+        ).toEqual({ "github-copilot": { serviceTier } });
+      }
+    );
+
+    test.each(["auto", "default", "flex", "priority", undefined] as const)(
+      "preserves explicit Copilot service tier %s without adding reasoning controls",
+      (serviceTier) => {
+        for (const thinking of ["off", "medium", "max"] as const) {
+          expect(
+            buildProviderOptions(
+              "github-copilot:gpt-6-astra",
+              thinking,
+              undefined,
+              undefined,
+              { openai: { serviceTier } },
+              undefined,
+              undefined,
+              undefined,
+              "github-copilot"
+            )
+          ).toEqual(serviceTier === undefined ? {} : { "github-copilot": { serviceTier } });
+        }
+      }
+    );
+
+    test.each(["github-copilot:claude-sonnet-4.5", "github-copilot:alias"])(
+      "does not enable tiers for mapped non-OpenAI Copilot model %s",
+      (modelString) => {
+        expect(
+          buildProviderOptions(
+            modelString,
+            "medium",
+            undefined,
+            undefined,
+            { openai: { serviceTier: "priority" } },
+            undefined,
+            undefined,
+            createMockProvidersConfig({ [modelString]: "openai:gpt-6-astra" }),
+            "github-copilot"
+          )
+        ).toEqual({});
+      }
+    );
+
     test("returns no Copilot-routed OpenAI provider options when thinking is off", () => {
       const result = buildProviderOptions(
         "openai:gpt-5.2",
@@ -979,7 +1351,202 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
-  describe("GPT-5.6 native pro reasoning mode", () => {
+  describe("Coder Pro mode", () => {
+    const providersConfig: ProvidersConfigMap = {
+      // Direct OpenAI settings must not disable Coder's independent Responses route.
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        wireFormat: "chatCompletions",
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [
+          { name: "prod-openai", type: "openai" },
+          { name: "compat", type: "openai-compat" },
+        ],
+      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+
+    test.each([
+      ["coder:openai/gpt-6-astra", true],
+      ["coder:prod-openai/gpt-6-astra", true],
+      ["openai:gpt-6-astra", true],
+      ["openai:team-astra", true],
+      ["coder:prod-openai/team-astra", true],
+      ["coder:openai/gpt-5.6-sol", true],
+      ["coder:openai/gpt-6-astra-mini", false],
+      ["coder:compat/gpt-6-astra", false],
+      ["coder:unknown/gpt-6-astra", false],
+      ["openrouter:openai/gpt-6-astra", false],
+    ] as const)("gates the picker and request consistently for %s", (model, available) => {
+      expect(
+        openaiProModeAvailable(model, { providersConfig, resolvedRouteProvider: "coder" })
+      ).toBe(available);
+      // The request builder pins wireFormat to the Coder instance's protocol.
+      const options = buildProviderOptions(
+        model,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "responses" } },
+        undefined,
+        undefined,
+        providersConfig,
+        "coder",
+        undefined,
+        "pro"
+      );
+      expect(getOpenAIOptions(options)?.reasoningMode).toBe(available ? "pro" : undefined);
+      // Pro eligibility must not broaden the shared direct-only Fast mode gate.
+      expect(
+        openaiDirectProviderOptionsAvailable(model, {
+          providersConfig,
+          resolvedRouteProvider: "coder",
+        })
+      ).toBe(false);
+    });
+
+    test.each([
+      { scoped: "openai:gpt-6-astra", upstream: "openai:gpt-5.2", type: "openai", pro: true },
+      { scoped: "openai:gpt-5.2", upstream: "openai:gpt-6-astra", type: "openai", pro: false },
+      {
+        scoped: "openai:gpt-6-astra",
+        upstream: "openai:gpt-6-astra",
+        type: "openai-compat",
+        pro: false,
+      },
+    ])("scoped aliases control capabilities, not Coder's wire: %j", (testCase) => {
+      const model = "coder:prod-openai/team-astra";
+      const config: ProvidersConfigMap = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "team-astra", mappedToModel: testCase.upstream }],
+        },
+        coder: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          discoveredProviders: [{ name: "prod-openai", type: testCase.type }],
+          models: [{ id: "prod-openai/team-astra", mappedToModel: testCase.scoped }],
+        },
+      };
+      expect(openaiProModeAvailable(model, { providersConfig: config })).toBe(testCase.pro);
+      const options = buildProviderOptions(
+        model,
+        "high",
+        undefined,
+        undefined,
+        { openai: { wireFormat: "responses" } },
+        undefined,
+        undefined,
+        config,
+        "coder",
+        undefined,
+        "pro"
+      );
+      expect(getOpenAIOptions(options)?.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+    });
+
+    const fallbackAvailability: Array<Partial<NonNullable<ProvidersConfigMap["coder"]>>> = [
+      { isEnabled: false, isConfigured: true },
+      { isEnabled: true, isConfigured: false },
+      { isEnabled: true, isConfigured: true, discoveredModels: [] },
+      { isEnabled: true, isConfigured: true, removedModels: ["prod-openai/gpt-6-astra"] },
+    ];
+    test.each(fallbackAvailability)(
+      "preserves Pro on custom-instance direct fallback (%j)",
+      (availability) => {
+        const config: ProvidersConfigMap = {
+          ...providersConfig,
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: { ...providersConfig.coder, ...availability },
+        };
+        const model = "coder:prod-openai/gpt-6-astra";
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(true);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "mux-gateway",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: config,
+            resolvedRouteProvider: "direct",
+            openaiWireFormat: "chatCompletions",
+          })
+        ).toBe(false);
+        expect(
+          openaiProModeAvailable(model, {
+            providersConfig: { ...config, openai: { ...config.openai, codexOauthSet: true } },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
+
+    test.each(["compat", "unknown"])(
+      "does not invent an upstream for %s on fallback",
+      (instance) => {
+        expect(
+          openaiProModeAvailable(`coder:${instance}/gpt-6-astra`, {
+            providersConfig: {
+              ...providersConfig,
+              openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+              coder: { ...providersConfig.coder, isEnabled: false },
+            },
+            resolvedRouteProvider: "direct",
+          })
+        ).toBe(false);
+      }
+    );
+
+    test.each(["anthropic", "openai-compat"])(
+      "does not trust an OpenAI-named instance whose type is %s",
+      (type) => {
+        const config = {
+          ...providersConfig,
+          coder: {
+            ...providersConfig.coder,
+            discoveredProviders: [{ name: "openai", type }],
+          },
+        };
+        expect(
+          openaiProModeAvailable("coder:openai/gpt-6-astra", { providersConfig: config })
+        ).toBe(false);
+      }
+    );
+
+    test("does not treat a custom provider shadowing coder as the gateway", () => {
+      expect(
+        openaiProModeAvailable("coder:openai/gpt-6-astra", {
+          providersConfig: {
+            coder: {
+              ...providersConfig.coder,
+              providerType: "openai-responses",
+            },
+          },
+          resolvedRouteProvider: "coder",
+        })
+      ).toBe(false);
+    });
+  });
+
+  describe("native pro reasoning mode", () => {
     const buildWithMode = (
       model: string,
       reasoningMode: Parameters<typeof buildProviderOptions>[10],
@@ -1027,6 +1594,12 @@ describe("buildProviderOptions - OpenAI", () => {
     test("omits pro mode for standard mode, unsupported models, gateways, and Chat Completions", () => {
       const cases = [
         buildWithMode("openai:gpt-5.6-sol", "standard"),
+        buildWithMode("openai:gpt-6-astra", "standard"),
+        buildWithMode("openai:gpt-6-astra", undefined),
+        buildWithMode("openai:gpt-6-astra", "pro", { routeProvider: "mux-gateway" }),
+        buildWithMode("openai:gpt-6-astra", "pro", {
+          muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+        }),
         buildWithMode("openai:gpt-5.5-pro", "pro"),
         buildWithMode("openai:gpt-5.6-sol", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-5.6-sol", "pro", {
@@ -1049,93 +1622,196 @@ describe("buildProviderOptions - OpenAI", () => {
       );
     });
 
-    test("serializes native max and pro through @ai-sdk/openai 4.0.11", async () => {
-      const capturedBodies: Array<Record<string, unknown>> = [];
-      const captureFetch = Object.assign(
-        (
-          input: Parameters<typeof fetch>[0],
-          init?: Parameters<typeof fetch>[1]
-        ): Promise<Response> => {
-          if (typeof init?.body !== "string") {
-            throw new Error("Expected the OpenAI provider to send a JSON string body");
-          }
-          capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
-          const url =
-            typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-          const responseBody = url.endsWith("/responses")
-            ? {
-                id: "resp_test",
-                model: "gpt-5.6-sol",
-                output: [],
-                usage: { input_tokens: 1, output_tokens: 0 },
-              }
-            : {
-                id: "chat_test",
-                model: "gpt-5.6-sol",
-                choices: [
-                  {
-                    index: 0,
-                    message: { role: "assistant", content: "ok" },
-                    finish_reason: "stop",
-                  },
-                ],
-                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-              };
-          return Promise.resolve(
-            new Response(JSON.stringify(responseBody), {
-              status: 200,
-              headers: { "content-type": "application/json" },
-            })
-          );
-        },
-        { preconnect: fetch.preconnect.bind(fetch) }
-      );
-      const openai = createOpenAI({
-        apiKey: "test",
-        baseURL: "https://example.test/v1",
-        fetch: captureFetch,
-      });
-      const responsesOptions = buildWithMode("openai:gpt-5.6-sol", "pro", {
-        thinkingLevel: "max",
-      });
-      if (!responsesOptions) {
-        throw new Error("Expected OpenAI Responses provider options");
+    test.each([
+      ["gpt-5.6-sol", "openai"],
+      ["gpt-6-astra", "openai"],
+      ["gpt-6-astra", "coder"],
+    ] as const)(
+      "serializes native max and pro for %s via %s through the OpenAI SDK",
+      async (model, routeProvider) => {
+        const capturedBodies: Array<Record<string, unknown>> = [];
+        const captureFetch = Object.assign(
+          (
+            input: Parameters<typeof fetch>[0],
+            init?: Parameters<typeof fetch>[1]
+          ): Promise<Response> => {
+            if (typeof init?.body !== "string") {
+              throw new Error("Expected the OpenAI provider to send a JSON string body");
+            }
+            capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+            const url =
+              typeof input === "string"
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : input.url;
+            const responseBody = url.endsWith("/responses")
+              ? {
+                  id: "resp_test",
+                  model: model,
+                  output: [],
+                  usage: { input_tokens: 1, output_tokens: 0 },
+                }
+              : {
+                  id: "chat_test",
+                  model: model,
+                  choices: [
+                    {
+                      index: 0,
+                      message: { role: "assistant", content: "ok" },
+                      finish_reason: "stop",
+                    },
+                  ],
+                  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+                };
+            return Promise.resolve(
+              new Response(JSON.stringify(responseBody), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              })
+            );
+          },
+          { preconnect: fetch.preconnect.bind(fetch) }
+        );
+        const openai = createOpenAI({
+          apiKey: "test",
+          baseURL: "https://example.test/v1",
+          fetch: captureFetch,
+        });
+        const responsesOptions = buildWithMode(
+          routeProvider === "coder" ? `coder:openai/${model}` : `openai:${model}`,
+          "pro",
+          { thinkingLevel: "max", routeProvider }
+        );
+        if (!responsesOptions) {
+          throw new Error("Expected OpenAI Responses provider options");
+        }
+
+        const chatOptions = getOpenAIOptions(
+          buildProviderOptions(`openai:${model}`, "max", undefined, undefined, {
+            openai: { wireFormat: "chatCompletions" },
+          })
+        );
+        if (!chatOptions) {
+          throw new Error("Expected OpenAI Chat Completions provider options");
+        }
+
+        await generateText({
+          model: openai.responses(model),
+          prompt: "Return ok.",
+          providerOptions: { openai: responsesOptions },
+          maxRetries: 0,
+        });
+        await generateText({
+          model: openai.chat(model),
+          prompt: "Return ok.",
+          providerOptions: { openai: chatOptions },
+          maxRetries: 0,
+        });
+
+        expect(capturedBodies[0].reasoning).toEqual({
+          effort: "max",
+          summary: "detailed",
+          mode: "pro",
+        });
+        expect(capturedBodies[1].reasoning_effort).toBe("max");
       }
+    );
+  });
 
-      const chatOptions = getOpenAIOptions(
-        buildProviderOptions("openai:gpt-5.6-sol", "max", undefined, undefined, {
-          openai: { wireFormat: "chatCompletions" },
-        })
+  // Astra supports Pro independently of native max effort, but still rejects "none".
+  describe("GPT-6 Astra reasoning options", () => {
+    test("maps max to the native max effort and clamps off to low instead of none", () => {
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "max"))).toMatchObject({
+        reasoningEffort: "max",
+        reasoningSummary: "detailed",
+        include: ["reasoning.encrypted_content"],
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "xhigh"))).toMatchObject({
+        reasoningEffort: "xhigh",
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "off"))).toMatchObject({
+        reasoningEffort: "low",
+      });
+    });
+
+    test("preserves native max on the chatCompletions wire format", () => {
+      const result = buildProviderOptions("openai:gpt-6-astra", "max", undefined, undefined, {
+        openai: { wireFormat: "chatCompletions" },
+      });
+      expect(getOpenAIOptions(result)?.reasoningEffort).toBe("max");
+    });
+
+    test("degrades max to xhigh and keeps the low clamp through the Copilot-routed gateway", () => {
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        buildProviderOptions(
+          "openai:gpt-6-astra",
+          level,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          "github-copilot"
+        );
+      expect(build("max")).toEqual({ "github-copilot": { reasoningEffort: "xhigh" } });
+      expect(build("off")).toEqual({ "github-copilot": { reasoningEffort: "low" } });
+    });
+
+    test("delivers pro mode independently of effort on the direct Responses route", () => {
+      const result = buildProviderOptions(
+        "openai:gpt-6-astra",
+        "max",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "pro"
       );
-      if (!chatOptions) {
-        throw new Error("Expected OpenAI Chat Completions provider options");
-      }
+      const openai = getOpenAIOptions(result);
+      expect(openai?.reasoningEffort).toBe("max");
+      expect(openai?.reasoningMode).toBe("pro");
+    });
 
-      await generateText({
-        model: openai.responses("gpt-5.6-sol"),
-        prompt: "Return ok.",
-        providerOptions: { openai: responsesOptions },
-        maxRetries: 0,
+    test("resolves mapped aliases to Astra for the native effort mapping", () => {
+      const providersConfig = createMockProvidersConfig({
+        "openai:team-astra": "openai:gpt-6-astra",
       });
-      await generateText({
-        model: openai.chat("gpt-5.6-sol"),
-        prompt: "Return ok.",
-        providerOptions: { openai: chatOptions },
-        maxRetries: 0,
-      });
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        getOpenAIOptions(
+          buildProviderOptions(
+            "openai:team-astra",
+            level,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            providersConfig
+          )
+        );
+      expect(build("max")?.reasoningEffort).toBe("max");
+      expect(build("off")?.reasoningEffort).toBe("low");
+    });
 
-      expect(capturedBodies[0].reasoning).toEqual({
-        effort: "max",
-        summary: "detailed",
-        mode: "pro",
-      });
-      expect(capturedBodies[1].reasoning_effort).toBe("max");
+    test("keeps named Astra variants on the legacy OpenAI mapping", () => {
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "max"))
+      ).toMatchObject({ reasoningEffort: "xhigh" });
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "off"))?.reasoningEffort
+      ).toBeUndefined();
     });
   });
 
   describe("GPT-5.6 explicit prompt caching serialization", () => {
     // Production-path wire test: createOpenAI + capture fetch + streamText
-    // (the same streaming parser Mux uses), not intermediate TS objects.
+    // (the same streaming parser Xum uses), not intermediate TS objects.
     const providersConfig: ProvidersConfigMap = {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
@@ -1213,7 +1889,7 @@ describe("buildProviderOptions - OpenAI", () => {
 
       // Production system-message shape from the cache strategy helper.
       const cachedSystem = createOpenAICachedSystemMessage(
-        "You are Mux.",
+        "You are Xum.",
         "openai:gpt-5.6-luna",
         "openai",
         providersConfig
@@ -1287,7 +1963,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(responsesSystem?.content).toEqual([
         {
           type: "input_text",
-          text: "You are Mux.",
+          text: "You are Xum.",
           prompt_cache_breakpoint: { mode: "explicit" },
         },
       ]);
@@ -1303,7 +1979,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(chatSystem?.content).toEqual([
         {
           type: "text",
-          text: "You are Mux.",
+          text: "You are Xum.",
           prompt_cache_breakpoint: { mode: "explicit" },
         },
       ]);
@@ -1319,7 +1995,7 @@ describe("buildProviderOptions - OpenAI", () => {
   });
 
   describe("OpenAI conversation state management", () => {
-    test("does not reuse previousResponseId when Mux already sends explicit GPT-5.5 history", () => {
+    test("does not reuse previousResponseId when Xum already sends explicit GPT-5.5 history", () => {
       const messages = [
         createMuxMessage("assistant-1", "assistant", "", {
           model: "mux-gateway:openai/gpt-5.5",
@@ -1478,6 +2154,67 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
+  test("maps Gemini 3.7 Flash off to minimal thinking without thoughts", () => {
+    expect(buildProviderOptions("google:gemini-3.7-flash", "off")).toEqual({
+      google: {
+        thinkingConfig: {
+          thinkingLevel: "minimal",
+        },
+      },
+    });
+  });
+
+  test("maps Gemini 3.7 Flash medium to thinkingLevel medium with thoughts", () => {
+    expect(buildProviderOptions("google:gemini-3.7-flash", "medium")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "medium",
+        },
+      },
+    });
+  });
+
+  test("clamps Gemini 3.8 Flash off to low thinking because the API rejects minimal", () => {
+    // Policy already excludes "off" for 3.8 Flash; this guards callers that bypass it.
+    expect(buildProviderOptions("google:gemini-3.8-flash", "off")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "low",
+        },
+      },
+    });
+    // Older Flash tiers keep the minimal mapping.
+    expect(buildProviderOptions("google:gemini-3.7-flash", "off")).toEqual({
+      google: { thinkingConfig: { thinkingLevel: "minimal" } },
+    });
+  });
+
+  test("maps Gemini 3.8 Flash low/medium/high to the matching thinkingLevel with thoughts", () => {
+    for (const level of ["low", "medium", "high"] as const) {
+      expect(buildProviderOptions("google:gemini-3.8-flash", level)).toEqual({
+        google: {
+          thinkingConfig: {
+            includeThoughts: true,
+            thinkingLevel: level,
+          },
+        },
+      });
+    }
+  });
+
+  test("maps gateway-routed Gemini 3.8 Flash to thinkingLevel config", () => {
+    expect(buildProviderOptions("mux-gateway:google/gemini-3.8-flash", "high")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "high",
+        },
+      },
+    });
+  });
+
   test("maps Gemini 3.5 Flash medium to thinkingLevel medium with thoughts", () => {
     expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "medium")).toEqual({
       google: {
@@ -1598,6 +2335,123 @@ describe("buildProviderOptions - Moonshot", () => {
   });
 });
 
+describe("buildProviderOptions - Z.ai", () => {
+  test("enables thinking and maps every GLM 5.3 policy level", () => {
+    for (const [level, reasoningEffort] of [
+      ["low", "low"],
+      ["high", "high"],
+      ["max", "max"],
+    ] as const) {
+      expect(buildProviderOptions("zai:glm-5.3-flash", level)).toEqual({
+        zai: {
+          thinking: { type: "enabled" },
+          reasoningEffort,
+          toolStream: true,
+        },
+      });
+    }
+  });
+
+  test("does not apply forced GLM 5.3 options to other Z.ai models", () => {
+    expect(buildProviderOptions("zai:glm-4.7-flash", "high")).toEqual({});
+  });
+});
+
+describe("buildProviderOptions - OpenRouter service tiers", () => {
+  test.each(["auto", "default", "flex", "priority", undefined] as const)(
+    "serializes service tier %s independently of reasoning",
+    async (serviceTier) => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+      const captureFetch: typeof fetch = Object.assign(
+        (_input: RequestInfo | URL, init?: RequestInit) => {
+          if (typeof init?.body !== "string") {
+            throw new Error("Expected a JSON request body");
+          }
+          capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "chat_test",
+                object: "chat.completion",
+                created: 0,
+                model: "openai/gpt-5.2",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: "ok" },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              }),
+              { headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const model = createOpenRouter({ apiKey: "test", fetch: captureFetch })("openai/gpt-5.2");
+      for (const thinking of ["off", "medium"] as const) {
+        const options = buildProviderOptions(
+          "openrouter:openai/gpt-5.2",
+          thinking,
+          undefined,
+          undefined,
+          { openai: { serviceTier } },
+          undefined,
+          undefined,
+          undefined,
+          "openrouter"
+        );
+        await generateText({
+          model,
+          prompt: "Return ok.",
+          providerOptions: "openrouter" in options ? { openrouter: options.openrouter } : {},
+          maxRetries: 0,
+        });
+      }
+      expect(capturedBodies).toHaveLength(2);
+      for (const body of capturedBodies) {
+        expect(body.service_tier).toBe(serviceTier);
+        expect(body).not.toHaveProperty("serviceTier");
+        if (serviceTier === undefined) {
+          expect(body).not.toHaveProperty("service_tier");
+        }
+      }
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning_effort");
+      expect(capturedBodies[1].reasoning).toMatchObject({ effort: "medium" });
+    }
+  );
+});
+
+describe.each(["openrouter", "github-copilot"] as const)(
+  "buildProviderOptions - %s gateway service tiers",
+  (routeProvider) => {
+    test.each(["anthropic:claude-sonnet-4-5", "google:gemini-2.5-pro"])(
+      "does not send an OpenAI tier for %s, even when metadata maps it to OpenAI",
+      (modelString) => {
+        const config = createMockProvidersConfig({ [modelString]: "openai:gpt-5.2" });
+        for (const thinking of ["off", "medium"] as const) {
+          const build = (serviceTier?: "priority") =>
+            buildProviderOptions(
+              modelString,
+              thinking,
+              undefined,
+              undefined,
+              { openai: { serviceTier } },
+              undefined,
+              undefined,
+              config,
+              routeProvider
+            );
+          expect(build("priority")).toEqual(build());
+        }
+      }
+    );
+  }
+);
+
 describe("buildProviderOptions - OpenRouter", () => {
   test("sends the explicit max effort for OpenRouter-routed Kimi K3", () => {
     // `enabled: true` alone falls back to OpenRouter's default (medium) effort,
@@ -1646,6 +2500,21 @@ describe("buildProviderOptions - xAI", () => {
       xai: { reasoningEffort: "medium", store: false },
     });
     expect(buildProviderOptions("xai:grok-4.5", "max")).toEqual({
+      xai: { reasoningEffort: "high", store: false },
+    });
+  });
+
+  test("passes native xhigh through for Grok 4.6 while Grok 4.5 clamps to high", () => {
+    expect(buildProviderOptions("xai:grok-4.6", "xhigh")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.6", "max")).toEqual({
+      xai: { reasoningEffort: "xhigh", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.6", "medium")).toEqual({
+      xai: { reasoningEffort: "medium", store: false },
+    });
+    expect(buildProviderOptions("xai:grok-4.5", "xhigh")).toEqual({
       xai: { reasoningEffort: "high", store: false },
     });
   });
@@ -1762,10 +2631,10 @@ describe("buildRequestHeaders", () => {
     });
   }
 
-  // Native xhigh effort no longer needs a Mux-internal override header: the
+  // Native xhigh effort no longer needs a Xum-internal override header: the
   // SDK accepts effort "xhigh" directly (see buildProviderOptions tests above),
   // so buildRequestHeaders is thinking-level-independent.
-  test("does not emit any Mux-internal effort header for native-xhigh models", () => {
+  test("does not emit any Xum-internal effort header for native-xhigh models", () => {
     expect(buildRequestHeaders("anthropic:claude-opus-4-7")).toBeUndefined();
     expect(buildRequestHeaders("anthropic:claude-sonnet-5")).toBeUndefined();
   });
@@ -1816,15 +2685,19 @@ describe("buildRequestHeaders", () => {
   });
 
   describe("openaiProModeAvailable", () => {
-    // UI gating must mirror provider-option delivery: only direct OpenAI routes
-    // surface the toggle while gateways still drop or reject the field.
+    // UI gating must mirror provider-option delivery: direct OpenAI and Coder
+    // Responses surface the toggle; other gateways still drop or reject it.
     const cases: Array<[string, boolean]> = [
       ["openai:gpt-5.6-sol", true],
       ["openai:gpt-5.6-terra", true],
       // Pro mode is family-wide at GA (including Luna and the bare alias).
       ["openai:gpt-5.6-luna", true],
       ["openai:gpt-5.6", true],
-      // All gateways fail closed — mux-gateway drops the field server-side.
+      ["openai:gpt-6-astra", true],
+      ["openai:gpt-6-astra-2026-09-03", true],
+      ["mux-gateway:openai/gpt-6-astra", false],
+      ["openai:gpt-6-astra-mini", false],
+      // Other gateways fail closed — mux-gateway drops the field server-side.
       ["mux-gateway:openai/gpt-5.6-sol", false],
       ["openrouter:openai/gpt-5.6-sol", false],
       ["github-copilot:gpt-5.6-sol", false],
@@ -1974,6 +2847,13 @@ describe("buildRequestHeaders", () => {
       expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },
     },
     {
+      name: "should include X-Mux-Workspace-Id for mux-gateway routes",
+      model: "mux-gateway:openai/gpt-5.2",
+      options: undefined,
+      workspaceId: "a1b2c3d4e5",
+      expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },
+    },
+    {
       name: "should encode non-header-safe workspace IDs before attaching request header",
       model: "openai:gpt-5.2",
       options: undefined,
@@ -2001,9 +2881,18 @@ describe("buildRequestHeaders", () => {
     },
   ] as const) {
     test(name, () => {
-      expect(buildRequestHeaders(model, options, workspaceId)).toEqual(expected);
+      const headers = buildRequestHeaders(model, options, workspaceId);
+      expect(headers).toEqual(expected);
+      expect(headers?.["X-Xum-Workspace-Id"]).toBeUndefined();
     });
   }
+
+  test("workspace correlation header uses the mux wire name, not Xum", () => {
+    expect(MUX_WORKSPACE_ID_HEADER).toBe("X-Mux-Workspace-Id");
+    const headers = buildRequestHeaders("openai:gpt-5.2", undefined, "ws-id");
+    expect(headers?.["X-Mux-Workspace-Id"]).toBe("ws-id");
+    expect(headers?.["X-Xum-Workspace-Id"]).toBeUndefined();
+  });
 
   test("should return undefined when no workspaceId and no provider-specific headers apply", () => {
     expect(buildRequestHeaders("openai:gpt-5.2")).toBeUndefined();
@@ -2011,5 +2900,108 @@ describe("buildRequestHeaders", () => {
 
   test("should return undefined when no muxProviderOptions provided", () => {
     expect(buildRequestHeaders("anthropic:claude-sonnet-4-5")).toBeUndefined();
+  });
+});
+
+describe("custom provider wire origins", () => {
+  const customConfig = (
+    providerType: "openai-compatible" | "openai-responses" | "anthropic-messages"
+  ): ProvidersConfigMap => ({
+    zen: {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      isCustom: true,
+      providerType,
+    },
+  });
+
+  test("anthropic-messages providers get Anthropic thinking options", () => {
+    const result = buildProviderOptions(
+      "zen:claude-sonnet-4-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("anthropic-messages")
+    );
+
+    expect(result).toEqual({
+      anthropic: {
+        disableParallelToolUse: false,
+        sendReasoning: true,
+        thinking: {
+          type: "enabled",
+          budgetTokens: 10000,
+        },
+      },
+    });
+  });
+
+  test("openai-responses providers get OpenAI reasoning options", () => {
+    const result = buildProviderOptions(
+      "zen:gpt-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("openai-responses")
+    );
+
+    const openai = "openai" in result ? result.openai : undefined;
+    expect(openai).toBeDefined();
+    expect(openai!.reasoningEffort).toBe("medium");
+    expect("anthropic" in result).toBe(false);
+  });
+
+  test("resolves mappedToModel aliases from the raw custom identity", () => {
+    const providersConfig: ProvidersConfigMap = {
+      zen: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "anthropic-messages",
+        models: [{ id: "my-opus", mappedToModel: "anthropic:claude-opus-4-6-20260219" }],
+      },
+    };
+
+    const result = buildProviderOptions(
+      "zen:my-opus",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      providersConfig
+    );
+    const anthropic = (result as Record<string, unknown>).anthropic as Record<string, unknown>;
+
+    // The alias maps to an adaptive-thinking model; resolving metadata from
+    // the wire-remapped identity would miss the mapping and emit legacy
+    // budget-based thinking instead.
+    expect(anthropic.thinking).toEqual({ type: "adaptive" });
+    expect(anthropic.effort).toBe("high");
+  });
+
+  test("openai-compatible providers keep their own wire identity", () => {
+    const result = buildProviderOptions(
+      "zen:claude-sonnet-4-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("openai-compatible")
+    );
+
+    expect("anthropic" in result).toBe(false);
+    expect("openai" in result).toBe(false);
   });
 });

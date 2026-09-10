@@ -12,6 +12,7 @@ import {
   runPostHook,
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 
 describe("hooks", () => {
   let tempDir: string;
@@ -24,6 +25,67 @@ describe("hooks", () => {
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  describe("exec path mapping", () => {
+    test("discovery returns host-namespace paths even on exec-mapping runtimes", async () => {
+      const configDir = path.join(tempDir, ".xum");
+      const hookPath = path.join(configDir, "tool_hook");
+      const toolEnvPath = path.join(configDir, "tool_env");
+      await fs.mkdir(configDir, { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\necho test");
+      await fs.writeFile(toolEnvPath, "export FOO=bar");
+
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, "/workspaces/project");
+      expect(await getHookPath(mappingRuntime, tempDir)).toBe(hookPath);
+      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(toolEnvPath);
+    });
+
+    test("hook runners export the mapped project dir as XUM_PROJECT_DIR", async () => {
+      const execPrefix = path.join(tempDir, "exec");
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
+      const hookDir = path.join(tempDir, ".xum");
+      const execHookDir = path.join(execPrefix, ".xum");
+      await Promise.all([
+        fs.mkdir(hookDir, { recursive: true }),
+        fs.mkdir(execHookDir, { recursive: true }),
+      ]);
+      const writeHook = async (name: string) => {
+        const hookPath = path.join(hookDir, name);
+        const contents = '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"';
+        await Promise.all([
+          fs.writeFile(hookPath, contents),
+          fs.writeFile(path.join(execHookDir, name), contents),
+        ]);
+        await Promise.all([
+          fs.chmod(hookPath, 0o755),
+          fs.chmod(path.join(execHookDir, name), 0o755),
+        ]);
+        return hookPath;
+      };
+      const context = {
+        tool: "test_tool",
+        toolInput: "{}",
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+      };
+
+      const preResult = await runPreHook(mappingRuntime, await writeHook("tool_pre"), context);
+      expect(preResult.output).toContain(`project_dir=${execPrefix}`);
+
+      const postResult = await runPostHook(mappingRuntime, await writeHook("tool_post"), context, {
+        success: true,
+      });
+      expect(postResult.output).toContain(`project_dir=${execPrefix}`);
+
+      const { hook } = await runWithHook(
+        mappingRuntime,
+        await writeHook("tool_hook"),
+        context,
+        () => Promise.resolve({ success: true })
+      );
+      expect(hook.stdoutBeforeExec).toContain(`project_dir=${execPrefix}`);
+    });
   });
 
   describe("getHookPath", () => {
@@ -51,6 +113,55 @@ describe("hooks", () => {
       const result = await getHookPath(runtime, tempDir);
       expect(result).toBeNull();
     });
+
+    test("falls back to the user-global hook in getXumHome()", async () => {
+      const xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "xum-home-hooks-"));
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = xumHome;
+      const hookPath = path.join(xumHome, "tool_hook");
+      await fs.writeFile(hookPath, "#!/bin/bash\necho test");
+      await fs.chmod(hookPath, 0o755);
+
+      try {
+        const result = await getHookPath(runtime, tempDir);
+        expect(result).toBe(hookPath);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.XUM_ROOT;
+        } else {
+          process.env.XUM_ROOT = previousRoot;
+        }
+        await fs.rm(xumHome, { recursive: true, force: true });
+      }
+    });
+
+    test("prefers .xum hooks over legacy and user-global hooks", async () => {
+      const xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "xum-home-hooks-"));
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = xumHome;
+      await fs.writeFile(path.join(xumHome, "tool_hook"), "#!/bin/bash\necho user");
+
+      const legacyHookDir = path.join(tempDir, ".mux");
+      await fs.mkdir(legacyHookDir, { recursive: true });
+      await fs.writeFile(path.join(legacyHookDir, "tool_hook"), "#!/bin/bash\necho legacy");
+
+      const canonicalHookDir = path.join(tempDir, ".xum");
+      const canonicalHookPath = path.join(canonicalHookDir, "tool_hook");
+      await fs.mkdir(canonicalHookDir, { recursive: true });
+      await fs.writeFile(canonicalHookPath, "#!/bin/bash\necho canonical");
+
+      try {
+        const result = await getHookPath(runtime, tempDir);
+        expect(result).toBe(canonicalHookPath);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.XUM_ROOT;
+        } else {
+          process.env.XUM_ROOT = previousRoot;
+        }
+        await fs.rm(xumHome, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("getToolEnvPath", () => {
@@ -76,6 +187,26 @@ describe("hooks", () => {
 
       const result = await getToolEnvPath(runtime, tempDir);
       expect(result).toBeNull();
+    });
+
+    test("falls back to user-global tool_env in getXumHome()", async () => {
+      const xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "xum-home-tool-env-"));
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = xumHome;
+      const envPath = path.join(xumHome, "tool_env");
+      await fs.writeFile(envPath, "export FOO=user");
+
+      try {
+        const result = await getToolEnvPath(runtime, tempDir);
+        expect(result).toBe(envPath);
+      } finally {
+        if (previousRoot === undefined) {
+          delete process.env.XUM_ROOT;
+        } else {
+          process.env.XUM_ROOT = previousRoot;
+        }
+        await fs.rm(xumHome, { recursive: true, force: true });
+      }
     });
   });
 

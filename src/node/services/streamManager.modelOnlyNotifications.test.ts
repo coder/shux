@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { StreamManager } from "./streamManager";
+import { onTurnEngineEvent } from "./streamManager.testHarness";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -29,9 +30,13 @@ describe("StreamManager - model-only tool notifications", () => {
     };
 
     const events: Array<{ toolName?: string; result?: unknown }> = [];
-    streamManager.on("tool-call-end", (data: { toolName: string; result: unknown }) => {
-      events.push({ toolName: data.toolName, result: data.result });
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-end",
+      (data: { toolName: string; result: unknown }) => {
+        events.push({ toolName: data.toolName, result: data.result });
+      }
+    );
 
     const mockStreamResult = {
       // eslint-disable-next-line @typescript-eslint/require-await
@@ -70,6 +75,7 @@ describe("StreamManager - model-only tool notifications", () => {
       startTime: Date.now(),
       model: "noop:model",
       historySequence: 1,
+      stepStartIndices: [0],
       parts: [],
       lastPartialWriteTime: 0,
       partialWritePromise: undefined,
@@ -115,7 +121,8 @@ describe("StreamManager - model-only tool notifications", () => {
       result?: unknown;
       providerExecuted?: boolean;
     }> = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-end",
       (data: { toolName: string; result: unknown; providerExecuted?: boolean }) => {
         events.push({
@@ -163,6 +170,7 @@ describe("StreamManager - model-only tool notifications", () => {
       startTime: Date.now(),
       model: "noop:model",
       historySequence: 1,
+      stepStartIndices: [0],
       parts: [],
       lastPartialWriteTime: 0,
       partialWritePromise: undefined,

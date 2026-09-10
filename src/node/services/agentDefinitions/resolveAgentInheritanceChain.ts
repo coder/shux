@@ -16,6 +16,11 @@ export interface AgentForInheritance {
   base?: AgentId;
   tools?: AgentDefinitionPackage["frontmatter"]["tools"];
   uiColor?: string;
+  /** Per-hop (unmerged) frontmatter `ai` defaults for AI-settings resolution. */
+  ai?: AgentDefinitionPackage["frontmatter"]["ai"];
+  /** Provenance of the hop's winning definition (strict-send chain pinning). */
+  scope: AgentDefinitionPackage["scope"];
+  source?: string;
 }
 
 interface ResolveAgentInheritanceChainOptions {
@@ -25,6 +30,8 @@ interface ResolveAgentInheritanceChainOptions {
   agentDefinition: AgentDefinitionPackage;
   workspaceId: string;
   maxDepth?: number;
+  /** agent-plugins experiment: also resolve base agents contributed by Agent Plugins. */
+  includeAgentPlugins?: boolean;
 }
 
 /**
@@ -66,6 +73,9 @@ export async function resolveAgentInheritanceChain(
       base: currentDefinition.frontmatter.base,
       tools: currentDefinition.frontmatter.tools,
       uiColor: currentDefinition.frontmatter.ui?.color,
+      ai: currentDefinition.frontmatter.ai,
+      scope: currentDefinition.scope,
+      ...(currentDefinition.source != null ? { source: currentDefinition.source } : {}),
     });
 
     const baseId = currentDefinition.frontmatter.base;
@@ -78,6 +88,7 @@ export async function resolveAgentInheritanceChain(
 
     try {
       currentDefinition = await readAgentDefinition(runtime, workspacePath, baseId, {
+        includeAgentPlugins: options.includeAgentPlugins,
         skipScopesAbove,
       });
     } catch (error) {

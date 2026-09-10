@@ -24,7 +24,13 @@ import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import {
+  combineGitNoRepoAutomationEnvs,
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
@@ -815,23 +821,18 @@ function formatResult(
 }
 
 /**
- * Shell-escape a string for safe use in bash commands (single-quote wrapping).
- */
-function shellEscape(str: string): string {
-  return `'${str.replace(/'/g, "'\\''")}'`;
-}
-
-/**
- * Build script prelude that sources .mux/tool_env if present.
+ * Build script prelude that sources .xum/tool_env if present.
  * Returns empty string if no tool_env path is provided.
  */
+const TOOL_ENV_PATH_ENV = "XUM_INTERNAL_TOOL_ENV_PATH";
+
 function buildToolEnvPrelude(toolEnvPath: string | null): string {
   if (!toolEnvPath) return "";
-  // Source the tool_env file; fail with clear error if sourcing fails
-  return `if ! source ${shellEscape(toolEnvPath)} 2>&1; then
-  echo "mux: failed to source ${toolEnvPath}" >&2
+  return `if ! source "$${TOOL_ENV_PATH_ENV}" 2>&1; then
+  echo "mux: failed to source $${TOOL_ENV_PATH_ENV}" >&2
   exit 1
 fi
+unset ${TOOL_ENV_PATH_ENV}
 `;
 }
 
@@ -906,16 +907,42 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           ? CAT_FILE_READ_NOTICE
           : undefined;
 
-      // Look up .mux/tool_env to source before script (for direnv, nvm, venv, etc.)
+      // Look up .xum/tool_env to source before script (for direnv, nvm, venv, etc.)
       // Skip for untrusted projects — tool_env is repo-controlled code
       const toolEnvPath =
         config.trusted && config.runtime ? await getToolEnvPath(config.runtime, config.cwd) : null;
       const toolEnvPrelude = buildToolEnvPrelude(toolEnvPath);
 
-      // Neutralize git hooks for untrusted projects — prevent repository-controlled
-      // hooks from executing when the model runs git subcommands (for example,
-      // `git commit` or `git am`) through this bash tool.
-      const hooksEnv = config.trusted !== true ? GIT_NO_HOOKS_ENV : {};
+      // Neutralize repo-controlled git automation when trust is absent or the
+      // benchmark kill-switch is active. Repo-aware discovery covers drivers
+      // selected by highest-precedence .git/info/attributes on every runtime.
+      let hooksEnv: Record<string, string> = {};
+      if (!gitHooksAllowed(config.trusted)) {
+        const repoPaths =
+          config.projects != null && config.projects.length > 0
+            ? [
+                ...new Set(
+                  config.projects.map((project) => path.join(config.cwd, project.projectName))
+                ),
+              ]
+            : [config.cwd];
+        const repoEnvs: Array<Record<string, string>> = [];
+        for (const repoPath of repoPaths) {
+          repoEnvs.push(
+            config.runtime instanceof LocalBaseRuntime
+              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
+              : config.runtime != null
+                ? await gitNoRepoAutomationEnvForRuntimeRepo(
+                    config.runtime,
+                    repoPath,
+                    abortSignal,
+                    true
+                  )
+                : gitNoRepoAutomationEnv()
+          );
+        }
+        hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
+      }
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.
@@ -977,17 +1004,20 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
           const filterExclude = monitor.filter_exclude ?? false;
           const cooldownMs = monitor.cooldown_ms ?? 1000;
+          const wakeOnExit = monitor.wake_on_exit ?? true;
           monitorConfig = {
             filter: monitor.filter,
             pattern,
             exclude: filterExclude,
             cooldownMs,
+            wakeOnExit,
             ...(monitor.max_events != null ? { maxEvents: monitor.max_events } : {}),
           };
           monitorResult = {
             filter: monitor.filter,
             filter_exclude: filterExclude,
             cooldown_ms: cooldownMs,
+            wake_on_exit: wakeOnExit,
             ...(monitor.max_events != null ? { max_events: monitor.max_events } : {}),
           };
         }
@@ -999,8 +1029,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            // Match foreground bash behavior: muxEnv is present and secrets override it.
-            env: { ...hooksEnv, ...(config.muxEnv ?? {}), ...(config.secrets ?? {}) },
+            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
+            pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
@@ -1079,7 +1109,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...hooksEnv, ...config.muxEnv, ...config.secrets, ...NON_INTERACTIVE_ENV_VARS },
+        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
+        pathEnv: toolEnvPath ? { [TOOL_ENV_PATH_ENV]: toolEnvPath } : undefined,
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
       });
@@ -1399,9 +1430,14 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
+            let migrationError = "background process manager unavailable";
             if (config.backgroundProcessManager && config.workspaceId) {
-              const processId =
-                config.backgroundProcessManager.generateUniqueProcessId(safeDisplayName);
+              // Allocate-and-reserve atomically: the migration awaits below would otherwise
+              // let a concurrent same-name migration receive the same ID and share this
+              // process's output directory and manager entry (see reserveUniqueProcessId).
+              const reservation =
+                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
+              const processId = reservation.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1426,7 +1462,6 @@ ${scriptWithEnv}`;
               );
 
               if (migrateResult.success) {
-                // Register the migrated process with the manager
                 config.backgroundProcessManager.registerMigratedProcess(
                   migrateResult.handle,
                   processId,
@@ -1435,6 +1470,8 @@ ${scriptWithEnv}`;
                   migrateResult.outputDir,
                   safeDisplayName
                 );
+                // The processes map now holds the name; the reservation has done its job.
+                reservation.release();
 
                 return withNotice({
                   success: true,
@@ -1445,14 +1482,30 @@ ${scriptWithEnv}`;
                   backgroundProcessId: processId,
                 });
               }
-              // Migration failed, fall through to simple return
+              // Migration failed, fall through to fail-closed termination below. Keep the
+              // name reserved until the aborted process's exit actually settles; if it never
+              // does, leaking the name for the session is the safe fail-closed behavior.
+              migrationError = migrateResult.error;
+              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
             }
 
-            // Fallback: return without process ID (no manager or migration failed)
+            // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
+            // manager entry nor a durable spawn record, so archive gates and crash-orphan scans
+            // could not see the surviving command — a snapshot archive could remove the checkout
+            // (or a Coder-stop archive stop the VM) under it. Fail closed: terminate the process
+            // instead of letting it run untracked. (Backgrounding requires the manager-backed
+            // foreground registration, so the manager-unavailable branch is defensive only.)
+            wrappedAbortController.abort();
+            stdoutForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
+            stderrForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
             return withNotice({
-              success: true,
-              output: `Process sent to background. It will continue running.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
-              exitCode: 0,
+              success: false,
+              error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
+              exitCode: -1,
               wall_duration_ms,
             });
           }

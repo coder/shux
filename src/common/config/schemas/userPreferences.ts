@@ -7,12 +7,15 @@ import {
 import {
   BASH_COLLAPSED_SUMMARY_MODES,
   EDITOR_TYPES,
+  TERMINAL_BADGE_POSITIONS,
   TRANSCRIPT_DENSITIES,
   normalizeEditorConfig,
+  normalizeTerminalBadgeConfig,
   normalizeTerminalFontConfig,
   type BashCollapsedSummaryMode,
   type EditorConfig,
   type LaunchBehavior,
+  type TerminalBadgeConfig,
   type TerminalFontConfig,
   type TranscriptDensity,
 } from "@/common/constants/storage";
@@ -49,6 +52,15 @@ export const UserPreferencesSchema = z.object({
       terminalFontConfig: z
         .object({
           fontFamily: z.string().min(1),
+          fontSize: z.number().positive(),
+        })
+        .optional(),
+      terminalBadgeConfig: z
+        .object({
+          enabled: z.boolean(),
+          template: z.string(),
+          position: z.enum(TERMINAL_BADGE_POSITIONS),
+          opacity: z.number().min(0).max(1),
           fontSize: z.number().positive(),
         })
         .optional(),
@@ -151,6 +163,14 @@ function parseTerminalFontConfig(value: unknown): TerminalFontConfig | undefined
   }
 
   return normalizeTerminalFontConfig(value);
+}
+
+function parseTerminalBadgeConfig(value: unknown): TerminalBadgeConfig | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  return normalizeTerminalBadgeConfig(value);
 }
 
 function parseEditorConfig(value: unknown): EditorConfig | undefined {
@@ -379,6 +399,11 @@ export function normalizeUserPreferences(value: unknown): UserPreferences | unde
     const terminalFontConfig = parseTerminalFontConfig(value.appearance.terminalFontConfig);
     if (terminalFontConfig) {
       appearance.terminalFontConfig = terminalFontConfig;
+    }
+
+    const terminalBadgeConfig = parseTerminalBadgeConfig(value.appearance.terminalBadgeConfig);
+    if (terminalBadgeConfig) {
+      appearance.terminalBadgeConfig = terminalBadgeConfig;
     }
 
     const editorConfig = parseEditorConfig(value.appearance.editorConfig);

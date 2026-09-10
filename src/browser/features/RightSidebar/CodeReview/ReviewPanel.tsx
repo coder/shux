@@ -1232,7 +1232,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     }
   }, []);
 
-  // Handler for when a hunk's composing state changes
   const handleHunkComposingChange = useCallback(
     (hunkId: string, isComposing: boolean) => {
       if (isComposing) {
@@ -1360,9 +1359,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     if (!api || isCreating) return;
     let cancelled = false;
 
-    const prevRefreshTrigger = lastFileTreeRefreshTriggerRef.current;
-    lastFileTreeRefreshTriggerRef.current = refreshTrigger;
-    const isManualRefresh = refreshTrigger !== 0 && prevRefreshTrigger !== refreshTrigger;
+    const isManualRefresh =
+      refreshTrigger !== 0 && lastFileTreeRefreshTriggerRef.current !== refreshTrigger;
 
     const numstatCommand = buildGitDiffCommand(
       filters.diffBase,
@@ -1486,6 +1484,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         });
 
         if (cancelled) return;
+        lastFileTreeRefreshTriggerRef.current = refreshTrigger;
         setFileTree(tree);
       } catch (err) {
         console.error("Failed to load file tree:", err);
@@ -1519,9 +1518,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     if (!api || isCreating) return;
     let cancelled = false;
 
-    const prevRefreshTrigger = lastDiffRefreshTriggerRef.current;
-    lastDiffRefreshTriggerRef.current = refreshTrigger;
-    const isManualRefresh = refreshTrigger !== 0 && prevRefreshTrigger !== refreshTrigger;
+    const isManualRefresh =
+      refreshTrigger !== 0 && lastDiffRefreshTriggerRef.current !== refreshTrigger;
 
     const effectiveIncludeUncommitted = getEffectiveReviewIncludeUncommitted({
       assistedOnly: filters.assistedOnly,
@@ -1652,6 +1650,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
 
         if (cancelled) return;
 
+        lastDiffRefreshTriggerRef.current = refreshTrigger;
         setDiagnosticInfo(data.diagnosticInfo);
 
         // Preserve object references for unchanged hunks to prevent unnecessary re-renders.
@@ -2083,7 +2082,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       // Find all hunks in the same file
       const fileHunkIds = hunks.filter((h) => h.filePath === hunk.filePath).map((h) => h.id);
 
-      // Mark all hunks in the file as read
       markAsRead(fileHunkIds);
 
       // If marking the selected hunk's file as read and hunks will be filtered out, navigate.
@@ -2659,6 +2657,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               assistedOnly={filters.assistedOnly}
               assistedCount={assistedHunks.length}
               assistedUnreadCount={unreadAssistedInDiff}
+              isMultiProjectWorkspace={(workspaceReviewMetadata?.projects?.length ?? 0) > 1}
             />,
             root
           );

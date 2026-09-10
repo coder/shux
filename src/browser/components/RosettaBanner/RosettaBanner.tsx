@@ -7,7 +7,7 @@ const ROSETTA_BANNER_DISMISSED_KEY = "rosettaBannerDismissedAt";
 const DISMISS_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**
- * Banner shown when Mux is running under Rosetta 2 translation.
+ * Banner shown when Xum is running under Rosetta 2 translation.
  * Users can dismiss it, but it will re-appear after 30 days.
  */
 export const RosettaBanner: React.FC = () => {
@@ -67,7 +67,7 @@ export const RosettaBanner: React.FC = () => {
       <div className="flex items-center gap-2">
         <AlertTriangle className="text-warning size-4 shrink-0" />
         <span>
-          Mux is running under Rosetta. For better performance,{" "}
+          Xum is running under Rosetta. For better performance,{" "}
           <a
             href="https://mux.coder.com/install#downloads"
             target="_blank"

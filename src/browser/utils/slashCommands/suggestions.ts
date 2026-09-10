@@ -14,8 +14,6 @@ import type {
   SuggestionDefinition,
 } from "./types";
 
-export type { SlashSuggestion } from "./types";
-
 const COMMAND_DEFINITIONS = getSlashCommandDefinitions();
 
 function filterAndMapSuggestions<T extends SuggestionDefinition>(
@@ -92,6 +90,37 @@ function buildTopLevelSuggestions(
     };
   });
 
+  // Agent Plugins: manifest-contributed commands are pure data-driven entries
+  // whose replacement IS the expansion text (no parser/send-path involvement).
+  // Built-in command keys and skill names take precedence on collision.
+  const claimedSkillNames = new Set(skillDefinitions.map((definition) => definition.key));
+  const pluginCommandSuggestions = (context.pluginCommands ?? [])
+    .filter(
+      (command) =>
+        !SLASH_COMMAND_DEFINITION_MAP.has(command.name) && !claimedSkillNames.has(command.name)
+    )
+    .filter((command) => matchesNameBySegmentPrefix(command.name, partial))
+    .map((command) => ({
+      id: `plugin-command:${command.name}`,
+      display: `/${command.name}`,
+      description: `${command.description ?? "Plugin command"} (plugin:${command.pluginName})`,
+      replacement: command.expansion,
+    }));
+
+  const promptSuggestions = (context.mcpPrompts ?? [])
+    .filter((prompt) => matchesNameBySegmentPrefix(prompt.commandKey, partial))
+    .map((prompt) => {
+      const argumentHint = (prompt.arguments ?? [])
+        .map((argument) => `[${argument.name}${argument.required ? "" : "?"}]`)
+        .join(" ");
+      return {
+        id: `mcp-prompt:${prompt.commandKey}`,
+        display: `/${prompt.commandKey}${argumentHint ? ` ${argumentHint}` : ""}`,
+        description: `${prompt.description ?? "MCP prompt"} (${prompt.serverName})`,
+        replacement: `/${prompt.commandKey} `,
+      };
+    });
+
   // Model alias one-shot suggestions (e.g., /haiku, /sonnet, /opus+high).
   // The build callback below hardcodes the trailing space, so `appendSpace`
   // is intentionally omitted here.
@@ -113,7 +142,13 @@ function buildTopLevelSuggestions(
     })
   );
 
-  return [...commandSuggestions, ...skillSuggestions, ...modelAliasSuggestions];
+  return [
+    ...commandSuggestions,
+    ...skillSuggestions,
+    ...pluginCommandSuggestions,
+    ...promptSuggestions,
+    ...modelAliasSuggestions,
+  ];
 }
 
 function buildSubcommandSuggestions(

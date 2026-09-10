@@ -263,7 +263,8 @@ FETCH_ALL_THUMBS_UP_REACTIONS() {
     fi
 
     page_nodes=$(echo "$reactions_page" | jq -c '.data.repository.pullRequest.reactions.nodes // []')
-    all_reactions=$(jq -cn --argjson existing "$all_reactions" --argjson page "$page_nodes" '$existing + $page')
+    # Via stdin: accumulated pages can exceed Linux's per-argument limit (MAX_ARG_STRLEN).
+    all_reactions=$(printf '%s\n%s' "$all_reactions" "$page_nodes" | jq -cs '.[0] + .[1]')
 
     has_next=$(echo "$reactions_page" | jq -r '.data.repository.pullRequest.reactions.pageInfo.hasNextPage')
     end_cursor=$(echo "$reactions_page" | jq -r '.data.repository.pullRequest.reactions.pageInfo.endCursor // empty')
@@ -458,7 +459,17 @@ CHECK_CODEX_STATUS_ONCE() {
     return 0
   fi
 
-  codex_response_count_comments=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select(.author.login == $bot and .createdAt > $request_at)] | length')
+  # Completed status/no-findings envelopes are neither approval nor a failed
+  # review. Reuse the CI classifier and keep waiting for the approval signal.
+  # Unfinished/unknown envelopes and account errors retain their blocking behavior.
+  codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
+    include "codex_comments";
+    [.[] | select(.author.login == $bot and .createdAt > $request_at)
+      | select(
+          ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->") or startswith("Security review completed."))
+            and codex_comment_is_informational($bot)) | not
+        )] | length
+  ')
   codex_response_count_threads=$(echo "$all_threads" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '[.[] | select((.comments.nodes | length) > 0 and .comments.nodes[0].author.login == $bot and .comments.nodes[0].createdAt > $request_at)] | length')
   codex_response_count=$((codex_response_count_comments + codex_response_count_threads))
 

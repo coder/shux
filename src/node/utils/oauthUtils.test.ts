@@ -188,8 +188,8 @@ describe("renderOAuthCallbackHtml", () => {
       message: "M",
       success: false,
     });
-    expect(successHtml).toContain("Mux should now be in the foreground");
-    expect(failureHtml).not.toContain("Mux should now be in the foreground");
+    expect(successHtml).toContain("Xum should now be in the foreground");
+    expect(failureHtml).not.toContain("Xum should now be in the foreground");
     expect(failureHtml).toContain("You can close this tab.");
   });
 });

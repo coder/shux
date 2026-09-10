@@ -1,10 +1,26 @@
+import type { StreamAbortEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import * as fsPromises from "node:fs/promises";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
+import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import type { AIService } from "./aiService";
+import type { CompactionMonitor } from "./compactionMonitor";
+import type { TurnCompletion } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
+const WORKSPACE_TURN_CORRELATION = {
+  type: "workspace-turn-task",
+  taskHandleId: "wst_preparing",
+  ownerWorkspaceId: "owner-workspace",
+  turnId: "turn-preparing",
+} as const;
 
 function toolCallEndEvent(workspaceId: string): Record<string, unknown> {
   return {
@@ -28,10 +44,7 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
   };
 }
 
-function streamAbortEvent(
-  workspaceId: string,
-  abortReason: "system" | "user"
-): Record<string, unknown> {
+function streamAbortEvent(workspaceId: string, abortReason: "system" | "user"): StreamAbortEvent {
   return {
     type: "stream-abort",
     workspaceId,
@@ -53,6 +66,409 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
+    const successor = Promise.withResolvers<void>();
+    let calls = 0;
+    const streamMessage = mock(() => {
+      if (++calls === 1)
+        return Promise.resolve(
+          Err({ type: "api_key_not_found" as const, provider: "anthropic" as const })
+        );
+      successor.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-provider-startup-failure",
+      aiServiceOverrides: { streamMessage },
+    });
+    try {
+      session.queueMessage(
+        "failed startup",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage("successor", { model: TEST_MODEL, agentId: "exec" });
+      session.sendQueuedMessages();
+      await successor.promise;
+      await session.waitForIdle();
+      expect(calls).toBe(2);
+      expect(session.hasQueuedMessages()).toBe(false);
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each(["returned error", "rejection"] as const)(
+    "reserves queued startup synchronously and drains after %s cleanup",
+    async (failureKind) => {
+      const workspaceId = `queue-prestart-${failureKind}`;
+      const failureEntered = Promise.withResolvers<void>();
+      const releaseFailure = Promise.withResolvers<void>();
+      const successorStarted = Promise.withResolvers<void>();
+      const streamMessage = mock(() => {
+        successorStarted.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      const { session, historyService, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: { streamMessage },
+      });
+      const append = spyOn(historyService, "appendToHistory");
+      if (failureKind === "returned error") {
+        append.mockResolvedValueOnce(Err("disk unavailable"));
+      } else {
+        append.mockRejectedValueOnce(new Error("disk unavailable"));
+      }
+      const failures: unknown[] = [];
+
+      try {
+        session.queueMessage(
+          "failed head",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            synthetic: true,
+            onAcceptedPreStreamFailure: async (error) => {
+              failures.push(error);
+              failureEntered.resolve();
+              await releaseFailure.promise;
+            },
+          }
+        );
+        session.queueMessage("surviving successor", { model: TEST_MODEL, agentId: "exec" });
+        session.sendQueuedMessages();
+
+        // Admission must cover the first await, or another caller can bypass this FIFO head.
+        expect(session.isBusy()).toBe(true);
+        expect(session.isPreparingTurn()).toBe(true);
+        expect(append).not.toHaveBeenCalled();
+
+        await failureEntered.promise;
+        expect(session.isBusy()).toBe(true);
+        expect(session.queuedMessageEntryCount()).toBe(1);
+        expect(streamMessage).not.toHaveBeenCalled();
+        expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+
+        // No stream-end will arrive for the failed head. Cleanup must finish before its
+        // successor persists, then the queue must make progress without an external nudge.
+        releaseFailure.resolve();
+        await successorStarted.promise;
+        await session.waitForIdle();
+        expect(failures).toHaveLength(1);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        expect(session.hasQueuedMessages()).toBe(false);
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data).toMatchObject([
+          { role: "user", parts: [{ type: "text", text: "surviving successor" }] },
+        ]);
+      } finally {
+        releaseFailure.resolve();
+        append.mockRestore();
+        await session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each([
+    { effectiveModel: undefined, metadataModel: undefined },
+    { effectiveModel: "anthropic:claude-opus-4-1", metadataModel: undefined },
+    // A Coder runtime ID has no catalog price; the request-pinned identity must price it.
+    { effectiveModel: "coder:acme/opus", metadataModel: "anthropic:claude-opus-4-1" },
+  ])(
+    "accounts aborted usage against the effective model $effectiveModel priced as $metadataModel",
+    async ({ effectiveModel, metadataModel }) => {
+      const workspaceId = "abort-effective-model";
+      const aiEmitter = new EventEmitter();
+      const accounting = Promise.withResolvers<number>();
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const workspaceGoalService = {
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+        recordStreamAccounting: mock((input: { costUsd: number }) => {
+          accounting.resolve(input.costUsd);
+          return Promise.resolve();
+        }),
+        applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+        requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+        recordStreamStarted: mock(() => Promise.resolve()),
+        syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+      } as unknown as WorkspaceGoalService;
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter,
+        workspaceGoalService,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+            return Promise.resolve(
+              Ok({ messageId: "assistant-1", completion: completion.promise })
+            );
+          }),
+        },
+      });
+      try {
+        expect(
+          (
+            await session.sendMessage(
+              "start",
+              { model: TEST_MODEL, agentId: "exec" },
+              { synthetic: true, agentInitiated: true }
+            )
+          ).success
+        ).toBe(true);
+        const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+        completion.resolve({
+          status: "aborted",
+          abortReason: "system",
+          streamAbort: {
+            type: "stream-abort",
+            workspaceId,
+            metadata: { duration: 1, usage, model: effectiveModel, metadataModel },
+          },
+        });
+        const expectedCost =
+          getTotalCost(
+            createDisplayUsage(usage, effectiveModel ?? TEST_MODEL, undefined, metadataModel)
+          ) ?? 0;
+        expect(expectedCost).toBeGreaterThan(0);
+        expect(await accounting.promise).toBe(expectedCost);
+        await session.waitForIdle();
+      } finally {
+        await session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test("counts only a different direct preparing send as a superseding predecessor", async () => {
+    const sessionHolder: {
+      current?: {
+        hasQueuedOrDispatchingEntry(
+          continuationMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        ): boolean;
+        hasPendingWorkspaceTurnContinuation(
+          continuationMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        ): boolean;
+      };
+    } = {};
+    let preparingState:
+      | {
+          sameTurn: boolean;
+          differentTurn: boolean;
+          uncorrelated: boolean;
+          pendingSameTurn: boolean;
+          pendingDifferentTurn: boolean;
+        }
+      | undefined;
+    const streamMessage = mock(() => {
+      const observedSession = sessionHolder.current;
+      preparingState = {
+        sameTurn: observedSession?.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION) === true,
+        differentTurn:
+          observedSession?.hasQueuedOrDispatchingEntry({
+            ...WORKSPACE_TURN_CORRELATION,
+            turnId: "turn-different",
+          }) === true,
+        uncorrelated: observedSession?.hasQueuedOrDispatchingEntry() === true,
+        pendingSameTurn:
+          observedSession?.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION) === true,
+        pendingDifferentTurn:
+          observedSession?.hasPendingWorkspaceTurnContinuation({
+            ...WORKSPACE_TURN_CORRELATION,
+            turnId: "turn-different",
+          }) === true,
+      };
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-dispatch-preparing-predecessor",
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    sessionHolder.current = session;
+
+    try {
+      expect(session.hasQueuedOrDispatchingEntry()).toBe(false);
+      const result = await session.sendMessage("direct send", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        muxMetadata: WORKSPACE_TURN_CORRELATION,
+      });
+
+      expect(result.success).toBe(true);
+      expect(preparingState).toEqual({
+        sameTurn: false,
+        differentTurn: true,
+        uncorrelated: true,
+        pendingSameTurn: true,
+        pendingDifferentTurn: false,
+      });
+      expect(session.hasQueuedOrDispatchingEntry()).toBe(false);
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("preserves correlation for same-turn queued and dequeued predecessors", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-dispatch-same-turn-predecessor",
+    });
+    const differentCorrelation = {
+      ...WORKSPACE_TURN_CORRELATION,
+      turnId: "turn-different",
+    };
+
+    try {
+      session.queueMessage(
+        "queued continuation",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
+
+      session.queueMessage(
+        "second queued continuation",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+
+      session.queueMessage(
+        "unrelated predecessor",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+        }
+      );
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(true);
+
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
+      sendMessage.mockRestore();
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter reports an engaged no-metadata dispatch over a queued follow-up", async () => {
+    // Queue-cut attribution must never blame an entry queued BEHIND the input
+    // actually taking over the session: a manual message being dispatched wins
+    // over a workspace-turn follow-up waiting behind it, even though its
+    // metadata is undefined.
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-preparing",
+    });
+
+    try {
+      expect(session.getQueueCutCutter()).toBeUndefined();
+
+      session.queueMessage(
+        "manual message",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+
+      // Queued stage: the manual head entry is the candidate (no metadata).
+      const queued = session.getQueueCutCutter();
+      expect(queued?.stage).toBe("queued");
+      expect(queued?.muxMetadata).toBeUndefined();
+
+      // Dispatch the manual entry: it becomes the engaged PREPARING cutter and
+      // keeps winning over the follow-up still queued behind it.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect(engaged?.muxMetadata).toBeUndefined();
+      sendMessage.mockRestore();
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter reports a no-metadata mid-dispatch entry over a queued follow-up", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-dispatching",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      // Force the dequeue-to-stream-start window with PREPARING already
+      // released (a background send can resolve before stream-start): the
+      // dispatched entry stays the engaged cutter.
+      const internal = session as unknown as {
+        dispatchingQueuedEntry: boolean;
+        dispatchingQueuedEntryMuxMetadata?: unknown;
+      };
+      internal.dispatchingQueuedEntry = true;
+      internal.dispatchingQueuedEntryMuxMetadata = undefined;
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("dispatching");
+      expect(cutter?.muxMetadata).toBeUndefined();
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter exposes the queued head's dispatch mode and correlation", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-queued",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+          queueDispatchMode: "turn-end",
+        },
+        { synthetic: true }
+      );
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("queued");
+      expect(cutter?.stage === "queued" ? cutter.dispatchMode : undefined).toBe("turn-end");
+      expect((cutter?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
+
+      // Once dispatched, the follow-up's correlation rides through PREPARING.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect((engaged?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
+      sendMessage.mockRestore();
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
   test("waits for stream-end instead of interrupting between sibling tool results", async () => {
     const workspaceId = "queue-dispatch-full-step";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -76,7 +492,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).not.toHaveBeenCalled();
       expect(sendQueuedMessages).not.toHaveBeenCalled();
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -95,7 +511,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -125,17 +541,106 @@ describe("AgentSession queued message tool-call dispatch", () => {
         abortReason: "system",
       });
 
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
       expect(didDispatch).toBe(true);
       expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
+
+  test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-head";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+        }
+      );
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+
+      controller.abort("monitor withdrawn");
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
+
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).not.toHaveBeenCalled();
+
+      session.queueMessage("follow up", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+      expect(queuedSignals).toEqual([true, false]);
+    } finally {
+      stopStream.mockRestore();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each([
+    ["turn-end", "tool-end"],
+    ["tool-end", "turn-end"],
+  ] as const)(
+    "queueMessage reports the live entry's mode behind a withdrawn %s head",
+    async (withdrawnMode, liveMode) => {
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId: "queue-dispatch-withdrawn-" + withdrawnMode + "-head",
+      });
+      try {
+        const controller = new AbortController();
+        session.queueMessage(
+          "Background monitor wake",
+          { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
+          {
+            synthetic: true,
+            agentInitiated: true,
+            cancelSignal: controller.signal,
+          }
+        );
+        controller.abort("monitor withdrawn");
+
+        expect(
+          session.queueMessage("follow up", {
+            model: TEST_MODEL,
+            agentId: "exec",
+            queueDispatchMode: liveMode,
+          })
+        ).toBe(liveMode);
+      } finally {
+        await session.dispose();
+        await cleanup();
+      }
+    }
+  );
 
   test("waits for every known sibling before stopping after a provider-executed result", async () => {
     const workspaceId = "queue-dispatch-provider-siblings";
@@ -185,7 +690,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).toHaveBeenCalledTimes(1);
     } finally {
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -221,7 +726,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       // The next turn (e.g. a descendant-task terminal wake) starts and ends.
       aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -244,7 +749,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.hasQueuedDedupeKey("heartbeat-request")).toBe(false);
     } finally {
       sendMessage.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -288,7 +793,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -333,7 +838,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       unsubscribeUser();
       expect(restoredTexts).toEqual(["my own words"]);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -385,7 +890,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toHaveLength(1);
       expect(session.hasQueuedMessages()).toBe(false);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -464,14 +969,20 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       releaseAppend();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
 
   test("rollback failure preserves the wake and continues acceptance", async () => {
     const workspaceId = "queue-dispatch-cancel-rollback-failure";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
     const originalAppend = historyService.appendToHistory.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
@@ -505,6 +1016,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -524,6 +1036,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      // Accepted but withdrawn: the row stays durable and no turn starts.
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
@@ -540,7 +1055,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       releaseAppend();
       deleteMessagesSpy.mockRestore();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -586,6 +1101,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -621,7 +1137,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       releaseAppend();
       deleteMessagesSpy.mockRestore();
       appendSpy.mockRestore();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -649,9 +1165,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
       assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
       syncGoalModeWithChatTail,
     } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
       workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
     });
 
     try {
@@ -667,6 +1187,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -686,6 +1207,102 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      const wakeRow = history.success
+        ? history.data.find((message) =>
+            message.parts.some(
+              (part) => part.type === "text" && part.text === "Background monitor wake"
+            )
+          )
+        : undefined;
+      expect(wakeRow).toBeDefined();
+
+      // The accepted row has no assistant follow-up, so startup recovery would otherwise treat
+      // it as an interrupted turn and replay the withdrawn wake.
+      const preferencePath = (
+        session as unknown as { getAutoRetryPreferencePath: () => string }
+      ).getAutoRetryPreferencePath();
+      const persisted = (await Bun.file(preferencePath).json()) as {
+        startupAutoRetryAbandon?: unknown;
+      };
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: wakeRow?.id,
+      });
+    } finally {
+      releaseInitialSync();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake whose admission goes stale during goal sync is finalized, not left owed", async () => {
+    const workspaceId = "queue-dispatch-stale-after-goal-sync";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const syncGoalModeWithChatTail = mock(async () => {
+      markSyncStarted();
+      await syncRelease;
+      return null;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail,
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+
+    try {
+      const controller = new AbortController();
+      // Stands in for the requireIdle preflight probe: a manual send enters preflight while the
+      // wake's durable row is already past the rollback horizon.
+      let manualSendInPreflight = false;
+      let accepted = false;
+      let preStreamFailures = 0;
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
+          admissionStale: () => manualSendInPreflight,
+          onAccepted: () => {
+            accepted = true;
+          },
+          onAcceptedPreStreamFailure: () => {
+            preStreamFailures += 1;
+          },
+        }
+      );
+
+      await syncStarted;
+      manualSendInPreflight = true;
+      releaseSync();
+      const result = await sendPromise;
+
+      expect(result.success).toBe(false);
+      expect(accepted).toBe(true);
+      expect(preStreamFailures).toBe(1);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
@@ -699,8 +1316,85 @@ describe("AgentSession queued message tool-call dispatch", () => {
         ).toBe(true);
       }
     } finally {
-      releaseInitialSync();
-      session.dispose();
+      releaseSync();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake withdrawn under on-send compaction records the persisted compaction row as abandoned", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-compaction-row";
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail: mock(async () => {
+        markSyncStarted();
+        await syncRelease;
+        return null;
+      }),
+    } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
+    });
+    const internals = session as unknown as {
+      compactionMonitor: CompactionMonitor;
+      getAutoRetryPreferencePath(): string;
+    };
+    internals.compactionMonitor = {
+      checkBeforeSend: () => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 99,
+        thresholdPercentage: 85,
+      }),
+      checkMidStream: () => false,
+      resetForNewStream: () => undefined,
+      setThreshold: () => undefined,
+      getThreshold: () => 0.85,
+    } as unknown as CompactionMonitor;
+
+    try {
+      const controller = new AbortController();
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
+        }
+      );
+      await syncStarted;
+      // A Stop withdraws the wake past the point of no return.
+      controller.abort();
+      releaseSync();
+      expect((await sendPromise).success).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const trailing = history.data.at(-1);
+      expect(trailing?.metadata?.muxMetadata?.type).toBe("compaction-request");
+      const persisted = JSON.parse(
+        await fsPromises.readFile(internals.getAutoRetryPreferencePath(), "utf-8")
+      ) as { startupAutoRetryAbandon?: { userMessageId?: string } };
+      expect(persisted.startupAutoRetryAbandon?.userMessageId).toBe(trailing?.id);
+    } finally {
+      releaseSync();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -729,7 +1423,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceGoalService,
     });
 
-    let disposed = false;
     try {
       const controller = new AbortController();
       const cancelState = { canceledBeforeAcceptance: false };
@@ -742,6 +1435,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onAccepted: () => {
             accepted = true;
           },
@@ -749,8 +1443,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
 
       await syncStarted;
-      session.dispose();
-      disposed = true;
+      session.beginDispose();
       releaseSync();
       const result = await sendPromise;
 
@@ -759,7 +1452,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
     } finally {
       releaseSync();
-      if (!disposed) session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -801,6 +1494,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentInitiated: true,
           cancelState,
           cancelSignal: controller.signal,
+          withdrawAcceptedOnCancel: true,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -811,6 +1505,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
 
       await syncStarted;
+      // Accepted before goal sync began: a crash anywhere past the durable row leaves an accepted
+      // row, never one the reconciler's transcript lookup would misread as delivered.
+      expect(accepted).toBe(true);
       releaseSync();
       let syncError: unknown;
       try {
@@ -821,7 +1518,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(syncError).toBeInstanceOf(Error);
       expect((syncError as Error).message).toContain("injected goal sync failure");
 
-      expect(accepted).toBe(true);
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -837,7 +1533,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     } finally {
       releaseSync();
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -865,14 +1561,46 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
 
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
       stopStream.mockRestore();
-      session.dispose();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("rejected queued dispatch surfaces through onAcceptedPreStreamFailure", async () => {
+    const workspaceId = "queue-dispatch-rejected";
+    const { session, cleanup } = await createAgentSessionHarness({ workspaceId });
+    const failures: string[] = [];
+
+    try {
+      session.queueMessage(
+        "queued peer trigger",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          // Peer sends refund their family-message reservation through this hook; a dispatch
+          // that REJECTS (throws) instead of returning Err must reach it just like the
+          // returned-error branch, or the reservation is stranded until restart.
+          onAcceptedPreStreamFailure: (error) => {
+            failures.push(error.type === "unknown" ? error.raw : error.type);
+          },
+        }
+      );
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation(() =>
+        Promise.reject(new Error("pricing gate exploded"))
+      );
+      session.sendQueuedMessages();
+      expect(await waitForCondition(() => failures.length === 1)).toBe(true);
+      expect(failures[0]).toContain("pricing gate exploded");
+      sendMessage.mockRestore();
+    } finally {
+      await session.dispose();
       await cleanup();
     }
   });

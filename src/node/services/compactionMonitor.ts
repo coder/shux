@@ -11,6 +11,7 @@ import {
   type AutoCompactionUsageState,
 } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 
 export type CompactionStatusEvent =
   | {
@@ -28,6 +29,8 @@ interface CheckBeforeSendParams {
   usage: AutoCompactionUsageState | undefined;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
+  /** Request-level OpenAI wire format; decides whether the Codex OAuth cap applies. */
+  openaiWireFormat?: OpenAIWireFormat | null;
 }
 
 interface CheckMidStreamParams {
@@ -35,6 +38,8 @@ interface CheckMidStreamParams {
   usage: LanguageModelV2Usage;
   use1MContext: boolean;
   providersConfig: ProvidersConfigMap | null;
+  /** Request-level OpenAI wire format; decides whether the Codex OAuth cap applies. */
+  openaiWireFormat?: OpenAIWireFormat | null;
 }
 
 /**
@@ -71,7 +76,8 @@ export class CompactionMonitor {
       params.use1MContext,
       this.threshold,
       undefined,
-      params.providersConfig
+      params.providersConfig,
+      { openaiWireFormat: params.openaiWireFormat }
     );
   }
 
@@ -101,7 +107,8 @@ export class CompactionMonitor {
     const contextLimit = getEffectiveContextLimit(
       params.model,
       params.use1MContext,
-      params.providersConfig
+      params.providersConfig,
+      { openaiWireFormat: params.openaiWireFormat }
     );
     // Defensive: malformed provider overrides can yield invalid/non-positive limits.
     // Treat those as "no compaction signal" instead of throwing inside usage-delta handlers.

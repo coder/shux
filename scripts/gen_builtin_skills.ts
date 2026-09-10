@@ -18,7 +18,7 @@ import * as yaml from "yaml";
 
 const ARGS = new Set(process.argv.slice(2));
 const MODE = ARGS.has("check") ? "check" : "write";
-const SYNC_MUX_DOCS_SKILL = ARGS.has("--sync-mux-docs-skill");
+const SYNC_XUM_DOCS_SKILL = ARGS.has("--sync-xum-docs-skill");
 
 const PROJECT_ROOT = path.join(import.meta.dir, "..");
 const BUILTIN_SKILLS_DIR = path.join(PROJECT_ROOT, "src", "node", "builtinSkills");
@@ -253,7 +253,7 @@ function resolveDocsPageFilePath(page: string): string {
     // macOS and Windows filesystems are commonly case-insensitive. `fs.existsSync()` will return
     // true even when the requested path casing does not match what's actually on disk.
     //
-    // This matters for mux docs generation because the docs tree is indexed by exact page IDs
+    // This matters for xum docs generation because the docs tree is indexed by exact page IDs
     // (e.g. "agents" vs "AGENTS"). If we accept case-insensitive matches, we can accidentally
     // resolve the wrong file (and produce platform-dependent output).
     let current = baseDir;
@@ -291,8 +291,8 @@ function resolveDocsPageFilePath(page: string): string {
 
 interface GenerateResult {
   output: string;
-  muxDocsSkillWasUpdated: boolean;
-  muxDocsSkillOutOfSync: boolean;
+  xumDocsSkillWasUpdated: boolean;
+  xumDocsSkillOutOfSync: boolean;
 }
 function renderJoinedLines(lines: string[], indent: string): string {
   const innerIndent = indent + "  ";
@@ -308,8 +308,8 @@ function generate(): GenerateResult {
 
   const fileMaps: Record<string, Record<string, string[]>> = {};
 
-  let muxDocsSkillWasUpdated = false;
-  let muxDocsSkillOutOfSync = false;
+  let xumDocsSkillWasUpdated = false;
+  let xumDocsSkillOutOfSync = false;
 
   for (const filename of skills) {
     const skillName = filename.slice(0, -3);
@@ -324,8 +324,8 @@ function generate(): GenerateResult {
     const supportDir = path.join(BUILTIN_SKILLS_DIR, skillName);
     if (directoryExists(supportDir)) {
       assert(
-        skillName !== "mux-docs",
-        "mux-docs embeds docs via special handling; do not add src/node/builtinSkills/mux-docs/"
+        skillName !== "xum-docs",
+        "xum-docs embeds docs via special handling; do not add src/node/builtinSkills/xum-docs/"
       );
 
       for (const relPath of walkRelativeFiles(supportDir)) {
@@ -335,8 +335,8 @@ function generate(): GenerateResult {
       }
     }
 
-    // mux-docs: embed docs site content as progressive-disclosure reference files.
-    if (skillName === "mux-docs") {
+    // xum-docs: embed docs site content as progressive-disclosure reference files.
+    if (skillName === "xum-docs") {
       const docsConfigPath = path.join(DOCS_DIR, "docs.json");
       const docsConfigRaw = fs.readFileSync(docsConfigPath, "utf-8");
       files["references/docs/docs.json"] = readFileLines(docsConfigPath);
@@ -372,12 +372,12 @@ function generate(): GenerateResult {
       );
       files["SKILL.md"] = updatedSkillContent.split("\n");
 
-      if (SYNC_MUX_DOCS_SKILL && updatedSkillContent !== skillContent) {
+      if (SYNC_XUM_DOCS_SKILL && updatedSkillContent !== skillContent) {
         if (MODE === "check") {
-          muxDocsSkillOutOfSync = true;
+          xumDocsSkillOutOfSync = true;
         } else {
           fs.writeFileSync(skillPath, updatedSkillContent, "utf-8");
-          muxDocsSkillWasUpdated = true;
+          xumDocsSkillWasUpdated = true;
         }
       }
     }
@@ -403,11 +403,11 @@ function generate(): GenerateResult {
 
   output += "};\n";
 
-  return { output, muxDocsSkillWasUpdated, muxDocsSkillOutOfSync };
+  return { output, xumDocsSkillWasUpdated, xumDocsSkillOutOfSync };
 }
 
 async function main(): Promise<void> {
-  const { output: raw, muxDocsSkillWasUpdated, muxDocsSkillOutOfSync } = generate();
+  const { output: raw, xumDocsSkillWasUpdated, xumDocsSkillOutOfSync } = generate();
 
   const prettierConfig = await prettier.resolveConfig(OUTPUT_PATH);
   const formatted = await prettier.format(raw, {
@@ -418,16 +418,16 @@ async function main(): Promise<void> {
   const current = fs.existsSync(OUTPUT_PATH) ? fs.readFileSync(OUTPUT_PATH, "utf-8") : null;
   const outputOutOfSync = current !== formatted;
 
-  const muxDocsSkillPath = path.join(BUILTIN_SKILLS_DIR, "mux-docs.md");
+  const xumDocsSkillPath = path.join(BUILTIN_SKILLS_DIR, "xum-docs.md");
 
   if (MODE === "check") {
-    if (!outputOutOfSync && !muxDocsSkillOutOfSync) {
+    if (!outputOutOfSync && !xumDocsSkillOutOfSync) {
       console.log(`✓ ${path.relative(PROJECT_ROOT, OUTPUT_PATH)} is up-to-date`);
       return;
     }
 
-    if (muxDocsSkillOutOfSync) {
-      console.error(`✗ ${path.relative(PROJECT_ROOT, muxDocsSkillPath)} is out of sync`);
+    if (xumDocsSkillOutOfSync) {
+      console.error(`✗ ${path.relative(PROJECT_ROOT, xumDocsSkillPath)} is out of sync`);
     }
 
     if (outputOutOfSync) {
@@ -445,8 +445,8 @@ async function main(): Promise<void> {
     console.log(`✓ ${path.relative(PROJECT_ROOT, OUTPUT_PATH)} is up-to-date`);
   }
 
-  if (muxDocsSkillWasUpdated) {
-    console.log(`✓ Updated ${path.relative(PROJECT_ROOT, muxDocsSkillPath)}`);
+  if (xumDocsSkillWasUpdated) {
+    console.log(`✓ Updated ${path.relative(PROJECT_ROOT, xumDocsSkillPath)}`);
   }
 }
 

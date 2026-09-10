@@ -2,7 +2,7 @@
  * Creates an oRPC router proxy that delegates procedure calls to a running server via HTTP.
  *
  * This allows using trpc-cli with an oRPC router without needing to initialize
- * services locally - calls are forwarded to a running mux server.
+ * services locally - calls are forwarded to a running xum server.
  *
  * The returned router maintains the same structure and schemas as the original,
  * so trpc-cli can extract procedure metadata for CLI generation.
@@ -10,7 +10,7 @@
 
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
-import { isProcedure } from "@orpc/server";
+import { Procedure } from "@orpc/server";
 import { z } from "zod";
 import type { AppRouter } from "@/node/orpc/router";
 import type { RouterClient } from "@orpc/server";
@@ -26,9 +26,15 @@ export interface ProxifyOrpcOptions {
 }
 
 interface OrpcDef {
+  /** Legacy (<1.14) singular schema field; still read by trpc-cli. */
   inputSchema?: unknown;
   outputSchema?: unknown;
+  /** oRPC >=1.14 stores merged schema chains as arrays. */
+  inputSchemas?: unknown[];
+  outputSchemas?: unknown[];
   middlewares?: unknown[];
+  /** oRPC >=1.14 replaced `middlewares` + validation indexes with this. */
+  orderedMiddlewares?: unknown[];
   inputValidationIndex?: number;
   outputValidationIndex?: number;
   errorMap?: unknown;
@@ -60,6 +66,8 @@ interface Zod4Like {
   _def?: Zod4Def;
   description?: string;
   describe?: (desc: string) => Zod4Like;
+  /** Standard Schema validator (own, non-enumerable on Zod 4 instances). */
+  "~standard"?: unknown;
 }
 
 /**
@@ -497,10 +505,19 @@ function enhanceInputSchema(schema: unknown): unknown {
   // so we explicitly copy it. We also update _zod.def.shape to use our enhanced shape,
   // since toJSONSchema reads from _zod.def, not schema.def.
   const enhancedDef = { ...def, shape: enhancedShape };
+  // Preserve the Standard Schema validator: oRPC validates call inputs via
+  // schema["~standard"].validate, but `~standard` is non-enumerable on Zod 4
+  // instances so object spread drops it — every procedure that took this
+  // enhancement path then crashed at call time with "Cannot read properties
+  // of undefined (reading 'validate')" (e.g. `xum api workspace create`).
+  // Reusing the ORIGINAL schema's validator is deliberate: enhancements only
+  // prettify CLI help text and must not change validation semantics.
+  const originalStandard = schema["~standard"];
   const enhanced = {
     ...schema,
     def: enhancedDef,
     _def: enhancedDef,
+    ...(originalStandard !== undefined ? { "~standard": originalStandard } : {}),
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
   const originalZod = (schema as any)._zod;
@@ -556,14 +573,18 @@ type ClientFactory = () => RouterClient<AppRouter>;
 export function proxifyOrpc(router: AppRouter, options: ProxifyOrpcOptions): AppRouter {
   // Client factory - creates a new client on each procedure invocation
   const createClient: ClientFactory = () => {
+    // oRPC >=1.14 splits the request URL into `origin` (base) + `url` (path).
     const link = new HTTPRPCLink({
-      url: `${options.baseUrl}/orpc`,
+      origin: options.baseUrl,
+      url: "/orpc",
       headers: options.authToken ? { Authorization: `Bearer ${options.authToken}` } : undefined,
     });
     return createORPCClient(link);
   };
 
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   return createRouterProxy(
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     router as unknown as OrpcRouterLike,
     createClient,
     []
@@ -580,8 +601,10 @@ function createRouterProxy(
   for (const [key, value] of Object.entries(router)) {
     const newPath = [...path, key];
 
-    if (isProcedure(value)) {
+    // oRPC >=1.14 removed `isProcedure`; `Procedure` implements `Symbol.hasInstance`.
+    if (value instanceof Procedure) {
       result[key] = createProcedureProxy(
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         value as unknown as OrpcProcedureLike,
         createClient,
         newPath
@@ -600,7 +623,9 @@ function createProcedureProxy(
   path: string[]
 ): OrpcProcedureLike {
   const originalDef = procedure["~orpc"];
-  const originalInputSchema = originalDef.inputSchema;
+  // oRPC >=1.14 stores `.input()` schemas as an array; xum procedures declare at
+  // most one input schema, so the head is the whole story.
+  const originalInputSchema = originalDef.inputSchema ?? originalDef.inputSchemas?.[0];
 
   // Check if the original schema was void/undefined - trpc-cli sends {} but server expects undefined
   const isVoidInput = isVoidOrUndefinedSchema(originalInputSchema);
@@ -627,11 +652,14 @@ function createProcedureProxy(
   const proxy: OrpcProcedureLike = {
     "~orpc": {
       ...originalDef,
-      // Use enhanced schema for CLI help generation
+      // Use enhanced schema for CLI help generation. Both spellings are set:
+      // trpc-cli reads the legacy singular field, oRPC >=1.14 `call()` reads the array.
       inputSchema: enhancedInputSchema,
+      inputSchemas: enhancedInputSchema === undefined ? undefined : [enhancedInputSchema],
       // Keep the original middlewares empty for the proxy - we don't need them
       // since the server will run its own middleware chain
       middlewares: [],
+      orderedMiddlewares: [],
       // The handler that will be called by @orpc/server's `call()` function
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       handler: async (opts: { input: unknown }): Promise<any> => {

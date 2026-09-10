@@ -6,7 +6,7 @@ export const MUX_GATEWAY_CLIENT_SECRET = "mux-client";
 export const MUX_GATEWAY_AUTHORIZE_URL = `${MUX_GATEWAY_ORIGIN}/oauth2/authorize`;
 export const MUX_GATEWAY_EXCHANGE_URL = `${MUX_GATEWAY_ORIGIN}/api/v1/oauth2/exchange`;
 export const MUX_GATEWAY_SESSION_EXPIRED_MESSAGE =
-  "You've been logged out of mux gateway. Please login again to continue using Mux Gateway.";
+  "You've been logged out of Xum Gateway. Please login again to continue using Xum Gateway.";
 
 export function buildAuthorizeUrl(input: { redirectUri: string; state: string }): string {
   const url = new URL(MUX_GATEWAY_AUTHORIZE_URL);

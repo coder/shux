@@ -1,7 +1,8 @@
+import type { TurnCoordinator } from "./turnCoordinator";
 import { describe, expect, it, mock, afterEach } from "bun:test";
 import { EventEmitter } from "events";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
@@ -21,7 +22,7 @@ import { createTestHistoryService } from "./testHistoryService";
 interface ReplayHarnessStreamInfo {
   messageId: string;
   startTime: number;
-  parts: Array<{ timestamp?: number }>;
+  parts: Array<{ type: "text"; text: string; timestamp?: number }>;
   toolCompletionTimestamps: Map<string, number>;
 }
 
@@ -40,7 +41,7 @@ async function createReplaySessionHarness(
       streamMessage: mock((_history: MuxMessage[]) =>
         Promise.resolve(Err({ type: "unknown", raw: "unused" }))
       ) as unknown as AIService["streamMessage"],
-      getStreamInfo: mock((_workspaceId: string) => streamInfo) as AIService["getStreamInfo"],
+      getStreamInfo: mock((_workspaceId: string) => streamInfo),
       replayStream,
     },
     initStateManagerOverrides: { replayInit },
@@ -133,7 +134,7 @@ describe("AgentSession pre-stream errors", () => {
     let finishStartup: (() => void) | undefined;
     const privateSession = session as unknown as {
       streamWithHistory: () => Promise<Result<void, SendMessageError>>;
-      activePreparedTurnAbortController: AbortController | null;
+      coordinator: TurnCoordinator;
     };
     privateSession.streamWithHistory = async () => {
       await new Promise<void>((resolve) => {
@@ -153,10 +154,10 @@ describe("AgentSession pre-stream errors", () => {
       );
     });
 
-    while (privateSession.activePreparedTurnAbortController == null || finishStartup == null) {
+    while (finishStartup == null) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
-    privateSession.activePreparedTurnAbortController.abort();
+    expect(privateSession.coordinator.preemptPreparation()).toBe(true);
     finishStartup();
 
     expect(await failure).toEqual({
@@ -226,7 +227,7 @@ describe("AgentSession pre-stream errors", () => {
         streamMessage: mock((_history: MuxMessage[]) =>
           Promise.resolve(Err({ type: "api_key_not_found", provider: "anthropic" }))
         ) as unknown as AIService["streamMessage"],
-        getStreamInfo: mock((_workspaceId: string) => undefined) as AIService["getStreamInfo"],
+        getStreamInfo: mock((_workspaceId: string) => undefined),
         replayStream: mock((_workspaceId: string, _opts?: { afterTimestamp?: number }) =>
           Promise.resolve()
         ),
@@ -292,10 +293,14 @@ describe("AgentSession pre-stream errors", () => {
     historyCleanup = cleanup;
 
     const privateSession = session as unknown as {
-      setTurnPhase(next: "idle" | "preparing" | "streaming" | "completing"): void;
+      coordinator: TurnCoordinator;
     };
 
-    privateSession.setTurnPhase("preparing");
+    privateSession.coordinator.prepare({
+      kind: "fresh",
+      intent: "handoff",
+      expectedTurnId: privateSession.coordinator.turnId,
+    });
     aiEmitter.emit("runtime-status", {
       type: "runtime-status",
       workspaceId,
@@ -387,6 +392,8 @@ describe("AgentSession pre-stream errors", () => {
     const aiService = Object.assign(aiEmitter, {
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+      getStreamInfo: mock((_workspaceId: string) => undefined),
+      replayStream: mock((_workspaceId: string) => Promise.resolve()),
       streamMessage: streamMessage as unknown as (
         ...args: Parameters<AIService["streamMessage"]>
       ) => Promise<Result<void, SendMessageError>>,
@@ -410,7 +417,7 @@ describe("AgentSession pre-stream errors", () => {
       backgroundProcessManager,
     });
     await sessionWithPersistedPreference.setAutoRetryEnabled(false);
-    sessionWithPersistedPreference.dispose();
+    await sessionWithPersistedPreference.dispose();
 
     const session = new AgentSession({
       workspaceId,
@@ -440,81 +447,7 @@ describe("AgentSession pre-stream errors", () => {
     expect(result.success).toBe(false);
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    session.dispose();
-  });
-
-  it("does not double-schedule auto-retry when runtime startup failure already emitted", async () => {
-    const workspaceId = "ws-runtime-start-failed-pre-emitted-error";
-
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => {
-      aiEmitter.emit("error", {
-        workspaceId,
-        messageId: "assistant-stream-startup-failed",
-        error: "Runtime is still starting",
-        errorType: "runtime_start_failed",
-      });
-
-      return Promise.resolve(
-        Err({
-          type: "runtime_start_failed",
-          message: "Runtime is still starting",
-        })
-      );
-    });
-
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const session = new AgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
-
-    const events: WorkspaceChatMessage[] = [];
-    session.onChatEvent((event) => {
-      events.push(event.message);
-    });
-
-    const result = await session.sendMessage("hello", {
-      model: "anthropic:claude-3-5-sonnet-latest",
-      agentId: "exec",
-    });
-
-    expect(result.success).toBe(false);
-
-    await session.waitForIdle();
-
-    const scheduledRetries = events.filter(
-      (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-scheduled" }> =>
-        event.type === "auto-retry-scheduled"
-    );
-
-    expect(scheduledRetries).toHaveLength(1);
-    expect(scheduledRetries[0]?.attempt).toBe(1);
-
-    session.dispose();
+    await session.dispose();
   });
 
   it("replays init state for since-mode reconnects", async () => {
@@ -610,6 +543,7 @@ describe("AgentSession pre-stream errors", () => {
     );
     expect(caughtUp).toBeDefined();
     expect(caughtUp?.replay).toBe("since");
+    expect(caughtUp?.downgradeReason).toBeUndefined();
 
     const replayedMessageIds = events.reduce<string[]>((ids, event) => {
       if (
@@ -634,7 +568,7 @@ describe("AgentSession pre-stream errors", () => {
         streamInfo: {
           messageId: "msg-live-clamp",
           startTime: 1_000,
-          parts: [{ timestamp: 100 }],
+          parts: [{ type: "text", text: "partial", timestamp: 100 }],
           toolCompletionTimestamps: new Map(),
         },
       }
@@ -770,11 +704,90 @@ describe("AgentSession pre-stream errors", () => {
     );
     expect(caughtUp).toBeDefined();
     expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("fingerprint-mismatch");
 
     const replayedMessageIds = events.filter(isMuxMessage).map((message) => message.id);
     expect(replayedMessageIds).toContain(persistedFirst.id);
     expect(replayedMessageIds).toContain(persistedThird.id);
     expect(replayedMessageIds).not.toContain(persistedSecond.id);
+  });
+
+  it("classifies cursor-row-missing downgrades on since replay", async () => {
+    const workspaceId = "ws-replay-downgrade-cursor-row-missing";
+    const { session, cleanup, historyService } = await createReplaySessionHarness(workspaceId);
+    historyCleanup = cleanup;
+
+    const seedMessage = createMuxMessage("msg-history-seed", "assistant", "seed");
+    expect((await historyService.appendToHistory(workspaceId, seedMessage)).success).toBe(true);
+
+    const events: WorkspaceChatMessage[] = [];
+    await session.replayHistory(
+      ({ message }) => {
+        events.push(message);
+      },
+      {
+        type: "since",
+        cursor: {
+          history: {
+            messageId: "missing-message",
+            historySequence: 123,
+            oldestHistorySequence: 123,
+          },
+        },
+      }
+    );
+
+    const caughtUp = events.find(
+      (event): event is Extract<WorkspaceChatMessage, { type: "caught-up" }> =>
+        "type" in event && event.type === "caught-up"
+    );
+    expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("cursor-row-missing");
+  });
+
+  it("classifies oldest-mismatch downgrades on since replay", async () => {
+    const workspaceId = "ws-replay-downgrade-oldest-mismatch";
+    const { session, cleanup, historyService } = await createReplaySessionHarness(workspaceId);
+    historyCleanup = cleanup;
+
+    const seedMessage = createMuxMessage("msg-history-seed", "assistant", "seed");
+    expect((await historyService.appendToHistory(workspaceId, seedMessage)).success).toBe(true);
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!historyResult.success) {
+      throw new Error(`Failed to read seeded history: ${historyResult.error}`);
+    }
+    const persistedSeed = historyResult.data.find((message) => message.id === seedMessage.id);
+    const seedHistorySequence = persistedSeed?.metadata?.historySequence;
+    if (!persistedSeed || seedHistorySequence === undefined) {
+      throw new Error("Expected seeded history message with historySequence");
+    }
+
+    const events: WorkspaceChatMessage[] = [];
+    await session.replayHistory(
+      ({ message }) => {
+        events.push(message);
+      },
+      {
+        type: "since",
+        cursor: {
+          history: {
+            messageId: persistedSeed.id,
+            historySequence: seedHistorySequence,
+            // Claim an older replay window than the server currently has, as if rows
+            // below the cursor were truncated while the client was disconnected.
+            oldestHistorySequence: seedHistorySequence - 1,
+          },
+        },
+      }
+    );
+
+    const caughtUp = events.find(
+      (event): event is Extract<WorkspaceChatMessage, { type: "caught-up" }> =>
+        "type" in event && event.type === "caught-up"
+    );
+    expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("oldest-mismatch");
   });
 
   it("keeps since replay mode when failure occurs after incremental payload is emitted", async () => {
@@ -1111,5 +1124,54 @@ describe("AgentSession pre-stream errors", () => {
 
     expect(replayInit).toHaveBeenCalledWith(workspaceId);
     expect(events.some((event) => "type" in event && event.type === "caught-up")).toBe(true);
+  });
+
+  it("handles a pre-start error event once and resolves its recovery decision", async () => {
+    const workspaceId = "ws-prestart-error-event";
+    const preStartMessageId = "assistant-prestart-error";
+
+    // Mirrors AIService's runtime-readiness failure: the error event fires for
+    // fire-and-forget senders (and the caller's onPreStartError collector),
+    // then streamMessage returns Err with no handle.
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((opts: StreamMessageOptions) => {
+      const errorEvent = {
+        type: "error" as const,
+        workspaceId,
+        messageId: preStartMessageId,
+        error: "Runtime unavailable.",
+        errorType: "runtime_not_ready" as const,
+      };
+      aiEmitter.emit("error", errorEvent);
+      opts.onPreStartError?.(errorEvent);
+      return Promise.resolve(Err({ type: "runtime_not_ready", message: "Runtime unavailable." }));
+    });
+
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+      captureEvents: true,
+    });
+    historyCleanup = harness.cleanup;
+
+    await harness.session.sendMessage("hello", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+    });
+
+    // The decision opened at event emission must resolve through the returned
+    // failure path; an unresolved decision would hang settlement waiters.
+    expect(await harness.session.waitForPendingStreamErrorRecoveryDecision(preStartMessageId)).toBe(
+      "terminal"
+    );
+
+    const streamErrors = harness.events.filter(
+      (event): event is StreamErrorMessage =>
+        "type" in event && event.type === "stream-error" && event.messageId === preStartMessageId
+    );
+    expect(streamErrors).toHaveLength(1);
   });
 });

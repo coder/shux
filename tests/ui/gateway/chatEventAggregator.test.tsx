@@ -34,7 +34,7 @@ const stubAggregator = {
   clearTokenState: () => {},
 };
 
-describe("applyWorkspaceChatEventToAggregator (Mux Gateway session expiry)", () => {
+describe("applyWorkspaceChatEventToAggregator (Xum Gateway session expiry)", () => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {

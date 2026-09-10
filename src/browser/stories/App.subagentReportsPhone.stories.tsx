@@ -4,6 +4,7 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import {
   PhoneSubagentReportDecorator,
   setupSubagentReportStory,
+  setupSubagentFailureStory,
 } from "./helpers/subagentReportStory";
 
 export default {
@@ -26,4 +27,9 @@ export const Preview: AppStory = {
       matrix: { themes: ["dark", "light"], viewports: ["phone"] },
     },
   },
+};
+
+export const Failures: AppStory = {
+  ...Preview,
+  render: () => <AppWithMocks setup={setupSubagentFailureStory} />,
 };

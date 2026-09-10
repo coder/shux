@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { WorkspaceWithContext, getWorkspacePath } from "./muxConfig";
+import { WorkspaceWithContext, getWorkspacePath } from "./xumConfig";
 
 /**
  * Check if a Remote-SSH extension is installed
@@ -30,7 +30,7 @@ export async function openWorkspace(workspace: WorkspaceWithContext) {
   // Check if Remote-SSH is installed
   if (!isRemoteSshInstalled()) {
     const selection = await vscode.window.showErrorMessage(
-      'mux: The "Remote - SSH" extension is required to open SSH workspaces. ' +
+      'xum: The "Remote - SSH" extension is required to open SSH workspaces. ' +
         "Please install it from the Extensions marketplace.",
       "Open Extensions"
     );
@@ -48,7 +48,7 @@ export async function openWorkspace(workspace: WorkspaceWithContext) {
   // At this point, it must be SSH (we handled local/worktree above)
   if (workspace.runtimeConfig.type !== "ssh") {
     // This should never happen given the early return above
-    vscode.window.showErrorMessage("mux: Unknown workspace runtime type.");
+    vscode.window.showErrorMessage("xum: Unknown workspace runtime type.");
     return;
   }
 
@@ -66,7 +66,7 @@ export async function openWorkspace(workspace: WorkspaceWithContext) {
     });
   } catch (error) {
     const selection = await vscode.window.showErrorMessage(
-      `mux: Failed to open SSH workspace on host "${host}". ` +
+      `xum: Failed to open SSH workspace on host "${host}". ` +
         `Make sure the host is configured in your ~/.ssh/config or in the Remote-SSH extension. ` +
         `Error: ${error instanceof Error ? error.message : String(error)}`,
       "Open SSH Config"

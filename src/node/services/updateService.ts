@@ -3,13 +3,15 @@ import type { UpdateStatus } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
 import { parseDebugUpdater } from "@/common/utils/env";
 import type { Config } from "@/node/config";
+import { ServerUpdater, type ServerUpdaterDeps } from "./serverUpdate/serverUpdater";
+import type { LayoutResult } from "./serverUpdate/installLayout";
 
-// Interface matching the implementation class in desktop/updater.ts
-// We redefine it here to avoid importing the class directly which brings in electron-updater
-interface DesktopUpdaterService {
-  checkForUpdates(options?: { source?: "auto" | "manual" }): void;
+// Keep the Electron implementation out of CLI value imports.
+interface UpdaterImpl {
+  checkForUpdates(options?: { source?: "auto" | "manual" }): void | Promise<void>;
   downloadUpdate(): Promise<void>;
-  installUpdate(): void;
+  installUpdate(options?: { force?: boolean }): void | Promise<void>;
+  beginShutdown?(): Promise<void>;
   subscribe(callback: (status: UpdateStatus) => void): () => void;
   getStatus(): UpdateStatus;
   getChannel(): UpdateChannel;
@@ -17,13 +19,17 @@ interface DesktopUpdaterService {
 }
 
 export class UpdateService {
-  private impl: DesktopUpdaterService | null = null;
-  private currentStatus: UpdateStatus = { type: "idle" };
-  // Keep the user's stable/nightly preference loaded from config at startup so
+  private impl: UpdaterImpl | null = null;
+  private currentStatus: UpdateStatus = {
+    type: "unsupported",
+    reason: "Server updater is not enabled for this process",
+  };
+  // Keep the user's channel preference loaded from config at startup so
   // the About dialog and updater initialization share the same persisted value.
   private currentChannel: UpdateChannel;
   private subscribers = new Set<(status: UpdateStatus) => void>();
   private readonly ready: Promise<void>;
+  private channelChange: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: Config) {
     this.currentChannel = this.config.getUpdateChannel();
@@ -60,6 +66,16 @@ export class UpdateService {
     }
   }
 
+  async enableServerUpdater(layout: LayoutResult, deps: ServerUpdaterDeps): Promise<void> {
+    await this.ready;
+    if (process.versions.electron) return;
+    this.impl = new ServerUpdater(layout, this.config.loadConfigOrDefault().updateChannel, deps);
+    this.impl.subscribe((status) => {
+      this.currentStatus = status;
+      this.notifySubscribers();
+    });
+  }
+
   async check(options?: { source?: "auto" | "manual" }): Promise<void> {
     await this.ready;
     if (this.impl) {
@@ -82,7 +98,7 @@ export class UpdateService {
           log.debug("UpdateService: Error checking env:", err);
         }
       }
-      this.impl.checkForUpdates(options);
+      await this.impl.checkForUpdates(options);
     } else {
       log.debug("UpdateService: check() called but no implementation (CLI mode)");
     }
@@ -95,10 +111,14 @@ export class UpdateService {
     }
   }
 
-  install(): void {
+  async install(options?: { force?: boolean }): Promise<void> {
     if (this.impl) {
-      this.impl.installUpdate();
+      await this.impl.installUpdate(options);
     }
+  }
+
+  async beginShutdown(): Promise<void> {
+    await this.impl?.beginShutdown?.();
   }
 
   getChannel(): UpdateChannel {
@@ -106,18 +126,38 @@ export class UpdateService {
       return this.impl.getChannel();
     }
 
-    return this.currentChannel;
+    return process.versions.electron && this.currentChannel === "npm"
+      ? "stable"
+      : this.currentChannel;
+  }
+
+  getSupportedChannels(): UpdateChannel[] {
+    return process.versions.electron ? ["stable", "nightly"] : ["stable", "nightly", "npm"];
   }
 
   async setChannel(channel: UpdateChannel): Promise<void> {
+    if (!this.getSupportedChannels().includes(channel))
+      throw new Error("This update channel is only available on the server");
+    // Persist, switch, and roll back run as one transaction: a second change interleaving with
+    // them could leave the runtime on one channel and the config on another.
+    const change = this.channelChange.then(() => this.changeChannel(channel));
+    this.channelChange = change.catch(() => undefined);
+    await change;
+  }
+
+  private async changeChannel(channel: UpdateChannel): Promise<void> {
     await this.ready;
-    // Apply runtime switch first — it throws if the updater is in a blocked
-    // state (checking/downloading/downloaded). Only persist after success so
-    // config and runtime stay in sync.
-    if (this.impl) {
-      this.impl.setChannel(channel);
-    }
+    // The runtime switch discards a staged update, so persist first: a failed write then costs
+    // nothing, and a runtime refusal (operation in progress) reverts the write so the two never
+    // disagree.
+    const previous = this.impl?.getChannel() ?? this.currentChannel;
     await this.config.setUpdateChannel(channel);
+    try {
+      this.impl?.setChannel(channel);
+    } catch (error) {
+      await this.config.setUpdateChannel(previous);
+      throw error;
+    }
     this.currentChannel = channel;
   }
 

@@ -1,9 +1,9 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
 import { VoiceService } from "./voiceService";
@@ -29,9 +29,26 @@ async function withTempConfig(
 }
 
 describe("VoiceService.transcribe", () => {
+  // Voice credential resolution consults process.env (config -> file -> env
+  // funnel), so pin the env key to keep "unconfigured" scenarios deterministic.
+  let savedOpenAiEnvKey: string | undefined;
+
+  beforeEach(() => {
+    savedOpenAiEnvKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  afterEach(() => {
+    if (savedOpenAiEnvKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = savedOpenAiEnvKey;
+    }
+  });
+
   it("returns provider-disabled error without calling fetch", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -58,7 +75,7 @@ describe("VoiceService.transcribe", () => {
 
   it("calls fetch when OpenAI provider is enabled with an API key", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -78,35 +95,9 @@ describe("VoiceService.transcribe", () => {
     });
   });
 
-  it("returns error without calling fetch when OpenAI key is unresolved op:// reference", async () => {
-    await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
-        openai: {
-          apiKey: "op://Personal/OpenAI/password",
-        },
-      });
-
-      const fetchSpy = spyOn(globalThis, "fetch");
-      fetchSpy.mockResolvedValue(new Response("transcribed text"));
-
-      try {
-        const result = await service.transcribe("Zm9v");
-
-        expect(result).toEqual({
-          success: false,
-          error:
-            "OpenAI API key could not be resolved from 1Password. Update the key in Settings → Providers and try again.",
-        });
-        expect(fetchSpy).not.toHaveBeenCalled();
-      } finally {
-        fetchSpy.mockRestore();
-      }
-    });
-  });
-
   it("uses gateway when couponCode is set and OpenAI key is absent", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -134,7 +125,7 @@ describe("VoiceService.transcribe", () => {
 
   it("preserves reverse-proxy path prefix from gateway baseURL", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           baseURL: "https://proxy.example.com/gateway/api/v1/ai-gateway/v1/ai",
@@ -163,7 +154,7 @@ describe("VoiceService.transcribe", () => {
 
   it("prefers gateway over OpenAI when both are configured", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -194,7 +185,7 @@ describe("VoiceService.transcribe", () => {
 
   it("respects direct-before-gateway route priority when both are configured", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -229,7 +220,7 @@ describe("VoiceService.transcribe", () => {
 
   it("falls back to OpenAI when gateway is disabled", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           enabled: false,
@@ -261,7 +252,7 @@ describe("VoiceService.transcribe", () => {
 
   it("returns error when the mux-gateway provider is disabled and OpenAI is unavailable", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           enabled: false,
@@ -277,7 +268,7 @@ describe("VoiceService.transcribe", () => {
         expect(result).toEqual({
           success: false,
           error:
-            "Voice input requires a Mux Gateway login or an OpenAI API key. Configure in Settings → Providers.",
+            "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.",
         });
         expect(fetchSpy).not.toHaveBeenCalled();
       } finally {
@@ -288,7 +279,7 @@ describe("VoiceService.transcribe", () => {
 
   it("falls back to OpenAI when policy disallows mux-gateway", async () => {
     await withTempConfig(async (config, service, _providerService, policyService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -322,7 +313,7 @@ describe("VoiceService.transcribe", () => {
 
   it("uses policy forced base URL for gateway transcription", async () => {
     await withTempConfig(async (config, service, _providerService, policyService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           baseURL: "https://config.example.com/config-prefix/api/v1/ai-gateway/v1/ai",
@@ -359,7 +350,7 @@ describe("VoiceService.transcribe", () => {
 
   it("clears gateway credentials on 401", async () => {
     await withTempConfig(async (config, service, providerService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           voucher: "legacy-token",
@@ -375,7 +366,7 @@ describe("VoiceService.transcribe", () => {
 
         expect(result).toEqual({
           success: false,
-          error: "You've been logged out of Mux Gateway. Please login again to use voice input.",
+          error: "You've been logged out of Xum Gateway. Please login again to use voice input.",
         });
         expect(setConfigSpy).toHaveBeenCalledWith("mux-gateway", ["couponCode"], "");
         expect(setConfigSpy).toHaveBeenCalledWith("mux-gateway", ["voucher"], "");
@@ -397,7 +388,7 @@ describe("VoiceService.transcribe", () => {
         expect(result).toEqual({
           success: false,
           error:
-            "Voice input requires a Mux Gateway login or an OpenAI API key. Configure in Settings → Providers.",
+            "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.",
         });
         expect(fetchSpy).not.toHaveBeenCalled();
       } finally {

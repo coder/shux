@@ -51,11 +51,16 @@ export const MAC_TRAFFIC_LIGHTS_INSET = 80;
 export const WIN_LINUX_OVERLAY_INSET = 138;
 
 /**
+ * Desktop titlebar height in pixels. Keep in sync with the Tailwind classes below.
+ */
+export const DESKTOP_TITLEBAR_HEIGHT_PX = 36;
+
+/**
  * Tailwind height classes for the desktop titlebar.
  * Use these in components that need to align with the titlebar height.
  */
-export const DESKTOP_TITLEBAR_HEIGHT_CLASS = "h-9"; // 36px
-export const DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS = "min-h-9"; // 36px
+export const DESKTOP_TITLEBAR_HEIGHT_CLASS = "h-9";
+export const DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS = "min-h-9";
 
 /**
  * Returns the left inset needed for macOS traffic lights.

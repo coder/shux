@@ -1,5 +1,5 @@
 # Periodically cleans up the codebase and maintains a refactor PR.
-# SETUP: Add AUTO_CLEANUP_ANTHROPIC_API_KEY, MUX_APP_PRIVATE_KEY, and MUX_APP_ID
+# SETUP: Add AUTO_CLEANUP_ANTHROPIC_API_KEY, XUM_APP_PRIVATE_KEY, and XUM_APP_ID
 # to repository secrets so auto-cleanup spend stays isolated from terminal-bench.
 
 name: Auto-Cleanup
@@ -22,13 +22,13 @@ jobs:
         env:
           # Keep the runtime env name stable while routing spend to a dedicated key.
           ANTHROPIC_API_KEY: ${{ secrets.AUTO_CLEANUP_ANTHROPIC_API_KEY }}
-          MUX_APP_ID: ${{ secrets.MUX_APP_ID }}
-          MUX_APP_PRIVATE_KEY: ${{ secrets.MUX_APP_PRIVATE_KEY }}
+          XUM_APP_ID: ${{ secrets.XUM_APP_ID || secrets.MUX_APP_ID }}
+          XUM_APP_PRIVATE_KEY: ${{ secrets.XUM_APP_PRIVATE_KEY || secrets.MUX_APP_PRIVATE_KEY }}
         run: |
           missing=0
           [ -z "$ANTHROPIC_API_KEY" ] && echo "Skipping (missing AUTO_CLEANUP_ANTHROPIC_API_KEY)." && missing=1
-          [ -z "$MUX_APP_ID" ] && echo "Skipping (missing MUX_APP_ID)." && missing=1
-          [ -z "$MUX_APP_PRIVATE_KEY" ] && echo "Skipping (missing MUX_APP_PRIVATE_KEY)." && missing=1
+          [ -z "$XUM_APP_ID" ] && echo "Skipping (missing XUM_APP_ID)." && missing=1
+          [ -z "$XUM_APP_PRIVATE_KEY" ] && echo "Skipping (missing XUM_APP_PRIVATE_KEY)." && missing=1
 
           if [ "$missing" -eq 1 ]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -42,8 +42,8 @@ jobs:
         with:
           # Use a GitHub App token so PR events trigger CI. PRs opened via
           # GITHUB_TOKEN intentionally do not trigger other workflows.
-          app-id: ${{ secrets.MUX_APP_ID }}
-          private-key: ${{ secrets.MUX_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.XUM_APP_ID || secrets.MUX_APP_ID }}
+          private-key: ${{ secrets.XUM_APP_PRIVATE_KEY || secrets.MUX_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: ${{ steps.precheck.outputs.enabled == 'true' }}
@@ -64,13 +64,13 @@ jobs:
           git config user.name "mux-bot[bot]"
           git config user.email "264182336+mux-bot[bot]@users.noreply.github.com"
 
-      - name: Cleanup with mux
+      - name: Cleanup with xum
         if: ${{ steps.precheck.outputs.enabled == 'true' }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.AUTO_CLEANUP_ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          bunx mux@next run \
+          bunx @coder/xum@next run \
             --model anthropic:claude-opus-5 \
             --thinking xhigh \
             < .github/prompts/auto-cleanup.md

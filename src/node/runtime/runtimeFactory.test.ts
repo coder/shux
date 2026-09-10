@@ -15,7 +15,7 @@ describe("isIncompatibleRuntimeConfig", () => {
   it("returns false for local config with srcBaseDir (legacy worktree)", () => {
     const config: RuntimeConfig = {
       type: "local",
-      srcBaseDir: "~/.mux/src",
+      srcBaseDir: "~/.xum/src",
     };
     expect(isIncompatibleRuntimeConfig(config)).toBe(false);
   });
@@ -29,7 +29,7 @@ describe("isIncompatibleRuntimeConfig", () => {
   it("returns false for worktree config", () => {
     const config: RuntimeConfig = {
       type: "worktree",
-      srcBaseDir: "~/.mux/src",
+      srcBaseDir: "~/.xum/src",
     };
     expect(isIncompatibleRuntimeConfig(config)).toBe(false);
   });
@@ -83,7 +83,7 @@ describe("createRuntime", () => {
   it("throws IncompatibleRuntimeError for unknown runtime type", () => {
     const config = { type: "future-runtime" } as unknown as RuntimeConfig;
     expect(() => createRuntime(config)).toThrow(IncompatibleRuntimeError);
-    expect(() => createRuntime(config)).toThrow(/newer version of mux/);
+    expect(() => createRuntime(config)).toThrow(/newer version/);
   });
 });
 

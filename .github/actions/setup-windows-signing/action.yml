@@ -43,6 +43,15 @@ runs:
           exit 0
         }
 
+        # Signing requires a GCP access token for Cloud KMS. Fail closed when
+        # auth produced no token (e.g. skipped because no workload identity
+        # provider was configured) so a certificate-bearing release can never
+        # ship unsigned.
+        if (-not $env:GCLOUD_ACCESS_TOKEN) {
+          Write-Host "::error::EV certificate provided but GCP signing auth produced no access token - failing closed"
+          exit 1
+        }
+
         # Save EV certificate to temp file
         $certPath = Join-Path $env:TEMP "ev_cert.pem"
         Set-Content -Path $certPath -Value $env:EV_SIGNING_CERT
@@ -56,3 +65,4 @@ runs:
         Write-Host "✅ Windows EV code signing configured"
       env:
         EV_SIGNING_CERT: ${{ inputs.ev_signing_cert }}
+        GCLOUD_ACCESS_TOKEN: ${{ steps.gcloud_auth.outputs.access_token }}

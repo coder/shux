@@ -77,7 +77,7 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
           workspacePath,
-          muxScope: config.muxScope ?? null,
+          xumScope: config.xumScope ?? null,
           includeClaudeSkills,
           includeAgentPlugins,
         });

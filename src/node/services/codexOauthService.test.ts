@@ -1,8 +1,9 @@
+import type { ProvidersConfigStore } from "@/node/config";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
-import type { Config, ProvidersConfig } from "@/node/config";
+import type { ProvidersConfig } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import type { CodexOauthAuth } from "@/node/utils/codexOauthAuth";
@@ -61,7 +62,9 @@ function createMockDeps(): MockDeps {
   };
 }
 
-function createMockConfig(deps: MockDeps): Pick<Config, "loadProvidersConfig"> {
+function createMockProvidersConfigStore(
+  deps: MockDeps
+): Pick<ProvidersConfigStore, "loadProvidersConfig"> {
   return {
     loadProvidersConfig: () => deps.providersConfig,
   };
@@ -102,7 +105,7 @@ function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMain
 
 function createService(deps: MockDeps): CodexOauthService {
   return new CodexOauthService(
-    createMockConfig(deps) as Config,
+    createMockProvidersConfigStore(deps) as ProvidersConfigStore,
     createMockProviderService(deps) as ProviderService,
     createMockWindowService(deps) as WindowService
   );

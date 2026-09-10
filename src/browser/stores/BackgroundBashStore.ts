@@ -23,6 +23,7 @@ function areMonitorSnapshotsEqual(
     a.totalMatches === b.totalMatches &&
     a.droppedLines === b.droppedLines &&
     a.stopped === b.stopped &&
+    a.pendingWakeKind === b.pendingWakeKind &&
     a.lastLines.length === b.lastLines.length &&
     a.lastLines.every((line, index) => line === b.lastLines[index])
   );
@@ -38,6 +39,9 @@ function areProcessesEqual(a: BackgroundProcessInfo[], b: BackgroundProcessInfo[
       proc.pid === other.pid &&
       proc.script === other.script &&
       proc.displayName === other.displayName &&
+      // A synthesized wake-only row and a manager-backed row can otherwise compare equal,
+      // deduping the transition that restores (or removes) the View output action.
+      proc.synthesized === other.synthesized &&
       proc.startTime === other.startTime &&
       proc.status === other.status &&
       areMonitorSnapshotsEqual(proc.monitor, other.monitor) &&

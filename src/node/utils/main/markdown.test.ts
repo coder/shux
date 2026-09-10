@@ -174,7 +174,7 @@ Custom agent content
   });
 
   it("should join all matching mode sections in source order (multi-file blobs)", () => {
-    // Mux context content is a concatenation of parent + sub-project/project
+    // Xum context content is a concatenation of parent + sub-project/project
     // .mux/AGENTS.md files; every file's section for the active mode must survive.
     const multiFile = `
 # Mode: plan

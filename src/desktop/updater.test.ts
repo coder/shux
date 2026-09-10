@@ -100,9 +100,19 @@ describe("UpdaterService", () => {
       expect(mockAutoUpdater.setFeedURL).toHaveBeenCalledWith({
         provider: "github",
         owner: "coder",
-        repo: "mux",
+        repo: "xum",
         releaseType: "release",
       });
+    });
+
+    it("falls back from a server npm preference and refuses selecting npm on desktop", () => {
+      const desktop = new UpdaterService("npm");
+      expect(desktop.getChannel()).toBe("stable");
+      expect(mockAutoUpdater.channel).toBe("latest");
+      desktop.setChannel("nightly");
+      expect(() => desktop.setChannel("npm")).toThrow();
+      expect(desktop.getChannel()).toBe("nightly");
+      expect(mockAutoUpdater.channel).toBe("nightly");
     });
 
     it("accepts initial channel 'nightly'", () => {
@@ -114,7 +124,7 @@ describe("UpdaterService", () => {
       expect(mockAutoUpdater.setFeedURL).toHaveBeenCalledWith({
         provider: "github",
         owner: "coder",
-        repo: "mux",
+        repo: "xum",
         releaseType: "prerelease",
       });
       expect(mockAutoUpdater.allowPrerelease).toBe(true);
@@ -134,7 +144,7 @@ describe("UpdaterService", () => {
       expect(mockAutoUpdater.setFeedURL).toHaveBeenLastCalledWith({
         provider: "github",
         owner: "coder",
-        repo: "mux",
+        repo: "xum",
         releaseType: "prerelease",
       });
       expect(mockAutoUpdater.channel).toBe("nightly");

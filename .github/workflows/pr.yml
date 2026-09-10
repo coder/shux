@@ -57,6 +57,8 @@ jobs:
               - 'tests/ui/**'
             config:
               - '.github/**'
+              - 'scripts/**'
+              - 'packages/mux-compat/**'
               - 'jest.config.cjs'
               - 'babel.config.cjs'
               - 'package.json'
@@ -80,7 +82,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -168,17 +170,15 @@ jobs:
     name: Test / Unit
     needs: [changes]
     if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    # Bound the unit job (healthy runs finish in ~6-8 min). The suite shares one bun
-    # process, so a single order-dependent test that hangs (e.g. a leaked module mock
-    # driving an infinite render loop) would otherwise stall the runner for GitHub's
-    # 6h default. Fail fast with logs instead. Test / Integration is capped the same way.
-    timeout-minutes: 15
+    # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
+    # Healthy unit jobs can exceed the previous wall-clock budget.
+    timeout-minutes: 20
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: make build-main
       # workflow_dispatch inputs are only triggerable by repo members, so direct
       # interpolation is acceptable and preserves shell quoting in the filter.
@@ -192,9 +192,15 @@ jobs:
 
 
           isolated_unit_tests=(
-            # QuickJS-heavy workflow tests can crash Bun coverage when sharing
-            # the monolithic unit-test process; keep them in the isolated pass.
+            # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
+            # when sharing the monolithic process; keep them in fresh isolated processes.
             src/node/services/workflows/WorkflowRunner.test.ts
+            src/node/services/ptc/quickjsRuntime.test.ts
+            src/node/services/tools/code_execution.test.ts
+            # This suite also creates QuickJS runtimes. Shared coverage can trap during startup.
+            src/node/services/tools/code_execution.integration.test.ts
+            src/node/services/sandbox/sandboxHostService.test.ts
+            src/node/services/agentPlugins/hookService.test.ts
             src/node/orpc/router.test.ts
             src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx
             src/browser/features/Messages/InlineSkillMarkdown.test.tsx
@@ -213,19 +219,51 @@ jobs:
             # or installDom alike) makes the portal land in a stale document. Verified
             # order-dependent on origin/main; only reliable in its own process.
             src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx
+            # Its "last prompt" popup tests fail when any earlier test file in the
+            # shared process evaluated UI modules without a DOM installed (Radix's
+            # use-layout-effect binds to `globalThis.document` at module eval, so a
+            # DOM-less first import caches the broken no-op mode process-wide).
+            # Verified order-dependent on origin/main via a two-file repro; only
+            # reliable in its own process. Took the merge queue down on 2026-08-29
+            # when runner file enumeration order changed.
+            src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
+            # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
+            # making catalog-call assertions order-dependent in the shared process.
+            src/node/services/coderOauthService.test.ts
           )
-          bun test --max-concurrency=1 "${isolated_unit_tests[@]}"
+          # One process per file rather than one shared isolated process. Sharing it still
+          # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)
+          # while leaving the file transition as the only suspect, and these files are already
+          # here because they do not survive sharing a process.
+          # Bun can also crash at teardown after every test passed (e.g. exit 132).
+          # Retry only signal exits (>= 128); genuine test failures exit 1.
+          for isolated_unit_test in "${isolated_unit_tests[@]}"; do
+            for attempt in 1 2 3; do
+              exit_code=0
+              bun test --max-concurrency=1 "$isolated_unit_test" || exit_code=$?
+              if [[ "$exit_code" -eq 0 ]]; then
+                break
+              fi
+              if [[ "$exit_code" -lt 128 || "$attempt" -eq 3 ]]; then
+                exit "$exit_code"
+              fi
+              echo "bun crashed (exit $exit_code) on $isolated_unit_test, retrying (attempt $attempt of 3)..."
+            done
+          done
+
+          # Derive the exclusions from isolated_unit_tests so the two lists cannot
+          # drift. A hand-maintained duplicate list previously desynced: the QuickJS-heavy
+          # sandboxHostService.test.ts ran a second time inside this shared coverage
+          # process and segfaulted Bun mid-suite (merge-queue runs 32666269009 and
+          # 32667158072), kicking a fully green PR out of the queue.
+          find_excludes=()
+          for isolated_unit_test in "${isolated_unit_tests[@]}"; do
+            find_excludes+=(! -path "$isolated_unit_test")
+          done
 
           mapfile -d '' unit_files < <(
             find src -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
-              ! -path 'src/node/orpc/router.test.ts' \
-              ! -path 'src/node/services/workflows/WorkflowRunner.test.ts' \
-              ! -path 'src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx' \
-              ! -path 'src/browser/features/Messages/InlineSkillMarkdown.test.tsx' \
-              ! -path 'src/browser/hooks/useChatTranscriptFullWidth.test.tsx' \
-              ! -path 'src/browser/utils/commands/sources.test.ts' \
-              ! -path 'src/browser/components/CommandPalette/CommandPalette.prompt.test.tsx' \
-              ! -path 'src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx' \
+              "${find_excludes[@]}" \
               -print0
           )
           bun test --max-concurrency=1 --coverage --coverage-reporter=lcov "${unit_files[@]}"
@@ -240,13 +278,19 @@ jobs:
     name: Test / Integration
     needs: [changes]
     if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    timeout-minutes: 10
+    # Healthy runs finish in ~4-5 min, but jest's integration testTimeout is 10 minutes,
+    # so a single hung test used to collide with a 10-minute job cap: the runner killed
+    # the job ("exceeded the maximum execution time of 10m0s") and destroyed all logs,
+    # repeatedly kicking green PRs from the merge queue (e.g. runs 32632804824,
+    # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
+    # diagnostics and still bounds a wedged runner.
+    timeout-minutes: 20
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: make build-main
       # workflow_dispatch inputs are only triggerable by repo members, so direct
       # interpolation is acceptable and preserves shell quoting in the filter.
@@ -254,9 +298,19 @@ jobs:
         run: | # zizmor: ignore[template-injection]
           set -euo pipefail
 
+          # No --maxWorkers override: jest.config.js sizes the pool via
+          # workerBudgetFor("jest") (scripts/lib/worker_budget.js), which accounts for
+          # per-fork peak memory (~4.7GiB) and live cgroup usage. The old CLI
+          # --maxWorkers=100% took precedence over that budget and forked 16 workers
+          # on the 16-core/64GB runner (~75GiB peak), thrashing memory. Under that
+          # load, wall clock inflated ~10-20x: suites that normally finish in seconds
+          # passed at 100-135s while tests with tight explicit timeouts (30-45s) died,
+          # which is what made focus/sendModeDropdown/anthropicCacheStrategy flake in
+          # the merge queue.
+
           # Manual override (workflow_dispatch input)
           if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent ${{ github.event.inputs.test_filter }}
+            TEST_INTEGRATION=1 bun x jest --coverage --silent ${{ github.event.inputs.test_filter }}
             exit 0
           fi
 
@@ -269,11 +323,11 @@ jobs:
           # Backend changed: run ALL integration tests (includes tests/ui)
           if [[ "$BACKEND" == "true" ]]; then
             echo "Backend changes detected - running all integration tests"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/
           else
             # Browser-only changes: run tests/ui
             echo "Browser changes detected - running tests/ui"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/ui/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/ui/
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -297,7 +351,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
       - run: make storybook-build
@@ -332,10 +386,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Install xvfb
         if: matrix.os == 'linux'
         run: |
+          if command -v Xvfb >/dev/null 2>&1 && command -v xvfb-run >/dev/null 2>&1; then
+            echo "Xvfb is already installed"
+            exit 0
+          fi
+
           sudo apt-get update
           sudo apt-get install -y xvfb
       # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
@@ -343,7 +402,8 @@ jobs:
         timeout-minutes: 10
       - name: Run tests
         if: matrix.os == 'linux'
-        run: xvfb-run -a make test-e2e
+        # Native focus and clipboard are shared by every Electron app on this display.
+        run: xvfb-run -a make test-e2e PLAYWRIGHT_ARGS="--workers=1"
         env:
           ELECTRON_DISABLE_SANDBOX: 1
       - name: Run tests
@@ -362,7 +422,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
         with:
           skip-build-caches: true
       - name: Generate version.ts
@@ -374,7 +434,10 @@ jobs:
       - name: Run unit tests (Windows smoke)
         shell: pwsh
         run: |
-          bun test src/node/utils/paths.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts
+          bun test src/node/utils/paths.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts
+      - name: Verify Windows plugin path aliases
+        shell: pwsh
+        run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
@@ -398,18 +461,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
-      - run: npm pack
+      - name: Pack npm package
+        id: pack
+        run: echo "tarball=$(./scripts/pack-npm-package.sh)" >> "$GITHUB_OUTPUT"
       - env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           SERVER_PORT: 3001
           SERVER_HOST: localhost
           STARTUP_TIMEOUT: 30
-        run: |
-          # shellcheck disable=SC2012 # ls is fine here - known filename pattern in controlled directory
-          TARBALL=$(ls mux-*.tgz | head -1)
-          PACKAGE_TARBALL="$TARBALL" ./scripts/smoke-test.sh
+        run: ./scripts/smoke-test.sh
+      - name: Test legacy mux forwarding package
+        env:
+          CANONICAL_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: ./scripts/smoke-test-mux-compat.sh
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: failure()
         with:
@@ -438,6 +505,12 @@ jobs:
           context: .
           load: true
           tags: mux-server:test
+          # The coder/shux -> coder/xum repo rename broke Depot's OIDC trust
+          # policy (matches owner/repo as a string), so `depot build` fails with
+          # "permission_denied: Invalid token" and blocks the merge queue. Fall
+          # back to plain buildx until the Depot project trust policy is updated
+          # for the new repo name; Depot acceleration resumes automatically then.
+          buildx-fallback: true
       - name: Test container
         run: |
           docker run -d --name mux-test -p 3000:3000 mux-server:test
@@ -463,7 +536,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - run: bun run build
       - run: make dist-linux
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -485,7 +558,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Setup code signing
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: ./scripts/setup-macos-signing.sh
@@ -498,17 +571,19 @@ jobs:
       - name: Build macOS distributables
         # Retry for transient Apple timestamp-server failures during code signing.
         run: ./scripts/retry.sh 3 30 make dist-mac
+      - name: Smoke test packaged macOS attach_file runtime
+        run: make check-mac-attach-file-runtime
       - name: Upload x64 artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          path: release/*-x64.dmg
+          path: release/*-x64-mac.dmg
           retention-days: 30
           if-no-files-found: error
           archive: false
       - name: Upload arm64 artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          path: release/*-arm64.dmg
+          path: release/*-arm64-mac.dmg
           retention-days: 30
           if-no-files-found: error
           archive: false
@@ -527,7 +602,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - name: Add MSYS2 make to PATH
         shell: pwsh
         run: |
@@ -575,7 +650,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
       - uses: ./.github/actions/build-vscode-extension
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -593,6 +668,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Test PR readiness gates
+        run: make test-codex-comments test-pr-checks
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }}

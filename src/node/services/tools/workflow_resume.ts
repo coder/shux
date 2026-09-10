@@ -2,7 +2,7 @@ import { tool } from "ai";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
+import { isTerminalWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
@@ -154,9 +154,29 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       const mode: WorkflowResumeMode = args.mode ?? "resume";
       const invocationStartedAtMs = Date.now();
 
+      // A kernel-nested resume (mux.workflow_resume inside code_execution) leaves no top-level
+      // workflow_resume part in history, so the history-walk consumption predicates cannot see
+      // that this turn already received the terminal result. Persist consumption durably so the
+      // terminal-attention drain never re-delivers it.
+      const markTerminalAttentionSettled = async (
+        terminalRun: Pick<WorkflowRunRecord, "id" | "status" | "updatedAt">
+      ) => {
+        if (!isTerminalWorkflowRunStatus(terminalRun.status)) {
+          return;
+        }
+        await config.taskService?.markWorkflowRunTerminalAttentionSettled?.({
+          ownerWorkspaceId: workspaceId,
+          runId: terminalRun.id,
+          status: terminalRun.status,
+          runUpdatedAt: terminalRun.updatedAt,
+          settledAs: "delivered",
+        });
+      };
+
       // Idempotent success: the work is already done, so hand back the durable result instead
       // of failing the agent's recovery loop (e.g. resuming after a crash that actually finished).
       if (run.status === "completed" && mode === "resume") {
+        await markTerminalAttentionSettled(run);
         return parseToolResult(
           WorkflowResumeToolResultSchema,
           {
@@ -216,6 +236,12 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
 
       // Background-style resumes outlive this turn; persist provenance so the run is
       // rediscoverable (task_await/task_list) and its terminal result re-engages the agent.
+      // Deliberately AFTER the dispatch, unlike workflow_run's onRunCreated record: the
+      // resumed run sits in an old terminal state until the dispatch durably restarts it, and
+      // a pre-dispatch reference would let a crash in that window make startup recovery
+      // deliver the stale failure/interruption as a current wake. Recording late fails safe
+      // instead (a crash loses this resume's wake); with the process alive, delivery always
+      // waits for the owner to go idle, by which point this record is durable.
       const isBackgroundDispatch =
         args.run_in_background === true || dispatched.status === "backgrounded";
       if (isBackgroundDispatch) {
@@ -230,6 +256,20 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // result's `status` field plus run polling converge on the live state.
       const refreshedRunIsStale =
         isBackgroundDispatch && refreshedRun != null && refreshedRun.status === run.status;
+
+      // Foreground only: a background dispatch can still observe the stale pre-dispatch
+      // terminal status, and settling it would absorb the retried run's future terminal wake.
+      // The settled marker binds to the run's terminal generation (updatedAt), so it needs a
+      // refreshed record that reflects the dispatched terminal status; when the refresh failed
+      // or lags, skip the marker and the wake settles as consumed from the tool result in
+      // history on the next scan (worst case one redundant wake for a kernel-nested resume).
+      if (
+        !isBackgroundDispatch &&
+        refreshedRun != null &&
+        refreshedRun.status === dispatched.status
+      ) {
+        await markTerminalAttentionSettled(refreshedRun);
+      }
 
       return parseToolResult(
         WorkflowResumeToolResultSchema,

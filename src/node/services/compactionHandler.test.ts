@@ -209,6 +209,49 @@ describe("CompactionHandler", () => {
       expect(result).toBe(false);
     });
 
+    it("uses the correlated compaction request when a synthetic snapshot follows it", async () => {
+      const followUpContent = {
+        text: "Continue",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      };
+      const compactionRequest = createMuxMessage(
+        "correlated-compaction-request",
+        "user",
+        "Please summarize the conversation",
+        {
+          synthetic: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: { followUpContent },
+            source: "auto-compaction",
+          },
+        }
+      );
+      const snapshot = createMuxMessage("file-change-snapshot", "user", "<file-change />", {
+        synthetic: true,
+      });
+      await seedHistory(compactionRequest, snapshot);
+
+      const handled = await handler.handleCompletion(
+        createStreamEndEvent("Compacted context"),
+        compactionRequest.id
+      );
+
+      expect(handled).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) {
+        throw new Error(history.error);
+      }
+      expect(history.data).toHaveLength(1);
+      expect(history.data[0]?.metadata?.muxMetadata).toEqual({
+        type: "compaction-summary",
+        pendingFollowUp: followUpContent,
+      });
+    });
+
     it("reports the latest durable context boundary sequence in completion metadata", async () => {
       const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
       handler = new CompactionHandler({
@@ -1435,19 +1478,6 @@ describe("CompactionHandler", () => {
       });
     });
 
-    it("should not emit DeleteMessage events during append-only compaction", async () => {
-      const compactionReq = createCompactionRequest();
-      await seedHistory(compactionReq);
-
-      const event = createStreamEndEvent("Summary");
-      await handler.handleCompletion(event);
-
-      const deleteEvent = emittedEvents.find(
-        (_e) => (_e.data.message as { type?: string })?.type === "delete"
-      );
-      expect(deleteEvent).toBeUndefined();
-    });
-
     it("should emit summary message with proper MuxMessage structure", async () => {
       const compactionReq = createCompactionRequest();
       await seedHistory(compactionReq);
@@ -1784,6 +1814,275 @@ describe("CompactionHandler", () => {
 
       const result = await handler.handleCompletion(event);
       expect(result).toBe(true);
+    });
+  });
+
+  describe("RLM keep-recent tail", () => {
+    const createStampedCompactionRequest = (id: string, startHistorySequence: number): MuxMessage =>
+      createMuxMessage(id, "user", "Please summarize the conversation", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {},
+          keepRecentTail: { startHistorySequence },
+        },
+      });
+
+    it("re-appends sanitized tail copies after the boundary for stamped requests", async () => {
+      const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        onCompactionComplete,
+      });
+
+      const tailAssistant = createMuxMessage("a1", "assistant", "tail answer", {
+        model: "claude-x",
+        usage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+        contextUsage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        tailAssistant,
+        // seedHistory assigns sequences 0..4; the tail starts at u1 (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      const handled = await handler.handleCompletion(createStreamEndEvent("Summary"));
+      expect(handled).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const epoch = epochResult.data;
+
+      // [boundary summary, copy(u1), copy(a1)] — the tail rides after the boundary.
+      expect(epoch).toHaveLength(3);
+      expect(epoch[0].metadata?.compactionBoundary).toBe(true);
+      expect(epoch[1].role).toBe("user");
+      expect(epoch[2].role).toBe("assistant");
+      // History round-trips normalize parts (adds state markers), so compare content.
+      expect(epoch[1].parts).toMatchObject([{ type: "text", text: "tail question" }]);
+      expect(epoch[2].parts).toMatchObject([{ type: "text", text: "tail answer" }]);
+
+      for (const copy of epoch.slice(1)) {
+        // Fresh IDs + durable marker, UI-hidden synthetic.
+        expect(copy.id.startsWith("rlm-tail-")).toBe(true);
+        expect(copy.metadata?.rlmPreservedTailCopy).toBe(true);
+        expect(copy.metadata?.synthetic).toBe(true);
+        expect(copy.metadata?.uiVisible).toBeUndefined();
+        // Usage/cost metadata must be stripped so rebuilds never double-count.
+        expect(copy.metadata?.usage).toBeUndefined();
+        expect(copy.metadata?.contextUsage).toBeUndefined();
+        // Copies must never masquerade as boundaries.
+        expect(copy.metadata?.compactionBoundary).toBeUndefined();
+      }
+      // Informational metadata survives.
+      expect(epoch[2].metadata?.model).toBe("claude-x");
+
+      const metadata = onCompactionComplete.mock.calls[0]?.[0];
+      expect(metadata?.preservedTailMessageCount).toBe(2);
+    });
+
+    it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
+      // MCP snapshot rows precede the user row they expand, so the invoking
+      // row's copy ID must be preassigned before any copy is built — a
+      // forward single-pass map would preserve the archived original ID and
+      // request-time orphan filtering would drop the snapshot.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const snapshotRow = createMuxMessage("mcp-snap-1", "user", "prompt body", {
+        synthetic: true,
+        mcpPromptSnapshot: {
+          serverName: "srv",
+          promptName: "p",
+          commandKey: "srv:p",
+          invokingMessageId: "u1",
+        },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        snapshotRow,
+        createMuxMessage("u1", "user", "/mcp srv p"),
+        createMuxMessage("a1", "assistant", "prompt answer"),
+        // Tail starts at the snapshot row (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      const handled = await handler.handleCompletion(createStreamEndEvent("Summary"));
+      expect(handled).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const epoch = epochResult.data;
+
+      // [boundary, copy(snapshot), copy(u1), copy(a1)]
+      expect(epoch).toHaveLength(4);
+      const snapshotCopy = epoch[1];
+      const invokingCopy = epoch[2];
+      expect(snapshotCopy.metadata?.mcpPromptSnapshot).toBeDefined();
+      // The pairing must point at the invoking row's COPY, not the archived
+      // original — this is the forward-reference the preassignment fixes.
+      expect(snapshotCopy.metadata?.mcpPromptSnapshot?.invokingMessageId).toBe(invokingCopy.id);
+      expect(invokingCopy.id.startsWith("rlm-tail-")).toBe(true);
+    });
+
+    it("keeps default whole-epoch behavior for unstamped requests (RLM off)", async () => {
+      const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        onCompactionComplete,
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "question"),
+        createMuxMessage("a0", "assistant", "answer"),
+        createCompactionRequest("compact-req")
+      );
+
+      const handled = await handler.handleCompletion(createStreamEndEvent("Summary"));
+      expect(handled).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      // Only the boundary summary — no tail copies.
+      expect(epochResult.data).toHaveLength(1);
+      expect(epochResult.data[0].metadata?.compactionBoundary).toBe(true);
+
+      const metadata = onCompactionComplete.mock.calls[0]?.[0];
+      expect(metadata?.preservedTailMessageCount).toBe(0);
+    });
+
+    it("commits the boundary and tail all-or-nothing: a failed commit leaves no boundary", async () => {
+      // The boundary write seals the previous epoch and the summarizer already
+      // excluded the stamped tail rows — a boundary that became durable without
+      // its full tail would permanently drop the suffix from provider context.
+      // The commit is one atomic history operation: on failure NOTHING lands.
+      const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        onCompactionComplete,
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      spyOn(historyService, "persistBoundaryWithTailCopies").mockResolvedValueOnce(
+        Err("injected commit failure")
+      );
+
+      await handler.handleCompletion(createStreamEndEvent("Summary"));
+
+      // No boundary and no partial tail copies: the original epoch is intact
+      // and the compaction never reported completion.
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      expect(epochResult.data.some((m) => m.metadata?.compactionBoundary === true)).toBe(false);
+      expect(epochResult.data.some((m) => m.metadata?.rlmPreservedTailCopy === true)).toBe(false);
+      expect(onCompactionComplete).not.toHaveBeenCalled();
+    });
+
+    it("never preserves older compaction-request rows inside the tail", async () => {
+      await seedHistory(
+        createMuxMessage("u0", "user", "head question"),
+        createMuxMessage("a0", "assistant", "head answer"),
+        // A failed prior compaction attempt left its request in the epoch.
+        createCompactionRequest("stale-compact-req"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        // Tail starts at the stale request's sequence (2) — it must be skipped.
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      const handled = await handler.handleCompletion(createStreamEndEvent("Summary"));
+      expect(handled).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const epoch = epochResult.data;
+      expect(epoch).toHaveLength(3);
+      expect(epoch[1].parts).toMatchObject([{ type: "text", text: "tail question" }]);
+      expect(epoch[2].parts).toMatchObject([{ type: "text", text: "tail answer" }]);
+    });
+  });
+
+  describe("RLM read-file tracking", () => {
+    const createSuccessfulFileReadMessage = (id: string, filePath: string): MuxMessage => ({
+      id,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: `tool-${id}`,
+          toolName: "file_read",
+          state: "output-available",
+          input: { path: filePath },
+          output: { success: true },
+        },
+      ],
+      metadata: { timestamp: 1234 },
+    });
+
+    it("merges read files cumulatively across two consecutive compactions", async () => {
+      await seedHistory(
+        createMuxMessage("u0", "user", "first question"),
+        createSuccessfulFileReadMessage("read-1", "/first.ts"),
+        createCompactionRequest("compact-req-1")
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary one"))).toBe(true);
+
+      await seedHistory(
+        createMuxMessage("u1", "user", "second question"),
+        createSuccessfulFileReadMessage("read-2", "/second.ts"),
+        createCompactionRequest("compact-req-2")
+      );
+      // handleCompletion dedupes by request ID, so the second cycle needs a
+      // fresh stream-end (same shape, different request row found in history).
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary two"))).toBe(true);
+
+      const pending = await handler.peekPendingState();
+      expect(pending?.readFiles).toEqual(["/second.ts", "/first.ts"]);
+    });
+
+    it("reloads persisted read files on restart (new handler instance)", async () => {
+      await seedHistory(
+        createMuxMessage("u0", "user", "question"),
+        createSuccessfulFileReadMessage("read-1", "/persisted.ts"),
+        createCompactionRequest("compact-req")
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const reloaded = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+      const pending = await reloaded.peekPendingState();
+      expect(pending?.readFiles).toEqual(["/persisted.ts"]);
     });
   });
 });

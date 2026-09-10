@@ -1,11 +1,12 @@
 import React from "react";
-import { Check, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
+import { Check, ChevronRight, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
 
 import { useAPI } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 
 import { WorkflowScopeBadge, WorkflowStatusPill } from "./WorkflowBadges";
+import { WorkflowLongText } from "./WorkflowLongText";
 import type { WorkflowRunView } from "./projectWorkflowRun";
 import {
   formatWorkflowCost,
@@ -127,13 +128,69 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
           {view.argEntries.map((entry, index) => (
             <div
               key={entry.key ?? index}
-              className="border-border bg-surface-secondary text-content-secondary flex gap-1.5 rounded-md border px-2 py-1 text-xs"
+              className="border-border bg-surface-secondary text-content-secondary flex min-w-0 gap-1.5 rounded-md border px-2 py-1 text-xs"
             >
-              {entry.key != null && (
-                <span className="text-muted shrink-0 font-mono text-[11px]">{entry.key}</span>
+              {entry.stages != null ? (
+                // Keep the step stream visible until details are requested; launch metadata
+                // describes a plan, not evidence of runtime progress.
+                <details className="group/stages min-w-0 flex-1">
+                  <summary className="focus-visible:outline-accent cursor-pointer list-none rounded focus-visible:outline-2 [&::-webkit-details-marker]:hidden">
+                    <span className="text-muted flex items-center gap-1 font-medium">
+                      <ChevronRight className="h-3 w-3 shrink-0 group-open/stages:rotate-90" />
+                      <span>Planned stages</span>
+                      <span className="counter-nums">· {entry.stages.length}</span>
+                    </span>
+                    <span className="text-content-primary mt-1 flex flex-wrap gap-x-3 gap-y-1 group-open/stages:hidden">
+                      {entry.stages.map((stage, stageIndex) => (
+                        <span key={stageIndex} className="max-w-full min-w-0 break-words">
+                          <span className="text-muted counter-nums">{stageIndex + 1}.</span>{" "}
+                          {stage.name}
+                        </span>
+                      ))}
+                    </span>
+                  </summary>
+                  <ol
+                    aria-label="Planned stages"
+                    className="counter-nums mt-2 list-decimal space-y-2 pl-5"
+                  >
+                    {entry.stages.map((stage, stageIndex) => (
+                      <li key={stageIndex} className="min-w-0 space-y-0.5 break-words">
+                        <div className="text-content-primary font-medium">{stage.name}</div>
+                        {stage.role && <div className="text-muted">{stage.role}</div>}
+                        {stage.brief && (
+                          <WorkflowLongText
+                            text={stage.brief}
+                            title={`Stage ${stageIndex + 1}: ${stage.name}`}
+                          />
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                  <details className="group mt-2 min-w-0">
+                    <summary className="text-muted hover:text-foreground focus-visible:outline-accent flex cursor-pointer list-none items-center gap-1 rounded focus-visible:outline-2 [&::-webkit-details-marker]:hidden">
+                      <ChevronRight className="h-3 w-3 shrink-0 group-open:rotate-90" />
+                      Original argument
+                    </summary>
+                    <WorkflowLongText
+                      className="mt-1"
+                      text={entry.value}
+                      title="Argument: stages"
+                    />
+                  </details>
+                </details>
+              ) : (
+                <>
+                  {entry.key != null && (
+                    <span className="text-muted shrink-0 font-mono text-[11px]">{entry.key}</span>
+                  )}
+                  {/* Long values preview-truncate; expand inline or open the full view. */}
+                  <WorkflowLongText
+                    className="flex-1"
+                    text={entry.value}
+                    title={entry.key != null ? `Argument: ${entry.key}` : "Workflow argument"}
+                  />
+                </>
               )}
-              {/* Wrap long values across lines so the full arg is visible, not truncated to one row. */}
-              <span className="min-w-0 break-words whitespace-pre-wrap">{entry.value}</span>
             </div>
           ))}
         </div>

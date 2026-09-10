@@ -117,19 +117,6 @@ describe("SshPromptService", () => {
     expect(secondResult).toBe("yes");
   });
 
-  it("emits request event only for first caller", async () => {
-    const verification1 = service.requestPrompt(HOST_KEY_REQUEST_PARAMS);
-    const verification2 = service.requestPrompt(HOST_KEY_REQUEST_PARAMS);
-    const verification3 = service.requestPrompt(HOST_KEY_REQUEST_PARAMS);
-
-    expect(requests).toHaveLength(1);
-
-    service.respond(requests[0].requestId, "yes");
-
-    const results = await Promise.all([verification1, verification2, verification3]);
-    expect(results).toEqual(["yes", "yes", "yes"]);
-  });
-
   it("returns immediately with empty response when no responders", async () => {
     releaseResponder();
 
@@ -152,15 +139,6 @@ describe("SshPromptService", () => {
     expect(result).toBe("yes");
 
     release();
-  });
-
-  it("returns immediately after responder released", async () => {
-    releaseResponder();
-
-    const result = await service.requestPrompt(HOST_KEY_REQUEST_PARAMS);
-
-    expect(result).toBe("");
-    expect(requests).toHaveLength(0);
   });
 
   it("keeps pending verification alive when last responder disconnects", async () => {

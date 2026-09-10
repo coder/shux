@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { getErrorMessage } from "./errors";
+import { clampErrorMessage, getErrorMessage } from "./errors";
 
 describe("getErrorMessage", () => {
   it("returns string representation of non-Error values", () => {
@@ -45,10 +45,18 @@ describe("getErrorMessage", () => {
     expect(getErrorMessage(obj)).toBe("[object Object]");
   });
 
-  it("falls back to String() for circular plain objects", () => {
+  it("serializes circular plain objects with a [Circular] marker instead of degrading", () => {
     const obj: Record<string, unknown> = { code: 500 };
     obj.self = obj;
-    expect(getErrorMessage(obj)).toBe("[object Object]");
+    expect(getErrorMessage(obj)).toBe('{"code":500,"self":"[Circular]"}');
+  });
+
+  it("keeps shared (non-cyclic) sibling references intact", () => {
+    // Only true cycles become [Circular]; a payload referencing the same
+    // detail object from two fields must serialize both occurrences.
+    const detail = { reason: "quota" };
+    const obj = { error: detail, details: detail };
+    expect(getErrorMessage(obj)).toBe('{"error":{"reason":"quota"},"details":{"reason":"quota"}}');
   });
 
   it("returns .message for a plain Error", () => {
@@ -110,5 +118,29 @@ describe("getErrorMessage", () => {
     const err = new Error("self");
     err.cause = err;
     expect(getErrorMessage(err)).toBe("self");
+  });
+});
+
+describe("clampErrorMessage", () => {
+  it("returns short messages unchanged", () => {
+    expect(clampErrorMessage("boom", 100)).toBe("boom");
+  });
+
+  it("clamps oversized messages while keeping head and tail", () => {
+    const head = "Invalid prompt: schema mismatch. ";
+    const tail = " Error message: expected string, received undefined";
+    const message = head + "x".repeat(100_000) + tail;
+
+    const clamped = clampErrorMessage(message, 1_000);
+
+    expect(clamped.length).toBeLessThan(1_100);
+    expect(clamped.startsWith(head)).toBe(true);
+    expect(clamped.endsWith(tail)).toBe(true);
+    expect(clamped).toContain("chars omitted");
+  });
+
+  it("clamps at the default bound", () => {
+    const clamped = clampErrorMessage("y".repeat(500_000));
+    expect(clamped.length).toBeLessThan(10_000);
   });
 });

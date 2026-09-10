@@ -139,6 +139,61 @@ describe("locatePinnedBlock", () => {
     expect(block).toEqual({ fullOrder: ["mB", "mA"], blockIds: ["mB", "mA"] });
   });
 
+  it("treats pinned roots from every project as one block in flat mode", () => {
+    const a = createWorkspace("a", {
+      pinnedAt: "2026-01-01T00:00:01.000Z",
+      projectPath: "/test/a",
+    });
+    const b = createWorkspace("b", {
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+      projectPath: "/test/b",
+    });
+    const sorted = new Map([
+      ["/test/a", [a]],
+      ["/test/b", [b]],
+    ]);
+
+    expect(locatePinnedBlock(a, sorted, new Map(), { multiProjectEnabled: true })).toEqual({
+      fullOrder: ["b", "a"],
+      blockIds: ["b", "a"],
+    });
+  });
+
+  it("excludes feature-gated multi-project pins from the flat block", () => {
+    // With the multi-project experiment off the sidebar hides these rows, so
+    // a move must swap with the next visible pin instead of an invisible row.
+    const a = createWorkspace("a", {
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+      projectPath: "/test/a",
+    });
+    const hiddenMulti = createWorkspace("m", {
+      pinnedAt: "2026-01-01T00:00:01.000Z",
+      projectPath: "/test/a",
+      projects: [
+        { projectPath: "/test/a", projectName: "a" },
+        { projectPath: "/test/b", projectName: "b" },
+      ],
+    });
+    const b = createWorkspace("b", {
+      pinnedAt: "2026-01-01T00:00:02.000Z",
+      projectPath: "/test/b",
+    });
+    const sorted = new Map([
+      ["/test/a", [a, hiddenMulti]],
+      ["/test/b", [b]],
+    ]);
+
+    expect(locatePinnedBlock(a, sorted, new Map(), { multiProjectEnabled: false })).toEqual({
+      fullOrder: ["a", "b"],
+      blockIds: ["a", "b"],
+    });
+    // With the experiment on, the multi-project pin joins the block again.
+    expect(locatePinnedBlock(a, sorted, new Map(), { multiProjectEnabled: true })).toEqual({
+      fullOrder: ["a", "m", "b"],
+      blockIds: ["a", "m", "b"],
+    });
+  });
+
   it("treats all pinned scratch rows as one block despite distinct workdir projectPaths", () => {
     // Each scratch chat's projectPath is its own app-managed workdir, but the
     // sidebar renders them together in the Chats section, so a reorder between

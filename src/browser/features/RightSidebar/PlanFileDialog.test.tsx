@@ -1,8 +1,11 @@
+import * as RealMarkdownCore from "../Messages/MarkdownCore";
+import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
+import * as RealAPI from "@/browser/contexts/API";
 import type { ReactNode } from "react";
+import { PlanFileDialog } from "./PlanFileDialog";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render, waitFor } from "@testing-library/react";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 
 type GetPlanContentResult =
@@ -17,49 +20,60 @@ interface MockApiClient {
 
 let mockApi: MockApiClient | null = null;
 
-restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+// Scope module mocks to each test so renderer assertions use the real pipeline.
+const realModules: Array<[string, Record<string, unknown>]> = [
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  ["@/browser/features/Messages/MarkdownCore", { ...RealMarkdownCore }],
+  ["@/browser/features/Messages/MarkdownRenderer", { ...RealMarkdownRenderer }],
+  ["@/browser/contexts/API", { ...RealAPI }],
+];
 
-void mock.module("@/browser/components/Dialog/Dialog", () => ({
-  Dialog: (props: { open: boolean; children: ReactNode }) =>
-    props.open ? <div>{props.children}</div> : null,
-  DialogContent: (props: { children: ReactNode; className?: string }) => (
-    <div className={props.className}>{props.children}</div>
-  ),
-  DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
-  DialogTitle: (props: { children: ReactNode; className?: string }) => (
-    <h2 className={props.className}>{props.children}</h2>
-  ),
-}));
+async function installModuleMocks() {
+  await mock.module("@/browser/components/Dialog/Dialog", () => ({
+    Dialog: (props: { open: boolean; children: ReactNode }) =>
+      props.open ? <div>{props.children}</div> : null,
+    DialogContent: (props: { children: ReactNode; className?: string }) => (
+      <div className={props.className}>{props.children}</div>
+    ),
+    DialogHeader: (props: { children: ReactNode }) => <div>{props.children}</div>,
+    DialogTitle: (props: { children: ReactNode; className?: string }) => (
+      <h2 className={props.className}>{props.children}</h2>
+    ),
+  }));
 
-void mock.module("@/browser/features/Messages/MarkdownCore", () => ({
-  MarkdownCore: (props: { content: string }) => (
-    <div data-testid="plan-markdown-core">{props.content}</div>
-  ),
-}));
+  await mock.module("@/browser/features/Messages/MarkdownCore", () => ({
+    MarkdownCore: (props: { content: string }) => (
+      <div data-testid="plan-markdown-core">{props.content}</div>
+    ),
+  }));
 
-void mock.module("@/browser/features/Messages/MarkdownRenderer", () => ({
-  PlanMarkdownContainer: (props: { children: ReactNode }) => (
-    <div data-testid="plan-markdown-container">{props.children}</div>
-  ),
-}));
+  await mock.module("@/browser/features/Messages/MarkdownRenderer", () => ({
+    PlanMarkdownContainer: (props: { children: ReactNode }) => (
+      <div data-testid="plan-markdown-container">{props.children}</div>
+    ),
+  }));
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: mockApi ? "connected" : "error",
-    error: mockApi ? null : "API unavailable",
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+  await mock.module("@/browser/contexts/API", () => ({
+    useAPI: () => ({
+      api: mockApi,
+      status: mockApi ? "connected" : "error",
+      error: mockApi ? null : "API unavailable",
+      authenticate: () => undefined,
+      retry: () => undefined,
+    }),
+  }));
+}
 
-import { PlanFileDialog } from "./PlanFileDialog";
+async function restoreModuleMocks() {
+  for (const [path, exports] of realModules) await mock.module(path, () => exports);
+}
 
 describe("PlanFileDialog", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await installModuleMocks();
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
@@ -67,8 +81,9 @@ describe("PlanFileDialog", () => {
     mockApi = null;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    await restoreModuleMocks();
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;

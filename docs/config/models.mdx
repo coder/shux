@@ -1,26 +1,27 @@
 ---
 title: Models
-description: Select and configure AI models in Mux
+description: Select and configure AI models in Xum
 ---
 
-Mux supports multiple AI providers. Configure provider API keys in **Settings → Providers** — see [Providers](/config/providers) for setup.
+Xum supports multiple AI providers. Configure provider API keys in **Settings → Providers** — see [Providers](/config/providers) for setup.
 
 ## First-class Models
 
-Mux ships with curated models kept up to date with the frontier. Use any custom model with `/model <provider:model_id>`.
+Xum ships with curated models kept up to date with the frontier. Use any custom model with `/model <provider:model_id>`.
 
 {/* BEGIN KNOWN_MODELS_TABLE */}
 
 | Model                  | ID                            | Aliases                                                      | Default |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------ | ------- |
-| Fable 5                | anthropic:claude-fable-5      | `fable`                                                      |         |
-| Mythos 5               | anthropic:claude-mythos-5     | `mythos`                                                     |         |
+| Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |
+| Mythos 5.1             | anthropic:claude-mythos-5-1   | `mythos`                                                     |         |
 | Opus 5                 | anthropic:claude-opus-5       | `opus`                                                       | ✓       |
 | Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |
 | Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |
 | GPT-5.6 Sol            | openai:gpt-5.6-sol            | `gpt`, `sol`                                                 |         |
 | GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |
 | GPT-5.6 Luna           | openai:gpt-5.6-luna           | `luna`                                                       |         |
+| GPT-6 Astra            | openai:gpt-6-astra            | `astra`, `gpt-6-astra`                                       |         |
 | GPT-5.5 Pro            | openai:gpt-5.5-pro            | `gpt-pro`, `gpt-5.5-pro`                                     |         |
 | GPT-5.4 Mini           | openai:gpt-5.4-mini           | `gpt-mini`                                                   |         |
 | GPT-5.4 Nano           | openai:gpt-5.4-nano           | `gpt-nano`                                                   |         |
@@ -28,18 +29,23 @@ Mux ships with curated models kept up to date with the frontier. Use any custom 
 | Spark 5.3              | openai:gpt-5.3-codex-spark    | `spark`                                                      |         |
 | Codex Mini 5.1         | openai:gpt-5.1-codex-mini     | `codex-mini`                                                 |         |
 | Codex Max 5.1          | openai:gpt-5.1-codex-max      | `codex-max`                                                  |         |
+| Daybreak Blue Latest   | openai:daybreak-blue-latest   | —                                                            |         |
+| Daybreak Red Latest    | openai:daybreak-red-latest    | —                                                            |         |
 | Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |
-| Gemini 3.6 Flash       | google:gemini-3.6-flash       | `gemini-flash`                                               |         |
-| Grok 4.5               | xai:grok-4.5                  | `grok`, `grok-4.5`                                           |         |
+| Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |
+| Grok 4.6               | xai:grok-4.6                  | `grok`, `grok-4.6`                                           |         |
 | DeepSeek V4 Pro        | deepseek:deepseek-v4-pro      | `deepseek`, `deepseek-pro`, `deepseek-v4`, `deepseek-v4-pro` |         |
 | DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |
 | Kimi K3                | moonshotai:kimi-k3            | `kimi`, `k3`, `kimi-k3`                                      |         |
+| GLM 5.3 Flash          | zai:glm-5.3-flash             | `glm`, `glm-flash`, `glm-5.3-flash`                          |         |
 
 {/* END KNOWN_MODELS_TABLE */}
 
-### Pro reasoning mode (GPT-5.6)
+### Pro reasoning mode (GPT-5.6 and GPT-6 Astra)
 
-Every GPT-5.6 model (Sol, Terra, and Luna) supports OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode uses the same per-token pricing but consumes more tokens and responses can take noticeably longer. Requests routed through non-passthrough gateways (e.g. OpenRouter, GitHub Copilot) fall back to standard mode.
+GPT-6 Astra and every GPT-5.6 model (Sol, Terra, and Luna) support OpenAI's pro reasoning mode. Open the reasoning selector next to the model picker and enable **Pro mode** (or run "Toggle Pro Reasoning Mode" from the Command Palette) to send `reasoning.mode: "pro"` with each request. The setting is saved per workspace. Pro mode can consume more tokens and responses can take noticeably longer. Pro is available on supported direct OpenAI Responses API routes. Gateway routes, Chat Completions, and Codex OAuth use standard mode.
+
+For advisor calls, enable the Advisor Tool experiment and use its **Reasoning** picker under **Settings → Experiments**. Advisor Pro mode is saved independently of reasoning effort and the calling chat’s mode.
 
 ## Model Selection
 
@@ -87,11 +93,11 @@ Use `/+level` (no model) to override thinking on the current model: `/+0 quick a
 
 ### CLI
 
-The `mux run` CLI accepts the same thinking levels via `--thinking`:
+The `xum run` CLI accepts the same thinking levels via `--thinking`:
 
 ```bash
-mux run -t 0 "Quick fix"          # Lowest thinking for the model
-mux run -t high "Deep analysis"   # Named level
+xum run -t 0 "Quick fix"          # Lowest thinking for the model
+xum run -t high "Deep analysis"   # Named level
 ```
 
 ## Next Steps

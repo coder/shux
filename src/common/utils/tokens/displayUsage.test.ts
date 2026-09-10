@@ -388,7 +388,7 @@ describe("createDisplayUsage", () => {
     });
   });
 
-  describe("Subscription-covered usage costs", () => {
+  describe("Legacy subscription-covered usage costs", () => {
     test("returns $0 costs when providerMetadata.mux.costsIncluded is true", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 1000, // OpenAI includes cached tokens
@@ -413,7 +413,7 @@ describe("createDisplayUsage", () => {
       expect(result!.reasoning.cost_usd).toBe(0);
     });
 
-    test("gpt-5.3-codex routed through ChatGPT subscription is always zero-cost", () => {
+    test("preserves zero costs for historical Codex usage marked as included", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 1500, // includes cached input tokens
         outputTokens: 450,

@@ -3,18 +3,44 @@ import * as path from "node:path";
 
 import {
   isTerminalWorkflowRunStatus,
+  WORKFLOW_BACKGROUND_CONTINUATION_STATUSES,
   type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
+  type WorkflowRunStreamEvent,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import {
+  appendSubProjectRelativePath,
+  createRuntimeForWorkspace,
+  resolveWorkspaceRootPath,
+} from "@/node/runtime/runtimeHelpers";
+import type { Config } from "@/node/config";
+import type { AIService } from "@/node/services/aiService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { sendWorkflowRunTerminalContinuation } from "@/node/services/workflowContinuation";
+import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
-import type { WorkflowRunStatusSnapshot, WorkflowRunStore } from "./WorkflowRunStore";
+import {
+  WorkflowRunStore,
+  getWorkflowRunStatusesForOwners,
+  listActiveWorkflowRunsForOwners,
+  type WorkflowRunStatusSnapshot,
+} from "./WorkflowRunStore";
+import { workflowRunStreamHub } from "./workflowRunStreamHub";
+import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
+import { ORPCError } from "@orpc/server";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
@@ -24,9 +50,20 @@ import {
   type WorkflowTaskAdapter,
 } from "./WorkflowRunner";
 import { deriveChildWorkflowRunId, MAX_NESTED_WORKFLOW_DEPTH } from "./nestedWorkflowRuns";
+import {
+  acquireWorkflowArchiveAdmission,
+  registerInProcessWorkflowRun,
+} from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
+import { parseDeclaredPhasesFromSource } from "./workflowMetadata";
+import { hydrateWorkflowRunPhaseManifest } from "./workflowPhaseManifest";
+import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
-import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
+import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
+import {
+  DEFAULT_WORKFLOW_AGENT_ID,
+  WorkflowTaskServiceAdapter,
+} from "./WorkflowTaskServiceAdapter";
 
 export interface WorkflowBackgroundRunTerminalEvent {
   runId: string;
@@ -100,11 +137,6 @@ export interface StartNamedWorkflowResult {
   result: unknown;
 }
 
-const WORKFLOW_BACKGROUND_CONTINUATION_STATUSES = new Set<WorkflowRunStatus>([
-  "completed",
-  "failed",
-]);
-
 // oRPC creates a WorkflowService per request, so workflow lifecycle state that spans requests
 // needs process-wide registries.
 const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -176,7 +208,9 @@ export class WorkflowService {
           }
         })
     );
-    return runs.filter((run): run is WorkflowRunRecord => run != null);
+    return runs
+      .filter((run): run is WorkflowRunRecord => run != null)
+      .map(hydrateWorkflowRunPhaseManifest);
   }
 
   async resumeCrashedRuns(input: {
@@ -211,7 +245,10 @@ export class WorkflowService {
     assert(input.runId.length > 0, "WorkflowService.getRun: runId is required");
     try {
       const run = await this.runStore.getRun(input.runId);
-      return run.workspaceId === input.workspaceId ? run : null;
+      // Hydrate here, not only in the oRPC wrappers: workflow_run/workflow_resume
+      // embed this record in persisted tool output, and a reloaded terminal card
+      // renders that snapshot without any live fetch.
+      return run.workspaceId === input.workspaceId ? hydrateWorkflowRunPhaseManifest(run) : null;
     } catch {
       return null;
     }
@@ -318,6 +355,8 @@ export class WorkflowService {
     runId: string;
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -337,6 +376,10 @@ export class WorkflowService {
     runId: string;
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing: refuse while the workspace is archiving/archived, and hold
+    // the admission across the method so the archive sink observes a resume that has not yet
+    // durably re-activated its run (see workflowArchiveAdmission).
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -357,6 +400,8 @@ export class WorkflowService {
     projectTrusted: boolean;
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -376,6 +421,8 @@ export class WorkflowService {
     projectTrusted: boolean;
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -428,6 +475,7 @@ export class WorkflowService {
         onLeaseAcquired: () => {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
+            input.workspaceId,
             runnerAbortController
           );
         },
@@ -468,6 +516,8 @@ export class WorkflowService {
   }
 
   async startWorkflowInBackground(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const createdRun = await this.createWorkflowRun({
       ...input,
       attentionPolicy: "notify_on_terminal",
@@ -489,6 +539,8 @@ export class WorkflowService {
   }
 
   async startWorkflow(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
@@ -516,6 +568,7 @@ export class WorkflowService {
         onLeaseAcquired: () => {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
+            input.workspaceId,
             runnerAbortController
           );
         },
@@ -612,6 +665,7 @@ export class WorkflowService {
 
   private registerActiveRunnerAbortController(
     runId: string,
+    workspaceId: string,
     controller: AbortController
   ): () => void {
     assert(runId.length > 0, "WorkflowService.registerActiveRunnerAbortController: runId required");
@@ -620,10 +674,15 @@ export class WorkflowService {
       existing.abort();
     }
     activeWorkflowRunnerAbortControllers.set(runId, controller);
+    // Registration happens at lease acquisition, while the entry point's archive admission is
+    // still held, so the archive sink observes in-process workflow work continuously from
+    // admission entry to terminal settlement (see workflowArchiveAdmission).
+    const releaseInProcessWork = registerInProcessWorkflowRun(workspaceId);
     return () => {
       if (activeWorkflowRunnerAbortControllers.get(runId) === controller) {
         activeWorkflowRunnerAbortControllers.delete(runId);
       }
+      releaseInProcessWork();
     };
   }
 
@@ -691,6 +750,9 @@ export class WorkflowService {
     const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
     });
+    // Fail fast on invalid meta.phases before the durable run record exists,
+    // mirroring argsSchema validation above (all issues enumerated at once).
+    parseDeclaredPhasesFromSource(input.script.source);
     return await this.runStore.createRun({
       id: runId,
       workspaceId: input.workspaceId,
@@ -742,6 +804,7 @@ export class WorkflowService {
     const markLeaseAcquired = () => {
       unregisterRunnerAbort = this.registerActiveRunnerAbortController(
         runId,
+        runStatus.workspaceId,
         runnerAbortController
       );
       markStarted();
@@ -848,6 +911,8 @@ export class WorkflowService {
     );
     const script = await resolveScript(input.spec.scriptPath);
     const normalized = normalizeWorkflowArgsForSource(script.source, input.spec.args);
+    // Same fail-fast declared-phase gate as top-level run creation.
+    parseDeclaredPhasesFromSource(script.source);
     return await this.runStore.createRunIfAbsent({
       id: childRunId,
       workspaceId: parentRun.workspaceId,
@@ -909,6 +974,377 @@ export class WorkflowService {
   }
 }
 
+export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are disabled";
+
+export interface WorkflowServiceContext {
+  config: Config;
+  aiService: AIService;
+  initStateManager: InitStateManager;
+  workspaceService: WorkspaceService;
+  taskService: TaskService;
+  experimentsService: ExperimentsService;
+  workflowRuntimeFactory: IJSRuntimeFactory;
+}
+
+export interface WorkflowStartRequest {
+  workspaceId: string;
+  scriptPath: string;
+  args?: unknown;
+  runInBackground?: boolean | null;
+  rawCommand?: string | null;
+  continuationOptions?: SendMessageOptions | null;
+}
+
+export async function resolveWorkflowContext(
+  context: WorkflowServiceContext,
+  workspaceId: string,
+  options: {
+    onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
+    notifyInterruptedBackgroundRunTerminal?: boolean;
+    projectPath?: string;
+  } = {}
+) {
+  assert(workspaceId.length > 0, "resolveWorkflowContext: workspaceId is required");
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+    throw new Error(DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE);
+  }
+  await context.initStateManager.waitForInit(workspaceId);
+  const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
+  if (!metadataResult.success) {
+    throw new Error(metadataResult.error);
+  }
+  const metadata = metadataResult.data;
+  const requestedWorkflowProjectPath = options.projectPath?.trim();
+  const hasRequestedWorkflowProjectPath =
+    requestedWorkflowProjectPath != null && requestedWorkflowProjectPath.length > 0;
+  const workflowProjectPath = hasRequestedWorkflowProjectPath
+    ? requestedWorkflowProjectPath
+    : metadata.projectPath;
+  const resolveWorkflowProjectTrusted = () =>
+    hasRequestedWorkflowProjectPath
+      ? isProjectTrusted(context.config, workflowProjectPath)
+      : isWorkspaceProjectTrusted(context.config, metadata);
+  const projectTrusted = resolveWorkflowProjectTrusted();
+  const runtime = createRuntimeForWorkspace(metadata);
+  const workspaceRootPath = resolveWorkspaceRootPath(metadata, runtime);
+  const workflowExecutionProjectPath = hasRequestedWorkflowProjectPath
+    ? appendSubProjectRelativePath(
+        { ...metadata, subProjectPath: workflowProjectPath },
+        runtime,
+        workspaceRootPath
+      )
+    : appendSubProjectRelativePath(metadata, runtime, workspaceRootPath);
+  const workspacePath = workflowExecutionProjectPath;
+  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.AGENT_PLUGINS
+  );
+  const skillStorageContext = resolveSkillStorageContext({
+    runtime,
+    workspacePath,
+    xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
+    includeAgentPlugins,
+  });
+  const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
+
+  return {
+    workflowExecutionProjectPath,
+    runtime,
+    workspacePath,
+    projectSearchRoot: workspaceRootPath,
+    skillStorageContext,
+    projectTrusted,
+    service: new WorkflowService({
+      notifyInterruptedBackgroundRunTerminal:
+        options.notifyInterruptedBackgroundRunTerminal === true,
+      runStore: new WorkflowRunStore({
+        sessionDir: path.join(context.config.sessionsDir, workspaceId),
+      }),
+      runtimeFactory: context.workflowRuntimeFactory,
+      taskAdapterFactory: (runId, workflowName) =>
+        new WorkflowTaskServiceAdapter({
+          taskService: context.taskService,
+          parentWorkspaceId: workspaceId,
+          workflowRunId: runId,
+          workflowName,
+          defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
+          patchToolConfig: {
+            workspaceId,
+            cwd: workspacePath,
+            runtime,
+            runtimeTempDir: workflowRuntimeTempDir,
+            workspaceSessionDir: path.join(context.config.sessionsDir, workspaceId),
+            trusted: projectTrusted,
+          },
+          getProjectTrusted: resolveWorkflowProjectTrusted,
+          experiments: { dynamicWorkflows: true },
+        }),
+      resolveWorkflowScript: (scriptPath) =>
+        resolveWorkflowScript({
+          scriptPath,
+          runtime,
+          workspacePath,
+          projectSearchRoot: workspaceRootPath,
+          projectTrusted: resolveWorkflowProjectTrusted(),
+          includeAgentPlugins,
+          skillStorageContext,
+        }),
+      // Settled markers are keyed by the run's terminal generation, so a resumed run's next
+      // terminal transition re-arms attention by itself; only the downgrade-compat stable
+      // marker needs clearing when the run leaves terminal state (see
+      // clearWorkflowRunDowngradeSettlement).
+      onRunStatusChanged: async (event) => {
+        if (!isTerminalWorkflowRunStatus(event.status)) {
+          await context.taskService.clearWorkflowRunDowngradeSettlement({
+            ownerWorkspaceId: event.workspaceId,
+            runId: event.runId,
+          });
+        }
+        await context.workspaceService.emitWorkflowRunActivity(event);
+      },
+      // Read paths (listRuns / stream subscribe) create services purely to observe runs, but
+      // crash recovery can resume an orphaned background run on them: without a terminal
+      // callback the settled run would owe its wake to the next sweep. Explicit callbacks
+      // (slash-command continuations, retry) keep their custom behavior.
+      onBackgroundRunTerminal:
+        options.onBackgroundRunTerminal ??
+        ((event) => {
+          // Nested runs surface through their parent workflow, not their own wake.
+          if (event.run.parentWorkflow != null) {
+            return;
+          }
+          context.taskService.noteWorkflowRunTerminalAttention({
+            ownerWorkspaceId: workspaceId,
+            runId: event.runId,
+            status: event.status,
+          });
+        }),
+      getCurrentProjectTrusted: resolveWorkflowProjectTrusted,
+      runnerId: "workflow-runner:" + workspaceId,
+    }),
+  };
+}
+
+export async function listWorkflowRuns(context: WorkflowServiceContext, workspaceId: string) {
+  const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
+  await service.resumeCrashedRuns({ workspaceId, projectTrusted });
+  return await service.listRuns({ workspaceId });
+}
+
+export async function getWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+) {
+  const { service } = await resolveWorkflowContext(context, input.workspaceId);
+  return await service.getRun(input);
+}
+
+export async function interruptWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+) {
+  const { service } = await resolveWorkflowContext(context, input.workspaceId);
+  // The tool card installs this response as its newest snapshot; it ties with the
+  // hydrated subscription update on updatedAt/sequence, so an unhydrated record
+  // here would win the tie and drop the phase rail from the interrupted card.
+  return hydrateWorkflowRunPhaseManifest(await service.interruptRun(input));
+}
+
+export async function getWorkflowRunStatuses(
+  context: WorkflowServiceContext,
+  runs: Array<{ workspaceId: string; runId: string }>
+) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
+  return getWorkflowRunStatusesForOwners(context.config, runs);
+}
+
+export async function listActiveWorkflowRuns(
+  context: WorkflowServiceContext,
+  workspaceIds: string[]
+) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
+  return listActiveWorkflowRunsForOwners(context.config, workspaceIds);
+}
+
+export function subscribeWorkflowRuns(
+  context: WorkflowServiceContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<WorkflowRunStreamEvent> {
+  return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
+    signal,
+    validate: () => {
+      if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+        throw new ORPCError("BAD_REQUEST", { message: DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE });
+      }
+    },
+    subscribe: (push) =>
+      workflowRunStreamHub.subscribe(workspaceId, (run) => {
+        if (run.parentWorkflow == null)
+          push({ type: "run-changed", run: hydrateWorkflowRunPhaseManifest(run) });
+      }),
+    initial: async () => ({
+      type: "snapshot" as const,
+      runs: await listWorkflowRuns(context, workspaceId),
+    }),
+  });
+}
+
+export async function resumeWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+): Promise<StartNamedWorkflowResult> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId);
+  return service.resumeRunInBackground({ ...input, projectTrusted });
+}
+
+export async function retryWorkflowRunFromCheckpoint(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+): Promise<StartNamedWorkflowResult> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId, {
+    onBackgroundRunTerminal: (event) => {
+      const name = event.run.workflow.sourcePath ?? event.run.workflow.name;
+      return sendWorkflowRunTerminalContinuation(context.workspaceService, {
+        ...event,
+        workspaceId: input.workspaceId,
+        rawCommand: "workflow_run " + name,
+        name,
+      });
+    },
+  });
+  return service.retryRunFromCheckpointInBackground({ ...input, projectTrusted });
+}
+
+export async function startWorkflowRun(
+  context: WorkflowServiceContext,
+  input: WorkflowStartRequest,
+  signal?: AbortSignal
+): Promise<StartNamedWorkflowResult & { invocationMessagePersisted?: boolean }> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  let invocationMessagePersisted: boolean | undefined;
+  let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
+  const invocationPersistence = new Promise<boolean>((resolve) => {
+    resolveInvocationPersistence = resolve;
+  });
+  const rawCommandForContinuation = input.rawCommand;
+  const continuationOptions = input.continuationOptions;
+  const onBackgroundRunTerminal =
+    rawCommandForContinuation != null && continuationOptions != null
+      ? async (event: WorkflowBackgroundRunTerminalEvent) => {
+          const persistedInvocation =
+            invocationMessagePersisted === true ? true : await invocationPersistence;
+          if (!persistedInvocation) {
+            log.warn("Skipping slash workflow continuation without persisted invocation", {
+              workspaceId: input.workspaceId,
+              runId: event.runId,
+            });
+            return;
+          }
+          await sendWorkflowRunTerminalContinuation(context.workspaceService, {
+            ...event,
+            workspaceId: input.workspaceId,
+            rawCommand: rawCommandForContinuation,
+            name: input.scriptPath,
+            continuationOptions,
+          });
+        }
+      : undefined;
+
+  if (input.rawCommand != null) {
+    await context.workspaceService.waitForWorkspaceIdle(input.workspaceId, {
+      signal,
+      manualFollowUp: true,
+    });
+  }
+  const resolved = await resolveWorkflowContext(context, input.workspaceId, {
+    onBackgroundRunTerminal,
+  });
+  const script = await resolveWorkflowScript({
+    scriptPath: input.scriptPath,
+    runtime: resolved.runtime,
+    workspacePath: resolved.workspacePath,
+    projectSearchRoot: resolved.projectSearchRoot,
+    projectTrusted: resolved.projectTrusted,
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+    skillStorageContext: resolved.skillStorageContext,
+  });
+  if (input.rawCommand != null) {
+    await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
+  }
+  const args = input.args === undefined ? {} : input.args;
+  const startInput: StartWorkflowInput = {
+    script,
+    workspaceId: input.workspaceId,
+    projectTrusted: resolved.projectTrusted,
+    args,
+    ...(input.rawCommand != null
+      ? { defaultArgs: { projectPath: resolved.workflowExecutionProjectPath } }
+      : {}),
+  };
+  const persistInvocation = async (details: {
+    runId: string;
+    status: WorkflowRunStatus;
+    result: unknown;
+    run?: WorkflowRunRecord;
+  }) => {
+    assert(input.rawCommand != null, "Workflow invocation persistence requires rawCommand");
+    try {
+      invocationMessagePersisted = await context.workspaceService.appendWorkflowRunInvocation({
+        workspaceId: input.workspaceId,
+        rawCommand: input.rawCommand,
+        scriptPath: input.scriptPath,
+        args,
+        runId: details.runId,
+        status: details.status,
+        result: details.result,
+        ...(details.run != null ? { run: details.run } : {}),
+      });
+    } finally {
+      resolveInvocationPersistence(invocationMessagePersisted === true);
+    }
+  };
+
+  const result =
+    input.runInBackground === true
+      ? await resolved.service.startWorkflowInBackground({
+          ...startInput,
+          ...(input.rawCommand != null ? { onBackgroundRunCreated: persistInvocation } : {}),
+        })
+      : await resolved.service.startWorkflow({ ...startInput, abortSignal: signal });
+  if (input.rawCommand == null) {
+    return result;
+  }
+  if (input.runInBackground !== true) {
+    const run = await resolved.service.getRun({
+      workspaceId: input.workspaceId,
+      runId: result.runId,
+    });
+    await persistInvocation({ ...result, ...(run != null ? { run } : {}) });
+  }
+  return { ...result, invocationMessagePersisted };
+}
+
+export async function listWorkflowScripts(
+  context: WorkflowServiceContext,
+  workspaceId: string
+): ReturnType<typeof discoverWorkflowScripts> {
+  const resolved = await resolveWorkflowContext(context, workspaceId);
+  return discoverWorkflowScripts({
+    runtime: resolved.runtime,
+    workspacePath: resolved.workspacePath,
+    projectSearchRoot: resolved.projectSearchRoot,
+    projectTrusted: resolved.projectTrusted,
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+    skillStorageContext: resolved.skillStorageContext,
+  });
+}
+
 export function buildWorkflowScriptDescriptor(
   script: ResolvedWorkflowScript
 ): WorkflowScriptDescriptor {
@@ -916,7 +1352,12 @@ export function buildWorkflowScriptDescriptor(
     name: getWorkflowScriptDefinitionName(script),
     description:
       parseWorkflowDescription(script.source) ?? `Workflow script ${script.canonicalScriptPath}`,
-    scope: script.sourceKind === "skill" ? (script.scope ?? "global") : "project",
+    // Skill and plugin scripts carry their discovery scope (project/global/built-in);
+    // workspace-file and inline scripts are project-trust-gated by definition.
+    scope:
+      script.sourceKind === "skill" || script.sourceKind === "plugin"
+        ? (script.scope ?? "global")
+        : "project",
     sourcePath: script.canonicalScriptPath,
     requestedScriptPath: script.requestedScriptPath,
     canonicalScriptPath: script.canonicalScriptPath,

@@ -5,7 +5,7 @@ import { Ok } from "@/common/types/result";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 
 import { inheritOpenWorkspaceTurnMetadata } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const correlation = {
   type: "workspace-turn-task",
@@ -142,7 +142,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     let streamedMuxMetadata: StreamMessageOptions["muxMetadata"];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       streamedMuxMetadata = opts.muxMetadata;
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId: "workspace-turn-inheritance",
@@ -167,7 +167,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       expect(streamMessage.mock.calls).toHaveLength(1);
       return streamedMuxMetadata;
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   }
@@ -184,14 +184,46 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     expect(streamed).toBeUndefined();
   });
 
-  test("on-send compaction consuming a wake stamps the correlation on the follow-up", async () => {
-    const workspaceId = "workspace-turn-compaction-stamp";
-    const streamMessage = mock((_opts: StreamMessageOptions) => Promise.resolve(Ok(undefined)));
+  test("workspace-turn correlation persists in startup retry options", async () => {
+    const workspaceId = "workspace-turn-retry-metadata";
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
-      aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      },
+    });
+    try {
+      const result = await session.sendMessage(
+        "Nested terminal report",
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: correlation,
+        },
+        { synthetic: true, agentInitiated: true }
+      );
+      expect(result.success).toBe(true);
+
+      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(historyResult.success).toBe(true);
+      if (!historyResult.success) throw new Error("history read failed");
+      const userMessage = historyResult.data.find(
+        (message) =>
+          message.role === "user" &&
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Nested terminal report"
+          )
+      );
+      expect(userMessage?.metadata?.retrySendOptions).toMatchObject({
+        muxMetadata: correlation,
+      });
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("on-send compaction consuming a wake stamps the correlation on the follow-up", async () => {
+    const workspaceId = "workspace-turn-compaction-stamp";
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
     });
     try {
       await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));
@@ -212,11 +244,15 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
         getThreshold: mock(() => 0.85),
       };
 
-      const result = await session.sendMessage("monitor wake", {
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-        muxMetadata: { type: "bash-monitor-wake", records: [] },
-      });
+      const result = await session.sendMessage(
+        "monitor wake",
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { agentInitiated: true }
+      );
       expect(result.success).toBe(true);
 
       const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -229,9 +265,10 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
       if (requestMeta?.type !== "compaction-request") {
         throw new Error("expected a persisted compaction request");
       }
+      expect(requestMeta.parsed.followUpContent?.agentInitiated).toBe(true);
       expect(requestMeta.parsed.followUpContent?.workspaceTurnMetadata).toEqual(correlation);
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

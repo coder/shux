@@ -394,10 +394,10 @@ export function mergeResults(
 }
 
 /**
- * Calculate token statistics from raw MuxMessages
+ * Calculate token statistics from raw XumMessages
  * This is the single source of truth for token counting
  *
- * @param messages - Array of MuxMessages from chat history
+ * @param messages - Array of XumMessages from chat history
  * @param model - Model string (e.g., "anthropic:claude-opus-4-1")
  * @returns ChatStats with token breakdown by consumer and usage history
  */

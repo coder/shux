@@ -7,7 +7,11 @@
  */
 
 import type { APIClient } from "@/browser/contexts/API";
-import { expandProjects, selectWorkspace } from "@/browser/stories/helpers/uiState";
+import {
+  expandLeftSidebar,
+  expandProjects,
+  selectWorkspace,
+} from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import type { AppStory } from "@/browser/stories/meta.js";
@@ -29,6 +33,9 @@ function setupProjectCreateStory(): APIClient {
   const workspaces = [createWorkspace({ id: "ws-1", name: "main", projectName: "my-app" })];
   selectWorkspace(workspaces[0]);
   expandProjects(["/mock/my-app"]);
+  // The sidebar defaults to collapsed at phone widths; the play functions need
+  // its "Add project" button visible to open the modal.
+  expandLeftSidebar();
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
     workspaces,
@@ -58,6 +65,27 @@ export const LocalFolder: AppStory = {
     pixel: { matrix: PIXEL_DUAL_THEME },
   },
   // Integration: stories navigate via sidebar → "Add project" button to open the modal portal.
+  render: () => <AppWithMocks setup={setupProjectCreateStory} />,
+  play: async ({ canvasElement }) => {
+    await openNewProjectModal(canvasElement);
+  },
+};
+
+/**
+ * Three labeled modes must fit narrow dialogs without overflowing the right edge;
+ * the pinned phone viewport guards the wrap layout (dialogs portal to body, so a
+ * fixed-width decorator cannot constrain them).
+ */
+export const PhoneViewport: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
   render: () => <AppWithMocks setup={setupProjectCreateStory} />,
   play: async ({ canvasElement }) => {
     await openNewProjectModal(canvasElement);

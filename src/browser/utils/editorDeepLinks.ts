@@ -1,7 +1,7 @@
 /**
  * Editor deep link URL generation for browser mode.
  *
- * When running `mux server` and accessing via browser, we can't spawn editor
+ * When running `xum server` and accessing via browser, we can't spawn editor
  * processes on the server. Instead, we generate deep link URLs that the browser
  * opens, triggering the user's locally installed editor.
  */

@@ -182,7 +182,7 @@ Expose these conductor-only primitives in v1:
 - `args` — read-only workflow input.
 - `limits` or `budget` — read-only run caps.
 
-Represent variants and best-of-style fan-out with `parallelAgents(...)` patterns in v1. Keep existing task-tool `n` and `variants` available to ordinary agents, but do not add dedicated workflow primitives yet.
+Represent generic parallel fan-out and best-of-style retries with `parallelAgents(...)` patterns in v1. Keep the existing task-tool `n` available to ordinary agents, but do not add a dedicated workflow primitive yet.
 
 #### Durable step identity
 
@@ -643,9 +643,9 @@ Rejected for v1. Existing project trust already gates repo-controlled Mux script
 
 Rejected for v1. Existing task settings and queueing should govern concurrency. Raise the global default parallel task limit to 16 instead of adding arbitrary workflow-only caps.
 
-### Dedicated best-of/variant primitives
+### Dedicated best-of primitives
 
-Deferred. `parallelAgents(...)` can express v1 variants and best-of-style fan-out. Dedicated primitives should wait until built-in workflows reveal stable semantics.
+Deferred. `parallelAgents(...)` can express v1 best-of-style retries. A dedicated primitive should wait until built-in workflows reveal stable semantics.
 
 ### Deep review as the first built-in
 

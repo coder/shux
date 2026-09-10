@@ -1,14 +1,12 @@
 import { resolveRoute } from "@/common/routing";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
-import type { ExternalSecretResolver } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isOpReference } from "@/common/utils/opRef";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
-import type { Config } from "@/node/config";
+import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
-import { log } from "./log";
 
 const OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions";
 const MUX_GATEWAY_TRANSCRIPTION_PATH = "/api/v1/openai/v1/audio/transcriptions";
@@ -34,12 +32,16 @@ interface MuxGatewayTranscriptionConfig {
  * Voice input service using OpenAI-compatible transcription APIs.
  */
 export class VoiceService {
+  private readonly providersConfigStore: ProvidersConfigStore;
+
   constructor(
     private readonly config: Config,
     private readonly providerService?: ProviderService,
     private readonly policyService?: PolicyService,
-    private readonly opResolver?: ExternalSecretResolver
-  ) {}
+    providersConfigStore?: ProvidersConfigStore
+  ) {
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  }
 
   /**
    * Transcribe audio from base64-encoded data using mux-gateway or OpenAI.
@@ -48,7 +50,7 @@ export class VoiceService {
    */
   async transcribe(audioBase64: string): Promise<Result<string, string>> {
     try {
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
+      const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
       const gatewayConfig = providersConfig["mux-gateway"] as
         | MuxGatewayTranscriptionConfig
         | undefined;
@@ -61,7 +63,13 @@ export class VoiceService {
         !isProviderDisabledInConfig(gatewayConfig ?? {}) &&
         !!gatewayToken &&
         (this.policyService?.isProviderAllowed("mux-gateway") ?? true);
-      const openaiApiKey = openaiConfig?.apiKey;
+      // Resolve through the shared config -> file -> env funnel so voice honors
+      // the same credential fallbacks as chat requests (and ignores legacy
+      // op:// references from the removed 1Password integration).
+      const openaiApiKey = resolveProviderCredentials(
+        "openai",
+        providersConfig.openai ?? {}
+      ).apiKey;
       const openaiAvailable =
         !isProviderDisabledInConfig(openaiConfig ?? {}) &&
         !!openaiApiKey &&
@@ -92,7 +100,7 @@ export class VoiceService {
       return {
         success: false,
         error:
-          "Voice input requires a Mux Gateway login or an OpenAI API key. Configure in Settings → Providers.",
+          "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.",
       };
     } catch (error) {
       const message = getErrorMessage(error);
@@ -107,7 +115,7 @@ export class VoiceService {
     openaiAvailable: boolean;
   }): "mux-gateway" | "openai" | null {
     // User rationale: when Settings routes OpenAI directly, voice transcription should use
-    // the same direct path instead of silently detouring through Mux Gateway.
+    // the same direct path instead of silently detouring through Xum Gateway.
     const route = resolveRoute(
       OPENAI_TRANSCRIPTION_MODEL,
       options.routePriority ?? DEFAULT_TRANSCRIPTION_ROUTE_PRIORITY,
@@ -157,7 +165,7 @@ export class VoiceService {
       await this.clearMuxGatewayCredentials();
       return {
         success: false,
-        error: "You've been logged out of Mux Gateway. Please login again to use voice input.",
+        error: "You've been logged out of Xum Gateway. Please login again to use voice input.",
       };
     }
 
@@ -175,25 +183,11 @@ export class VoiceService {
     openaiConfig: OpenAITranscriptionConfig | undefined
   ): Promise<Result<string, string>> {
     const forcedBaseUrl = this.policyService?.getForcedBaseUrl("openai");
-    let resolvedApiKey = apiKey;
-    if (isOpReference(apiKey) && this.opResolver) {
-      resolvedApiKey = (await this.opResolver(apiKey)) ?? apiKey;
-    }
-
-    const opReferenceUnresolved = isOpReference(resolvedApiKey as unknown);
-    if (opReferenceUnresolved) {
-      log.warn("Voice transcription skipped: 1Password key could not be resolved");
-      return {
-        success: false,
-        error:
-          "OpenAI API key could not be resolved from 1Password. Update the key in Settings → Providers and try again.",
-      };
-    }
 
     const response = await fetch(this.resolveOpenAITranscriptionUrl(openaiConfig, forcedBaseUrl), {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${resolvedApiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       body: this.createTranscriptionFormData(audioBase64),
     });

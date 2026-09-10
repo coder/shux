@@ -1,0 +1,35 @@
+---
+title: .xumignore
+description: Sync gitignored files to worktree workspaces
+---
+
+Git worktrees share the `.git` directory but **not** untracked or gitignored files. This means files like `.env` that are in your `.gitignore` won't be available in worktree-based workspaces.
+
+A `.xumignore` file lets you declare which gitignored files should be copied into new worktree workspaces. Existing `.muxignore` files remain readable when `.xumignore` is absent, but new repositories should use the canonical name.
+
+## Setup
+
+Create a `.xumignore` file in your project root (alongside `.gitignore`):
+
+```gitignore
+# Sync these gitignored files to worktree workspaces
+!.env
+!.env.local
+!config/secrets.json
+```
+
+Only lines prefixed with `!` (negation) are actionable — they identify gitignored files to copy. Comments (`#`) and blank lines are ignored.
+
+> Xum only copies files that are already gitignored in your project and currently exist on disk.
+
+## Behavior
+
+- **When:** Files are copied after the git worktree is created, before [init hooks](/hooks/init) run — so your init scripts have access to `.env` and other secrets.
+- **Source:** Your project root directory (the main checkout).
+- **Copy mode:** Physical file copy, not symlink. Each workspace gets its own independent copy.
+- **No overwrite:** Files that already exist in the worktree are not overwritten.
+- **Best-effort:** If a file can't be copied, Xum logs debug information and continues — it won't block workspace creation.
+
+## Where to place it
+
+Place `.xumignore` in the project root, next to your `.gitignore`. You may want to commit it to your repo so all collaborators share the same sync rules.

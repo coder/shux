@@ -28,6 +28,7 @@ export async function runAcpAdapter(server: ServerConnection): Promise<void> {
   assert(server != null, "runAcpAdapter: server connection is required");
 
   // ACP SDK expects Web streams; process stdio is Node stream instances.
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const input = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
   const output = Writable.toWeb(process.stdout) as WritableStream<Uint8Array>;
   const stream = ndJsonStream(output, input);

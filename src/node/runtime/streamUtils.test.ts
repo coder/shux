@@ -1,6 +1,11 @@
 import { describe, expect, it } from "bun:test";
 
-import { streamToString, streamToStringCapped } from "./streamUtils";
+import {
+  StreamByteCeilingExceededError,
+  streamToString,
+  streamToStringCapped,
+  streamToStringWithByteCeiling,
+} from "./streamUtils";
 
 function chunkedStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -13,6 +18,48 @@ function chunkedStream(chunks: string[]): ReadableStream<Uint8Array> {
     },
   });
 }
+
+describe("streamToStringWithByteCeiling", () => {
+  it("returns full content when under the ceiling", async () => {
+    const result = await streamToStringWithByteCeiling(chunkedStream(["hello ", "world"]), 1024);
+    expect(result).toBe("hello world");
+  });
+
+  it("throws and CANCELS the source as soon as the ceiling is exceeded", async () => {
+    // An infinite source models /dev/zero (stat size 0) and stat→read growth
+    // races: draining (streamToStringCapped behavior) would never terminate,
+    // so the reader must cancel the underlying source and fail instead.
+    let cancelled = false;
+    let pulls = 0;
+    const infinite = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(1024));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    try {
+      await streamToStringWithByteCeiling(infinite, 4096);
+      expect.unreachable("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(StreamByteCeilingExceededError);
+    }
+    expect(cancelled).toBe(true);
+    // Bounded consumption: the ceiling trips at the fifth 1KB chunk.
+    expect(pulls).toBeLessThanOrEqual(6);
+  });
+
+  it("rejects a non-positive ceiling", async () => {
+    try {
+      await streamToStringWithByteCeiling(chunkedStream(["x"]), 0);
+      expect.unreachable("Should have thrown");
+    } catch (e) {
+      expect(String(e)).toContain("must be a positive number");
+    }
+  });
+});
 
 describe("streamToStringCapped", () => {
   it("returns full content when under the cap", async () => {

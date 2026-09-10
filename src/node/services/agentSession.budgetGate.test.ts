@@ -7,6 +7,7 @@ import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -43,12 +44,14 @@ async function setGoalOk(
   return result.data;
 }
 
-function createAiService(workspaceId: string): AIService {
+function createAiService(workspaceId: string, getClosingSignal: () => AbortSignal): AIService {
   const aiEmitter = new EventEmitter();
   return Object.assign(aiEmitter, {
     isStreaming: mock((_workspaceId: string) => false),
     stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(undefined))),
+    streamMessage: mock((_request: unknown) =>
+      Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
+    ),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
@@ -91,11 +94,11 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     setMessageQueued: mock((_workspaceId: string, _queued: boolean) => undefined),
   } as unknown as BackgroundProcessManager;
 
-  const session = new AgentSession({
+  const session: AgentSession = new AgentSession({
     workspaceId,
     config,
     historyService,
-    aiService: createAiService(workspaceId),
+    aiService: createAiService(workspaceId, () => session.closingSignal),
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,
@@ -148,7 +151,7 @@ describe("AgentSession.sendMessage budget gate", () => {
         expect(result.error.raw).toContain("Target model has no pricing data");
       }
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("resumeStream rejects an unpriced model when a budgeted resumable goal exists", async () => {
@@ -171,7 +174,7 @@ describe("AgentSession.sendMessage budget gate", () => {
         expect(result.error.raw).toContain("Target model has no pricing data");
       }
     }
-    session.dispose();
+    await session.dispose();
   });
 
   test("allows an unpriced model when no budgeted goal exists", async () => {
@@ -184,7 +187,7 @@ describe("AgentSession.sendMessage budget gate", () => {
 
     const result = await session.sendMessage("Unpriced", UNPRICED_OPTIONS);
     expect(result.success).toBe(true);
-    session.dispose();
+    await session.dispose();
   });
 
   test("allows an unpriced model when goal has no budget", async () => {
@@ -199,7 +202,7 @@ describe("AgentSession.sendMessage budget gate", () => {
 
     const result = await session.sendMessage("Unpriced", UNPRICED_OPTIONS);
     expect(result.success).toBe(true);
-    session.dispose();
+    await session.dispose();
   });
 
   test("manual rejected send preserves the user message + emits a stream-error event", async () => {
@@ -258,7 +261,47 @@ describe("AgentSession.sendMessage budget gate", () => {
     // intervened (Codex P1 PRRT_kwDOPxxmWM5_tOFt).
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
 
-    session.dispose();
+    await session.dispose();
+  });
+
+  test("rejected queued sends persist authoring metadata and pre-goal rows do not pause the goal", async () => {
+    // Queue race on the rejection path: a message the user typed before the
+    // goal existed can be rejected by the pricing gate when it dispatches
+    // after the goal-creating turn. The persisted row must carry authoring
+    // metadata (timestamp + enqueuedAtMs) so goal-safety reconciliation still
+    // classifies it as pre-goal after a restart, and the dispatch-time hook
+    // must leave the fresh goal active.
+    const workspaceId = "as-budget-gate-queued-pre-goal";
+    const { historyService, session, goalService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+
+    const enqueuedAtMs = Date.now() - 1;
+    await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Stay under budget",
+      budgetCents: 500,
+    });
+
+    const result = await session.sendMessage("Typed before the goal existed", UNPRICED_OPTIONS, {
+      enqueuedAtMs,
+    });
+    expect(result.success).toBe(false);
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      const userMessage = history.data.find((m) => m.role === "user");
+      expect(typeof userMessage?.metadata?.timestamp).toBe("number");
+      expect(userMessage?.metadata?.enqueuedAtMs).toBe(enqueuedAtMs);
+    }
+
+    // Dispatch-time guard: no pause. getGoal also re-runs chat-tail
+    // reconciliation against the persisted row, exercising the durable
+    // enqueuedAtMs path.
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+
+    await session.dispose();
   });
 
   test("empty manual rejected send does NOT pause an active goal", async () => {
@@ -281,7 +324,7 @@ describe("AgentSession.sendMessage budget gate", () => {
     expect(result.success).toBe(false);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("synthetic rejected send does NOT pause an active goal", async () => {
@@ -305,7 +348,7 @@ describe("AgentSession.sendMessage budget gate", () => {
     expect(result.success).toBe(false);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("synthetic rejected send does NOT persist a user message", async () => {
@@ -336,7 +379,7 @@ describe("AgentSession.sendMessage budget gate", () => {
       expect(userMessages.length).toBe(0);
     }
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("queue-dispatch race: setGoal between enqueue and drain still rejects", async () => {
@@ -392,6 +435,6 @@ describe("AgentSession.sendMessage budget gate", () => {
       );
       expect(queuedUserMessage).toBeDefined();
     }
-    session.dispose();
+    await session.dispose();
   });
 });

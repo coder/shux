@@ -56,9 +56,6 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
-// Shared with workspace metadata IPC; see src/common/orpc/schemas/workspace.ts.
-export { WorkflowTaskMetadataSchema };
-
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -178,13 +175,35 @@ export const WorkspaceConfigSchema = z.object({
       "Initial prompt for a queued agent task (persisted only until the task actually starts).",
   }),
   taskExperiments: z
-    .object({
-      programmaticToolCalling: z.boolean().optional(),
-      programmaticToolCallingExclusive: z.boolean().optional(),
-      advisorTool: z.boolean().optional(),
-      dynamicWorkflows: z.boolean().optional(),
-      execSubagentHardRestart: z.boolean().optional(),
-    })
+    .preprocess(
+      // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
+      // separate experiment may carry only programmaticToolCallingExclusive.
+      // The merged PTC experiment activates exactly that posture, so the flag
+      // must map onto programmaticToolCalling on resumption instead of being
+      // stripped (which would silently drop PTC and make rlm inert). `true`
+      // wins over an explicit programmaticToolCalling: false because the old
+      // exclusive flag activated the posture regardless of the supplement flag.
+      (value) =>
+        typeof value === "object" &&
+        value !== null &&
+        (value as Record<string, unknown>).programmaticToolCallingExclusive === true
+          ? { ...value, programmaticToolCalling: true }
+          : value,
+      z.object({
+        programmaticToolCalling: z.boolean().optional(),
+        // Downgrade-compat mirror (see toPersistedTaskExperiments): retained
+        // through parsing and stamped alongside programmaticToolCalling so a
+        // downgraded build resumes the task in its exclusive posture instead
+        // of reading bare PTC as the removed (~2x cost) supplement mode.
+        programmaticToolCallingExclusive: z.boolean().optional(),
+        // RLM mode is stamped at spawn so child sessions keep RLM-gated features
+        // (persistent sandbox kernel, family messaging tools) across app restarts
+        // without depending on live frontend experiment state.
+        rlm: z.boolean().optional(),
+        advisorTool: z.boolean().optional(),
+        dynamicWorkflows: z.boolean().optional(),
+      })
+    )
     .optional()
     .meta({
       description: "Experiments inherited from parent for restart-safe resumptions.",
@@ -201,6 +220,11 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
   }),
+  // Delegation changes the operator, not the computer; checkout isolation is independent.
+  taskDesktopOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Ancestor owning the shared desktop. Absent means this workspace owns its desktop.",
+  }),
   taskIsolation: z
     .enum(["fork", "none"])
     .optional()
@@ -215,9 +239,18 @@ export const WorkspaceConfigSchema = z.object({
     .optional()
     .meta({
       description:
-        "When true, automatic agent-task cleanup leaves this workspace intact after it reports. " +
-        "Explicit user lifecycle actions may still archive or remove it.",
+        "Strong retention for an agent-task workspace. Ordinary user-spawned tasks persist after " +
+        "reporting. This legacy field is ignored by modern task lifecycle logic and retained only " +
+        "for downgrade compatibility.",
     }),
+  taskExecutionId: z.string().optional().meta({
+    description:
+      "Latest internal execution handle for a persistent sub-agent reawakened through task_send_message.",
+  }),
+  taskExecutionStatus: z
+    .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
+    .optional()
+    .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +
@@ -226,7 +259,7 @@ export const WorkspaceConfigSchema = z.object({
   }),
   mcp: WorkspaceMCPOverridesSchema.optional().meta({
     description:
-      "LEGACY: Per-workspace MCP overrides (migrated to <workspace>/.mux/mcp.local.jsonc)",
+      "LEGACY: Per-workspace MCP overrides (migrated to <workspace>/.xum/mcp.local.jsonc)",
   }),
   archivedAt: z.string().optional().meta({
     description:
@@ -287,6 +320,14 @@ export const ProjectConfigSchema = z.object({
   trusted: z.boolean().optional().meta({
     description:
       "Whether the user has confirmed trust for this project. Untrusted projects cannot run hooks or user scripts.",
+  }),
+  customInstructions: z.string().optional().meta({
+    description:
+      "Custom system prompt appended for every workspace in this project (Settings → Instructions)",
+  }),
+  codeWorkspaceSyncPath: z.string().optional().meta({
+    description:
+      "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",
   }),
 });
 

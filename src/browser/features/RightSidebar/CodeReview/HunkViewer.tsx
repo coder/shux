@@ -505,6 +505,7 @@ export const HunkViewer = React.memo<HunkViewerProps>(
                   className="rounded-none border-0 [&>div]:overflow-x-visible"
                   onReviewNote={onReviewNote}
                   onLineClick={() => {
+                    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
                     const syntheticEvent = {
                       currentTarget: { dataset: { hunkId } },
                     } as unknown as React.MouseEvent<HTMLElement>;

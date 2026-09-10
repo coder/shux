@@ -11,7 +11,7 @@
  * - Use getRuntimeTypeForTelemetry to convert RuntimeConfig to telemetry-safe type
  */
 
-export { initTelemetry, shutdownTelemetry } from "./client";
+export { initTelemetry } from "./client";
 export { trackAppStarted } from "./lifecycle";
 
 // Tracking functions - callers pass raw values, rounding handled internally
@@ -30,12 +30,3 @@ export {
 
 // Utility for converting RuntimeConfig to telemetry-safe runtime type
 export { getRuntimeTypeForTelemetry } from "./utils";
-
-// Type exports for callers that need them
-export type {
-  TelemetryEventPayload,
-  ErrorContext,
-  TelemetryRuntimeType,
-  TelemetryThinkingLevel,
-  TelemetryCommandType,
-} from "./payload";

@@ -3,6 +3,7 @@ import { getEffectiveSlotKeybind, getPresetForSlot } from "@/browser/utils/uiLay
 import {
   matchesKeybind,
   isBrowserViewportFocused,
+  isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
 } from "@/browser/utils/ui/keybinds";
@@ -34,7 +35,11 @@ export function handleLayoutSlotHotkeys(
 
   // Slot hotkeys are global, but we avoid stealing keyboard shortcuts from terminals
   // or the focused browser viewport.
-  if (isTerminalFocused(e.target) || isBrowserViewportFocused(e.target)) {
+  if (
+    isTerminalFocused(e.target) ||
+    isBrowserViewportFocused(e.target) ||
+    isDesktopViewportFocused(e.target)
+  ) {
     return false;
   }
 

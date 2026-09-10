@@ -88,7 +88,7 @@ CHECK_PR_CHECKS_ONCE() {
   local reviews_output
 
   # Get PR status
-  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,reviewDecision,state 2>/dev/null || echo "error")
+  status=$(gh pr view "$PR_NUMBER" --json mergeable,mergeStateStatus,reviewDecision,state,headRefOid 2>/dev/null || echo "error")
 
   if [ "$status" = "error" ]; then
     echo "❌ Failed to get PR status. Does PR #$PR_NUMBER exist?"
@@ -184,12 +184,16 @@ CHECK_PR_CHECKS_ONCE() {
   local ignored_unready_count
   local ignored_unready_checks
 
-  checks_json=$(gh pr checks "$PR_NUMBER" --json name,state,bucket,workflow,link,description 2>&1) || true
-  if ! echo "$checks_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  checks_json=$(fetch_pr_checks "$PR_NUMBER" "$status" 2>&1) || {
+    local fetch_status=$?
+    if [ "$fetch_status" -eq 10 ]; then
+      echo "PR state changed while collecting checks; retrying."
+      return 10
+    fi
     echo "❌ Failed to get PR checks for PR #$PR_NUMBER" >&2
     echo "$checks_json" >&2
     return 1
-  fi
+  }
 
   jq_defs=$(visual_check_jq_defs)
   filtered_checks=$(echo "$checks_json" | jq "$jq_defs [ .[] | select(is_visual_review_check | not) ]")
@@ -231,7 +235,7 @@ CHECK_PR_CHECKS_ONCE() {
   if [ "$has_fail" -eq 1 ]; then
     echo "❌ Some non-visual-review checks failed:"
     echo ""
-    echo "$checks"
+    echo "$filtered_checks" | jq -r "$jq_defs .[] | select(is_failed_check) | check_line"
     if [ "$ignored_unready_count" -gt 0 ]; then
       echo ""
       echo "ℹ️ Ignoring visual-review unready checks:"
@@ -265,16 +269,9 @@ CHECK_PR_CHECKS_ONCE() {
       return 1
     fi
 
-    # If a Pixel review status is required in branch protection, GitHub reports
-    # the aggregate merge state as BLOCKED. At this point non-visual-review checks,
-    # review-thread checks, and GitHub's reviewDecision gate have passed, so an
-    # ignored unready status is the only remaining blocker this script can see.
-    local merge_state_blocked_by_ignored_visual=0
-    if { [ "$merge_state" = "UNSTABLE" ] || [ "$merge_state" = "BLOCKED" ]; } && [ "$ignored_unready_count" -gt 0 ]; then
-      merge_state_blocked_by_ignored_visual=1
-    fi
-
-    if [ "$merge_state" = "CLEAN" ] || [ "$merge_state_blocked_by_ignored_visual" -eq 1 ]; then
+    # Optional visual checks can explain UNSTABLE, but their presence does not
+    # prove why GitHub is BLOCKED (for example, an unsatisfied repository rule).
+    if [ "$merge_state" = "CLEAN" ] || { [ "$merge_state" = "UNSTABLE" ] && [ "$ignored_unready_count" -gt 0 ]; }; then
       echo "✅ All non-visual-review checks passed!"
       echo ""
       echo "$checks"

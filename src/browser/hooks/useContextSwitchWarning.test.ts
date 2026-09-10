@@ -13,6 +13,8 @@ import {
   recordWorkspaceModelChange,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
+import { getModelKey } from "@/common/constants/storage";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 
 async function* emptyStream() {
   // no-op
@@ -384,6 +386,44 @@ describe("useContextSwitchWarning", () => {
     });
 
     await waitFor(() => expect(result.current.warning).toBeNull());
+  });
+
+  test("handleModelChange treats a Coder gateway entry as distinct from the direct model", () => {
+    // Cross-typed instance scenario: coder:openai/<model> and openai:<model>
+    // are different selections; name-only canonicalization made them compare
+    // equal, so the picker returned before persisting the switch.
+    const directModel = "openai:claude-opus-4-1";
+    const coderModel = "coder:openai/claude-opus-4-1";
+    const props = {
+      workspaceId: "workspace-coder-eq",
+      messages: [buildAssistantMessage(directModel)],
+      pendingModel: directModel,
+      use1M: false,
+      workspaceUsage: buildUsage(1_000, directModel),
+      api: undefined,
+      pendingSendOptions: buildSendOptions(directModel),
+      providersConfig: null,
+    };
+
+    const { result } = renderHook((hookProps: typeof props) => useContextSwitchWarning(hookProps), {
+      initialProps: props,
+      wrapper,
+    });
+
+    act(() => {
+      result.current.handleModelChange(coderModel);
+    });
+
+    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBe(
+      coderModel
+    );
+
+    // Re-selecting the identical selection stays a no-op.
+    window.localStorage.clear();
+    act(() => {
+      result.current.handleModelChange(directModel);
+    });
+    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBeNull();
   });
 
   test("warns when gateway model strings are normalized for explicit switches", async () => {

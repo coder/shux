@@ -17,7 +17,7 @@ let browserControlCommandCounter = 0;
 
 function createBrowserControlCommandId(): string {
   browserControlCommandCounter += 1;
-  return `mux-browser-control-${Date.now()}-${browserControlCommandCounter}`;
+  return `xum-browser-control-${Date.now()}-${browserControlCommandCounter}`;
 }
 
 function isExplicitFileUrl(url: string): boolean {
@@ -395,7 +395,7 @@ export class BrowserControlService {
       timeoutMs: this.timeoutMs,
       // Older agent-browser CLI parsers can normalize file:// into https:// before
       // the daemon sees it. Send the navigation command directly for explicit file
-      // URLs so Mux preserves the exact local-file target the user requested.
+      // URLs so Xum preserves the exact local-file target the user requested.
       command: {
         id: createBrowserControlCommandId(),
         action: "navigate",

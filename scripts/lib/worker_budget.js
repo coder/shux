@@ -15,10 +15,11 @@ const DEFAULT_PROC_SELF_CGROUP = "/proc/self/cgroup";
 // caps as absent instead of trusting them.
 const UNLIMITED_BYTES_FLOOR = 2n ** 62n;
 
-// Peak RSS measured per worker in this repo, rounded up for growth: ESLint's --concurrency lanes are
-// worker threads in one process (~2.8GiB per lane), while Jest forks reach ~4.7GiB each.
+// Peak RSS measured per worker in this repo, rounded up for growth. Cold type-aware ESLint runs at
+// --concurrency 4 measured 14.3 and 15.4GiB RSS (3.6 to 3.9GiB per lane); 8GiB per lane keeps one
+// cold lint on a 32GiB cgroup at 2 lanes, leaving room for another workspace. Jest forks: ~4.7GiB.
 const PROFILES = {
-  eslint: { memoryPerWorkerGib: 4, maxWorkers: 4 },
+  eslint: { memoryPerWorkerGib: 8, maxWorkers: 4 },
   jest: { memoryPerWorkerGib: 6, maxWorkers: 4 },
 };
 
@@ -217,6 +218,7 @@ function workerBudgetFor(profileName) {
 }
 
 module.exports = {
+  PROFILES,
   computeWorkers,
   readCgroupUsageBytes,
   resolveMemoryConstraint,

@@ -1,27 +1,71 @@
-import { useState, type ReactElement } from "react";
-import { ChevronRight, Radar } from "lucide-react";
-import { cn } from "@/common/lib/utils";
+import type { ReactElement } from "react";
+import { Radar } from "lucide-react";
 import type { BashMonitorWakeDisplayRecord, DisplayedMessage } from "@/common/types/message";
-import { TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
+import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
 
 interface BashMonitorWakeMessageProps {
   message: DisplayedMessage & { type: "user" };
   className?: string;
 }
 
+/** A stale terminal (re-armed processId) still summarizes as a settlement, never as a match. */
+function settlementOf(
+  record: BashMonitorWakeDisplayRecord
+): BashMonitorWakeDisplayRecord["terminal"] {
+  return record.terminal ?? record.staleTerminal;
+}
+
+function summarizeTerminal(record: BashMonitorWakeDisplayRecord): string {
+  const terminal = settlementOf(record);
+  if (terminal == null) return `${record.displayName} monitor matched`;
+  // Attribute a stale settlement to the earlier run so the card cannot read as the live
+  // (re-armed) process having settled.
+  const suffix = record.terminal == null ? " — earlier run, ID re-armed" : "";
+  switch (terminal.status) {
+    case "exited":
+      return terminal.exitCode != null
+        ? `${record.displayName} exited (code ${terminal.exitCode})${suffix}`
+        : `${record.displayName} exited${suffix}`;
+    case "killed":
+      return `${record.displayName} killed${suffix}`;
+    case "failed":
+      return `${record.displayName} failed${suffix}`;
+    case "unknown":
+      // Backend read-time degrade of malformed settlement metadata: still a settlement.
+      return `${record.displayName} settled${suffix}`;
+  }
+}
+
 function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
   if (records.length === 1) {
     const record = records[0];
     return record.kind === "monitor-lost"
-      ? `${record.displayName} monitor stopped after restart`
-      : `${record.displayName} monitor matched`;
+      ? record.lostReason === "runtime-failure"
+        ? `${record.displayName} monitor failed`
+        : `${record.displayName} monitor stopped after restart`
+      : summarizeTerminal(record);
   }
 
-  const matchCount = records.filter((record) => record.kind === "match").length;
-  if (matchCount === records.length) {
+  const matchRecords = records.filter((record) => record.kind === "match");
+  const runtimeFailureRecords = records.filter(
+    (record) => record.kind === "monitor-lost" && record.lostReason === "runtime-failure"
+  );
+  const restartLostRecords = records.filter(
+    (record) => record.kind === "monitor-lost" && record.lostReason !== "runtime-failure"
+  );
+  if (matchRecords.length === records.length) {
+    if (matchRecords.every((record) => settlementOf(record) != null)) {
+      return `${records.length} background processes finished`;
+    }
+    if (matchRecords.some((record) => settlementOf(record) != null)) {
+      return `${records.length} background monitor updates`;
+    }
     return `${records.length} background monitors matched`;
   }
-  if (matchCount === 0) {
+  if (runtimeFailureRecords.length === records.length) {
+    return `${records.length} background monitors failed`;
+  }
+  if (restartLostRecords.length === records.length) {
     return `${records.length} background monitors stopped after restart`;
   }
   return `${records.length} background monitor updates`;
@@ -34,40 +78,15 @@ function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
  * resumed the turn, while keeping the model-facing prompt available on demand.
  */
 export function BashMonitorWakeMessage(props: BashMonitorWakeMessageProps): ReactElement {
-  const [expanded, setExpanded] = useState(false);
   const records = props.message.bashMonitorWake?.records ?? [];
-  const summary = summarizeRecords(records);
 
   return (
-    <div
-      className={cn("my-2 flex min-w-0 flex-col items-end", props.className)}
-      data-message-block
-      data-bash-monitor-wake
-    >
-      <button
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded((previous) => !previous)}
-        className="text-muted hover:bg-muted/10 hover:text-foreground focus-visible:ring-ring focus-visible:ring-offset-background flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-xs focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-      >
-        <Radar aria-hidden="true" className="size-3.5 shrink-0" />
-        <span className="truncate">{summary}</span>
-        <ChevronRight
-          aria-hidden="true"
-          className={cn(
-            "size-3 shrink-0 transition-transform duration-200",
-            expanded && "rotate-90"
-          )}
-        />
-        <span className="sr-only">{expanded ? "Hide details" : "Show details"}</span>
-      </button>
-      {expanded && (
-        <TranscriptQuoteRoot text={props.message.content} className="mt-1.5 w-full">
-          <pre className="text-muted bg-muted/5 border-border max-h-[40vh] overflow-y-auto rounded-md border p-2 text-xs leading-relaxed whitespace-pre-wrap">
-            {props.message.content}
-          </pre>
-        </TranscriptQuoteRoot>
-      )}
-    </div>
+    <CollapsibleMachineMessage
+      content={props.message.content}
+      summary={summarizeRecords(records)}
+      icon={<Radar aria-hidden="true" className="size-3.5 shrink-0" />}
+      marker="bash-monitor-wake"
+      className={props.className}
+    />
   );
 }

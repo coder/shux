@@ -122,6 +122,84 @@ describe("CopilotResponsesLanguageModel", () => {
     }
   });
 
+  it("rejects an invalid service tier before sending a request", async () => {
+    let requests = 0;
+    const model = new CopilotResponsesLanguageModel({
+      modelId: "gpt-5.4",
+      fetch: Object.assign(() => {
+        requests++;
+        return Promise.resolve(createJsonResponse({}));
+      }, globalThis.fetch),
+    });
+    const options: LanguageModelV2CallOptions = {
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      providerOptions: { "github-copilot": { serviceTier: "invalid" } },
+    };
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doGenerate(options)).rejects.toThrow();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun mistypes rejection matchers.
+    await expect(model.doStream(options)).rejects.toThrow();
+    expect(requests).toBe(0);
+  });
+
+  it.each(["auto", "default", "flex", "priority", undefined] as const)(
+    "serializes service tier %s for generate and stream independently of reasoning",
+    async (serviceTier) => {
+      const capturedBodies: Array<Record<string, unknown>> = [];
+      const response = createCompletedResponse("stop");
+      const model = new CopilotResponsesLanguageModel({
+        modelId: "copilot-test",
+        fetch: Object.assign(
+          (_url: RequestInfo | URL, init?: RequestInit) => {
+            if (!init) {
+              throw new Error("Expected request init");
+            }
+            const body = getJsonBody(init);
+            capturedBodies.push(body);
+            return Promise.resolve(
+              body.stream
+                ? createSseResponse([
+                    { event: "response.completed", data: { type: "response.completed", response } },
+                  ])
+                : createJsonResponse(response)
+            );
+          },
+          { preconnect: globalThis.fetch.preconnect.bind(globalThis.fetch) }
+        ),
+      });
+      for (const reasoningEffort of [undefined, "medium"] as const) {
+        const options: LanguageModelV2CallOptions = {
+          prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          providerOptions: {
+            "github-copilot": {
+              ...(serviceTier && { serviceTier }),
+              ...(reasoningEffort && { reasoningEffort }),
+            },
+            // Other namespaces must never supply a fallback tier.
+            openai: { serviceTier: "priority" },
+            anthropic: { serviceTier: "priority" },
+            google: { serviceTier: "priority" },
+          },
+        };
+        await model.doGenerate(options);
+        const result = await model.doStream(options);
+        await collectStreamParts(result.stream);
+      }
+      expect(capturedBodies).toHaveLength(4);
+      for (const body of capturedBodies) {
+        expect(body.service_tier).toBe(serviceTier);
+        expect(body).not.toHaveProperty("serviceTier");
+        if (serviceTier === undefined) {
+          expect(body).not.toHaveProperty("service_tier");
+        }
+      }
+      expect(capturedBodies[0]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[1]).not.toHaveProperty("reasoning");
+      expect(capturedBodies[2].reasoning).toEqual({ effort: "medium" });
+      expect(capturedBodies[3].reasoning).toEqual({ effort: "medium" });
+    }
+  );
+
   it("shapes the outbound request body for streaming calls", async () => {
     let capturedBody: Record<string, unknown> | undefined;
     restoreFetchers.push(
@@ -750,5 +828,561 @@ describe("CopilotResponsesLanguageModel", () => {
 
     expect(parts.map((part) => part.type)).toEqual(["stream-start", "response-metadata", "error"]);
     expect(parts[2].type).toBe("error");
+  });
+
+  it("maps function-call SSE events to tool stream parts", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_tool", created_at: 1_710_000_050, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: {
+                  type: "function_call",
+                  id: "fc_1",
+                  call_id: "call_1",
+                  name: "get_weather",
+                },
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 0,
+                item_id: "fc_1",
+                delta: '{"city":',
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 0,
+                item_id: "fc_1",
+                delta: '"Berlin"}',
+              },
+            },
+            {
+              event: "response.function_call_arguments.done",
+              data: {
+                type: "response.function_call_arguments.done",
+                output_index: 0,
+                item_id: "fc_1",
+                arguments: '{"city":"Berlin"}',
+              },
+            },
+            {
+              event: "response.output_item.done",
+              data: {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: {
+                  type: "function_call",
+                  id: "fc_1",
+                  call_id: "call_1",
+                  name: "get_weather",
+                  arguments: '{"city":"Berlin"}',
+                },
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 5, output_tokens: 9, total_tokens: 14 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "weather?" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    // The done events (arguments.done + output_item.done) must finalize once:
+    // exactly one tool-input-end and one tool-call.
+    expect(parts.map((part) => part.type)).toEqual([
+      "stream-start",
+      "response-metadata",
+      "tool-input-start",
+      "tool-input-delta",
+      "tool-input-delta",
+      "tool-input-end",
+      "tool-call",
+      "finish",
+    ]);
+    expect(parts[2]).toEqual({ type: "tool-input-start", id: "call_1", toolName: "get_weather" });
+    expect(parts[3]).toEqual({ type: "tool-input-delta", id: "call_1", delta: '{"city":' });
+    expect(parts[4]).toEqual({ type: "tool-input-delta", id: "call_1", delta: '"Berlin"}' });
+    expect(parts[5]).toEqual({ type: "tool-input-end", id: "call_1" });
+    expect(parts[6]).toEqual({
+      type: "tool-call",
+      toolCallId: "call_1",
+      toolName: "get_weather",
+      input: '{"city":"Berlin"}',
+    });
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: "tool-calls" });
+  });
+
+  it("interleaves text and tool-call parts from a mixed stream", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_mixed", created_at: 1_710_000_060, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { type: "message", id: "msg_1" },
+              },
+            },
+            {
+              event: "response.output_text.delta",
+              data: {
+                type: "response.output_text.delta",
+                output_index: 0,
+                content_index: 0,
+                item_id: "msg_1",
+                delta: "Checking the weather.",
+              },
+            },
+            {
+              event: "response.output_text.done",
+              data: {
+                type: "response.output_text.done",
+                output_index: 0,
+                content_index: 0,
+                item_id: "msg_1",
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 1,
+                item: {
+                  type: "function_call",
+                  id: "fc_2",
+                  call_id: "call_2",
+                  name: "get_weather",
+                },
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 1,
+                item_id: "fc_2",
+                delta: '{"city":"Paris"}',
+              },
+            },
+            {
+              event: "response.function_call_arguments.done",
+              data: {
+                type: "response.function_call_arguments.done",
+                output_index: 1,
+                item_id: "fc_2",
+                arguments: '{"city":"Paris"}',
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 4, output_tokens: 6, total_tokens: 10 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "weather?" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    expect(parts.map((part) => part.type)).toEqual([
+      "stream-start",
+      "response-metadata",
+      "text-start",
+      "text-delta",
+      "text-end",
+      "tool-input-start",
+      "tool-input-delta",
+      "tool-input-end",
+      "tool-call",
+      "finish",
+    ]);
+    expect(parts[3]).toEqual({
+      type: "text-delta",
+      id: "text-0-0",
+      delta: "Checking the weather.",
+    });
+    expect(parts[8]).toEqual({
+      type: "tool-call",
+      toolCallId: "call_2",
+      toolName: "get_weather",
+      input: '{"city":"Paris"}',
+    });
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: "tool-calls" });
+  });
+
+  it("routes interleaved argument deltas to the correct tool call", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_multi", created_at: 1_710_000_070, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { type: "function_call", id: "fc_a", call_id: "call_a", name: "lookup_user" },
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 1,
+                item: { type: "function_call", id: "fc_b", call_id: "call_b", name: "lookup_org" },
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 0,
+                item_id: "fc_a",
+                delta: '{"id":',
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 1,
+                item_id: "fc_b",
+                delta: '{"org":',
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 0,
+                item_id: "fc_a",
+                delta: "7}",
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 1,
+                item_id: "fc_b",
+                delta: '"acme"}',
+              },
+            },
+            {
+              event: "response.function_call_arguments.done",
+              data: {
+                type: "response.function_call_arguments.done",
+                output_index: 0,
+                item_id: "fc_a",
+                arguments: '{"id":7}',
+              },
+            },
+            {
+              event: "response.function_call_arguments.done",
+              data: {
+                type: "response.function_call_arguments.done",
+                output_index: 1,
+                item_id: "fc_b",
+                arguments: '{"org":"acme"}',
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 3, output_tokens: 8, total_tokens: 11 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "who?" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    const deltas = parts.filter(
+      (part): part is Extract<LanguageModelV2StreamPart, { type: "tool-input-delta" }> =>
+        part.type === "tool-input-delta"
+    );
+    expect(deltas.map((part) => ({ id: part.id, delta: part.delta }))).toEqual([
+      { id: "call_a", delta: '{"id":' },
+      { id: "call_b", delta: '{"org":' },
+      { id: "call_a", delta: "7}" },
+      { id: "call_b", delta: '"acme"}' },
+    ]);
+
+    const toolCalls = parts.filter(
+      (part): part is Extract<LanguageModelV2StreamPart, { type: "tool-call" }> =>
+        part.type === "tool-call"
+    );
+    expect(toolCalls).toEqual([
+      { type: "tool-call", toolCallId: "call_a", toolName: "lookup_user", input: '{"id":7}' },
+      { type: "tool-call", toolCallId: "call_b", toolName: "lookup_org", input: '{"org":"acme"}' },
+    ]);
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: "tool-calls" });
+  });
+
+  it("falls back to accumulated argument deltas when the done event omits arguments", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_acc", created_at: 1_710_000_080, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.output_item.added",
+              data: {
+                type: "response.output_item.added",
+                output_index: 0,
+                item: { type: "function_call", id: "fc_3", call_id: "call_3", name: "run_query" },
+              },
+            },
+            {
+              event: "response.function_call_arguments.delta",
+              data: {
+                type: "response.function_call_arguments.delta",
+                output_index: 0,
+                item_id: "fc_3",
+                delta: '{"q":"a"}',
+              },
+            },
+            {
+              event: "response.function_call_arguments.done",
+              data: {
+                type: "response.function_call_arguments.done",
+                output_index: 0,
+                item_id: "fc_3",
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 2, output_tokens: 3, total_tokens: 5 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "query" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    expect(parts.map((part) => part.type)).toEqual([
+      "stream-start",
+      "response-metadata",
+      "tool-input-start",
+      "tool-input-delta",
+      "tool-input-end",
+      "tool-call",
+      "finish",
+    ]);
+    expect(parts[5]).toEqual({
+      type: "tool-call",
+      toolCallId: "call_3",
+      toolName: "run_query",
+      input: '{"q":"a"}',
+    });
+  });
+
+  it("emits a full tool lifecycle for a done-only function_call stream", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_done", created_at: 1_710_000_085, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.output_item.done",
+              data: {
+                type: "response.output_item.done",
+                output_index: 0,
+                item: {
+                  type: "function_call",
+                  id: "fc_4",
+                  call_id: "call_4",
+                  name: "get_time",
+                  arguments: '{"tz":"UTC"}',
+                },
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 2, output_tokens: 2, total_tokens: 4 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "time?" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    expect(parts.map((part) => part.type)).toEqual([
+      "stream-start",
+      "response-metadata",
+      "tool-input-start",
+      "tool-input-end",
+      "tool-call",
+      "finish",
+    ]);
+    expect(parts[2]).toEqual({ type: "tool-input-start", id: "call_4", toolName: "get_time" });
+    expect(parts[4]).toEqual({
+      type: "tool-call",
+      toolCallId: "call_4",
+      toolName: "get_time",
+      input: '{"tz":"UTC"}',
+    });
+  });
+
+  it("keeps the non-tool finish mapping when no function call was seen", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.created",
+              data: {
+                type: "response.created",
+                response: { id: "resp_plain", created_at: 1_710_000_090, model: "copilot-test" },
+              },
+            },
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
+              },
+            },
+          ])
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "plain" }] }],
+    });
+    const parts = await collectStreamParts(result.stream);
+
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: "other" });
+  });
+
+  it("returns tool-call content for function_call output items in doGenerate", async () => {
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createJsonResponse({
+            id: "resp_gen",
+            created_at: 1_710_000_100,
+            model: "copilot-test",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "Looking that up." }],
+              },
+              {
+                type: "function_call",
+                id: "fc_gen",
+                call_id: "call_gen",
+                name: "get_weather",
+                arguments: '{"city":"Oslo"}',
+              },
+            ],
+            usage: { input_tokens: 6, output_tokens: 4, total_tokens: 10 },
+          })
+        )
+      )
+    );
+
+    const model = createModel();
+    const result = await model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "weather?" }] }],
+    });
+
+    expect(result.content).toEqual([
+      { type: "text", text: "Looking that up." },
+      {
+        type: "tool-call",
+        toolCallId: "call_gen",
+        toolName: "get_weather",
+        input: '{"city":"Oslo"}',
+      },
+    ]);
+    expect(result.finishReason).toBe("tool-calls");
   });
 });

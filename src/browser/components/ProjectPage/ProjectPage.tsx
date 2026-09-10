@@ -281,8 +281,9 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               </Button>
             )}
           </div>
-          {/* Scrollable content area */}
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* Scrollable content area. mobile-header-spacer keeps content below
+              the fixed mobile header on touch devices. */}
+          <div className="mobile-header-spacer min-h-0 flex-1 overflow-y-auto">
             {/* Main content - vertically centered with reduced gaps */}
             <div className="flex min-h-[50vh] flex-col items-center justify-center px-4 py-6">
               <div className={cn("flex w-full flex-col gap-4", CREATION_COLUMN_MAX_WIDTH_CLASS)}>

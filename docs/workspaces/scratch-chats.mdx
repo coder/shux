@@ -3,7 +3,7 @@ title: Scratch chats
 description: Start a durable chat with an app-managed folder and no project or Git repository.
 ---
 
-Scratch chats let you start working without adding a project. Each chat gets a private folder managed by Mux, so the agent can create and edit files even though the chat is not attached to an existing repository.
+Scratch chats let you start working without adding a project. Each chat gets a private folder managed by Xum, so the agent can create and edit files even though the chat is not attached to an existing repository.
 
 ## Start a scratch chat
 
@@ -13,13 +13,13 @@ Use any of these entry points:
 - Select the **+** button in the **Chats** section of the sidebar.
 - Press `Cmd+Shift+N` on macOS or `Ctrl+Shift+N` on Windows and Linux.
 
-Mux creates the chat and its folder when you send the first message. Closing an empty draft does not create a folder.
+Xum creates the chat and its folder when you send the first message. Closing an empty draft does not create a folder.
 
 ## Files and Git
 
-Scratch chat files are stored under `~/.mux/scratch/<workspace-id>`. The folder persists across app restarts.
+Scratch chat files are stored under `~/.xum/scratch/<workspace-id>`. The folder persists across app restarts.
 
-Mux does not initialize a Git repository for a scratch chat. Branch controls, Git status, and code review tools are hidden. You can still use the terminal and other tools that only need a working directory.
+Xum does not initialize a Git repository for a scratch chat. Branch controls, Git status, and code review tools are hidden. You can still use the terminal and other tools that only need a working directory.
 
 Sub-agent tasks run in the same scratch folder. They do not receive an isolated Git worktree.
 

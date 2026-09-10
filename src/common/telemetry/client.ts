@@ -98,10 +98,3 @@ export function trackEvent(payload: TelemetryEventPayload): void {
     // Silently ignore errors
   });
 }
-
-/**
- * Shutdown telemetry (no-op, kept for API compatibility)
- */
-export function shutdownTelemetry(): void {
-  // No-op - backend handles shutdown
-}

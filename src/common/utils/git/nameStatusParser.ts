@@ -41,7 +41,10 @@ function toFileChangeType(statusCode: string): FileChangeType {
  * `deleted > added > renamed > modified`.
  */
 export function parseNameStatus(output: string): NameStatusEntry[] {
-  const lines = output.trim().split("\n").filter(Boolean);
+  // Split before filtering instead of trimming the whole output: a full trim would
+  // strip trailing whitespace from the LAST line's file path, desyncing it from the
+  // exact paths parseNumstat preserves and losing that file's change status.
+  const lines = output.split("\n").filter(Boolean);
   const byPath = new Map<string, NameStatusEntry>();
 
   for (const line of lines) {

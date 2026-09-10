@@ -1,7 +1,7 @@
+import * as path from "path";
 import { randomUUID } from "crypto";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TIMELINE_FILE_NAME } from "@/common/constants/paths";
 import {
@@ -22,7 +22,7 @@ import {
 } from "@/common/orpc/schemas/timeline";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { HistoryService } from "@/node/services/historyService";
 import { log } from "@/node/services/log";
@@ -67,7 +67,7 @@ type TimelineAppendedListener = (event: { workspaceId: string; events: TimelineE
 
 export class TimelineService implements TimelineRecorder {
   private readonly events = new EventEmitter();
-  private readonly config: Pick<Config, "getSessionDir">;
+  private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">;
   private readonly historyService: HistoryService;
   private readonly experimentsService: Pick<ExperimentsService, "isExperimentEnabled">;
   private readonly writeQueues = new Map<string, Promise<void>>();
@@ -83,7 +83,7 @@ export class TimelineService implements TimelineRecorder {
   private mapperState: TimelineMapperState = createTimelineMapperState();
 
   constructor(
-    config: Pick<Config, "getSessionDir">,
+    config: Pick<WorkspaceSessionLocator, "sessionsDir">,
     historyService: HistoryService,
     experimentsService: Pick<ExperimentsService, "isExperimentEnabled">
   ) {
@@ -526,7 +526,7 @@ export class TimelineService implements TimelineRecorder {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), TIMELINE_FILE_NAME);
+    return path.join(this.config.sessionsDir, workspaceId, TIMELINE_FILE_NAME);
   }
 
   private hasRecentSourceKey(workspaceId: string, sourceKey: string): boolean {

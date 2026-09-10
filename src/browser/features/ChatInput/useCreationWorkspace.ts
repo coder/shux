@@ -66,7 +66,11 @@ import {
 } from "@/browser/features/ChatInput/draftAttachmentsStorage";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { processSlashCommand, type SlashCommandContext } from "@/browser/utils/chatCommands";
+import {
+  processSlashCommand,
+  type CommandAction,
+  type SlashCommandEnv,
+} from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   useWorkspaceName,
@@ -499,6 +503,7 @@ export function useCreationWorkspace({
       );
 
       let createdWorkspaceId: string | null = null;
+      let pendingSendId: string | null = null;
 
       try {
         // Wait for identity generation to complete (blocks if still in progress)
@@ -686,6 +691,34 @@ export function useCreationWorkspace({
           markPendingInitialSend: initialSlashCommand == null,
         });
 
+        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
+        // caller only ever passes XumMessageMetadata built in ChatInput.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
+        const overrideRawCommand =
+          overrideMuxMetadata &&
+          "rawCommand" in overrideMuxMetadata &&
+          typeof overrideMuxMetadata.rawCommand === "string"
+            ? overrideMuxMetadata.rawCommand
+            : null;
+
+        // Runtime startup can take minutes; keep the initial message visible in the new
+        // transcript until the backend echoes it. Files awaiting staging show as inert chips
+        // until the staged notice replaces them below.
+        pendingSendId = `pending-send-${Date.now()}`;
+        const pendingDisplayText = overrideRawCommand ?? messageText;
+        if (initialSlashCommand == null) {
+          workspaceStore.beginPendingSend(metadata.id, {
+            id: pendingSendId,
+            content: pendingDisplayText,
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+            stagingFilenames:
+              pendingFilesToStage.length > 0
+                ? pendingFilesToStage.map((file) => file.filename)
+                : undefined,
+          });
+        }
+
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
           // UI-only: show the created workspace in-place where the draft was rendered.
           promoteWorkspaceDraft(projectPath, draftId, metadata);
@@ -703,19 +736,16 @@ export function useCreationWorkspace({
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
 
-        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
-        // caller only ever passes MuxMessageMetadata built in ChatInput.
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
-        const overrideRawCommand =
-          overrideMuxMetadata &&
-          "rawCommand" in overrideMuxMetadata &&
-          typeof overrideMuxMetadata.rawCommand === "string"
-            ? overrideMuxMetadata.rawCommand
-            : null;
+        if (stagingOutcome.staged.length > 0 && !stagingFailed) {
+          workspaceStore.updatePendingSend(metadata.id, {
+            id: pendingSendId,
+            content: appendStagedAttachmentNotice(pendingDisplayText, stagingOutcome.staged),
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+          });
+        }
 
         if (stagingFailed) {
-          workspaceStore.clearPendingInitialSendState(metadata.id);
+          workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
           // Fail closed: a partial notice would misrepresent the workspace
           // contents. Transfer the draft (staged results kept, failed files
           // still pending) so the user can retry from the workspace composer.
@@ -741,7 +771,7 @@ export function useCreationWorkspace({
 
         if (initialSlashCommand) {
           await initialAiSettingsPersisted;
-          const commandContext: SlashCommandContext = {
+          const commandEnv: SlashCommandEnv = {
             api,
             workspaceId: metadata.id,
             variant: "workspace",
@@ -749,19 +779,26 @@ export function useCreationWorkspace({
             rawInput: messageText,
             dynamicWorkflowsEnabled,
             sendMessageOptions,
-            setInput: () => undefined,
-            setAttachments: () => undefined,
-            setSendingState: () => undefined,
-            setToast,
-            setPreferredModel: () => undefined,
-            setVimEnabled: () => undefined,
-            resetInputHeight: () => undefined,
           };
-          const commandResult = await processSlashCommand(initialSlashCommand, commandContext);
+          // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
+          const applyCommandActions = (actions: CommandAction[]) => {
+            for (const action of actions) {
+              if (action.type === "show-toast") setToast(action.toast);
+            }
+          };
+          let commandResult = await processSlashCommand(initialSlashCommand, commandEnv);
+          while (commandResult.kind === "phase") {
+            applyCommandActions(commandResult.actions);
+            commandResult = await commandResult.continue();
+          }
+          applyCommandActions(commandResult.actions);
+          if (commandResult.backgroundTask) {
+            void commandResult.backgroundTask().then(applyCommandActions);
+          }
           setIsSending(false);
 
-          if (!commandResult.clearInput) {
-            workspaceStore.clearPendingInitialSendState(metadata.id);
+          if (commandResult.inputDisposition !== "consume") {
+            workspaceStore.clearPendingInitialSendState(metadata.id, pendingSendId);
             return { success: false };
           }
 
@@ -825,7 +862,7 @@ export function useCreationWorkspace({
 
         if (!sendResult.success) {
           if (createdWorkspaceId) {
-            workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+            workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
           }
           if (stagingOutcome.staged.length > 0) {
             // The creation draft was already cleared; without a transferred
@@ -848,10 +885,11 @@ export function useCreationWorkspace({
           return { success: false, error: sendResult.error };
         }
 
+        workspaceStore.markPendingSendAccepted(metadata.id, pendingSendId);
         return { success: true };
       } catch (err) {
         if (createdWorkspaceId) {
-          workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+          workspaceStore.clearPendingInitialSendState(createdWorkspaceId, pendingSendId);
         }
         const errorMessage = getErrorMessage(err);
         setToast({
@@ -903,7 +941,7 @@ export function useCreationWorkspace({
         description:
           "Creating a workspace will execute repository scripts. Only trust projects from sources you trust.",
         warning:
-          "This includes .mux/init, .mux/tool_env, .mux/tool_pre, .mux/tool_post, and git hooks.",
+          "This includes .xum/init, .xum/tool_env, .xum/tool_pre, .xum/tool_post, and git hooks.",
         confirmLabel: "Trust and continue",
         cancelLabel: "Don't create",
         onConfirm: async () => {

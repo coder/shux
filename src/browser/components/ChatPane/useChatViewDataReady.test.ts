@@ -1,3 +1,10 @@
+// Bootstrap the baseline DOM before this file's import graph evaluates: the hook's
+// transitive UI imports include modules (e.g. Radix's use-layout-effect) that decide
+// behavior at module-eval time based on `globalThis.document`. Without this, running
+// this file first in a shared bun test process poisons those cached modules for every
+// later UI test file (see tests/ui/dom.ts bootstrap comment).
+import "../../../../tests/ui/dom";
+
 import { describe, expect, test } from "bun:test";
 import { computeChatViewReveal } from "./useChatViewDataReady";
 

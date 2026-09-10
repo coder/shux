@@ -1,9 +1,10 @@
 import path from "path";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import { profileChatInputTyping } from "../utils/chatInputPerf";
 import { seedWorkspaceHistoryProfile } from "../utils/historyFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
 const TYPING_SAMPLE =
   "Diagnose typing latency in a large chat transcript while keeping input responsive.";
@@ -14,7 +15,7 @@ test.skip(
 );
 
 test.describe("chat typing performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: type in composer with large chat history", async ({
     page,

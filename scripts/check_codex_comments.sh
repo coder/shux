@@ -13,6 +13,7 @@ if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
 fi
 
 BOT_LOGIN_GRAPHQL="chatgpt-codex-connector"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PR_DATA_FILE="${MUX_PR_DATA_FILE:-}"
 REGULAR_COMMENTS='[]'
 UNRESOLVED_THREADS='[]'
@@ -80,13 +81,16 @@ compute_codex_sets_from_arrays() {
   local comments_json="$1"
   local threads_json="$2"
 
-  REGULAR_COMMENTS=$(jq -cn --argjson comments "$comments_json" --arg bot "$BOT_LOGIN_GRAPHQL" '[
-    $comments[]
-    | select(.author.login == $bot and .isMinimized == false and (.body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account") | not))
+  # JSON goes through stdin, never argv: a long review history exceeds Linux's
+  # per-argument limit (MAX_ARG_STRLEN, ~128KB) and made --argjson fail with
+  # "Argument list too long". printf is a shell builtin, so it has no such limit.
+  REGULAR_COMMENTS=$(printf '%s' "$comments_json" | jq -c -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" 'include "codex_comments"; [
+    .[]
+    | select(.author.login == $bot and .isMinimized == false and (codex_comment_is_informational($bot) | not))
   ]')
 
-  UNRESOLVED_THREADS=$(jq -cn --argjson threads "$threads_json" --arg bot "$BOT_LOGIN_GRAPHQL" '[
-    $threads[]
+  UNRESOLVED_THREADS=$(printf '%s' "$threads_json" | jq -c --arg bot "$BOT_LOGIN_GRAPHQL" '[
+    .[]
     | select(.isResolved == false and .comments.nodes[0].author.login == $bot)
   ]')
 }
@@ -189,7 +193,8 @@ fetch_all_comments_via_api() {
     fi
 
     page_comments=$(echo "$page_data" | jq -c '.data.repository.pullRequest.comments.nodes // []')
-    all_comments=$(jq -cn --argjson existing "$all_comments" --argjson page "$page_comments" '$existing + $page')
+    # Accumulated pages outgrow MAX_ARG_STRLEN, so concatenate via stdin rather than --argjson.
+    all_comments=$(printf '%s\n%s' "$all_comments" "$page_comments" | jq -cs '.[0] + .[1]')
 
     has_next=$(echo "$page_data" | jq -r '.data.repository.pullRequest.comments.pageInfo.hasNextPage')
     end_cursor=$(echo "$page_data" | jq -r '.data.repository.pullRequest.comments.pageInfo.endCursor // empty')
@@ -262,7 +267,8 @@ fetch_all_threads_via_api() {
     fi
 
     page_threads=$(echo "$page_data" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
-    all_threads=$(jq -cn --argjson existing "$all_threads" --argjson page "$page_threads" '$existing + $page')
+    # Same MAX_ARG_STRLEN concern as the comments accumulator above.
+    all_threads=$(printf '%s\n%s' "$all_threads" "$page_threads" | jq -cs '.[0] + .[1]')
 
     has_next=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
     end_cursor=$(echo "$page_data" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')

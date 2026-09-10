@@ -1,28 +1,33 @@
 function transformImportMetaForJest({ types: t }) {
+  // Shared by MemberExpression and OptionalMemberExpression (`import.meta?.env`,
+  // used by the ESM-only `effect` package) so both spellings rewrite identically.
+  function rewriteImportMetaMember(path) {
+    if (!t.isMetaProperty(path.node.object)) return;
+
+    const meta = path.node.object;
+    if (meta.meta.name !== "import" || meta.property.name !== "meta") return;
+    if (!t.isIdentifier(path.node.property)) return;
+
+    if (path.node.property.name === "env") {
+      path.replaceWith(t.memberExpression(t.identifier("process"), t.identifier("env")));
+      return;
+    }
+
+    if (path.node.property.name === "url") {
+      // `import.meta.url` -> `require("url").pathToFileURL(__filename).toString()`
+      const requireUrl = t.callExpression(t.identifier("require"), [t.stringLiteral("url")]);
+      const pathToFileURL = t.memberExpression(requireUrl, t.identifier("pathToFileURL"));
+      const fileUrl = t.callExpression(pathToFileURL, [t.identifier("__filename")]);
+      const toString = t.memberExpression(fileUrl, t.identifier("toString"));
+      path.replaceWith(t.callExpression(toString, []));
+    }
+  }
+
   return {
     name: "transform-import-meta-for-jest",
     visitor: {
-      MemberExpression(path) {
-        if (!t.isMetaProperty(path.node.object)) return;
-
-        const meta = path.node.object;
-        if (meta.meta.name !== "import" || meta.property.name !== "meta") return;
-        if (!t.isIdentifier(path.node.property)) return;
-
-        if (path.node.property.name === "env") {
-          path.replaceWith(t.memberExpression(t.identifier("process"), t.identifier("env")));
-          return;
-        }
-
-        if (path.node.property.name === "url") {
-          // `import.meta.url` -> `require("url").pathToFileURL(__filename).toString()`
-          const requireUrl = t.callExpression(t.identifier("require"), [t.stringLiteral("url")]);
-          const pathToFileURL = t.memberExpression(requireUrl, t.identifier("pathToFileURL"));
-          const fileUrl = t.callExpression(pathToFileURL, [t.identifier("__filename")]);
-          const toString = t.memberExpression(fileUrl, t.identifier("toString"));
-          path.replaceWith(t.callExpression(toString, []));
-        }
-      },
+      MemberExpression: rewriteImportMetaMember,
+      OptionalMemberExpression: rewriteImportMetaMember,
     },
   };
 }

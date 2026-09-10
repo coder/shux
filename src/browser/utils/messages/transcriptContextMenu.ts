@@ -1,8 +1,11 @@
+import TurndownService from "turndown";
+import type { FormattedClipboardContent } from "@/browser/utils/clipboard";
 import {
   TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR,
   TRANSCRIPT_MESSAGE_SELECTOR,
   TRANSCRIPT_QUOTE_ROOT_SELECTOR,
   TRANSCRIPT_QUOTE_TEXT_ATTRIBUTE,
+  transcriptMermaidSources,
 } from "./transcriptQuoteAttributes";
 
 // Preserve native link context-menu actions (open/copy link, etc.) by treating
@@ -116,14 +119,15 @@ function selectionIntersectsIgnoredChrome(quoteRoot: Element, selectionRange: Ra
 function getSelectedTranscriptText(
   transcriptRoot: HTMLElement,
   selection: Selection | null,
-  target: EventTarget | null
+  target: EventTarget | null,
+  allowDiagrams = false
 ): string | null {
   if (!selection || selection.rangeCount === 0) {
     return null;
   }
 
   const selectedText = normalizeTranscriptText(selection.toString());
-  if (!hasNonWhitespaceTranscriptText(selectedText)) {
+  if (selection.isCollapsed || (!allowDiagrams && !hasNonWhitespaceTranscriptText(selectedText))) {
     return null;
   }
 
@@ -189,6 +193,14 @@ function getSelectedTranscriptText(
     return null;
   }
 
+  if (allowDiagrams && !hasNonWhitespaceTranscriptText(selectedText)) {
+    return Array.from(startQuoteRoot.querySelectorAll(".mermaid-container")).some(
+      (element) =>
+        transcriptMermaidSources.has(element) && hasSelectedContents(selectedRange, element)
+    )
+      ? "mermaid"
+      : null;
+  }
   return selectedText;
 }
 
@@ -308,6 +320,502 @@ export function getTranscriptContextMenuText(
   }
 
   return getHoveredTranscriptText(options.transcriptRoot, options.target);
+}
+
+// Copy only semantic formatting. Transcript content can contain untrusted repository text.
+const CLIPBOARD_TAGS = new Set([
+  "div",
+  "dl",
+  "dt",
+  "dd",
+  "p",
+  "br",
+  "strong",
+  "b",
+  "em",
+  "i",
+  "s",
+  "del",
+  "blockquote",
+  "pre",
+  "code",
+  "ul",
+  "ol",
+  "li",
+  "a",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "hr",
+  "table",
+  "thead",
+  "tbody",
+  "tfoot",
+  "tr",
+  "th",
+  "td",
+  "details",
+  "summary",
+  "sub",
+  "sup",
+]);
+const CLIPBOARD_EXCLUDED_SELECTOR = `script, style, annotation, svg, img, iframe, object, .line-number, .sr-only, button, input, textarea, select, [hidden], [aria-hidden="true"], ${TRANSCRIPT_IGNORE_CONTEXT_MENU_SELECTOR}`;
+
+function isSafeClipboardHref(href: string): boolean {
+  if (!href.trim() || href.includes("\\")) return false;
+  try {
+    // Resolve relative paths only for protocol validation. Keep the original destination when copying.
+    const url = new URL(href, "https://clipboard.invalid/");
+    return ["http:", "https:", "mailto:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function isClipboardElementHidden(element: Element): boolean {
+  const style = element.ownerDocument.defaultView!.getComputedStyle(element);
+  return (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.visibility === "collapse" ||
+    style.opacity === "0"
+  );
+}
+
+function hasSelectedOwnListText(item: Element, range: Range): boolean {
+  for (const child of item.childNodes) {
+    if (!range.intersectsNode(child)) continue;
+    if (child.nodeType === 3) {
+      const start = child === range.startContainer ? range.startOffset : 0;
+      const end = child === range.endContainer ? range.endOffset : child.textContent?.length;
+      if (child.textContent?.slice(start, end).trim()) return true;
+    } else if (child.nodeType === 1) {
+      const element = child as Element;
+      if (!element.matches("ul, ol, input") && hasSelectedOwnListText(element, range)) return true;
+    }
+  }
+  return false;
+}
+
+function hasSelectedContents(range: Range, element: Element): boolean {
+  if (!range.intersectsNode(element)) return false;
+  const intersection = element.ownerDocument.createRange();
+  intersection.selectNodeContents(element);
+  if (range.compareBoundaryPoints(range.START_TO_START, intersection) > 0)
+    intersection.setStart(range.startContainer, range.startOffset);
+  if (range.compareBoundaryPoints(range.END_TO_END, intersection) < 0)
+    intersection.setEnd(range.endContainer, range.endOffset);
+  return !intersection.collapsed;
+}
+
+function appendClipboardNodes(
+  source: Node,
+  destination: Node,
+  range: Range,
+  preserveSpanningTable = false,
+  collectFootnotes = true
+): void {
+  const document = destination.ownerDocument!;
+  for (const child of source.childNodes) {
+    const isTaskMarker =
+      child.nodeType === 1 &&
+      (child as Element).matches('li > input[type="checkbox"][disabled]:first-child') &&
+      hasSelectedOwnListText(child.parentElement!, range);
+    // Empty cells retain column positions and alignment without copying unselected text.
+    const isTableStructure =
+      child.nodeName === "TD" ||
+      child.nodeName === "TH" ||
+      (preserveSpanningTable && ["THEAD", "TBODY", "TFOOT", "TR"].includes(child.nodeName));
+    if (
+      source.nodeName === "DETAILS" &&
+      !(source as Element).hasAttribute("open") &&
+      child.nodeName !== "SUMMARY"
+    )
+      continue;
+    if (!range.intersectsNode(child) && !isTaskMarker && !isTableStructure) {
+      continue;
+    }
+    if (child.nodeType === 3) {
+      const start = child === range.startContainer ? range.startOffset : 0;
+      const end = child === range.endContainer ? range.endOffset : child.textContent?.length;
+      const selectedText = (child.textContent ?? "").slice(start, end);
+      if (selectedText) destination.appendChild(document.createTextNode(selectedText));
+      continue;
+    }
+    if (child.nodeType !== 1) continue;
+    const element = child as Element;
+    if (isClipboardElementHidden(element)) continue;
+    if (element.matches('input[type="checkbox"][disabled]')) {
+      const marker = document.createElement("span");
+      marker.setAttribute("data-clipboard-task", "true");
+      marker.textContent = (element as HTMLInputElement).checked ? "[x] " : "[ ] ";
+      destination.appendChild(marker);
+      continue;
+    }
+    const chart = transcriptMermaidSources.get(element);
+    if (chart != null && hasSelectedContents(range, element)) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.className = "language-mermaid";
+      code.textContent = chart;
+      pre.appendChild(code);
+      destination.appendChild(pre);
+      continue;
+    }
+    if (
+      element.matches(CLIPBOARD_EXCLUDED_SELECTOR) ||
+      element.hasAttribute("data-footnote-backref")
+    )
+      continue;
+    if (element.matches(".katex")) {
+      const tex = element.querySelector('annotation[encoding="application/x-tex"]')?.textContent;
+      if (tex != null) {
+        // Rendered math has duplicate accessibility text. Treat each selected formula as one unit.
+        const math = document.createElement("span");
+        math.textContent = element.closest(".katex-display")
+          ? "$$\n" + tex + "\n$$"
+          : "$$" + tex + "$$";
+        math.setAttribute("data-clipboard-math", math.textContent);
+        destination.appendChild(math);
+        continue;
+      }
+    }
+    // Highlighted code uses a grid, not semantic pre/code elements. Exclude its line numbers.
+    if (element.matches(".code-block-container")) {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      const language = element.getAttribute("data-code-language") ?? "";
+      if (/^[\w.+#-]+$/.test(language)) code.className = `language-${language}`;
+      const lines: string[] = [];
+      for (const line of element.querySelectorAll(".code-line")) {
+        if (!range.intersectsNode(line) || isClipboardElementHidden(line)) continue;
+        const selectedLine = document.createElement("div");
+        appendClipboardNodes(line, selectedLine, range, false, collectFootnotes);
+        lines.push(selectedLine.textContent ?? "");
+      }
+      code.textContent = lines.join("\n");
+      pre.appendChild(code);
+      destination.appendChild(pre);
+      continue;
+    }
+    // Streamdown renders Markdown bold as a styled span instead of a strong element.
+    const tag =
+      element.getAttribute("data-streamdown") === "strong"
+        ? "strong"
+        : element.tagName.toLowerCase();
+    const summary = tag === "details" ? element.querySelector(":scope > summary") : null;
+    // Body-only selections must not create a browser-generated disclosure label.
+    if (
+      !CLIPBOARD_TAGS.has(tag) ||
+      (tag === "details" && (!summary || !range.intersectsNode(summary)))
+    ) {
+      appendClipboardNodes(element, destination, range, preserveSpanningTable, collectFootnotes);
+      continue;
+    }
+    const copy = document.createElement(tag);
+    // Carry selected footnote candidates until both sides of each relationship are known.
+    if (
+      collectFootnotes &&
+      ((tag === "li" && element.id) || element.hasAttribute("data-footnote-ref"))
+    ) {
+      // Generated backlinks and trailing whitespace do not belong to the definition selection.
+      const contents = document.createRange();
+      contents.selectNodeContents(element);
+      const fullCopy = document.createElement("div");
+      const selectedCopy = document.createElement("div");
+      appendClipboardNodes(element, fullCopy, contents, false, false);
+      appendClipboardNodes(element, selectedCopy, range, false, false);
+      const fullySelected = fullCopy.textContent?.trim() === selectedCopy.textContent?.trim();
+      if (tag === "li" && fullySelected) copy.setAttribute("data-clipboard-source-id", element.id);
+      if (tag === "a")
+        copy.setAttribute(
+          "data-clipboard-footnote-candidate",
+          fullySelected ? "complete" : "partial"
+        );
+    }
+    if (tag === "a") {
+      const href = element.getAttribute("href") ?? "";
+      if (isSafeClipboardHref(href)) copy.setAttribute("href", href);
+    }
+    if (tag === "td" || tag === "th") {
+      const cell = element as HTMLTableCellElement;
+      const alignment = cell.getAttribute("align") ?? cell.style.textAlign;
+      if (["left", "center", "right"].includes(alignment)) copy.setAttribute("align", alignment);
+      if (/^\d+$/.test(element.getAttribute("colspan") ?? ""))
+        copy.setAttribute("colspan", String(cell.colSpan));
+      if (/^\d+$/.test(element.getAttribute("rowspan") ?? ""))
+        copy.setAttribute("rowspan", String(cell.rowSpan));
+    }
+    if (tag === "details" && element.hasAttribute("open")) copy.setAttribute("open", "");
+    if (tag === "code") {
+      const languageClass = Array.from(element.classList).find((name) =>
+        /^language-[\w.+#-]+$/.test(name)
+      );
+      if (languageClass) copy.className = languageClass;
+    }
+    // Keep empty spanning-table structure so partial selections retain cell positions.
+    const keepTableStructure =
+      preserveSpanningTable ||
+      (tag === "table" && element.querySelector("[rowspan], [colspan]") !== null);
+    appendClipboardNodes(element, copy, range, keepTableStructure, collectFootnotes);
+    // Range intersection includes empty boundary nodes. Keep only selected content or required structure.
+    if (!copy.hasChildNodes() && !["br", "hr", "td", "th"].includes(tag)) continue;
+    if (tag === "li" && source.nodeName === "OL" && destination.nodeName === "OL") {
+      const listCopy = destination as HTMLOListElement;
+      if (!listCopy.children.length) {
+        let number = (source as HTMLOListElement).start;
+        for (const item of (source as Element).children) {
+          if (item.tagName !== "LI") continue;
+          if (/^[+-]?\d+$/.test(item.getAttribute("value") ?? ""))
+            number = (item as HTMLLIElement).value;
+          if (item === element) break;
+          number++;
+        }
+        listCopy.setAttribute("start", String(number));
+      } else if (/^[+-]?\d+$/.test(element.getAttribute("value") ?? "")) {
+        copy.setAttribute("value", String((element as HTMLLIElement).value));
+      }
+    }
+    destination.appendChild(copy);
+  }
+}
+
+function restoreSelectedFootnotes(container: HTMLElement): void {
+  const definitions = new Map(
+    Array.from(container.querySelectorAll("[data-clipboard-source-id]"), (element) => [
+      element.getAttribute("data-clipboard-source-id")!,
+      element,
+    ])
+  );
+  let referenceNumber = 0;
+  for (const reference of container.querySelectorAll("[data-clipboard-footnote-candidate]")) {
+    const href = reference.getAttribute("href") ?? "";
+    const definition = href.startsWith("#") ? definitions.get(href.slice(1)) : undefined;
+    // Partial selections retain visible numbers, without unresolved navigation targets.
+    if (!definition || reference.getAttribute("data-clipboard-footnote-candidate") !== "complete") {
+      reference.replaceWith(...reference.childNodes);
+      continue;
+    }
+    referenceNumber++;
+    const label =
+      definition.getAttribute("data-clipboard-footnote-definition") ?? String(referenceNumber);
+    definition.setAttribute("data-clipboard-footnote-definition", label);
+    definition.id = "clipboard-fn-" + label;
+    reference.id = "clipboard-fnref-" + referenceNumber;
+    reference.setAttribute("href", "#" + definition.id);
+    reference.setAttribute("data-clipboard-footnote-ref", label);
+    const backlink = container.ownerDocument.createElement("a");
+    backlink.setAttribute("href", "#" + reference.id);
+    backlink.setAttribute("data-clipboard-footnote-backref", "");
+    backlink.textContent = "Back to reference";
+    definition.appendChild(backlink);
+  }
+  for (const element of container.querySelectorAll(
+    "[data-clipboard-source-id], [data-clipboard-footnote-candidate]"
+  )) {
+    element.removeAttribute("data-clipboard-source-id");
+    element.removeAttribute("data-clipboard-footnote-candidate");
+  }
+}
+
+/** Return only the selected chat text, with Markdown and safe rich-text formatting. */
+export function getTranscriptContextMenuMarkdown(
+  options: TranscriptContextMenuTextOptions
+): FormattedClipboardContent | null {
+  const target = getEventTargetElement(options.target);
+  const excludedTarget = target?.closest(CLIPBOARD_EXCLUDED_SELECTOR);
+  const diagramTarget = target?.closest(".mermaid-container");
+  // Permit diagram graphics, but never controls or links inside the diagram.
+  const trustedDiagramTarget =
+    diagramTarget &&
+    excludedTarget?.tagName.toLowerCase() === "svg" &&
+    transcriptMermaidSources.has(diagramTarget) &&
+    !target?.closest(INTERACTIVE_SELECTOR);
+  if (
+    !target ||
+    !options.transcriptRoot.contains(target) ||
+    (excludedTarget && !excludedTarget.closest(".katex") && !trustedDiagramTarget)
+  ) {
+    return null;
+  }
+  if (!getSelectedTranscriptText(options.transcriptRoot, options.selection, options.target, true)) {
+    return null;
+  }
+
+  const range = options.selection!.getRangeAt(0);
+  const quoteRoot = getEventTargetElement(range.startContainer)!.closest(
+    TRANSCRIPT_QUOTE_ROOT_SELECTOR
+  )!;
+  const container = options.transcriptRoot.ownerDocument.createElement("div");
+  // Walk the original range so partial selections retain their formatting and list positions.
+  let selectedList = getEventTargetElement(range.startContainer)?.closest("ul, ol");
+  while (selectedList && !selectedList.contains(range.endContainer)) {
+    selectedList = selectedList.parentElement?.closest("ul, ol");
+  }
+  // A nested-item selection forms its own list, without empty unselected parent tasks.
+  const copyRoot = selectedList?.parentElement?.matches("li")
+    ? selectedList.parentElement
+    : quoteRoot;
+  appendClipboardNodes(copyRoot, container, range);
+  // Drop redundant outer wrappers, but retain boundaries between adjacent raw HTML blocks.
+  while (container.childNodes.length === 1 && container.firstElementChild?.tagName === "DIV") {
+    container.replaceChildren(...container.firstElementChild.childNodes);
+  }
+  restoreSelectedFootnotes(container);
+  const markdown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  // Preserve literal HTML and entities as text when the copied Markdown is parsed again.
+  markdown.escape = (text) =>
+    TurndownService.prototype.escape(text).replace(/&/g, "&amp;").replace(/</g, "\\<");
+  markdown.addRule("footnoteReference", {
+    filter: (node) =>
+      node.nodeName === "SUP" && node.querySelector("[data-clipboard-footnote-ref]") !== null,
+    replacement: (_content, node) =>
+      "[^" +
+      node
+        .querySelector("[data-clipboard-footnote-ref]")!
+        .getAttribute("data-clipboard-footnote-ref") +
+      "]",
+  });
+  markdown.addRule("footnoteDefinition", {
+    filter: (node) => node.hasAttribute("data-clipboard-footnote-definition"),
+    replacement: (content, node) =>
+      "\n\n[^" +
+      node.getAttribute("data-clipboard-footnote-definition") +
+      "]: " +
+      content.trim().replace(/\n/g, "\n    ") +
+      "\n\n",
+  });
+  markdown.addRule("footnoteBacklink", {
+    filter: (node) => node.hasAttribute("data-clipboard-footnote-backref"),
+    replacement: () => "",
+  });
+  markdown.addRule("selectedMathAndTasks", {
+    filter: (node) =>
+      node.hasAttribute("data-clipboard-math") || node.hasAttribute("data-clipboard-task"),
+    replacement: (_content, node) =>
+      node.getAttribute("data-clipboard-math") ?? node.textContent?.trimEnd() ?? "",
+  });
+  markdown.addRule("disclosure", {
+    filter: ["details", "summary"],
+    replacement: (content, node) => {
+      const tag = node.nodeName.toLowerCase();
+      const open = tag === "details" && node.hasAttribute("open") ? " open" : "";
+      return "\n\n<" + tag + open + ">\n\n" + content.trim() + "\n\n</" + tag + ">\n\n";
+    },
+  });
+  markdown.addRule("scripts", {
+    filter: (node) =>
+      ["SUB", "SUP"].includes(node.nodeName) &&
+      !node.querySelector("[data-clipboard-footnote-ref]"),
+    // SECURITY AUDIT: This node contains only the sanitized clipboard elements and attributes.
+    replacement: (_content, node) => node.outerHTML,
+  });
+  markdown.addRule("safeLink", {
+    filter: (node) =>
+      node.nodeName === "A" &&
+      node.hasAttribute("href") &&
+      !node.hasAttribute("data-clipboard-footnote-backref"),
+    replacement: (content, node) => {
+      const href = (node.getAttribute("href") ?? "").replace(/[<>\s]/g, encodeURIComponent);
+      return "[" + content + "](<" + href + ">)";
+    },
+  });
+  markdown.addRule("strikethrough", {
+    filter: ["s", "del"],
+    replacement: (content) => `~~${content}~~`,
+  });
+  // Blank lines let Markdown parse content inside structures that GFM cannot represent.
+  const serializeStructuredHtml = (element: Element): string => {
+    const tag = element.tagName.toLowerCase();
+    const attributes = Array.from(element.attributes, (attribute) => {
+      // SECURITY AUDIT: Safe URL schemes can still contain quotes or HTML delimiters.
+      const value = attribute.value
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return " " + attribute.name + '="' + value + '"';
+    }).join("");
+    const content = element.matches("td, th, li, dt, dd")
+      ? markdown.turndown(element as HTMLElement)
+      : Array.from(element.children, serializeStructuredHtml).join("\n\n");
+    return "<" + tag + attributes + ">\n\n" + content + "\n\n</" + tag + ">";
+  };
+
+  markdown.addRule("definitionList", {
+    filter: "dl",
+    replacement: (_content, node) => "\n\n" + serializeStructuredHtml(node) + "\n\n",
+  });
+  markdown.addRule("numberedList", {
+    filter: (node) =>
+      node.nodeName === "OL" &&
+      (node.querySelector(":scope > li[value]") !== null ||
+        !/^\d{1,9}$/.test(node.getAttribute("start") ?? "1")),
+    replacement: (_content, node) => "\n\n" + serializeStructuredHtml(node) + "\n\n",
+  });
+  markdown.addRule("table", {
+    filter: "table",
+    replacement: (_content, node) => {
+      // GFM cannot represent spans or block content inside cells. Preserve their HTML structure.
+      if (
+        node.querySelector(
+          "[rowspan], [colspan], :is(td, th) :is(pre, p, div, ul, ol, dl, blockquote, h1, h2, h3, h4, h5, h6, details, table, hr)"
+        )
+      ) {
+        return "\n\n" + serializeStructuredHtml(node) + "\n\n";
+      }
+      const rows = Array.from(node.querySelectorAll<HTMLTableRowElement>("tr"), (row) =>
+        Array.from(row.cells, (cell) =>
+          markdown.turndown(cell).replace(/\|/g, "\\|").replace(/\n/g, "<br>")
+        )
+      );
+      const width = Math.max(0, ...rows.map((row) => row.length));
+      if (!width) return "";
+      const firstRow = node.querySelector("tr");
+      // Row headers do not turn the first data record into a column header.
+      if (!firstRow || !Array.from(firstRow.cells).every((cell) => cell.tagName === "TH")) {
+        rows.unshift(Array<string>(width).fill(""));
+      }
+      rows.splice(
+        1,
+        0,
+        Array.from({ length: width }, (_, index) => {
+          const alignment = firstRow?.cells[index]?.getAttribute("align");
+          return alignment === "left"
+            ? ":---"
+            : alignment === "right"
+              ? "---:"
+              : alignment === "center"
+                ? ":---:"
+                : "---";
+        })
+      );
+      return (
+        "\n\n" +
+        rows
+          .map(
+            (row) =>
+              "| " +
+              Array.from({ length: width }, (_, index) => row[index] ?? "").join(" | ") +
+              " |"
+          )
+          .join("\n") +
+        "\n\n"
+      );
+    },
+  });
+  const text = markdown.turndown(container);
+  if (!text.trim()) return null;
+  for (const element of container.querySelectorAll("*")) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.startsWith("data-clipboard-")) element.removeAttribute(attribute.name);
+    }
+  }
+  // SECURITY AUDIT: Serialize only allowlisted elements and attributes, never the original selection HTML.
+  return { text, html: container.innerHTML };
 }
 
 /**

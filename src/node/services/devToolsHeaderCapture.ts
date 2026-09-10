@@ -5,7 +5,7 @@ import assert from "@/common/utils/assert";
  *
  * The middleware injects a synthetic header (x-mux-devtools-step-id) into
  * AI SDK call params. The default fetch function calls captureAndStripDevToolsHeader()
- * after building final headers (including the Mux user-agent), which captures
+ * after building final headers (including the Xum user-agent), which captures
  * all real request headers keyed by step ID and strips the synthetic header
  * before the request is sent.
  */
@@ -89,7 +89,7 @@ export function consumeCapturedRequestHeaders(stepId: string): Record<string, st
  * strips the synthetic header. Mutates the Headers object in place.
  *
  * Called inside defaultFetchWithUnlimitedTimeout after buildAIProviderRequestHeaders
- * so captured headers include the Mux user-agent and all provider-added headers.
+ * so captured headers include the Xum user-agent and all provider-added headers.
  * No-op when the synthetic header is absent (i.e., devtools middleware is not active).
  */
 export function captureAndStripDevToolsHeader(headers: Headers): void {

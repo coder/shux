@@ -7,13 +7,13 @@ import { installDom } from "../../../../tests/ui/dom";
 
 // SVG ?react imports don't work in happy-dom; stub them as simple divs.
 const SvgStub = (props: Record<string, unknown>) =>
-  React.createElement("svg", { "data-testid": "mux-logo-mock", ...props });
+  React.createElement("svg", { "data-testid": "xum-logo-mock", ...props });
 
-void mock.module("@/browser/assets/logos/mux-logo-dark.svg?react", () => ({
+void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,
   default: SvgStub,
 }));
-void mock.module("@/browser/assets/logos/mux-logo-light.svg?react", () => ({
+void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
   __esModule: true,
   default: SvgStub,
 }));
@@ -45,7 +45,7 @@ describe("LoadingScreen", () => {
     cleanupDom = null;
   });
 
-  test("renders boot loader markup with Mux logo and animated dots", () => {
+  test("renders boot loader markup with Xum logo and animated dots", () => {
     const { container, getByRole, getByTestId, getByText } = render(
       <ThemeProvider>
         <LoadingScreen />
@@ -53,8 +53,8 @@ describe("LoadingScreen", () => {
     );
 
     expect(getByRole("status")).toBeTruthy();
-    expect(getByTestId("mux-logo-mock")).toBeTruthy();
-    expect(getByText("Loading Mux")).toBeTruthy();
+    expect(getByTestId("xum-logo-mock")).toBeTruthy();
+    expect(getByText("Loading Xum")).toBeTruthy();
     // Animated dots span is present for default text
     expect(container.querySelector(".boot-loader__dots")).toBeTruthy();
   });

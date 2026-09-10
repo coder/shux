@@ -3,7 +3,7 @@ import { MemoryBrowser } from "@/browser/features/Memory/MemoryBrowser";
 /**
  * Settings → Memory (experiment: "memory") — manages GLOBAL memory files
  * without a workspace: the memory.* routes are called with workspaceId null,
- * so only the global scope (~/.mux/memory/global) is reachable. Project/workspace
+ * so only the global scope (~/.xum/memory/global) is reachable. Project/workspace
  * memories are curated from each workspace's Memory tab instead.
  */
 export function MemorySection() {

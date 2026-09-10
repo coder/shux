@@ -1,3 +1,7 @@
+import {
+  createContextBudgetRejectedMessage,
+  restoreContextBudgetRejectedMessageForDisplay,
+} from "./contextBudgetRejection";
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
 
@@ -128,14 +132,64 @@ const PRESERVE_OUTPUT_TOOLS = new Set([
   "task",
   "task_await",
   "task_list",
+  "task_retitle",
+  "task_stop",
+  "task_remove",
+  "task_workspace_lifecycle",
   "task_terminate",
   "task_apply_git_patch",
 ]);
+
+/**
+ * task_workspace_lifecycle results stay preserved so shared lifecycle cards keep their
+ * per-target statuses, but some fields carry local filenames the exporter chose not to
+ * share: `paths` (the requires_confirmation untracked-file list) plus free-text `error`
+ * and `note`. Redact those fields while keeping the status/action/id fields the card
+ * renders from.
+ */
+function redactWorkspaceLifecycleOutputForSharing(output: unknown): unknown {
+  // Persistence may wrap the result in the SDK JSON container ({ type: "json", value })
+  // — the renderer unwraps this exact shape (see toolUtils.unwrapResult) — so redaction
+  // must unwrap, redact, and rewrap or a wrapped export would leak the local paths this
+  // function exists to remove.
+  if (
+    typeof output === "object" &&
+    output !== null &&
+    "type" in output &&
+    (output as { type: unknown }).type === "json" &&
+    "value" in output
+  ) {
+    const wrapper = output as { value: unknown };
+    const redactedValue = redactWorkspaceLifecycleOutputForSharing(wrapper.value);
+    return redactedValue === wrapper.value ? output : { ...wrapper, value: redactedValue };
+  }
+  if (typeof output !== "object" || output === null || !("results" in output)) return output;
+  const { results } = output;
+  if (!Array.isArray(results)) return output;
+  return {
+    ...output,
+    results: results.map((target: unknown) => {
+      if (typeof target !== "object" || target === null) return target;
+      const redacted = { ...(target as Record<string, unknown>) };
+      delete redacted.paths;
+      delete redacted.error;
+      delete redacted.note;
+      return redacted;
+    }),
+  };
+}
 
 function stripToolPartOutput(part: MuxToolPart): MuxToolPart {
   const nestedCalls = part.nestedCalls?.map(stripNestedToolCallOutput);
 
   if (PRESERVE_OUTPUT_TOOLS.has(part.toolName)) {
+    if (part.toolName === "task_workspace_lifecycle" && part.state === "output-available") {
+      return {
+        ...part,
+        output: redactWorkspaceLifecycleOutputForSharing(part.output),
+        ...(nestedCalls ? { nestedCalls } : {}),
+      };
+    }
     return nestedCalls ? { ...part, nestedCalls } : part;
   }
 
@@ -212,7 +266,7 @@ function inlinePlanContentForSharing(
 
       // For shared transcripts, inline plan content into completed propose_plan tool calls.
       // We intentionally do not try to match `planSnapshot.path` to `output.planPath` — tool output
-      // often uses `~/.mux/...` while the snapshot path is resolved, and path normalization is
+      // often uses `~/.xum/...` while the snapshot path is resolved, and path normalization is
       // brittle across platforms.
       if ("planContent" in output) {
         return part;
@@ -246,9 +300,20 @@ export function buildChatJsonlForSharing(
 
   const includeToolOutput = options.includeToolOutput ?? true;
 
+  // Sanitize the display payload as well, then retain inert capsules in the exported JSONL.
+  const displayMessages = messages.map((message) => {
+    const display = restoreContextBudgetRejectedMessageForDisplay(message);
+    if (!includeToolOutput && display.metadata?.contextBudgetRejectedMessage != null) {
+      // A malformed original could not be projected, so its opaque bytes cannot be safely redacted.
+      const metadata = { ...display.metadata };
+      delete metadata.contextBudgetRejectedMessage;
+      return { ...display, metadata };
+    }
+    return display;
+  });
   const withPlanInlined = options.planSnapshot
-    ? inlinePlanContentForSharing(messages, options.planSnapshot)
-    : messages;
+    ? inlinePlanContentForSharing(displayMessages, options.planSnapshot)
+    : displayMessages;
 
   const sanitized = includeToolOutput
     ? withPlanInlined
@@ -259,6 +324,7 @@ export function buildChatJsonlForSharing(
   return (
     compacted
       .map((msg): ChatJsonlEntry => {
+        if (msg.metadata?.contextBudgetRejected) msg = createContextBudgetRejectedMessage(msg);
         if (options.workspaceId === undefined) {
           return msg;
         }

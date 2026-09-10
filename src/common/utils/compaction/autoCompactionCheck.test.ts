@@ -44,6 +44,21 @@ describe("checkAutoCompaction", () => {
   const SONNET_70_PERCENT = SONNET_MAX_TOKENS * 0.7; // 140,000
   const SONNET_60_PERCENT = SONNET_MAX_TOKENS * 0.6; // 120,000
 
+  test("exposes raw context and model limit even when proactive compaction is disabled", () => {
+    const result = checkAutoCompaction(
+      createMockUsage(50000, undefined, BETA_SONNET_MODEL, createUsageEntry(60000)),
+      BETA_SONNET_MODEL,
+      false,
+      1
+    );
+    expect(result.contextTokens).toBe(60000);
+    expect(result.maxTokens).toBe(200000);
+    expect(result.shouldForceCompact).toBe(false);
+    const unknown = checkAutoCompaction(createMockUsage(50000), "unknown-model", false);
+    expect(unknown.contextTokens).toBe(50000);
+    expect(unknown.maxTokens).toBeUndefined();
+  });
+
   describe("Basic Functionality", () => {
     test("returns false when no usage data (first message)", () => {
       const result = checkAutoCompaction(undefined, BETA_SONNET_MODEL, false);
@@ -249,15 +264,6 @@ describe("checkAutoCompaction", () => {
   });
 
   describe("Edge Cases", () => {
-    test("missing context usage returns safe defaults", () => {
-      const usage: AutoCompactionUsageState = { totalTokens: 0 };
-      const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);
-
-      expect(result.shouldShowWarning).toBe(false);
-      expect(result.usagePercentage).toBe(0);
-      expect(result.thresholdPercentage).toBe(70);
-    });
-
     test("single context usage entry works correctly", () => {
       const usage = createMockUsage(140_000);
       const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);

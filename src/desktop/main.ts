@@ -2,17 +2,32 @@
 // Must be set before any filesystem operations occur.
 process.umask(0o077);
 
+import { installEpipeGuard, isEpipeError } from "./utils/epipeGuard";
+
+// When the launching terminal exits (packaged Linux/AppImage), stdout/stderr
+// become dead pipes and every console write raises EPIPE. Swallow those before
+// anything logs so they can never crash the app or loop the error dialog (#3082).
+installEpipeGuard(process.stdout);
+installEpipeGuard(process.stderr);
+
 // Enable source map support for better error stack traces in production
+import "@/node/compat/installLegacyMuxEnvironment";
 import "source-map-support/register";
-import * as fs from "node:fs";
 import { promises as fsPromises } from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
+import { cleanupObsoleteXumBinArtifacts, getXumHome } from "@/common/constants/paths";
+import { getElectronAppIdentity } from "@/common/compat/electronAppIdentity";
 import {
-  cleanupObsoleteMuxBinArtifacts,
-  getMuxHome,
-  migrateLegacyMuxHome,
-} from "@/common/constants/paths";
+  SUPPORTED_XUM_PROTOCOL_SCHEMES,
+  resolveXumEnvironmentValue,
+} from "@/common/compat/legacyMux";
+import { XUM_PRODUCT_DESCRIPTION } from "@/common/constants/product";
+import {
+  initializeXumHomeTransition,
+  initializeXumUserDataTransition,
+} from "@/node/compat/xumTransition";
 
 // Fix PATH on macOS when launched from Finder (not terminal).
 // GUI apps inherit minimal PATH from launchd, missing Homebrew tools like git-lfs.
@@ -27,15 +42,12 @@ if (process.platform === "darwin") {
   }
 }
 
-// Migrate ~/.cmux and clean obsolete mux-managed bin artifacts before startup uses mux home paths.
-try {
-  migrateLegacyMuxHome();
-  cleanupObsoleteMuxBinArtifacts();
-} catch (error) {
-  // Startup initialization must never crash the app.
-  console.debug("[mux-home] Failed mux home startup migrations:", error);
-}
-
+import { DesktopWindowManager } from "./desktopWindowManager";
+import { RemoteConnectionManager } from "./remoteConnectionManager";
+import {
+  REMOTE_CONNECTION_CHANNELS,
+  REMOTE_CONNECTION_RETURN_ACCELERATOR,
+} from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
@@ -44,7 +56,15 @@ import { formatOrpcError } from "../node/orpc/formatOrpcError";
 import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
 
-import type { MenuItemConstructorOptions, MessageBoxOptions } from "electron";
+import type {
+  BrowserWindowConstructorOptions,
+  Event as ElectronEvent,
+  IpcMainEvent,
+  IpcMainInvokeEvent,
+  MenuItemConstructorOptions,
+  MessageBoxOptions,
+  WebContents,
+} from "electron";
 import {
   app,
   crashReporter,
@@ -59,23 +79,94 @@ import {
   shell,
 } from "electron";
 
-// Pin the Linux app name so the window groups under mux.desktop instead of a
-// generic "Electron" entry. Launch modes that don't expose our package.json
-// (e.g. the Nix package's `electron dist/cli/index.js`) otherwise fall back to
-// the "Electron" default. setName sets WM_CLASS (XWayland matches
-// StartupWMClass=mux); CHROME_DESKTOP sets the native-Wayland app_id (same var
-// Electron sets from package.json desktopName when it can read it). Must run
-// before the ready event. sanitizeMuxChildEnv strips CHROME_DESKTOP from child
-// processes so apps launched from mux terminals don't inherit our identity.
-if (process.platform === "linux") {
-  app.setName("mux");
-  process.env.CHROME_DESKTOP = "mux.desktop";
+const getXumEnv = (suffix: string): string | undefined =>
+  resolveXumEnvironmentValue(suffix, process.env);
+
+const isE2ETest = getXumEnv("E2E") === "1";
+const forceDistLoad = getXumEnv("E2E_LOAD_DIST") === "1";
+
+// Split display name from desktop/userData identity before Electron creates windows.
+// Linux keeps the lowercase slug for WM_CLASS / Wayland app_id; other platforms use "Xum"
+// so app.getName() (and the macOS application menu) stay display-cased. userData is set
+// explicitly to the slug directory later so setName() cannot fork storage casing.
+const electronAppIdentity = getElectronAppIdentity(process.platform);
+app.setName(electronAppIdentity.appName);
+if (electronAppIdentity.chromeDesktop != null) {
+  // sanitizeXumChildEnv strips CHROME_DESKTOP from child processes launched in terminals.
+  process.env.CHROME_DESKTOP = electronAppIdentity.chromeDesktop;
 }
 
-// Enable local crash dump collection so renderer SIGSEGV produces a minidump
-// at ~/.config/mux/Crashpad/completed/*.dmp — no data leaves the machine.
-// Must be called as early as possible, before app.whenReady().
-crashReporter.start({ uploadToServer: false });
+async function isUsableDirectory(candidatePath: string): Promise<boolean> {
+  try {
+    return (await fsPromises.stat(candidatePath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Home and userData transitions must finish before crashReporter, the single-instance
+ * lock, services, or windows. Electron is already imported (CJS hoists requires), but
+ * app.setPath("userData") still has to complete before those later APIs run.
+ */
+async function initializeXumDesktopStorage(): Promise<void> {
+  try {
+    const transition = await initializeXumHomeTransition();
+    cleanupObsoleteXumBinArtifacts(transition.activePath);
+    for (const issue of transition.issues) {
+      console.debug("[xum-transition]", issue);
+    }
+  } catch (error) {
+    // Startup initialization must never crash the app.
+    console.debug("[xum-transition] Failed home transition:", error);
+  }
+
+  if (isE2ETest) {
+    // E2E state remains inside the explicitly isolated XUM_ROOT/MUX_ROOT directory.
+    const e2eUserData = path.join(getXumHome(), "user-data");
+    try {
+      await fsPromises.mkdir(e2eUserData, { recursive: true });
+      app.setPath("userData", e2eUserData);
+      console.log("Using test userData directory:", e2eUserData);
+    } catch (error) {
+      console.warn("Failed to prepare test userData directory:", error);
+    }
+    return;
+  }
+
+  const appDataDir = app.getPath("appData");
+  const canonicalUserData = path.join(appDataDir, electronAppIdentity.userDataDirName);
+  try {
+    const transition = await initializeXumUserDataTransition({
+      appDataDir,
+      platform: process.platform,
+    });
+    if (await isUsableDirectory(transition.activePath)) {
+      app.setPath("userData", transition.activePath);
+    } else {
+      console.debug(
+        "[xum-transition] Refusing to set userData to a non-directory:",
+        transition.activePath
+      );
+    }
+    for (const issue of transition.issues) {
+      console.debug("[xum-transition]", issue);
+    }
+  } catch (error) {
+    // Never fall back to Electron's name-derived userData: display-cased setName("Xum")
+    // would otherwise create a parallel Xum/ directory beside the canonical xum/ slug.
+    // Also never point userData at an obstructing file or broken alias.
+    console.debug("[xum-transition] Failed Electron userData transition:", error);
+    if (await isUsableDirectory(canonicalUserData)) {
+      app.setPath("userData", canonicalUserData);
+    } else {
+      console.debug(
+        "[xum-transition] Refusing to set userData to a non-directory:",
+        canonicalUserData
+      );
+    }
+  }
+}
 
 // Increase renderer V8 heap limit from default ~4GB to 8GB.
 // At ~3.9GB usage, the default limit causes frequent Mark-Compact GC cycles
@@ -86,9 +177,9 @@ app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
 import type { Config } from "../node/config";
 import type { ServiceContainer } from "../node/services/serviceContainer";
 import { VERSION } from "../version";
-import type { MuxDeepLinkPayload } from "../common/types/deepLink";
+import type { DeepLinkPayload } from "../common/types/deepLink";
 import type { UpdateStatus } from "../common/orpc/types";
-import { parseMuxDeepLink } from "../common/utils/deepLink";
+import { parseXumDeepLink } from "../common/utils/deepLink";
 
 import { normalizeAndValidateExternalUrl } from "./utils/normalizeAndValidateExternalUrl";
 import { hasSameOrigin } from "./utils/hasSameOrigin";
@@ -100,9 +191,9 @@ import windowStateKeeper from "electron-window-state";
 import { getTitleBarOptions } from "./titleBarOptions";
 import { isUpdateInstallInProgress } from "./updateInstallState";
 import {
-  getMuxDeepLinksFromArgv,
-  getMuxProtocolClientRegistration,
-} from "./utils/muxProtocolRegistration";
+  getXumDeepLinksFromArgv,
+  getXumProtocolClientRegistration,
+} from "./utils/xumProtocolRegistration";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 
@@ -124,39 +215,72 @@ import { log } from "@/node/services/log";
 // These will be loaded on-demand when createWindow() is called
 let config: Config | null = null;
 let services: ServiceContainer | null = null;
-const requireDesktopModule = createRequire(__filename);
-const isE2ETest = process.env.MUX_E2E === "1";
-const forceDistLoad = process.env.MUX_E2E_LOAD_DIST === "1";
+let remoteConnectionManager: RemoteConnectionManager | null = null;
+const localIpcWindows = new Map<WebContents, URL>();
 
-if (isE2ETest) {
-  // For e2e tests, use a test-specific userData directory
-  // Note: getMuxHome() already respects MUX_ROOT for test isolation
-  const e2eUserData = path.join(getMuxHome(), "user-data");
+function isTrustedLocalUrl(target: string, expected: URL): boolean {
   try {
-    fs.mkdirSync(e2eUserData, { recursive: true });
-    app.setPath("userData", e2eUserData);
-    console.log("Using test userData directory:", e2eUserData);
-  } catch (error) {
-    console.warn("Failed to prepare test userData directory:", error);
+    const url = new URL(target);
+    return expected.protocol === "file:"
+      ? url.protocol === "file:" && url.host === expected.host && url.pathname === expected.pathname
+      : url.origin === expected.origin;
+  } catch {
+    return false;
   }
 }
 
-// MUX_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
+function createLocalWindow(
+  options: BrowserWindowConstructorOptions,
+  page: "index.html" | "terminal.html" | "desktop.html" = "index.html"
+): BrowserWindow {
+  const window = new BrowserWindow(options);
+  const contents = window.webContents;
+  const expected =
+    !app.isPackaged && !forceDistLoad
+      ? new URL(
+          page === "terminal.html"
+            ? "http://localhost:5173"
+            : "http://" + (getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1") + ":" + devServerPort
+        )
+      : pathToFileURL(path.join(__dirname, "..", page));
+  localIpcWindows.set(contents, expected);
+  contents.once("destroyed", () => localIpcWindows.delete(contents));
+  // Redirects and other packaged files must not retain this window's privileged preload.
+  const guardNavigation = (event: ElectronEvent, target: string): void => {
+    if (!isTrustedLocalUrl(target, expected)) event.preventDefault();
+  };
+  contents.on("will-navigate", guardNavigation);
+  contents.on("will-redirect", guardNavigation);
+  return window;
+}
+
+function isLocalIpcSender(event: IpcMainEvent | IpcMainInvokeEvent): boolean {
+  const expected = localIpcWindows.get(event.sender);
+  return (
+    expected != null &&
+    event.senderFrame === event.sender.mainFrame &&
+    isTrustedLocalUrl(event.senderFrame.url, expected)
+  );
+}
+
+const requireDesktopModule = createRequire(__filename);
+
+// XUM_PROXY_URI is canonical; the transition layer mirrors legacy MUX_PROXY_URI.
 const localhostProxyTemplate =
   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: empty/whitespace-only env vars should be treated as unset
-  process.env.MUX_PROXY_URI?.trim() || process.env.VSCODE_PROXY_URI?.trim() || undefined;
+  getXumEnv("PROXY_URI")?.trim() || process.env.VSCODE_PROXY_URI?.trim() || undefined;
 
-const devServerPort = process.env.MUX_DEVSERVER_PORT ?? "5173";
+const devServerPort = getXumEnv("DEVSERVER_PORT") ?? "5173";
 
 console.log(
-  `Mux starting - version: ${(VERSION as { git?: string; buildTime?: string }).git ?? "(dev)"} (built: ${(VERSION as { git?: string; buildTime?: string }).buildTime ?? "dev-mode"})`
+  `Xum starting - version: ${(VERSION as { git?: string; buildTime?: string }).git ?? "(dev)"} (built: ${(VERSION as { git?: string; buildTime?: string }).buildTime ?? "dev-mode"})`
 );
 console.log("Main process starting...");
 
-// Debug: abort immediately if MUX_DEBUG_START_TIME is set
-// This is used to measure baseline startup time without full initialization
-if (process.env.MUX_DEBUG_START_TIME === "1") {
-  console.log("MUX_DEBUG_START_TIME is set - aborting immediately");
+// Debug: abort immediately if XUM_DEBUG_START_TIME (or legacy MUX_DEBUG_START_TIME) is set.
+// This is used to measure baseline startup time without full initialization.
+if (getXumEnv("DEBUG_START_TIME") === "1") {
+  console.log("XUM_DEBUG_START_TIME is set - aborting immediately");
   process.exit(0);
 }
 
@@ -169,8 +293,9 @@ process.on("uncaughtException", (error: unknown) => {
 
   console.error("Stack:", stack);
 
-  // Show error dialog in production
-  if (app.isPackaged) {
+  // Show error dialog in production. EPIPE never warrants a modal: it means a
+  // pipe reader went away (defense-in-depth for streams the guard above misses).
+  if (app.isPackaged && !isEpipeError(error)) {
     dialog.showErrorBox(
       "Application Error",
       `An unexpected error occurred:\n\n${message}\n\nStack trace:\n${stack ?? "No stack trace available"}`
@@ -182,7 +307,7 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise);
   console.error("Reason:", reason);
 
-  if (app.isPackaged) {
+  if (app.isPackaged && !isEpipeError(reason)) {
     const message = getErrorMessage(reason);
     const stack = reason instanceof Error ? reason.stack : undefined;
     dialog.showErrorBox(
@@ -192,31 +317,9 @@ process.on("unhandledRejection", (reason, promise) => {
   }
 });
 
-// Single instance lock (can be disabled for development with CMUX_ALLOW_MULTIPLE_INSTANCES=1)
-const allowMultipleInstances = process.env.CMUX_ALLOW_MULTIPLE_INSTANCES === "1";
-const gotTheLock = allowMultipleInstances || app.requestSingleInstanceLock();
-console.log("Single instance lock acquired:", gotTheLock);
-
-if (!gotTheLock) {
-  // Another instance is already running, quit this one
-  console.log("Another instance is already running, quitting...");
-  app.quit();
-} else {
-  // This is the primary instance
-  console.log("This is the primary instance");
-  app.on("second-instance", (_event, argv) => {
-    // Someone tried to run a second instance, focus our window instead
-    console.log("Second instance attempted to start");
-
-    try {
-      handleArgvMuxDeepLinks(argv);
-    } catch (error) {
-      console.debug("[deep-link] Failed to parse second-instance argv for mux deep links:", error);
-    }
-
-    focusMainWindow();
-  });
-}
+// Single-instance locking can be disabled for development with XUM_ALLOW_MULTIPLE_INSTANCES=1.
+// The compatibility layer also accepts MUX_ and the older CMUX_ spelling.
+const allowMultipleInstances = getXumEnv("ALLOW_MULTIPLE_INSTANCES") === "1";
 
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
@@ -225,55 +328,55 @@ let isQuitting = false;
 let latestUpdateStatus: UpdateStatus = { type: "idle" };
 let isUpdateClosePromptOpen = false;
 
-// mux:// deep links can arrive before the main window exists / finishes loading.
-const bufferedMuxDeepLinks: MuxDeepLinkPayload[] = [];
+// xum:// and legacy mux:// deep links can arrive before the main window finishes loading.
+const bufferedXumDeepLinks: DeepLinkPayload[] = [];
 let mainWindowFinishedLoading = false;
 
 function focusMainWindow() {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
-  // Closing Mux on Windows hides to tray; show it again when a second-instance launch occurs.
+  // Closing Xum on Windows hides to tray; show it again when a second-instance launch occurs.
   mainWindow.show();
   mainWindow.focus();
 }
 
-function flushBufferedMuxDeepLinks() {
+function flushBufferedXumDeepLinks() {
   if (!mainWindow || !mainWindowFinishedLoading) return;
 
-  while (bufferedMuxDeepLinks.length > 0) {
-    const payload = bufferedMuxDeepLinks[0];
+  while (bufferedXumDeepLinks.length > 0) {
+    const payload = bufferedXumDeepLinks[0];
     try {
       mainWindow.webContents.send("mux:deep-link", payload);
-      bufferedMuxDeepLinks.shift();
+      bufferedXumDeepLinks.shift();
     } catch (error) {
       // Best-effort: never crash startup if the renderer isn't ready.
-      console.debug("[deep-link] Failed to send mux deep link payload:", error);
+      console.debug("[deep-link] Failed to send xum/mux deep-link payload:", error);
       return;
     }
   }
 }
 
-function handleMuxDeepLink(raw: string) {
+function handleXumDeepLink(raw: string) {
   try {
-    const payload = parseMuxDeepLink(raw);
+    const payload = parseXumDeepLink(raw);
     if (!payload) return;
 
     // Buffer until the renderer has finished loading.
     if (!mainWindow || !mainWindowFinishedLoading) {
-      bufferedMuxDeepLinks.push(payload);
+      bufferedXumDeepLinks.push(payload);
       return;
     }
 
     mainWindow.webContents.send("mux:deep-link", payload);
   } catch (error) {
     // Best-effort: never crash startup if argv parsing/protocol handling is weird.
-    console.debug(`[deep-link] Failed to handle mux deep link: ${raw}`, error);
+    console.debug(`[deep-link] Failed to handle xum/mux deep link: ${raw}`, error);
   }
 }
 
-function handleArgvMuxDeepLinks(argv: string[]) {
-  for (const arg of getMuxDeepLinksFromArgv(argv)) {
-    handleMuxDeepLink(arg);
+function handleArgvXumDeepLinks(argv: string[]) {
+  for (const arg of getXumDeepLinksFromArgv(argv)) {
+    handleXumDeepLink(arg);
   }
 }
 
@@ -281,21 +384,21 @@ function handleArgvMuxDeepLinks(argv: string[]) {
 if (process.platform === "darwin") {
   app.on("open-url", (event, url) => {
     event.preventDefault();
-    handleMuxDeepLink(url);
+    handleXumDeepLink(url);
     focusMainWindow();
   });
 }
 
 // Initial launch: Windows/Linux deep links are passed in argv.
 try {
-  handleArgvMuxDeepLinks(process.argv);
+  handleArgvXumDeepLinks(process.argv);
 } catch (error) {
-  console.debug("[deep-link] Failed to parse initial argv for mux deep links:", error);
+  console.debug("[deep-link] Failed to parse initial argv for xum/mux deep links:", error);
 }
 
-function registerMuxProtocolClient() {
+function registerXumProtocolClients() {
   try {
-    const registration = getMuxProtocolClientRegistration({
+    const registration = getXumProtocolClientRegistration({
       platform: process.platform,
       isPackaged: app.isPackaged,
       defaultApp: process.defaultApp,
@@ -303,15 +406,16 @@ function registerMuxProtocolClient() {
       execPath: process.execPath,
     });
 
-    if (registration) {
-      app.setAsDefaultProtocolClient("mux", registration.executable, registration.args);
-      return;
+    for (const scheme of SUPPORTED_XUM_PROTOCOL_SCHEMES) {
+      if (registration) {
+        app.setAsDefaultProtocolClient(scheme, registration.executable, registration.args);
+      } else {
+        app.setAsDefaultProtocolClient(scheme);
+      }
     }
-
-    app.setAsDefaultProtocolClient("mux");
   } catch (error) {
     // Best-effort: never crash startup if protocol registration fails.
-    console.debug("[deep-link] Failed to register mux:// protocol handler:", error);
+    console.debug("[deep-link] Failed to register xum:// and mux:// handlers:", error);
   }
 }
 
@@ -325,6 +429,49 @@ function timestamp(): string {
   const seconds = String(now.getSeconds()).padStart(2, "0");
   const ms = String(now.getMilliseconds()).padStart(3, "0");
   return `${hours}:${minutes}:${seconds}.${ms}`;
+}
+
+function initializeRemoteConnections(): void {
+  const manager = new RemoteConnectionManager({
+    createWindow: (options) => new BrowserWindow(options),
+    onConnected: () => mainWindow?.hide(),
+    onDisconnected: () => {
+      if (!isQuitting) openXumFromTray();
+    },
+    onStateChanged: (state) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.stateChanged, state);
+      }
+      const returnItem = Menu.getApplicationMenu()?.getMenuItemById("return-to-local");
+      if (returnItem) returnItem.enabled = state.status !== "disconnected";
+    },
+    openExternal: (url) => {
+      shell.openExternal(url).catch(() => {
+        log.warn("Cannot open the remote server link in the browser.");
+      });
+    },
+  });
+  remoteConnectionManager = manager;
+
+  // Keep desktop connection controls off the network API and out of remote pages.
+  const assertLocalController = (event: IpcMainInvokeEvent): void => {
+    if (!isLocalIpcSender(event) || event.sender !== mainWindow?.webContents) {
+      throw new Error("Remote connection controls require the local desktop window.");
+    }
+  };
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.getState, (event) => {
+    assertLocalController(event);
+    return manager.getState();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.connect, (event, url: unknown) => {
+    assertLocalController(event);
+    if (typeof url !== "string") throw new Error("Enter a valid server URL.");
+    return manager.connect(url);
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.disconnect, (event) => {
+    assertLocalController(event);
+    manager.disconnect();
+  });
 }
 
 function createMenu() {
@@ -369,7 +516,20 @@ function createMenu() {
     },
     {
       label: "Window",
-      submenu: [{ role: "minimize" }, { role: "close" }],
+      submenu: [
+        { role: "minimize" },
+        { role: "close" },
+        { type: "separator" },
+        {
+          id: "return-to-local",
+          label: "Return to Local",
+          accelerator: REMOTE_CONNECTION_RETURN_ACCELERATOR,
+          enabled:
+            remoteConnectionManager?.getState().status !== "disconnected" &&
+            remoteConnectionManager != null,
+          click: () => remoteConnectionManager?.disconnect(),
+        },
+      ],
     },
   ];
 
@@ -383,6 +543,7 @@ function createMenu() {
           label: "Settings...",
           accelerator: "Cmd+,",
           click: () => {
+            openXumFromTray();
             services?.menuEventService.emitOpenSettings();
           },
         },
@@ -450,7 +611,7 @@ function loadTrayIconImage() {
   return image;
 }
 
-function openMuxFromTray() {
+function openXumFromTray() {
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
@@ -458,15 +619,8 @@ function openMuxFromTray() {
     return;
   }
 
-  // On macOS the app stays open after all windows are closed; recreate the window.
-  if (process.platform === "darwin") {
-    if (!services) {
-      console.warn(`[${timestamp()}] [tray] Cannot open mux (services not loaded yet)`);
-      return;
-    }
-
-    createWindow();
-  }
+  // A remote window can keep the app open after the local window closes.
+  if (services) createWindow();
 }
 
 function updateTrayIcon() {
@@ -499,9 +653,9 @@ function createTray() {
 
   const menu = Menu.buildFromTemplate([
     {
-      label: "Open mux",
+      label: "Open Xum",
       click: () => {
-        openMuxFromTray();
+        openXumFromTray();
       },
     },
     {
@@ -597,7 +751,7 @@ async function loadServices(): Promise<void> {
   // - These are large modules (~100ms load time) that would block splash from appearing
   // - Loading happens once, then cached
   const [
-    { Config: ConfigClass },
+    { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
   ] = await Promise.all([
@@ -606,9 +760,10 @@ async function loadServices(): Promise<void> {
     import("./terminalWindowManager"),
   ]);
   /* eslint-enable no-restricted-syntax */
-  config = new ConfigClass();
+  const stores = createConfigStores();
+  config = stores.config;
 
-  services = new ServiceContainerClass(config);
+  services = new ServiceContainerClass(stores);
   // Desktop bootstrap owns interactive host-key trust policy
   setOpenSSHHostKeyPolicyMode("strict");
   await services.initialize();
@@ -618,7 +773,7 @@ async function loadServices(): Promise<void> {
   });
 
   // Generate auth token (use env var or random per-session)
-  const authToken = process.env.MUX_SERVER_AUTH_TOKEN ?? randomBytes(32).toString("hex");
+  const authToken = getXumEnv("SERVER_AUTH_TOKEN") ?? randomBytes(32).toString("hex");
 
   // Store auth token so the API server can be restarted via Settings.
   services.serverService.setApiAuthToken(authToken);
@@ -626,7 +781,7 @@ async function loadServices(): Promise<void> {
   // Keep PATH-related recovery honest: Settings can re-check the current process view, but
   // shell/profile changes made after launch still need a full app relaunch to rerun startup PATH setup.
   services.windowService.setRestartAppHandler(() => {
-    assert(app, "Electron app must be available to restart mux");
+    assert(app, "Electron app must be available to restart xum");
     app.relaunch();
     app.quit();
   });
@@ -703,7 +858,7 @@ async function loadServices(): Promise<void> {
     }
 
     // Even if WSL is the default, don't warn if Git for Windows bash is available
-    // (Mux will use that instead).
+    // (Xum will use that instead).
     if (looksLikeWsl && isBashAvailable()) {
       return false;
     }
@@ -712,11 +867,17 @@ async function loadServices(): Promise<void> {
   });
 
   electronIpcMain.on("start-orpc-server", (event) => {
+    // SECURITY AUDIT: only registered local main frames can receive the local bearer credential.
+    if (!isLocalIpcSender(event)) {
+      for (const port of event.ports) port.close();
+      return;
+    }
     const [serverPort] = event.ports;
+    if (!serverPort) return;
     // Use Object.defineProperties to copy all property descriptors from
     // orpcContext as own-properties (required by oRPC's internal property
-    // enumeration) while preserving getters like onePasswordService that
-    // must resolve lazily rather than being snapshotted at construction.
+    // enumeration) while preserving any getters that must resolve lazily
+    // rather than being snapshotted at construction.
     const messagePortContext = Object.defineProperties(
       {} as typeof orpcContext & { headers: { authorization: string } },
       {
@@ -737,7 +898,7 @@ async function loadServices(): Promise<void> {
   });
 
   // Start HTTP/WS API server for CLI access (unless explicitly disabled)
-  if (process.env.MUX_NO_API_SERVER !== "1") {
+  if (getXumEnv("NO_API_SERVER") !== "1") {
     const lockfile = new ServerLockfile(config.rootDir);
     const existing = await lockfile.read();
 
@@ -754,9 +915,8 @@ async function loadServices(): Promise<void> {
         const serveStatic = loadedConfig.apiServerServeWebUi === true;
         const configuredPort = loadedConfig.apiServerPort;
 
-        const envPortRaw = process.env.MUX_SERVER_PORT
-          ? Number.parseInt(process.env.MUX_SERVER_PORT, 10)
-          : undefined;
+        const envServerPort = getXumEnv("SERVER_PORT");
+        const envPortRaw = envServerPort ? Number.parseInt(envServerPort, 10) : undefined;
         const envPort =
           envPortRaw !== undefined && Number.isFinite(envPortRaw) ? envPortRaw : undefined;
 
@@ -764,7 +924,7 @@ async function loadServices(): Promise<void> {
         const host = configuredBindHost ?? "127.0.0.1";
 
         const serverInfo = await services.serverService.startServer({
-          muxHome: config.rootDir,
+          xumHome: config.rootDir,
           context: orpcContext,
           router: orpcRouter,
           authToken,
@@ -781,7 +941,9 @@ async function loadServices(): Promise<void> {
   }
 
   // Set TerminalWindowManager for desktop mode (pop-out terminal windows)
-  const terminalWindowManager = new TerminalWindowManagerClass(config);
+  const terminalWindowManager = new TerminalWindowManagerClass(config, (options) =>
+    createLocalWindow(options, "terminal.html")
+  );
   services.setProjectDirectoryPicker(async (initialPath) => {
     const win = BrowserWindow.getFocusedWindow();
     if (!win) return null;
@@ -811,6 +973,12 @@ async function loadServices(): Promise<void> {
     return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0];
   });
 
+  services.setDesktopWindowManager(
+    new DesktopWindowManager(
+      (options) => createLocalWindow(options, "desktop.html"),
+      app.isPackaged
+    )
+  );
   services.setTerminalWindowManager(terminalWindowManager);
 
   loadTokenizerModules().catch((error) => {
@@ -830,7 +998,7 @@ function createWindow() {
   mainWindowFinishedLoading = false;
 
   const useDevServer = (isE2ETest && !forceDistLoad) || (!app.isPackaged && !forceDistLoad);
-  const devHost = process.env.MUX_DEVSERVER_HOST ?? "127.0.0.1";
+  const devHost = getXumEnv("DEVSERVER_HOST") ?? "127.0.0.1";
   const devServerUrl = `http://${devHost}:${devServerPort}`;
   let devServerRetryTimeout: ReturnType<typeof setTimeout> | null = null;
   let devServerRetryAttempt = 0;
@@ -886,7 +1054,7 @@ function createWindow() {
 
   console.log(`[${timestamp()}] [window] Creating BrowserWindow...`);
 
-  mainWindow = new BrowserWindow({
+  mainWindow = createLocalWindow({
     x: windowState.x,
     y: windowState.y,
     width: windowState.width,
@@ -896,11 +1064,11 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, "../preload.js"),
-      // Disable the native spellchecker: mux is a coding tool where inputs are
+      // Disable the native spellchecker: xum is a coding tool where inputs are
       // full of code, paths, and identifiers that trigger noisy red squiggles.
       spellcheck: false,
     },
-    title: "mux - coder multiplexer",
+    title: XUM_PRODUCT_DESCRIPTION,
     // Hide menu bar on Linux by default (like VS Code)
     // User can press Alt to toggle it
     autoHideMenuBar: process.platform === "linux",
@@ -921,7 +1089,7 @@ function createWindow() {
   services.windowService.setMainWindow(mainWindow);
 
   mainWindow.on("close", (event) => {
-    // Close-to-tray behavior: when the user closes the main window, keep mux
+    // Close-to-tray behavior: when the user closes the main window, keep xum
     // running in the tray/menu bar so it can be re-opened from there.
     //
     // Only hide when the tray exists to avoid trapping the user with no UI path
@@ -945,7 +1113,7 @@ function createWindow() {
         defaultId: 0,
         cancelId: 2,
         message: "An update is ready to install.",
-        detail: "Install now to restart and apply the update, or keep Mux running in the tray.",
+        detail: "Install now to restart and apply the update, or keep Xum running in the tray.",
       };
 
       const promptWindow = mainWindow;
@@ -956,8 +1124,7 @@ function createWindow() {
       void prompt
         .then(({ response }) => {
           if (response === 0) {
-            services?.updateService.install();
-            return;
+            return services?.updateService.install();
           }
 
           if (response === 1) {
@@ -1036,7 +1203,7 @@ function createWindow() {
     console.log(`[${timestamp()}] [window] Content finished loading`);
 
     mainWindowFinishedLoading = true;
-    flushBufferedMuxDeepLinks();
+    flushBufferedXumDeepLinks();
 
     // NOTE: Tokenizer modules are NOT loaded at startup anymore!
     // The Proxy in tokenizer.ts loads them on-demand when first accessed.
@@ -1082,7 +1249,7 @@ function createWindow() {
   });
 
   // Forward renderer console errors to the log service so they reach the log
-  // file (~/.mux/logs/mux.log) and Output Tab even when the UI is white/blank.
+  // file (~/.xum/logs/mux.log) and Output Tab even when the UI is white/blank.
   // The renderer's global error handlers (window.addEventListener("error")) log
   // to console.error, but that stays in renderer memory only — the main process
   // never sees it without this hook.
@@ -1106,8 +1273,8 @@ function createWindow() {
 }
 
 async function maybeRunAttachFileSmokeTest(): Promise<boolean> {
-  const pngPath = process.env.MUX_ATTACH_FILE_SMOKE_TEST_PNG_PATH?.trim();
-  const jpegPath = process.env.MUX_ATTACH_FILE_SMOKE_TEST_JPEG_PATH?.trim();
+  const pngPath = getXumEnv("ATTACH_FILE_SMOKE_TEST_PNG_PATH")?.trim();
+  const jpegPath = getXumEnv("ATTACH_FILE_SMOKE_TEST_JPEG_PATH")?.trim();
   if ((pngPath == null || pngPath.length === 0) && (jpegPath == null || jpegPath.length === 0)) {
     return false;
   }
@@ -1126,8 +1293,42 @@ async function maybeRunAttachFileSmokeTest(): Promise<boolean> {
   return true;
 }
 
-// Only setup app handlers if we got the lock
-if (gotTheLock) {
+void startDesktopAfterStorage().catch((error) => {
+  // Startup initialization must never crash the app.
+  console.debug("[xum-transition] Failed desktop storage bootstrap:", error);
+});
+
+async function startDesktopAfterStorage(): Promise<void> {
+  await initializeXumDesktopStorage();
+  // Enable local crash dump collection after userData points at canonical xum storage.
+  // No crash data leaves the machine.
+  crashReporter.start({ uploadToServer: false });
+
+  const gotTheLock = allowMultipleInstances || app.requestSingleInstanceLock();
+  console.log("Single instance lock acquired:", gotTheLock);
+
+  if (!gotTheLock) {
+    console.log("Another instance is already running, quitting...");
+    app.quit();
+    return;
+  }
+
+  console.log("This is the primary instance");
+  app.on("second-instance", (_event, argv) => {
+    console.log("Second instance attempted to start");
+
+    try {
+      handleArgvXumDeepLinks(argv);
+    } catch (error) {
+      console.debug(
+        "[deep-link] Failed to parse second-instance argv for xum/mux deep links:",
+        error
+      );
+    }
+
+    focusMainWindow();
+  });
+
   void app.whenReady().then(async () => {
     try {
       console.log("App ready, creating window...");
@@ -1136,11 +1337,7 @@ if (gotTheLock) {
         return;
       }
 
-      registerMuxProtocolClient();
-
-      // Safe to retry after ready: mux home migrations are idempotent.
-      migrateLegacyMuxHome();
-      cleanupObsoleteMuxBinArtifacts();
+      registerXumProtocolClients();
 
       // Install React DevTools in development
       if (!app.isPackaged) {
@@ -1170,6 +1367,7 @@ if (gotTheLock) {
         await showSplashScreen(); // Wait for splash to actually load
       }
       await loadServices();
+      initializeRemoteConnections();
       createWindow();
       createTray();
       // Note: splash closes in ready-to-show event handler
@@ -1201,6 +1399,7 @@ if (gotTheLock) {
     // Ensure window close handlers don't block an explicit quit.
     // IMPORTANT: must be set before any early returns.
     isQuitting = true;
+    remoteConnectionManager?.dispose();
     if (isUpdateInstallInProgress()) {
       // Don't block updater-driven quitAndInstall() — let Electron quit immediately
       // so the platform installer can take over. Best-effort cleanup only.
@@ -1261,7 +1460,7 @@ if (gotTheLock) {
     // hidden by close-to-tray.
     // Guard: services must be loaded (prevents race if activate fires during startup).
     if (app.isReady() && services) {
-      openMuxFromTray();
+      openXumFromTray();
     }
   });
 }

@@ -6,6 +6,14 @@ export interface DevToolsRun {
   workspaceId: string;
   startedAt: string; // ISO timestamp
   toolPolicy?: ToolPolicy;
+  /**
+   * The request's requestHistorySequence (max historySequence of the chat.jsonl
+   * rows the request was built from). Lets the replay verifier re-anchor this
+   * recorded run to its turn-envelope row and assistant message instead of
+   * relying on array-index pairing (which breaks on retries and devtools
+   * toggling). Absent on runs recorded by older binaries.
+   */
+  requestHistorySequence?: number;
 }
 
 /** A "step" = a single LLM round-trip within a run. */

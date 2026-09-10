@@ -10,7 +10,7 @@ import { z } from "zod";
  *   default for foreground/default launches and for any legacy record missing a
  *   persisted policy (backward compatibility).
  * - `notify_on_terminal`: active work does NOT block the owner's turn-end. When
- *   the work reaches a terminal state Mux sends a targeted synthetic wake-up so
+ *   the work reaches a terminal state Xum sends a targeted synthetic wake-up so
  *   the owner can integrate the completed output. This is derived from
  *   `run_in_background: true` and from foreground waits detached by a queued
  *   message or a foreground-wait timeout.

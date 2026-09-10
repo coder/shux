@@ -3,11 +3,12 @@ import { z } from "zod";
 import { AgentIdSchema, RuntimeEnablementIdSchema } from "../../schemas/ids";
 import { ProjectConfigSchema } from "../../schemas/project";
 import { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { SettingsBackupSchema } from "./settingsBackup";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
@@ -17,19 +18,54 @@ export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
 export type { TaskSettings } from "./taskSettings";
+// Managed Agent Plugin installs live in ~/.mux/plugins.json (see
+// ./agentPluginInstalls.ts for why they are NOT a config.json section).
+export {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+  AgentPluginInstallSourceSchema,
+  AgentPluginInstallsSchema,
+} from "./agentPluginInstalls";
+export type {
+  AgentPluginGitSource,
+  AgentPluginInstallEntry,
+  AgentPluginInstallSource,
+} from "./agentPluginInstalls";
+
+/**
+ * Sparse delegated-run (sub-agent) override profile nested under an agent's
+ * canonical defaults entry. Missing fields inherit field-wise from the base
+ * (interactive) profile and lower precedence tiers.
+ */
+export const AgentAiSubagentProfileSchema = z.object({
+  modelString: z.string().optional(),
+  thinkingLevel: ThinkingLevelSchema.optional(),
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
+});
 
 export const AgentAiDefaultsEntrySchema = z.object({
   modelString: z.string().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  // Sparse like the other fields: only explicit "pro" is persisted; absent
+  // inherits the workspace's current reasoning mode.
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
   enabled: z.boolean().optional(),
   advisorEnabled: z.boolean().optional(),
+  subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
 export const AgentAiDefaultsSchema = z.record(AgentIdSchema, AgentAiDefaultsEntrySchema);
 
+/**
+ * Legacy root map retained only as a one-way disk projection for downgrade
+ * compatibility: older builds read/write this map instead of the nested
+ * `subagent` profile. Current runtime code must never consume it outside the
+ * config load/serialization boundary.
+ */
 export const SubagentAiDefaultsEntrySchema = z.object({
   modelString: z.string().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
 });
 
 export const SubagentAiDefaultsSchema = z.record(AgentIdSchema, SubagentAiDefaultsEntrySchema);
@@ -72,17 +108,33 @@ export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchem
 
 export const AppConfigMigrationsSchema = z
   .object({
+    /**
+     * No longer consulted at load (legacy subagentAiDefaults now folds into the
+     * nested `subagent` profile); still written on save so downgraded builds do
+     * not re-run their exec split migration.
+     */
     execSubagentDefaultsSplit: z.boolean().optional(),
     userPreferencesInitialized: z.boolean().optional(),
+    daybreakModelsHidden: z.boolean().optional(),
+    // Default seeding must not claim legacy local-only hidden preferences.
+    hiddenModelsInitialized: z.boolean().optional(),
     /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
     defaultModelFallbacksSeeded: z.boolean().optional(),
+    /**
+     * One-time re-run of the fallback seed after the fable alias moved to
+     * Fable 5.1: configs seeded before the promotion lack a chain for the new
+     * source key.
+     */
+    defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
+    persistentSubagentsDefaulted: z.boolean().optional(),
   })
   // Preserve flags introduced by newer app versions: without the catchall a
   // downgrade to this version would strip unknown flags on save, re-running
   // their one-time migrations after re-upgrade (see normalizeConfigMigrations).
   .catchall(z.boolean());
 
-export const UpdateChannelSchema = z.enum(["stable", "nightly"]);
+export const UpdateChannelSchema = z.enum(["stable", "nightly", "npm"]);
 
 export const AppConfigOnDiskSchema = z
   .object({
@@ -130,6 +182,7 @@ export const AppConfigOnDiskSchema = z
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
+    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
     advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
     advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
@@ -154,18 +207,23 @@ export const AppConfigOnDiskSchema = z
     updateChannel: UpdateChannelSchema.optional(),
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
+    // `.catch`: an unusable stored value must not fail the whole config parse. Degrading to
+    // "not configured" keeps every other setting loadable and lets the user re-enter this one.
+    settingsBackup: SettingsBackupSchema.optional().catch(undefined),
+    // Legacy: 1Password integration was removed. Old builds still read/write this
+    // key, so it is round-tripped for downgrade compatibility but unused at runtime.
     onePasswordAccountName: z.string().optional(),
+    // A fresh random value per save (see Config.configFileWriteGeneration): lets a reader
+    // tell two writes of the same bytes apart, which no timestamp or inode reliably can.
+    writeId: z.string().optional(),
   })
   .passthrough();
 
 export type AppConfigMigrations = z.infer<typeof AppConfigMigrationsSchema>;
+export type AgentAiSubagentProfile = z.infer<typeof AgentAiSubagentProfileSchema>;
 export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
-export type SubagentAiDefaultsEntry = z.infer<typeof SubagentAiDefaultsEntrySchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
-export type GoalDefaultsConfig = z.infer<typeof GoalDefaultsSchema>;
-export type ModelFallbackTrigger = z.infer<typeof ModelFallbackTriggerSchema>;
-export type ModelFallbackEntry = z.infer<typeof ModelFallbackEntrySchema>;
 export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 

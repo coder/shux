@@ -10,8 +10,11 @@ import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { CompactionRequestData } from "@/common/types/message";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { coerceThinkingLevel } from "@/common/types/thinking";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import { coerceOpenAIReasoningMode, coerceThinkingLevel } from "@/common/types/thinking";
+import {
+  InvalidExplicitAiSettingError,
+  resolveAgentAiSettings,
+} from "@/common/utils/ai/resolveAgentAiSettings";
 
 /**
  * Apply compaction-specific option overrides to base options.
@@ -29,17 +32,41 @@ export function applyCompactionOverrides(
   compactData: CompactionRequestData
 ): SendMessageOptions {
   const compactionModelOverride = compactData.model?.trim();
-  const compactionModel =
-    compactionModelOverride === undefined || compactionModelOverride === ""
-      ? baseOptions.model
-      : compactionModelOverride;
-
   const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
-  const preferredThinking = agentAiDefaults.compact?.thinkingLevel;
 
-  const requestedThinking =
-    coerceThinkingLevel(preferredThinking ?? baseOptions.thinkingLevel) ?? "off";
-  const thinkingLevel = enforceThinkingPolicy(compactionModel, requestedThinking);
+  // Unified resolution as agent "compact": the /compact -m flag is the
+  // explicit tier, configured compact defaults (and their base chain, so a
+  // saved Exec pro default reaches compaction) win over the workspace's live
+  // settings (parent runtime). The send path re-gates reasoning per
+  // model/route so pro is inert for unsupported models.
+  const resolveWith = (explicitModel: string | undefined) =>
+    resolveAgentAiSettings({
+      targetAgentId: "compact",
+      profile: "interactive",
+      explicit: { model: explicitModel },
+      agentAiDefaults,
+      parentRuntime: {
+        model: baseOptions.model,
+        thinkingLevel: coerceThinkingLevel(baseOptions.thinkingLevel),
+        reasoningMode: coerceOpenAIReasoningMode(baseOptions.reasoningMode),
+      },
+    });
+
+  let resolved;
+  let compactionModel: string;
+  try {
+    // The resolver treats an empty/whitespace explicit model as absent.
+    resolved = resolveWith(compactionModelOverride);
+    compactionModel = resolved.selected.model;
+  } catch (error) {
+    if (!(error instanceof InvalidExplicitAiSettingError)) {
+      throw error;
+    }
+    // Preserve the legacy surface for an unrecognized -m value: send it
+    // verbatim and let the backend reject it visibly (model_not_found).
+    resolved = resolveWith(undefined);
+    compactionModel = compactionModelOverride ?? baseOptions.model;
+  }
 
   return {
     ...baseOptions,
@@ -47,7 +74,10 @@ export function applyCompactionOverrides(
     // Compaction shouldn't update persisted model/thinking defaults.
     skipAiSettingsPersistence: true,
     model: compactionModel,
-    thinkingLevel,
+    thinkingLevel: resolved.effective.thinkingLevel,
+    ...(resolved.selected.reasoningMode != null
+      ? { reasoningMode: resolved.selected.reasoningMode }
+      : {}),
     maxOutputTokens: compactData.maxOutputTokens,
     // Disable all tools during compaction - regex .* matches all tool names
     toolPolicy: [{ regex_match: ".*", action: "disable" }],

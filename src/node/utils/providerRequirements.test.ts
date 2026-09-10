@@ -139,6 +139,121 @@ describe("hasAnyConfiguredProvider", () => {
   });
 });
 
+describe("resolveProviderCredentials - Z.ai", () => {
+  it("resolves ZAI_API_KEY from the environment", () => {
+    const result = resolveProviderCredentials("zai", {}, { ZAI_API_KEY: "zai-test-key" });
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.apiKey).toBe("zai-test-key");
+    expect(result.apiKeySource).toBe("env");
+  });
+});
+
+describe("resolveProviderCredentials - legacy op:// references", () => {
+  it("falls back to the env key when config holds a legacy op:// reference", () => {
+    const result = resolveProviderCredentials(
+      "openai",
+      { apiKey: "op://Vault/OpenAI/credential" },
+      { OPENAI_API_KEY: "sk-from-env" }
+    );
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.apiKey).toBe("sk-from-env");
+    expect(result.apiKeySource).toBe("env");
+  });
+
+  it("reports not configured when only a legacy op:// reference exists", () => {
+    const result = resolveProviderCredentials(
+      "openai",
+      { apiKey: "op://Vault/OpenAI/credential" },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(false);
+    expect(result.apiKey).toBeUndefined();
+  });
+});
+
+describe("resolveProviderCredentials - coder", () => {
+  const coderOauth = {
+    type: "oauth",
+    sessionId: "sess",
+    deploymentUrl: "https://coder.example.com",
+    access: "at",
+    refresh: "rt",
+    expires: Date.now() + 3_600_000,
+    clientId: "c",
+    clientSecret: "s",
+  };
+
+  it("is configured with a deployment URL and OAuth tokens", () => {
+    const result = resolveProviderCredentials(
+      "coder",
+      { deploymentUrl: "https://coder.example.com", coderOauth },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.deploymentUrl).toBe("https://coder.example.com");
+  });
+
+  it("normalizes the deployment URL to its origin", () => {
+    const result = resolveProviderCredentials(
+      "coder",
+      { deploymentUrl: "https://coder.example.com/some/path/", coderOauth },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.deploymentUrl).toBe("https://coder.example.com");
+  });
+
+  it("is not configured without OAuth tokens", () => {
+    const result = resolveProviderCredentials(
+      "coder",
+      { deploymentUrl: "https://coder.example.com" },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(false);
+    expect(result.missingRequirement).toBe("coder_login");
+  });
+
+  it("is not configured without a deployment URL", () => {
+    const result = resolveProviderCredentials("coder", { coderOauth }, {});
+
+    expect(result.isConfigured).toBe(false);
+    expect(result.missingRequirement).toBe("coder_login");
+  });
+
+  it("is not configured with a malformed OAuth blob", () => {
+    const result = resolveProviderCredentials(
+      "coder",
+      {
+        deploymentUrl: "https://coder.example.com",
+        coderOauth: { type: "oauth", access: "at" },
+      },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(false);
+  });
+
+  it("is not configured when tokens were minted by a different deployment", () => {
+    // Issuer binding: an OAuth blob from deployment A must not make the
+    // provider configured for deployment B (its bearer token would be sent
+    // to B's AI Bridge).
+    const result = resolveProviderCredentials(
+      "coder",
+      { deploymentUrl: "https://other.example.com", coderOauth },
+      {}
+    );
+
+    expect(result.isConfigured).toBe(false);
+    expect(result.missingRequirement).toBe("coder_login");
+  });
+});
+
 describe("resolveProviderCredentials base URL source", () => {
   it("marks OpenAI base URL from OPENAI_BASE_URL as env sourced", () => {
     const result = resolveProviderCredentials(
@@ -249,8 +364,8 @@ describe("resolveProviderCredentials base URL source", () => {
 });
 
 describe("resolveCustomProviderCredentials", () => {
-  it("succeeds with no API key when only baseUrl is set", async () => {
-    const result = await resolveCustomProviderCredentials("local-vllm", {
+  it("succeeds with no API key when only baseUrl is set", () => {
+    const result = resolveCustomProviderCredentials("local-vllm", {
       providerType: "openai-compatible",
       baseUrl: "http://localhost:8000/v1",
     });
@@ -262,8 +377,8 @@ describe("resolveCustomProviderCredentials", () => {
     });
   });
 
-  it("returns a typed missing_base_url error without a base URL", async () => {
-    const result = await resolveCustomProviderCredentials("local-vllm", {
+  it("returns a typed missing_base_url error without a base URL", () => {
+    const result = resolveCustomProviderCredentials("local-vllm", {
       providerType: "openai-compatible",
     });
 
@@ -273,8 +388,8 @@ describe("resolveCustomProviderCredentials", () => {
     }
   });
 
-  it("resolves inline apiKey from config", async () => {
-    const result = await resolveCustomProviderCredentials("local-vllm", {
+  it("resolves inline apiKey from config", () => {
+    const result = resolveCustomProviderCredentials("local-vllm", {
       providerType: "openai-compatible",
       baseUrl: "http://localhost:8000/v1",
       apiKey: "sk-test",
@@ -288,13 +403,13 @@ describe("resolveCustomProviderCredentials", () => {
     });
   });
 
-  it("resolves apiKeyFile", async () => {
+  it("resolves apiKeyFile", () => {
     const tmpDir = mkdtempSync(path.join(os.tmpdir(), "mux-test-"));
     const keyFilePath = path.join(tmpDir, "api-key");
     writeFileSync(keyFilePath, "sk-from-file\n", "utf-8");
 
     try {
-      const result = await resolveCustomProviderCredentials("local-vllm", {
+      const result = resolveCustomProviderCredentials("local-vllm", {
         providerType: "openai-compatible",
         baseUrl: "http://localhost:8000/v1",
         apiKeyFile: keyFilePath,
@@ -309,26 +424,6 @@ describe("resolveCustomProviderCredentials", () => {
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
-
-  it("resolves op references with the provided resolver", async () => {
-    const opRef = "op://Personal/Local vLLM/api-key";
-    const result = await resolveCustomProviderCredentials(
-      "local-vllm",
-      {
-        providerType: "openai-compatible",
-        baseUrl: "http://localhost:8000/v1",
-        apiKey: opRef,
-      },
-      (ref) => Promise.resolve(ref === opRef ? "sk-from-op" : undefined)
-    );
-
-    expect(result).toEqual({
-      ok: true,
-      apiKey: "sk-from-op",
-      baseURL: "http://localhost:8000/v1",
-      resolvedFrom: "op",
-    });
   });
 });
 describe("resolveProviderCredentials - apiKeyFile", () => {

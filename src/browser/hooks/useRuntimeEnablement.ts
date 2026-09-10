@@ -75,7 +75,7 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
       setRawDefaultRuntime(nextDefaultRuntime);
     }
 
-    // Best-effort backend write keeps ~/.mux/config.json aligned across devices.
+    // Best-effort backend write keeps ~/.xum/config.json aligned across devices.
     const payload: {
       runtimeEnablement: RuntimeEnablement;
       defaultRuntime?: RuntimeEnablementId | null;

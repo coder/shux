@@ -1,11 +1,13 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "./mcpConfigService";
 import { MCPServerManager } from "./mcpServerManager";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 
 describe("MCPConfigService", () => {
   let tempDir: string;
@@ -20,6 +22,54 @@ describe("MCPConfigService", () => {
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("resolveWorkspaceAgentPluginsContext preserves the off-host null sentinel", async () => {
+    // null suppresses plugin discovery entirely; coercing it to undefined would
+    // fall back to project-level discovery and offer repo-controlled plugins for
+    // workspaces that execute off-host.
+    const cases: Array<{
+      runtimeConfig: WorkspaceMetadata["runtimeConfig"];
+      namedWorkspacePath?: string;
+      expectedNull: boolean;
+    }> = [
+      {
+        runtimeConfig: { type: "ssh", host: "example", srcBaseDir: "/remote/src" },
+        namedWorkspacePath: "/remote/src/proj/ws1",
+        expectedNull: true,
+      },
+      {
+        runtimeConfig: { type: "worktree", srcBaseDir: tempDir },
+        namedWorkspacePath: undefined,
+        expectedNull: false,
+      },
+    ];
+    for (const testCase of cases) {
+      const projectPath = path.join(tempDir, "proj");
+      // namedWorkspacePath is persisted alongside metadata for SSH workspaces (see WorkspaceMetadataForRuntime).
+      const metadata: WorkspaceMetadata & { namedWorkspacePath?: string } = {
+        id: "ws1234567890",
+        name: "ws1",
+        projectName: "proj",
+        projectPath,
+        runtimeConfig: testCase.runtimeConfig,
+        namedWorkspacePath: testCase.namedWorkspacePath,
+      };
+      const service = new MCPConfigService(config, {
+        workspaceMetadataProvider: {
+          getWorkspaceMetadata: () => Promise.resolve({ success: true as const, data: metadata }),
+        },
+      });
+      const resolved = await service.resolveWorkspaceAgentPluginsContext(
+        "ws1234567890",
+        projectPath
+      );
+      if (testCase.expectedNull) {
+        expect(resolved).toBeNull();
+      } else {
+        expect(resolved).toMatchObject({ projectKey: projectPath });
+      }
+    }
   });
 
   test("writes global config to <rootDir>/mcp.jsonc", async () => {
@@ -64,6 +114,26 @@ describe("MCPConfigService", () => {
     });
   });
 
+  test("prefers canonical repo overrides when both project paths exist", async () => {
+    const projectPath = path.join(tempDir, "repo-canonical");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.mkdir(path.join(projectPath, ".mux"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".mux", "mcp.jsonc"),
+      JSON.stringify({ servers: { selected: "legacy", "legacy-only": "legacy-only" } }),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({ servers: { selected: "canonical" } }),
+      "utf-8"
+    );
+
+    expect(await configService.listServers(projectPath, true)).toEqual({
+      selected: { transport: "stdio", command: "canonical", disabled: false },
+    });
+  });
+
   test("listServers ignores repo overrides for untrusted projects", async () => {
     await configService.addServer("global-only", {
       transport: "stdio",
@@ -89,6 +159,55 @@ describe("MCPConfigService", () => {
     expect(await configService.listServers(projectPath, false)).toEqual({
       "global-only": { transport: "stdio", command: "global-only", disabled: false },
     });
+  });
+
+  test("project-automation kill-switch ignores repo overrides even when trusted", async () => {
+    await configService.addServer("global-only", {
+      transport: "stdio",
+      command: "global-only",
+    });
+
+    const projectPath = path.join(tempDir, "repo-automation-disabled");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({ servers: { "repo-only": "repo-only" } }),
+      "utf-8"
+    );
+
+    const prev = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      // Trust stays (delegation depends on it) but repo-configured MCP
+      // servers must not load: they would run dataset code with provider
+      // credentials in the environment.
+      expect(await configService.listServers(projectPath, true)).toEqual({
+        "global-only": { transport: "stdio", command: "global-only", disabled: false },
+      });
+    } finally {
+      if (prev === undefined) {
+        delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      } else {
+        process.env[DISABLE_PROJECT_AUTOMATION_ENV] = prev;
+      }
+    }
+  });
+  test("API mutations enforce policy and emit telemetry", async () => {
+    const capture = mock(() => undefined);
+    const apiService = new MCPConfigService(config, {
+      policyService: {
+        isEnforced: () => true,
+        isMcpTransportAllowed: (transport: string) => transport === "stdio",
+      },
+      telemetryService: { capture },
+    });
+    expect(
+      await apiService.addForApi({ name: "remote", transport: "http", url: "https://x" })
+    ).toEqual({ success: false, error: "MCP transport is disabled by policy" });
+    await apiService.addForApi({ name: "local", command: "node server.js" });
+    expect(capture).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "mcp_server_config_changed" })
+    );
   });
 });
 
@@ -174,6 +293,44 @@ describe("MCP server disable filtering", () => {
       disabled: false,
       toolAllowlist: undefined,
     });
+  });
+
+  test("canonical plugin keys are reserved: ignored in user config layers, rejected by addServer", async () => {
+    // A user server occupying a canonical `plugin:<16-hex>:<name>` key would
+    // shadow the plugin server (user layers win on collision) yet lose its
+    // workspace overrides to that plugin's uninstall, which prunes such keys
+    // by shape. Hand-edited config entries are ignored (not started, not
+    // shadowing); the add flow rejects the name outright.
+    const reservedKey = "plugin:0123456789abcdef:srv";
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: () => Promise.resolve({ [reservedKey]: PLUGIN_SERVER }),
+    });
+
+    const added = await withProvider.addServer(reservedKey, { transport: "stdio", command: "x" });
+    expect(added.success).toBe(false);
+    if (!added.success) {
+      expect(added.error).toContain("reserved");
+    }
+
+    // Hand-edited global + project entries on the reserved key.
+    await fs.writeFile(
+      path.join(config.rootDir, "mcp.jsonc"),
+      JSON.stringify({ servers: { [reservedKey]: "user-global", ordinary: "user-ordinary" } }),
+      "utf-8"
+    );
+    const projectPath = path.join(tempDir, "repo-reserved");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({ servers: { [reservedKey]: "user-project" } }),
+      "utf-8"
+    );
+
+    const servers = await withProvider.listServers(projectPath, true);
+    // The plugin server keeps its reserved key; the user entries neither
+    // shadow it nor appear under their own name. Ordinary names still load.
+    expect(servers[reservedKey]).toEqual(PLUGIN_SERVER);
+    expect(servers.ordinary).toMatchObject({ command: "user-ordinary" });
   });
 
   test("listServers resolves the Agent Plugins context: default, explicit, and null", async () => {

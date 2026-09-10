@@ -80,11 +80,23 @@ export const TimelineStatusSchema = z.enum([
  */
 export const TIMELINE_TEXT_MAX_LENGTH = 600;
 
-export function truncateTimelineDigest(value: string): string {
+// Row digests are truncated by the mapper to this length. The preview card relies on the exact
+// producer lengths to tell truncation apart from a digest that naturally ends in "...".
+export const TIMELINE_ROW_DIGEST_MAX_LENGTH = 120;
+
+function truncateNormalized(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length <= TIMELINE_TEXT_MAX_LENGTH
-    ? normalized
-    : `${normalized.slice(0, TIMELINE_TEXT_MAX_LENGTH - 3)}...`;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+// TaskService stores longer digests than mapped rows, so cross-producer comparisons must reapply
+// this cap.
+export function truncateTimelineRowDigest(value: string): string {
+  return truncateNormalized(value, TIMELINE_ROW_DIGEST_MAX_LENGTH);
+}
+
+export function truncateTimelineDigest(value: string): string {
+  return truncateNormalized(value, TIMELINE_TEXT_MAX_LENGTH);
 }
 
 // A completed sub-agent report is recorded by TaskService and is also injected into parent history,

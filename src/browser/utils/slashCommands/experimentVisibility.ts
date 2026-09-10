@@ -5,6 +5,8 @@ export interface SlashCommandExperimentSnapshot {
   dynamicWorkflows?: boolean;
   memory?: boolean;
   memoryConsolidation?: boolean;
+  rlm?: boolean;
+  programmaticToolCalling?: boolean;
 }
 
 export function resolveSlashCommandExperimentValue(
@@ -20,6 +22,11 @@ export function resolveSlashCommandExperimentValue(
       // Sub-experiment of MEMORY: the backend rejects consolidation unless
       // BOTH flags are on, so /dream must not surface on the sub-flag alone.
       return snapshot.memoryConsolidation === true && snapshot.memory === true;
+    case EXPERIMENT_IDS.RLM:
+      // Sub-experiment of Programmatic Tool Calling: the backend refuses
+      // /refine unless RLM AND a PTC parent flag are on, so the sub-flag
+      // alone must not surface the command.
+      return snapshot.rlm === true && snapshot.programmaticToolCalling === true;
     default:
       return undefined;
   }

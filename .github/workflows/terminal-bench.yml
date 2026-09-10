@@ -145,7 +145,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Install uv
         run: |
@@ -252,32 +252,13 @@ jobs:
           fi
           python3 scripts/check_tbench_results.py "${args[@]}"
 
-      - name: Set artifact name
-        if: always()
-        id: artifact-name
-        env:
-          MODEL_NAME: ${{ inputs.model_name }}
-          DATASET: ${{ inputs.dataset }}
-          TASK_NAMES: ${{ inputs.task_names }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          # actions/upload-artifact@v7 requires artifact names to be unique per workflow run.
-          # Nightly workflows can run multiple jobs with the same model (e.g. Harbor smoke tests),
-          # so include dataset + task selection in the artifact name.
-          sanitize() { printf "%s" "$1" | tr ' :/@' '-' | tr -cd 'A-Za-z0-9._-'; }
-
-          SAFE_MODEL=$(sanitize "${MODEL_NAME:-no-model}")
-          SAFE_DATASET=$(sanitize "${DATASET:-unknown-dataset}")
-          if [ -n "${TASK_NAMES:-}" ]; then
-            SAFE_TASKS=$(sanitize "$TASK_NAMES")
-          else
-            SAFE_TASKS="all-tasks"
-          fi
-
-          ARTIFACT_NAME="terminal-bench-results-${SAFE_MODEL}-${SAFE_DATASET}-${SAFE_TASKS}-${RUN_ID}-a${RUN_ATTEMPT}"
-          echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          echo "Artifact name: $ARTIFACT_NAME"
+      # SECURITY: do not add an actions/upload-artifact step for jobs/ or
+      # benchmark.log. Agent stdout under jobs/ can capture provider API keys
+      # (Harbor serialises the run env as `env NAME=value ...` on the process
+      # argv, which task-side `ps` output copies into agent stdout), and
+      # artifacts on a public repo are downloadable by any authenticated
+      # GitHub user. Run output must stay on the runner; aggregate results go
+      # to BigQuery below.
 
       - name: Upload Terminal-Bench results to BigQuery
         if: always() && github.repository == 'coder/mux' && startsWith(inputs.dataset, 'terminal-bench@')
@@ -316,14 +297,3 @@ jobs:
           pip install --quiet google-cloud-bigquery
           python scripts/upload-harbor-results.py
           rm -f /tmp/gcp-sa.json
-
-      - name: Upload benchmark results
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: |
-            jobs/
-            benchmark.log
-          if-no-files-found: warn
-          retention-days: 30

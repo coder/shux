@@ -43,10 +43,6 @@ function getWorkspaceRow(container: HTMLElement, workspaceId: string): HTMLEleme
   ) as HTMLElement | null;
 }
 
-function getQuickArchiveButton(row: HTMLElement): HTMLButtonElement | null {
-  return row.querySelector('button[aria-label^="Archive workspace "]') as HTMLButtonElement | null;
-}
-
 function getSubagentConnector(container: HTMLElement, workspaceId: string): HTMLElement | null {
   // Find all connector elements and match by shared parent with the target workspace row.
   // This avoids fragile sibling/parent traversal assumptions.
@@ -184,224 +180,86 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
     await preloadTestModules();
   });
 
-  test("double-click renames parent rows and overflow menu toggles completed sub-agents", async () => {
+  test("double-click renames parent rows while inactive sub-agents stay out of the sidebar", async () => {
     const harness = await createSubagentSidebarHarness();
     const { env, repoPath } = harness;
 
     try {
       const parentWorkspace = await harness.createWorkspace("Parent Agent", "subagent-parent");
-
-      const activeChildOne = await harness.createWorkspace("Active Child One", "subagent-active-1");
-
-      const activeChildTwo = await harness.createWorkspace("Active Child Two", "subagent-active-2");
-
-      const interruptedCompletedChild = await harness.createWorkspace(
-        "Interrupted Completed Child",
-        "subagent-interrupted-completed"
+      const activeChild = await harness.createWorkspace("Active Child", "subagent-active");
+      const interruptedChild = await harness.createWorkspace(
+        "Interrupted Child",
+        "subagent-interrupted"
       );
-
       const reportedChild = await harness.createWorkspace("Reported Child", "subagent-reported");
 
-      // Seed child metadata to simulate parent/sub-agent hierarchy with mixed statuses.
       await env.config.addWorkspace(repoPath, {
-        ...activeChildOne,
+        ...activeChild,
         parentWorkspaceId: parentWorkspace.id,
         taskStatus: "running",
       });
       await env.config.addWorkspace(repoPath, {
-        ...activeChildTwo,
-        parentWorkspaceId: parentWorkspace.id,
-        taskStatus: "queued",
-      });
-      const completedAt = new Date().toISOString();
-      await env.config.addWorkspace(repoPath, {
-        ...interruptedCompletedChild,
+        ...interruptedChild,
         parentWorkspaceId: parentWorkspace.id,
         taskStatus: "interrupted",
-        reportedAt: completedAt,
       });
       await env.config.addWorkspace(repoPath, {
         ...reportedChild,
         parentWorkspaceId: parentWorkspace.id,
         taskStatus: "reported",
-        reportedAt: completedAt,
+        reportedAt: new Date().toISOString(),
       });
 
       const renderedView = await harness.render(parentWorkspace);
-
-      // Scenario 1: active children are visible, while both completed children stay hidden.
       await waitFor(
         () => {
-          if (!getWorkspaceRow(renderedView.container, activeChildOne.id)) {
-            throw new Error("Expected first active child to be visible");
-          }
-          if (!getWorkspaceRow(renderedView.container, activeChildTwo.id)) {
-            throw new Error("Expected second active child to be visible");
+          if (!getWorkspaceRow(renderedView.container, activeChild.id)) {
+            throw new Error("Expected active child to be visible");
           }
         },
         { timeout: 10_000 }
       );
-      expect(getWorkspaceRow(renderedView.container, interruptedCompletedChild.id)).toBeNull();
+      expect(getWorkspaceRow(renderedView.container, interruptedChild.id)).toBeNull();
       expect(getWorkspaceRow(renderedView.container, reportedChild.id)).toBeNull();
 
       const parentDisplayTitle = parentWorkspace.title ?? parentWorkspace.name;
       const parentRow = await waitFor(
         () => {
           const row = getWorkspaceRow(renderedView.container, parentWorkspace.id);
-          if (!row) {
-            throw new Error("Parent workspace row not found");
-          }
+          if (!row) throw new Error("Parent workspace row not found");
           return row;
         },
         { timeout: 10_000 }
       );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("false");
-      expect(parentRow.getAttribute("aria-keyshortcuts")).toBe("ArrowRight ArrowLeft");
+      expect(parentRow.getAttribute("aria-expanded")).toBeNull();
+      expect(parentRow.getAttribute("aria-keyshortcuts")).toBeNull();
 
-      // Scenario 2: double-clicking the parent always enters rename mode.
       fireEvent.doubleClick(parentRow);
-
       await waitFor(
         () => {
           const editInput = renderedView.container.querySelector(
             `input[aria-label="Edit title for workspace ${parentDisplayTitle}"]`
           );
-          if (!editInput) {
-            throw new Error("Expected rename input to appear after double-clicking parent row");
-          }
+          if (!editInput) throw new Error("Expected rename input after double-clicking parent row");
         },
         { timeout: 10_000 }
       );
-      expect(getWorkspaceRow(renderedView.container, interruptedCompletedChild.id)).toBeNull();
-      expect(getWorkspaceRow(renderedView.container, reportedChild.id)).toBeNull();
-
       const renameInput = renderedView.container.querySelector(
         `input[aria-label="Edit title for workspace ${parentDisplayTitle}"]`
-      ) as HTMLInputElement | null;
-      expect(renameInput).not.toBeNull();
-      fireEvent.keyDown(renameInput!, { key: "Escape" });
-
-      await waitFor(
-        () => {
-          const editInput = renderedView.container.querySelector(
-            `input[aria-label="Edit title for workspace ${parentDisplayTitle}"]`
-          );
-          if (editInput) {
-            throw new Error("Expected rename input to close after pressing Escape");
-          }
-        },
-        { timeout: 10_000 }
-      );
+      ) as HTMLInputElement;
+      fireEvent.keyDown(renameInput, { key: "Escape" });
 
       const parentActionsButton = await findWorkspaceActionsButton({
         container: renderedView.container,
         title: parentDisplayTitle,
       });
-
-      // Scenario 3: the overflow menu shows "Show sub-agents" while collapsed.
       fireEvent.click(parentActionsButton);
-      const showSubAgentsButton = await findMenuItem("Show sub-agents");
-      fireEvent.click(showSubAgentsButton);
-
-      await waitFor(
-        () => {
-          const interruptedCompletedRow = getWorkspaceRow(
-            renderedView.container,
-            interruptedCompletedChild.id
-          );
-          if (!interruptedCompletedRow) {
-            throw new Error("Expected interrupted completed child to be visible after expansion");
-          }
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (!reportedRow) {
-            throw new Error("Expected reported child to be visible after expansion");
-          }
-        },
-        { timeout: 10_000 }
+      await findMenuItem("Generate new title");
+      const menuLabels = Array.from(document.querySelectorAll("button")).map(
+        (button) => button.textContent ?? ""
       );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("true");
-      const reportedCompletedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-      if (!reportedCompletedRow) {
-        throw new Error("Expected reported child row after expansion");
-      }
-      expect(getQuickArchiveButton(reportedCompletedRow)).toBeNull();
-
-      // Active delegated work keeps the parent status dot visible, so the
-      // completed-children chevron overlay stays hidden while the group is active.
-      expect(parentRow.querySelector(".workspace-status-dot-active")).not.toBeNull();
-      expect(
-        parentRow.querySelector(
-          `[data-testid="completed-children-expanded-indicator-${parentWorkspace.id}"]`
-        )
-      ).toBeNull();
-
-      // Scenario 4: the overflow menu switches to "Hide sub-agents" when expanded.
-      fireEvent.click(parentActionsButton);
-      const hideSubAgentsButton = await findMenuItem("Hide sub-agents");
-      fireEvent.click(hideSubAgentsButton);
-
-      await waitFor(
-        () => {
-          const interruptedCompletedRow = getWorkspaceRow(
-            renderedView.container,
-            interruptedCompletedChild.id
-          );
-          if (interruptedCompletedRow) {
-            throw new Error("Expected interrupted completed child to be hidden after collapsing");
-          }
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (reportedRow) {
-            throw new Error("Expected reported child to be hidden after collapsing");
-          }
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("false");
-
-      // Scenario 5: keyboard users can still reveal and hide completed children from the row.
-      fireEvent.keyDown(parentRow, { key: "ArrowRight" });
-
-      await waitFor(
-        () => {
-          const interruptedCompletedRow = getWorkspaceRow(
-            renderedView.container,
-            interruptedCompletedChild.id
-          );
-          if (!interruptedCompletedRow) {
-            throw new Error(
-              "Expected interrupted completed child to be visible after keyboard expansion"
-            );
-          }
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (!reportedRow) {
-            throw new Error("Expected reported child to be visible after keyboard expansion");
-          }
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("true");
-
-      fireEvent.keyDown(parentRow, { key: "ArrowLeft" });
-
-      await waitFor(
-        () => {
-          const interruptedCompletedRow = getWorkspaceRow(
-            renderedView.container,
-            interruptedCompletedChild.id
-          );
-          if (interruptedCompletedRow) {
-            throw new Error(
-              "Expected interrupted completed child to be hidden after keyboard collapsing"
-            );
-          }
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (reportedRow) {
-            throw new Error("Expected reported child to be hidden after keyboard collapsing");
-          }
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("false");
+      expect(menuLabels.some((label) => label.includes("Show sub-agents"))).toBe(false);
+      expect(menuLabels.some((label) => label.includes("Hide sub-agents"))).toBe(false);
     } finally {
       await harness.cleanup();
     }
@@ -448,7 +306,7 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
     }
   }, 90_000);
 
-  test("expanded rows hide chevron indicator when status dot is visible", async () => {
+  test("unread parent rows do not expose expansion for inactive children", async () => {
     const harness = await createSubagentSidebarHarness();
     const { env, repoPath } = harness;
 
@@ -457,23 +315,19 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
         "Selected Agent",
         "subagent-selected-anchor"
       );
-
       const parentWorkspace = await harness.createWorkspace(
         "Unread Parent Agent",
         "subagent-unread-parent"
       );
-
       const reportedChild = await harness.createWorkspace(
         "Completed Child",
         "subagent-unread-reported"
       );
-
-      const completedAt = new Date().toISOString();
       await env.config.addWorkspace(repoPath, {
         ...reportedChild,
         parentWorkspaceId: parentWorkspace.id,
         taskStatus: "reported",
-        reportedAt: completedAt,
+        reportedAt: new Date().toISOString(),
       });
 
       const historyService = new HistoryService(env.config);
@@ -481,37 +335,23 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
         parentWorkspace.id,
         createMuxMessage("parent-unread-message", "user", "Mark this workspace unread")
       );
-      if (!appendResult.success) {
+      if (!appendResult.success)
         throw new Error(`Failed to seed unread history: ${appendResult.error}`);
-      }
 
       const renderedView = await harness.render(selectedWorkspace, () => {
         updatePersistedState(getWorkspaceLastReadKey(parentWorkspace.id), 0);
       });
-
       const parentRow = await waitFor(
         () => {
           const row = getWorkspaceRow(renderedView.container, parentWorkspace.id);
-          if (!row) {
-            throw new Error("Parent workspace row not found");
-          }
+          if (!row) throw new Error("Parent workspace row not found");
           return row;
         },
         { timeout: 10_000 }
       );
 
-      fireEvent.keyDown(parentRow, { key: "ArrowRight" });
-
-      await waitFor(
-        () => {
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (!reportedRow) {
-            throw new Error("Expected completed child to be visible after expansion");
-          }
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("true");
+      expect(getWorkspaceRow(renderedView.container, reportedChild.id)).toBeNull();
+      expect(parentRow.getAttribute("aria-expanded")).toBeNull();
       expect(
         parentRow.querySelector(
           `[data-testid="completed-children-expanded-indicator-${parentWorkspace.id}"]`
@@ -522,21 +362,18 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
     }
   }, 90_000);
 
-  test("expanding completed children reveals old reported rows without expanding age tiers", async () => {
+  test("old reported children stay hidden without creating an age tier", async () => {
     const harness = await createSubagentSidebarHarness();
     const { env, repoPath } = harness;
 
     try {
       const parentWorkspace = await harness.createWorkspace("Parent Agent", "subagent-old-parent");
-
       const activeChild = await harness.createWorkspace("Active Child", "subagent-old-active");
-
       const reportedChild = await harness.createWorkspace(
         "Old Reported Child",
         "subagent-old-reported"
       );
-
-      const reportedChildTimestamp = new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString();
+      const reportedAt = new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString();
 
       await env.config.addWorkspace(repoPath, {
         ...activeChild,
@@ -547,12 +384,11 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
         ...reportedChild,
         parentWorkspaceId: parentWorkspace.id,
         taskStatus: "reported",
-        createdAt: reportedChildTimestamp,
-        reportedAt: reportedChildTimestamp,
+        createdAt: reportedAt,
+        reportedAt,
       });
 
       const renderedView = await harness.render(parentWorkspace);
-
       await waitFor(
         () => {
           if (!getWorkspaceRow(renderedView.container, activeChild.id)) {
@@ -562,42 +398,9 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
         { timeout: 10_000 }
       );
       expect(getWorkspaceRow(renderedView.container, reportedChild.id)).toBeNull();
-
-      const parentDisplayTitle = parentWorkspace.title ?? parentWorkspace.name;
-      const parentRow = await waitFor(
-        () => {
-          const row = getWorkspaceRow(renderedView.container, parentWorkspace.id);
-          if (!row) {
-            throw new Error("Parent workspace row not found");
-          }
-          return row;
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("false");
-      const parentActionsButton = await findWorkspaceActionsButton({
-        container: renderedView.container,
-        title: parentDisplayTitle,
-      });
-      fireEvent.click(parentActionsButton);
-      const showSubAgentsButton = await findMenuItem("Show sub-agents");
-      fireEvent.click(showSubAgentsButton);
-
-      await waitFor(
-        () => {
-          const reportedRow = getWorkspaceRow(renderedView.container, reportedChild.id);
-          if (!reportedRow) {
-            throw new Error("Expected old reported child to be visible after expansion");
-          }
-        },
-        { timeout: 10_000 }
-      );
-      expect(parentRow.getAttribute("aria-expanded")).toBe("true");
-
-      const ageTierExpandButton = renderedView.container.querySelector(
-        'button[aria-label^="Expand workspaces older than "]'
-      );
-      expect(ageTierExpandButton).toBeNull();
+      expect(
+        renderedView.container.querySelector('button[aria-label^="Expand workspaces older than "]')
+      ).toBeNull();
     } finally {
       await harness.cleanup();
     }

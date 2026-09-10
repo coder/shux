@@ -55,16 +55,14 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const programmaticToolCalling = useExperimentOverrideValue(
     EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
   );
-  const programmaticToolCallingExclusive = useExperimentOverrideValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-  );
+  const rlm = useExperimentOverrideValue(EXPERIMENT_IDS.RLM);
   const advisorTool = useExperimentOverrideValue(EXPERIMENT_IDS.ADVISOR_TOOL);
-  const execSubagentHardRestart = useExperimentOverrideValue(
-    EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART
-  );
   const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
+  const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
   const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
+  const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+  const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const baseModel = resolveEffectiveComposerModel(
@@ -82,12 +80,14 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     providerOptions,
     experiments: {
       programmaticToolCalling,
-      programmaticToolCallingExclusive,
+      rlm,
       advisorTool,
-      execSubagentHardRestart,
       dynamicWorkflows,
       memory,
+      memoryIntuition,
       toolSearch,
+      continuousCompaction,
+      tokenBudget,
     },
     disableWorkspaceAgents,
   });

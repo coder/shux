@@ -17,7 +17,7 @@ describe("redactDevcontainerArgsForLog", () => {
   });
 
   it("leaves non-sensitive --remote-env keys unchanged", () => {
-    const args = ["exec", "--remote-env", "GIT_AUTHOR_NAME=Mux Tester"];
+    const args = ["exec", "--remote-env", "GIT_AUTHOR_NAME=Xum Tester"];
     expect(redactDevcontainerArgsForLog(args)).toEqual(args);
   });
 
@@ -34,7 +34,7 @@ describe("redactDevcontainerArgsForLog", () => {
       "--remote-env",
       "GH_TOKEN=shhh",
       "--remote-env",
-      "GIT_AUTHOR_NAME=Mux Tester",
+      "GIT_AUTHOR_NAME=Xum Tester",
       "--remote-env",
       "CODER_AGENT_TOKEN=super-secret",
       "--",
@@ -48,7 +48,7 @@ describe("redactDevcontainerArgsForLog", () => {
       "--remote-env",
       "GH_TOKEN=<redacted>",
       "--remote-env",
-      "GIT_AUTHOR_NAME=Mux Tester",
+      "GIT_AUTHOR_NAME=Xum Tester",
       "--remote-env",
       "CODER_AGENT_TOKEN=<redacted>",
       "--",

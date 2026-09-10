@@ -40,6 +40,7 @@ function createToolConfig(
   tempDir: string,
   options?: {
     reportModelUsage?: Parameters<typeof createAdvisorTool>[0]["reportModelUsage"];
+    metadataModel?: string;
     transcript?: ModelMessage[];
     snapshot?: AdvisorToolCallSnapshot | undefined;
     maxOutputTokens?: number;
@@ -47,7 +48,15 @@ function createToolConfig(
     workspaceId?: string;
   }
 ) {
-  const createModel = mock(() => Promise.resolve({} as LanguageModel));
+  const advisorLanguageModel = Object.create(null) as LanguageModel;
+  const createModel = mock(() =>
+    Promise.resolve({
+      model: advisorLanguageModel,
+      ...(options?.metadataModel ? { metadataModel: options.metadataModel } : {}),
+      optionsModelString: ADVISOR_MODEL,
+      optionsProvidersConfig: null,
+    })
+  );
   const transcript = options?.transcript ?? createTranscript();
   const getTranscriptSnapshot = mock(() => transcript);
   const takeToolCallSnapshot = mock((_toolCallId: string) => options?.snapshot);
@@ -170,6 +179,78 @@ describe("advisor tool", () => {
     mock.restore();
   });
 
+  it.each([
+    { model: "openai:gpt-5.6", mode: "pro", effort: "high", expectedMode: "pro" },
+    { model: "openai:gpt-5.6", mode: "pro", effort: "max", expectedMode: "pro" },
+    { model: "openai:gpt-5.6", mode: "standard", effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-5.6", mode: undefined, effort: "high", expectedMode: undefined },
+    { model: "openai:gpt-5.2", mode: "pro", effort: "high", expectedMode: undefined },
+  ] as const)("forwards advisor mode independently of effort: %j", async (testCase) => {
+    using tempDir = new TestTempDir("advisor-reasoning-mode");
+    const { config } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "Consider the tradeoff.",
+      usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+    });
+    const tool = createAdvisorTool({
+      ...config,
+      advisorRuntime: {
+        ...config.advisorRuntime,
+        advisorModelString: testCase.model,
+        reasoningLevel: testCase.effort,
+        reasoningMode: testCase.mode,
+        createModel: () =>
+          Promise.resolve({
+            model: Object.create(null) as LanguageModel,
+            optionsModelString: testCase.model,
+            optionsProvidersConfig: null,
+          }),
+      },
+    });
+    await tool.execute!({}, mockToolCallOptions);
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBe(
+      testCase.expectedMode
+    );
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningEffort).toBe(
+      testCase.effort
+    );
+  });
+
+  it.each([
+    { modelOptions: { optionsRouteProvider: "coder" }, expectedMode: "pro" },
+    { modelOptions: { optionsRouteProvider: "mux-gateway" }, expectedMode: undefined },
+    {
+      modelOptions: { optionsMuxProviderOptions: { openai: { wireFormat: "chatCompletions" } } },
+      expectedMode: undefined,
+    },
+  ] as const)("gates advisor Pro by the effective route/wire: %j", async (testCase) => {
+    using tempDir = new TestTempDir("advisor-reasoning-route");
+    const { config } = createToolConfig(tempDir.path);
+    const streamTextSpy = mockStreamTextSuccess({
+      text: "Consider the tradeoff.",
+      usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+    });
+    const tool = createAdvisorTool({
+      ...config,
+      advisorRuntime: {
+        ...config.advisorRuntime,
+        advisorModelString: "openai:gpt-5.6",
+        reasoningMode: "pro",
+        createModel: () =>
+          Promise.resolve({
+            model: Object.create(null) as LanguageModel,
+            optionsModelString: "openai:gpt-5.6",
+            optionsProvidersConfig: null,
+            ...testCase.modelOptions,
+          }),
+      },
+    });
+    await tool.execute!({}, mockToolCallOptions);
+    expect(getStreamTextArgs(streamTextSpy).providerOptions?.openai?.reasoningMode).toBe(
+      testCase.expectedMode
+    );
+  });
+
   it("reports model usage after a successful advisor call", async () => {
     using tempDir = new TestTempDir("advisor-tool-report-usage");
     const usage: LanguageModelV2Usage = {
@@ -183,7 +264,10 @@ describe("advisor tool", () => {
       anthropic: { cacheCreationInputTokens: 6 },
     };
     const reportModelUsage = mock((_event: ToolModelUsageEvent) => undefined);
-    const { config, createModel } = createToolConfig(tempDir.path, { reportModelUsage });
+    const { config, createModel } = createToolConfig(tempDir.path, {
+      reportModelUsage,
+      metadataModel: "openai:pinned-pricing-model",
+    });
     const streamTextSpy = mockStreamTextSuccess({
       text: "Focus on the highest-risk dependency edges first.",
       usage,
@@ -207,6 +291,7 @@ describe("advisor tool", () => {
         source: "tool",
         toolName: "advisor",
         model: ADVISOR_MODEL,
+        metadataModel: "openai:pinned-pricing-model",
         usage,
         providerMetadata,
         toolCallId: "test-call-id",

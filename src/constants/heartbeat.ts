@@ -57,7 +57,7 @@ export interface HeartbeatSchedulePolicy {
  * `.default()` does not rewrite), and the `whenBusy` default is conditional on the resolved
  * trigger — an idle-triggered heartbeat skips busy slots (today's behavior), while a
  * fixed-interval heartbeat defaults to delivery after the current turn. Keeping unset values
- * unset in `~/.mux/config.json` also preserves the distinction between "user chose skip" and
+ * unset in `~/.xum/config.json` also preserves the distinction between "user chose skip" and
  * "user never touched it".
  *
  * Invalid/null/undefined values fall back to the defaults (self-healing for hand-edited or

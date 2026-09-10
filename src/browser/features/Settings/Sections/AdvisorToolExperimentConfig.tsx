@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
+import { ThinkingSelectorControl } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import { Input } from "@/browser/components/Input/Input";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
 import {
@@ -11,18 +12,21 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { useAPI } from "@/browser/contexts/API";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import { normalizeTaskSettings, type TaskSettings } from "@/common/types/tasks";
 import {
   coerceThinkingLevel,
-  getThinkingOptionLabel,
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
   THINKING_LEVEL_OFF,
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 const DEFAULT_LIMITED_MAX_USES = ADVISOR_DEFAULT_MAX_USES_PER_TURN;
 const DEFAULT_LIMITED_MAX_OUTPUT_TOKENS = 16000;
@@ -41,6 +45,7 @@ type AdvisorMode = "limited" | "unlimited";
 interface AdvisorSettingsState {
   advisorModelString: string | null;
   advisorThinkingLevel: ThinkingLevel;
+  advisorReasoningMode: OpenAIReasoningMode;
   advisorMaxUsesPerTurn: number | null;
   advisorMaxOutputTokens: number | null;
 }
@@ -83,7 +88,9 @@ function parsePositiveInteger(value: string): number | null {
 
 function normalizeAdvisorDraft(params: {
   advisorModelString: string;
+  providersConfig: ProvidersConfigMap | null;
   advisorThinkingLevel: ThinkingLevel;
+  advisorReasoningMode: OpenAIReasoningMode;
   maxUsesMode: AdvisorMode;
   limitedDraft: string;
   lastValidLimitedValue: number;
@@ -94,7 +101,9 @@ function normalizeAdvisorDraft(params: {
   const normalizedModelString = normalizeAdvisorModelString(params.advisorModelString);
   const normalizedThinkingLevel = enforceThinkingPolicy(
     normalizedModelString ?? "",
-    params.advisorThinkingLevel
+    params.advisorThinkingLevel,
+    undefined,
+    params.providersConfig
   );
 
   let normalizedMaxUsesPerTurn: number | null = null;
@@ -120,6 +129,7 @@ function normalizeAdvisorDraft(params: {
   return {
     advisorModelString: normalizedModelString,
     advisorThinkingLevel: normalizedThinkingLevel,
+    advisorReasoningMode: params.advisorReasoningMode,
     advisorMaxUsesPerTurn: normalizedMaxUsesPerTurn,
     advisorMaxOutputTokens: normalizedMaxOutputTokens,
   };
@@ -129,6 +139,7 @@ function areAdvisorSettingsEqual(a: AdvisorSettingsState, b: AdvisorSettingsStat
   return (
     a.advisorModelString === b.advisorModelString &&
     a.advisorThinkingLevel === b.advisorThinkingLevel &&
+    a.advisorReasoningMode === b.advisorReasoningMode &&
     a.advisorMaxUsesPerTurn === b.advisorMaxUsesPerTurn &&
     a.advisorMaxOutputTokens === b.advisorMaxOutputTokens
   );
@@ -136,11 +147,13 @@ function areAdvisorSettingsEqual(a: AdvisorSettingsState, b: AdvisorSettingsStat
 
 export function AdvisorToolExperimentConfig() {
   const { api } = useAPI();
+  const { config: providersConfig } = useProvidersConfig();
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
 
   const [advisorModelString, setAdvisorModelString] = useState("");
   const [advisorThinkingLevel, setAdvisorThinkingLevel] =
     useState<ThinkingLevel>(THINKING_LEVEL_OFF);
+  const [advisorReasoningMode, setAdvisorReasoningMode] = useState<OpenAIReasoningMode>("standard");
   const [maxUsesMode, setMaxUsesMode] = useState<AdvisorMode>("limited");
   const [limitedDraft, setLimitedDraft] = useState(String(DEFAULT_LIMITED_MAX_USES));
   const [lastValidLimitedValue, setLastValidLimitedValue] = useState(DEFAULT_LIMITED_MAX_USES);
@@ -191,6 +204,8 @@ export function AdvisorToolExperimentConfig() {
         const normalizedModelString = normalizeAdvisorModelString(cfg.advisorModelString);
         const normalizedThinkingLevel =
           coerceThinkingLevel(cfg.advisorThinkingLevel) ?? THINKING_LEVEL_OFF;
+        const normalizedReasoningMode =
+          coerceOpenAIReasoningMode(cfg.advisorReasoningMode) ?? "standard";
         const normalizedMaxUsesPerTurn = normalizePositiveIntOrNull(cfg.advisorMaxUsesPerTurn);
         const normalizedMaxOutputTokens = normalizePositiveIntOrNull(cfg.advisorMaxOutputTokens);
         // Match the backend starter cap when the setting is unset; only an explicit null is
@@ -209,6 +224,7 @@ export function AdvisorToolExperimentConfig() {
         taskSettingsRef.current = normalizedTaskSettings;
         setAdvisorModelString(normalizedModelString ?? "");
         setAdvisorThinkingLevel(normalizedThinkingLevel);
+        setAdvisorReasoningMode(normalizedReasoningMode);
         setMaxUsesMode(nextMaxUsesMode);
         setLimitedDraft(String(nextLimitedValue));
         setLastValidLimitedValue(nextLimitedValue);
@@ -218,6 +234,7 @@ export function AdvisorToolExperimentConfig() {
         lastSyncedRef.current = {
           advisorModelString: normalizedModelString,
           advisorThinkingLevel: normalizedThinkingLevel,
+          advisorReasoningMode: normalizedReasoningMode,
           advisorMaxUsesPerTurn: nextMaxUsesPerTurn,
           advisorMaxOutputTokens: nextMaxOutputTokens,
         };
@@ -258,7 +275,9 @@ export function AdvisorToolExperimentConfig() {
 
     const normalizedAdvisorSettings = normalizeAdvisorDraft({
       advisorModelString,
+      providersConfig,
       advisorThinkingLevel,
+      advisorReasoningMode,
       maxUsesMode,
       limitedDraft,
       lastValidLimitedValue,
@@ -302,6 +321,7 @@ export function AdvisorToolExperimentConfig() {
             taskSettings: payload.taskSettings,
             advisorModelString: payload.advisorModelString,
             advisorThinkingLevel: payload.advisorThinkingLevel,
+            advisorReasoningMode: payload.advisorReasoningMode,
             advisorMaxUsesPerTurn: payload.advisorMaxUsesPerTurn,
             advisorMaxOutputTokens: payload.advisorMaxOutputTokens,
           })
@@ -309,6 +329,7 @@ export function AdvisorToolExperimentConfig() {
             lastSyncedRef.current = {
               advisorModelString: payload.advisorModelString,
               advisorThinkingLevel: payload.advisorThinkingLevel,
+              advisorReasoningMode: payload.advisorReasoningMode,
               advisorMaxUsesPerTurn: payload.advisorMaxUsesPerTurn,
               advisorMaxOutputTokens: payload.advisorMaxOutputTokens,
             };
@@ -338,8 +359,10 @@ export function AdvisorToolExperimentConfig() {
     };
   }, [
     api,
+    providersConfig,
     advisorModelString,
     advisorThinkingLevel,
+    advisorReasoningMode,
     limitedDraft,
     loadFailed,
     loaded,
@@ -385,6 +408,7 @@ export function AdvisorToolExperimentConfig() {
           taskSettings: payload.taskSettings,
           advisorModelString: payload.advisorModelString,
           advisorThinkingLevel: payload.advisorThinkingLevel,
+          advisorReasoningMode: payload.advisorReasoningMode,
           advisorMaxUsesPerTurn: payload.advisorMaxUsesPerTurn,
           advisorMaxOutputTokens: payload.advisorMaxOutputTokens,
         })
@@ -468,27 +492,10 @@ export function AdvisorToolExperimentConfig() {
     setLastValidOutputTokensValue(normalizedValue);
   };
 
-  const effectiveAdvisorModelStringForThinking =
-    normalizeAdvisorModelString(advisorModelString) ?? "";
-  const allowedThinkingLevels = getThinkingPolicyForModel(effectiveAdvisorModelStringForThinking);
-  const effectiveAdvisorThinkingLevel = enforceThinkingPolicy(
-    effectiveAdvisorModelStringForThinking,
-    advisorThinkingLevel
-  );
-
-  const handleAdvisorThinkingLevelChange = (value: string) => {
-    const nextThinkingLevel = coerceThinkingLevel(value);
-    if (!nextThinkingLevel) {
-      return;
-    }
-
-    setAdvisorThinkingLevel(nextThinkingLevel);
-  };
-
   if (!api) {
     return (
       <div className="bg-background-secondary px-4 py-3">
-        <div className="text-muted text-xs">Connect to mux to configure this setting.</div>
+        <div className="text-muted text-xs">Connect to xum to configure this setting.</div>
       </div>
     );
   }
@@ -512,12 +519,12 @@ export function AdvisorToolExperimentConfig() {
 
   return (
     <div className="bg-background-secondary space-y-3 px-4 py-3">
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Advisor Model</div>
           <div className="text-muted text-xs">Global default for nested advisor calls.</div>
         </div>
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex min-w-0 items-center gap-2 sm:justify-end">
           <ModelSelector
             value={advisorModelString}
             onChange={setAdvisorModelString}
@@ -525,42 +532,39 @@ export function AdvisorToolExperimentConfig() {
             hiddenModels={hiddenModelsForSelector}
             emptyLabel="Select model"
             variant="box"
-            className="bg-modal-bg md:max-w-[22rem]"
+            className="bg-modal-bg max-w-full sm:max-w-[22rem]"
           />
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Reasoning</div>
           <div className="text-muted text-xs">Applied to advisor requests.</div>
         </div>
-        <div className="flex items-center justify-end gap-2">
-          <Select
-            value={effectiveAdvisorThinkingLevel}
-            onValueChange={handleAdvisorThinkingLevelChange}
-            disabled={allowedThinkingLevels.length <= 1}
-          >
-            <SelectTrigger className="border-border-medium bg-modal-bg h-9 w-32">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {allowedThinkingLevels.map((level) => (
-                <SelectItem key={level} value={level}>
-                  {getThinkingOptionLabel(level, effectiveAdvisorModelStringForThinking)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+        <div className="w-52 shrink-0">
+          {/* Reuse the route-aware picker so advisor Pro has the same delivery gates as chat. */}
+          <ThinkingSelectorControl
+            modelString={advisorModelString || undefined}
+            modelCapabilitiesDeferred={!advisorModelString}
+            allowProMode={Boolean(advisorModelString)}
+            allowFastMode={false}
+            applyMinimumThinkingLevel={false}
+            thinkingLevel={advisorThinkingLevel}
+            onThinkingLevelChange={setAdvisorThinkingLevel}
+            reasoningMode={advisorReasoningMode}
+            onReasoningModeChange={setAdvisorReasoningMode}
+            variant="box"
+          />
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Max Uses / Turn</div>
           <div className="text-muted text-xs">Per response.</div>
         </div>
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex min-w-0 items-center gap-2 sm:justify-end">
           <Select value={maxUsesMode} onValueChange={setAdvisorMaxUsesMode}>
             <SelectTrigger className="border-border-medium bg-modal-bg h-9 w-32">
               <SelectValue />
@@ -587,12 +591,12 @@ export function AdvisorToolExperimentConfig() {
         </div>
       </div>
 
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex-1">
           <div className="text-foreground text-sm">Max Output Tokens</div>
           <div className="text-muted text-xs">Per advisor response.</div>
         </div>
-        <div className="flex items-center justify-end gap-2">
+        <div className="flex min-w-0 items-center gap-2 sm:justify-end">
           <Select value={maxOutputTokensMode} onValueChange={setAdvisorMaxOutputTokensMode}>
             <SelectTrigger className="border-border-medium bg-modal-bg h-9 w-32">
               <SelectValue />

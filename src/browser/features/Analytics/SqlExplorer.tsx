@@ -29,6 +29,27 @@ export const SAMPLE_QUERIES = [
     label: "Tokens by Thinking Level",
     sql: "SELECT thinking_level, sum(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens) as total_tokens\nFROM events\nWHERE thinking_level IS NOT NULL\nGROUP BY thinking_level\nORDER BY total_tokens DESC;",
   },
+  // Refusal analytics: 'model_fallback_refusal' rows are refused fallback hops
+  // on committed turns; 'headless:refused_stream' rows are refusals on turns
+  // that never committed (terminal refusals, aborted/errored refusal turns).
+  {
+    label: "Refusals per Day",
+    sql: "SELECT date, model, count(*) as refusals\nFROM events\nWHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\nGROUP BY date, model\nORDER BY date ASC;",
+  },
+  {
+    label: "Refusal Downgrades (Requested → Answered)",
+    sql: "SELECT requested_model, model as answered_model, count(*) as turns\nFROM events\nWHERE requested_model IS NOT NULL AND tool_name IS NULL\nGROUP BY requested_model, model\nORDER BY turns DESC;",
+  },
+  {
+    // Every events row is one recorded invocation of `model` (committed turns,
+    // tool-internal calls, and billed errored/aborted/refused attempts via
+    // headless:* rows), so attempts = count(*) per model and refusal rows are
+    // a subset — billed non-refusal failures count in the denominator instead
+    // of inflating refusal_pct. Refusal rows already carry the refused model,
+    // so requested_model must not be coalesced in (double-count).
+    label: "Refusal Rate by Model",
+    sql: "WITH attempts AS (\n  SELECT model, count(*) as n FROM events\n  WHERE model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT a.model,\n  COALESCE(r.n, 0) as refusals,\n  a.n as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / a.n, 2) as refusal_pct\nFROM attempts a LEFT JOIN refused r USING (model)\nORDER BY refusals DESC;",
+  },
 ];
 
 interface SqlExplorerProps {

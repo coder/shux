@@ -14,6 +14,16 @@ export type PinnedMoveDirection = "up" | "down";
 export type PinnedDropEdge = "before" | "after";
 
 /**
+ * Flat-mode block options, mirroring the sidebar's render gates so the
+ * reorder block never contains rows the user cannot see (a move would
+ * otherwise swap with an invisible row and appear to do nothing).
+ */
+export interface FlatPinnedBlockOptions {
+  /** The multi-project experiment gate applied to the flat chat list. */
+  multiProjectEnabled: boolean;
+}
+
+/**
  * A workspace's pinned surroundings, both in displayed order:
  * - `fullOrder`: every pinned id of its config bucket. Reorder requests always
  *   send the full bucket order so the backend never has to guess scope.
@@ -50,15 +60,28 @@ function collectFlatSectionRows(
 /**
  * Resolve the pinned block containing `meta`, mirroring the sidebar renderer:
  * multi-project rows form one flat block; regular rows partition by their
- * effective section. Returns null when the workspace is not a rendered pinned
- * row (unpinned, or missing from the sorted map).
+ * effective section. In flat sidebar mode all pinned roots instead form one
+ * unified block across projects. Returns null when the workspace is not a
+ * rendered pinned row (unpinned, or missing from the sorted map).
  */
 export function locatePinnedBlock(
   meta: FrontendWorkspaceMetadata,
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
-  userProjects: Map<string, ProjectConfig>
+  userProjects: Map<string, ProjectConfig>,
+  flatMode: FlatPinnedBlockOptions | false = false
 ): PinnedBlock | null {
   if (!isWorkspacePinned(meta)) return null;
+
+  if (flatMode !== false) {
+    const pinnedIds = collectFlatSectionRows(
+      sortedWorkspacesByProject,
+      (row) => flatMode.multiProjectEnabled || !isMultiProject(row)
+    )
+      .filter((row) => row.parentWorkspaceId == null && isWorkspacePinned(row))
+      .map((row) => row.id);
+    if (!pinnedIds.includes(meta.id)) return null;
+    return { fullOrder: pinnedIds, blockIds: pinnedIds };
+  }
 
   // Scratch chats render as one flat "Chats" section, but each row's
   // projectPath is its own app-managed workdir, so the per-projectPath
@@ -130,9 +153,10 @@ export function computePinnedMoveOrderForWorkspace(
   meta: FrontendWorkspaceMetadata,
   direction: PinnedMoveDirection,
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
-  userProjects: Map<string, ProjectConfig>
+  userProjects: Map<string, ProjectConfig>,
+  flatMode: FlatPinnedBlockOptions | false = false
 ): string[] | null {
-  const block = locatePinnedBlock(meta, sortedWorkspacesByProject, userProjects);
+  const block = locatePinnedBlock(meta, sortedWorkspacesByProject, userProjects, flatMode);
   if (!block) return null;
   return computePinnedMoveOrder(block, meta.id, direction);
 }

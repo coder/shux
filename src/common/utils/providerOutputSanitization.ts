@@ -19,6 +19,7 @@ interface SanitizeStringOptions {
   reason?: "provider-output" | "error-message";
 }
 
+// eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
 function isPlainRecord(value: object): value is Record<string, unknown> {
   const prototype: unknown = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;

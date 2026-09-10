@@ -18,8 +18,10 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { advanceAnchoredDeadline, HeartbeatService } from "./heartbeatService";
 import type { HistoryService } from "./historyService";
+import { IdleDispatcher } from "./idleDispatcher";
 import type { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
+import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { WorkspaceService } from "./workspaceService";
 
 async function waitForCondition(
@@ -583,6 +585,60 @@ describe("HeartbeatService", () => {
       expect(internals.queuedWorkspaceIds.size).toBe(0);
       expect(executeHeartbeatMock).not.toHaveBeenCalled();
     });
+
+    test("start failure releases earlier acquisitions and leaves the service restartable", () => {
+      const dispatcher = new IdleDispatcher();
+      const emitter = new EventEmitter();
+      let failListenerRegistration = true;
+      const realOn = emitter.on.bind(emitter);
+      // Fail only the SECOND listener registration ("metadata") so the test
+      // also covers partial-acquisition rollback: the already-registered
+      // "activity" listener must be released, not leaked across retries.
+      emitter.on = ((event: string, listener: (...args: unknown[]) => void) => {
+        if (failListenerRegistration && event === "metadata") {
+          throw new Error("listener registration failed");
+        }
+        return realOn(event, listener);
+      }) as typeof emitter.on;
+      const failingWorkspaceService = Object.assign(emitter, {
+        getChatHistory: getChatHistoryMock,
+        executeHeartbeat: executeHeartbeatMock,
+        isBusyForMessage: isBusyForMessageMock,
+      }) as unknown as WorkspaceService;
+
+      const failingService = new HeartbeatService(
+        mockConfig,
+        mockExtensionMetadata,
+        failingWorkspaceService,
+        mockTaskService,
+        dispatcher
+      );
+
+      expect(() => failingService.start()).toThrow();
+
+      // The "activity" listener registered before the failing "metadata"
+      // registration must have been rolled back — a leak here would double up
+      // event handling after a successful retry.
+      expect(emitter.listenerCount("activity")).toBe(0);
+
+      // The idle-consumer registration acquired before the failing step must
+      // have been released: re-registering the same consumer name would
+      // otherwise trip the dispatcher's duplicate-registration assert.
+      const disposeProbe = dispatcher.registerConsumer({
+        name: "heartbeat",
+        priority: 50,
+        buildPayload: () => Promise.resolve(null),
+      });
+      disposeProbe();
+
+      // The rollback restores the stopped state, so start() succeeds once the
+      // failure cause is fixed.
+      failListenerRegistration = false;
+      failingService.start();
+      expect(emitter.listenerCount("activity")).toBe(1);
+      failingService.stop();
+      expect(emitter.listenerCount("activity")).toBe(0);
+    });
   });
 
   describe("event handling", () => {
@@ -1059,6 +1115,9 @@ describe("HeartbeatService", () => {
     });
 
     test("startup does not fire heartbeats immediately", async () => {
+      // Default-runner smoke: the scheduler sleeps STARTUP_DELAY_MS on Effect's
+      // default (real) clock, so nothing may fire this early. Cadence itself is
+      // covered on virtual time in heartbeatService.testClock.test.ts.
       service.start();
 
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1251,9 +1310,11 @@ describe("HeartbeatService", () => {
         getOrCreateSession: mock(() => params.session),
         sendMessage: sendMessageMock,
       });
-      workspaceService.setTaskService({
-        hasActiveDescendantAgentTasksForWorkspace: () => params.hasActiveDescendantTasks ?? false,
-      } as unknown as TaskService);
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          hasActiveDescendantAgentTasksForWorkspace: () => params.hasActiveDescendantTasks ?? false,
+        })
+      );
       return {
         workspaceService,
         sendMessageMock,

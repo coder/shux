@@ -57,7 +57,10 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
         "task_await",
         "task_list",
         "task_send_message",
-        "task_terminate",
+        "task_retitle",
+        "task_stop",
+        "task_remove",
+        "task_workspace_lifecycle",
         "task_apply_git_patch",
         "propose_plan",
         "ask_user_question",
@@ -87,6 +90,15 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     },
   },
   {
+    id: "intuition",
+    scope: "built-in",
+    name: "Intuition",
+    description: "Read-only memory recognition (internal)",
+    uiSelectable: false,
+    subagentRunnable: false,
+    tools: { require: ["memory_read", "intuition_report"] },
+  },
+  {
     id: "dream",
     scope: "built-in",
     name: "Dream",
@@ -108,10 +120,15 @@ function compareAgentsByName(a: AgentDefinitionDescriptor, b: AgentDefinitionDes
 // via knownAgentIds below.
 function shouldShowAgentInTasksSettings(
   agent: AgentDefinitionDescriptor,
-  params: { portableDesktopEnabled: boolean; memoryConsolidationEnabled: boolean }
+  params: {
+    portableDesktopEnabled: boolean;
+    memoryConsolidationEnabled: boolean;
+    memoryIntuitionEnabled: boolean;
+  }
 ): boolean {
   if (agent.id === "desktop") return params.portableDesktopEnabled;
   if (agent.id === "dream") return params.memoryConsolidationEnabled;
+  if (agent.id === "intuition") return params.memoryIntuitionEnabled;
   return true;
 }
 
@@ -121,6 +138,8 @@ export function deriveTasksSectionAgentGroups(params: {
   portableDesktopEnabled: boolean;
   /** True only when both Agent Memory and Memory Consolidation experiments are on (mirrors the runtime gate in memoryConsolidationService). */
   memoryConsolidationEnabled: boolean;
+  /** True only when both Agent Memory and Memory Intuition are on. */
+  memoryIntuitionEnabled: boolean;
 }): {
   uiAgents: AgentDefinitionDescriptor[];
   subagents: AgentDefinitionDescriptor[];

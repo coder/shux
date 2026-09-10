@@ -5,6 +5,7 @@
  */
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
@@ -31,7 +32,9 @@ import type {
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
   ServerAuthSession,
+  UpdateStatus,
 } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import type { ProjectGitStatusResult as ApiProjectGitStatusResult } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -39,6 +42,12 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
+import type {
+  AgentPluginInstallPreview,
+  AgentPluginListItem,
+  AgentPluginUpdateCheck,
+  AgentPluginUpdateReview,
+} from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
 import {
@@ -49,9 +58,7 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   DEFAULT_TASK_SETTINGS,
-  normalizeSubagentAiDefaults,
   normalizeTaskSettings,
-  type SubagentAiDefaults,
   type TaskSettings,
 } from "@/common/types/tasks";
 import { normalizeAgentAiDefaults, type AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -73,7 +80,9 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import type { SendMessageError } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
 export interface MockSessionUsage {
@@ -114,11 +123,30 @@ export interface MockTerminalSession {
   outputChunks?: string[];
 }
 
+type MockBackupRoute = keyof APIClient["backup"];
+type MockBackupRouteOutput<Route extends MockBackupRoute> = Awaited<
+  ReturnType<APIClient["backup"][Route]>
+>;
+type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Extract<
+  MockBackupRouteOutput<Route>,
+  { success: true }
+>["data"];
+type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
+
 type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 export interface MockORPCClientOptions {
   /** Layout presets config for Settings → Layouts stories */
   layoutPresets?: LayoutPresetsConfig;
+  /** Agent Plugin installer mock data (Settings → Plugins). */
+  agentPlugins?: {
+    items?: AgentPluginListItem[];
+    updateChecks?: AgentPluginUpdateCheck[];
+    /** Returned by agentPlugins.preview; omit to make preview fail. */
+    preview?: AgentPluginInstallPreview;
+    /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
+    updateReview?: AgentPluginUpdateReview;
+  };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
   /** Pre-seeded multi-project git status rows keyed by workspace ID. */
@@ -133,11 +161,9 @@ export interface MockORPCClientOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** Agent definitions to expose via agents.list */
   agentDefinitions?: AgentDefinitionDescriptor[];
-  /** Initial per-subagent AI defaults for config.getConfig (e.g., Settings → Tasks section) */
-  subagentAiDefaults?: SubagentAiDefaults;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
-  /** What to do with mux-managed worktrees when archiving a chat. */
+  /** What to do with xum-managed worktrees when archiving a chat. */
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
@@ -145,8 +171,6 @@ export interface MockORPCClientOptions {
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
   defaultRuntime?: RuntimeEnablementId | null;
-  /** Initial 1Password account name for config.getConfig */
-  onePasswordAccountName?: string | null;
   /** Initial global heartbeat default prompt for config.getConfig */
   heartbeatDefaultPrompt?: string;
   /** Initial global heartbeat default interval for config.getConfig */
@@ -160,6 +184,8 @@ export interface MockORPCClientOptions {
    * keyed by the workspace ID the story uses.
    */
   goalBoardSnapshots?: Map<string, GoalBoardSnapshot>;
+  /** Pre-seeded timeline events served to workspace.timeline.list/subscribe for every workspace. */
+  timelineEvents?: TimelineEvent[];
   /**
    * Pre-seeded memory files for memory.list (Memory tab / Settings → Memory
    * stories). read/save/delete/setPinned operate on this in-memory set.
@@ -169,6 +195,11 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
+  /** Initial updater status for update.onStatus (About dialog stories). */
+  updateStatus?: UpdateStatus;
+  /** Release channel for update.getChannel. */
+  updateChannel?: UpdateChannel;
+  updateChannels?: UpdateChannel[];
   /** Initial route priority for config.getConfig */
   routePriority?: string[];
   /** Initial per-model route overrides for config.getConfig */
@@ -190,6 +221,11 @@ export interface MockORPCClientOptions {
   onProjectRemove?: (
     projectPath: string
   ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
+  /** Override for workspace.sendMessage (default: immediate success) */
+  onSendMessage?: (input: {
+    workspaceId: string;
+    message: string;
+  }) => Promise<{ success: true; data: undefined } | { success: false; error: SendMessageError }>;
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -281,9 +317,9 @@ export interface MockORPCClientOptions {
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidAgentSkills?: AgentSkillIssue[];
-  /** Mux Governor URL (null = not enrolled) */
+  /** Xum Governor URL (null = not enrolled) */
   muxGovernorUrl?: string | null;
-  /** Whether enrolled with Mux Governor */
+  /** Whether enrolled with Xum Governor */
   muxGovernorEnrolled?: boolean;
   /** Policy response for policy.get */
   policyResponse?: {
@@ -303,6 +339,11 @@ export interface MockORPCClientOptions {
     success: boolean;
     error?: string | null;
   };
+  backupSettings?: MockBackupSettings | null;
+  backupValidation?: MockBackupData<"validate">;
+  backupPreview?: MockBackupData<"preview">;
+  backupPush?: MockBackupData<"push">;
+  backupRestore?: MockBackupData<"restore">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -356,6 +397,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providersList = [],
     serverAuthSessions: initialServerAuthSessions = [],
     onProjectRemove,
+    onSendMessage,
     nameGenerationResult,
     backgroundProcesses = new Map<string, MockBackgroundProcess[]>(),
     sessionUsage = new Map<string, MockSessionUsage>(),
@@ -370,27 +412,30 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     projectSecrets = new Map<string, Secret[]>(),
     terminalSessions: initialTerminalSessions = [],
     globalMcpServers = {},
+    agentPlugins: agentPluginsMock,
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
     mcpTestResults = new Map<string, MockMcpTestResult>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
-    subagentAiDefaults: initialSubagentAiDefaults,
     agentAiDefaults: initialAgentAiDefaults,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
-    onePasswordAccountName: initialOnePasswordAccountName = null,
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
+    timelineEvents = [],
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
+    updateStatus,
+    updateChannel = "stable",
+    updateChannels = ["stable", "nightly"],
     routePriority: initialRoutePriority = ["direct"],
     routeOverrides: initialRouteOverrides = {},
     agentDefinitions: initialAgentDefinitions,
@@ -415,6 +460,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       policy: null,
     },
     logEntries = [],
+    backupSettings: initialBackupSettings,
+    backupValidation,
+    backupPreview,
+    backupPush,
+    backupRestore,
     clearLogsResult = { success: true, error: null },
     runtimeStatuses = new Map<string, "running" | "stopped" | "unknown" | "unsupported">(),
   } = options;
@@ -504,9 +554,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let userPreferencesInitialized = initialUserPreferences !== undefined;
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
 
-  let agentAiDefaults = normalizeAgentAiDefaults(
-    initialAgentAiDefaults ?? ({ ...(initialSubagentAiDefaults ?? {}) } as const)
-  );
+  let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
   let muxGatewayEnabled: boolean | undefined = undefined;
   let muxGatewayModels: string[] | undefined = undefined;
@@ -523,7 +571,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   };
 
   let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
-  let onePasswordAccountName: string | null = initialOnePasswordAccountName;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
@@ -585,19 +632,39 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     ...session,
   }));
 
-  const deriveSubagentAiDefaults = () => {
-    const raw: Record<string, unknown> = {};
-    for (const [agentId, entry] of Object.entries(agentAiDefaults)) {
-      if (agentId === "plan" || agentId === "exec" || agentId === "compact") {
-        continue;
-      }
-      raw[agentId] = entry;
-    }
-    return normalizeSubagentAiDefaults(raw);
+  let backupSettings: MockBackupSettings | null = initialBackupSettings ?? null;
+  const backupValidationResult: MockBackupData<"validate"> = backupValidation ?? {
+    reachable: true,
+    empty: false,
+    credential: "gh",
+  };
+  const backupPreviewResult: MockBackupData<"preview"> = backupPreview ?? {
+    pushChanges: [],
+    restoreChanges: [],
+    localOnlyFiles: [],
+    redactions: [],
+    commandApprovals: [],
+    projectImports: [],
+    projectBundleSkipped: false,
+    pushError: null,
+  };
+  const backupPushResult: MockBackupData<"push"> = backupPush ?? {
+    commit: "abc1234",
+    changed: true,
+    credential: backupValidationResult.credential,
+    redactions: [],
+  };
+  const backupRestoreResult: MockBackupData<"restore"> = backupRestore ?? {
+    commit: "def5678",
+    snapshotPath: "/tmp/mux-backup-snapshot",
+    changedFiles: [],
+    localOnlyFiles: [],
+    projectImportResults: [],
+    projectBundleSkipped: false,
+    unapprovedProjectImports: [],
   };
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-  let subagentAiDefaults = deriveSubagentAiDefaults();
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -691,6 +758,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ revokedCount: beforeCount - serverAuthSessionsState.length });
       },
     },
+    backup: {
+      getSettings: () => Promise.resolve(backupSettings),
+      saveSettings: (input: Parameters<APIClient["backup"]["saveSettings"]>[0]) => {
+        backupSettings = { ...input };
+        notifyConfigChanged();
+        return Promise.resolve({ success: true as const, data: backupSettings });
+      },
+      validate: (_input: Parameters<APIClient["backup"]["validate"]>[0]) =>
+        Promise.resolve({ success: true as const, data: backupValidationResult }),
+      preview: (_input: Parameters<APIClient["backup"]["preview"]>[0]) =>
+        Promise.resolve({ success: true as const, data: backupPreviewResult }),
+      push: (_input: Parameters<APIClient["backup"]["push"]>[0]) =>
+        Promise.resolve({ success: true as const, data: backupPushResult }),
+      restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
+        Promise.resolve({ success: true as const, data: backupRestoreResult }),
+    },
     // Settings → Layouts (layout presets)
     // Stored in-memory for Storybook only.
     // Frontend code normalizes the response defensively, but we normalize here too so
@@ -717,9 +800,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           runtimeEnablement,
           defaultRuntime,
           agentAiDefaults,
-          subagentAiDefaults,
           muxGovernorUrl,
-          onePasswordAccountName,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
@@ -731,7 +812,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         taskSettings?: unknown;
         userPreferences?: unknown;
         agentAiDefaults?: unknown;
-        subagentAiDefaults?: unknown;
       }) => {
         if (input.taskSettings != null) {
           taskSettings = normalizeTaskSettings(input.taskSettings);
@@ -744,18 +824,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
         if (input.agentAiDefaults !== undefined) {
           agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
-          subagentAiDefaults = deriveSubagentAiDefaults();
-        }
-
-        if (input.subagentAiDefaults !== undefined) {
-          subagentAiDefaults = normalizeSubagentAiDefaults(input.subagentAiDefaults);
-
-          const nextAgentAiDefaults: Record<string, unknown> = { ...agentAiDefaults };
-          for (const [agentType, entry] of Object.entries(subagentAiDefaults)) {
-            nextAgentAiDefaults[agentType] = entry;
-          }
-
-          agentAiDefaults = normalizeAgentAiDefaults(nextAgentAiDefaults);
         }
 
         notifyConfigChanged();
@@ -781,7 +849,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateAgentAiDefaults: (input: { agentAiDefaults: unknown }) => {
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
-        subagentAiDefaults = deriveSubagentAiDefaults();
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -814,11 +881,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       }) => {
         coderWorkspaceArchiveBehavior = input.coderWorkspaceArchiveBehavior;
         worktreeArchiveBehavior = input.worktreeArchiveBehavior;
-        notifyConfigChanged();
-        return Promise.resolve(undefined);
-      },
-      updateOnePasswordAccountName: (input: { onePasswordAccountName?: string | null }) => {
-        onePasswordAccountName = input.onePasswordAccountName ?? null;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -954,6 +1016,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(agentPackage);
       },
     },
+    workflows: {
+      // The tray's cold-mount discovery and nested-run liveness poll run in any
+      // story that renders chat input; resolve empty so no groups are seeded.
+      getRunStatuses: () => Promise.resolve([]),
+      listActiveRuns: () => Promise.resolve([]),
+    },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
       listDiagnostics: () =>
@@ -971,13 +1039,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       getConfig: () => Promise.resolve(providersConfig),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
-    },
-    onePassword: {
-      isAvailable: () => Promise.resolve({ available: false }),
-      listVaults: () => Promise.resolve([]),
-      listItems: () => Promise.resolve([]),
-      getItemFields: () => Promise.resolve([]),
-      buildReference: () => Promise.resolve({ reference: "", label: "" }),
     },
     muxGateway: {
       getAccountStatus: () =>
@@ -1082,6 +1143,34 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
         return Promise.resolve({ success: true, data: undefined });
       },
+    },
+    agentPlugins: {
+      list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
+      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      checkUpdates: () =>
+        Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
+      preview: () =>
+        agentPluginsMock?.preview
+          ? Promise.resolve({ success: true, data: agentPluginsMock.preview })
+          : Promise.resolve({ success: false, error: "No preview configured in this story" }),
+      install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
+        Promise.resolve({
+          success: true,
+          data: {
+            name: agentPluginsMock?.preview?.manifest.name ?? "plugin",
+            scope: "global" as const,
+            source: input.source,
+            lockedSha: input.expectedSha,
+            installedAt: new Date().toISOString(),
+          },
+        }),
+      uninstall: () => Promise.resolve({ success: true, data: undefined }),
+      previewUpdate: (input: { name: string }) =>
+        agentPluginsMock?.updateReview && agentPluginsMock.updateReview.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.updateReview })
+          : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
+      update: (input: { name: string }) =>
+        Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
     },
     mcp: {
       list: (input?: { projectPath?: string }) => {
@@ -1273,14 +1362,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     projects: {
-      list: () => Promise.resolve(Array.from(projects.entries())),
+      // Mirror the server-side read projection: projects.list excludes archived
+      // workspaces (the UI loads them on demand via workspace.list({archived:true})).
+      list: () =>
+        Promise.resolve(
+          Array.from(projects.entries()).map(([projectPath, project]): [string, ProjectConfig] => [
+            projectPath,
+            {
+              ...project,
+              workspaces: project.workspaces.filter(
+                (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+              ),
+            },
+          ])
+        ),
       create: () =>
         Promise.resolve({
           success: true,
           data: { projectConfig: { workspaces: [] }, normalizedPath: "/mock/project" },
         }),
       pickDirectory: () => Promise.resolve(null),
-      getDefaultProjectDir: () => Promise.resolve("~/.mux/projects"),
+      getDefaultProjectDir: () => Promise.resolve("~/.xum/projects"),
       setDefaultProjectDir: () => Promise.resolve(),
       clone: () =>
         Promise.resolve(
@@ -1321,9 +1423,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true as const });
       },
-      remove: (input: { projectPath: string }) => {
+      // Read-only preflight used by the delete confirmation dialog.
+      getRemovalBlockers: (input: { projectPath: string }) => {
+        const project = projects.get(input.projectPath);
+        return Promise.resolve(getProjectWorkspaceCounts(project?.workspaces ?? []));
+      },
+      remove: (input: { projectPath: string; force?: boolean | null }) => {
         if (onProjectRemove) {
           return Promise.resolve(onProjectRemove(input.projectPath));
+        }
+        // Mirror the real backend: a non-forced removal of a project that still
+        // has workspaces is rejected with authoritative blocker counts, which
+        // the sidebar uses to populate the delete confirmation dialog.
+        const project = projects.get(input.projectPath);
+        const counts = getProjectWorkspaceCounts(project?.workspaces ?? []);
+        if (input.force !== true && counts.activeCount + counts.archivedCount > 0) {
+          return Promise.resolve({
+            success: false,
+            error: { type: "workspace_blockers", ...counts },
+          });
         }
         return Promise.resolve({ success: true, data: undefined });
       },
@@ -1338,6 +1456,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         const project = projects.get(input.projectPath);
         if (project) {
           project.displayName = input.displayName ?? undefined;
+        }
+        return Promise.resolve();
+      },
+      setCustomInstructions: (input: {
+        projectPath: string;
+        customInstructions?: string | null;
+      }) => {
+        const project = projects.get(input.projectPath);
+        if (project) {
+          project.customInstructions = input.customInstructions?.trim()
+            ? input.customInstructions
+            : undefined;
         }
         return Promise.resolve();
       },
@@ -1458,11 +1588,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
       timeline: {
-        list: () => Promise.resolve({ events: [], nextCursor: null, hasOlder: false }),
+        list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),
         subscribe: () =>
           Promise.resolve(
             (function* () {
-              yield { type: "snapshot" as const, events: [], nextCursor: null, hasOlder: false };
+              yield {
+                type: "snapshot" as const,
+                events: timelineEvents,
+                nextCursor: null,
+                hasOlder: false,
+              };
             })()
           ),
         preview: () => Promise.resolve(null),
@@ -1538,7 +1673,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: { newWorkspaceId: input.workspaceId },
         }),
       fork: () => Promise.resolve({ success: false, error: "Not implemented in mock" }),
-      sendMessage: () => Promise.resolve({ success: true, data: undefined }),
+      sendMessage: (input: { workspaceId: string; message: string }) =>
+        onSendMessage ? onSendMessage(input) : Promise.resolve({ success: true, data: undefined }),
       resumeStream: () => Promise.resolve({ success: true, data: { started: true } }),
       setAutoRetryEnabled: () =>
         Promise.resolve({
@@ -1693,7 +1829,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             content: "",
             enabled: true,
           },
-          sources: { global: null, context: [] },
+          sources: { global: [], context: [] },
           files: [],
           totalTokens: null,
         }),
@@ -1718,8 +1854,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       mcp: {
         get: (input: { workspaceId: string }) =>
-          Promise.resolve(mcpOverrides.get(input.workspaceId) ?? {}),
-        set: (input: { workspaceId: string; overrides: MockMcpOverrides }) => {
+          Promise.resolve({
+            overrides: mcpOverrides.get(input.workspaceId) ?? {},
+            revision: "mock-revision",
+          }),
+        set: (input: {
+          workspaceId: string;
+          overrides: MockMcpOverrides;
+          expectedRevision: string;
+        }) => {
           mcpOverrides.set(input.workspaceId, input.overrides);
           return Promise.resolve({ success: true, data: undefined });
         },
@@ -1880,10 +2023,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       download: () => Promise.resolve(undefined),
       install: () => Promise.resolve(undefined),
       onStatus: async function* () {
-        yield* [];
+        if (updateStatus) yield updateStatus;
         await new Promise<void>(() => undefined);
       },
-      getChannel: () => Promise.resolve("stable" as const),
+      getChannel: () =>
+        Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
     },
     policy: {

@@ -3,7 +3,7 @@ title: Providers
 description: Configure API keys and settings for AI providers
 ---
 
-Mux supports multiple AI providers. The easiest way to configure them is through **Settings → Providers** (`Cmd+,` / `Ctrl+,`).
+Xum supports multiple AI providers. The easiest way to configure them is through **Settings → Providers** (`Cmd+,` / `Ctrl+,`).
 
 ## Quick Setup
 
@@ -24,10 +24,12 @@ Most providers only need an API key. The UI handles validation and shows which p
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
 | **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
+| **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
 | **OpenRouter**     | 300+ models                 | [openrouter.ai](https://openrouter.ai/)                 |
 | **Ollama**         | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |
 | **Bedrock**        | Claude via AWS              | AWS Console                                             |
 | **GitHub Copilot** | GPT-4o, Claude Sonnet, etc. | [GitHub Copilot](https://github.com/features/copilot)   |
+| **Coder**          | Models via AI Bridge        | Your Coder deployment (Login with Coder, no key needed) |
 
 ## Environment Variables
 
@@ -44,6 +46,7 @@ Providers also read from environment variables as fallback:
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
+| Z.ai           | `ZAI_API_KEY`                                      |
 | github-copilot | `GITHUB_COPILOT_TOKEN`                             |
 | Bedrock        | `AWS_REGION` (credentials via AWS SDK chain)       |
 
@@ -70,7 +73,7 @@ Azure OpenAI env vars configure the OpenAI provider with Azure backend.
 
 ## Advanced: Manual Configuration
 
-For advanced options not exposed in the UI, edit `~/.mux/providers.jsonc` directly:
+For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` directly:
 
 ```jsonc
 {
@@ -99,13 +102,43 @@ For advanced options not exposed in the UI, edit `~/.mux/providers.jsonc` direct
 }
 ```
 
-### Custom OpenAI-compatible providers
+### OpenAI wire format
 
-Custom OpenAI-compatible providers let you keep the built-in `openai` provider for OpenAI and
-Codex, while also adding named local or remote endpoints such as llama.cpp, vLLM, LM Studio,
-or proxies.
+The built-in `openai` provider supports two wire formats:
 
-Add each endpoint as a top-level provider in `~/.mux/providers.jsonc`:
+| Value             | Description                                                                                                                                  |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `responses`       | Uses the OpenAI Responses API. This is the default and supports current OpenAI and Codex features.                                           |
+| `chatCompletions` | Uses `/v1/chat/completions`. Use this for OpenAI-API-shaped gateways that do not expose `/v1/responses`, such as Azure Government endpoints. |
+
+OpenAI documents that GPT-6 Astra only supports tool calling through the Responses API, so keep
+`responses` when using that model.
+
+Set the format in **Settings → Providers → OpenAI → Wire format**, or in
+`~/.xum/providers.jsonc`:
+
+```jsonc
+{
+  "openai": {
+    "baseUrl": "https://your-openai-gateway.example/v1",
+    "wireFormat": "chatCompletions",
+  },
+}
+```
+
+Like custom providers, a built-in `openai` `baseUrl` without a path gains `/v1` automatically;
+add a trailing slash to keep requests at the origin root.
+
+For llama.cpp, vLLM, LM Studio, and multiple local endpoints, prefer named custom
+`providerType: "openai-compatible"` providers instead of changing the built-in OpenAI provider.
+
+### Custom providers
+
+Custom providers let you keep the built-in `openai` and `anthropic` providers for their official
+APIs while adding named local endpoints, remote gateways, or proxies. Each custom provider selects
+the API format that its endpoint accepts.
+
+Add each endpoint as a top-level provider in `~/.xum/providers.jsonc`:
 
 ```jsonc
 {
@@ -118,14 +151,39 @@ Add each endpoint as a top-level provider in `~/.mux/providers.jsonc`:
 }
 ```
 
-| Option         | Required | Description                                                                           |
-| -------------- | -------- | ------------------------------------------------------------------------------------- |
-| `providerType` | Yes      | Must be `"openai-compatible"` for custom OpenAI-compatible providers.                 |
-| `baseUrl`      | Yes      | The OpenAI-compatible API base URL. Most servers require the `/v1` suffix.            |
-| `apiKey`       | No       | Optional API key. Keyless local servers do not need a placeholder key.                |
-| `apiKeyFile`   | No       | Path to a file containing the API key. Supports `~` for home directory.               |
-| `displayName`  | No       | Optional UI label shown instead of the provider ID.                                   |
-| `models`       | No       | Discovery list shown in the model picker. You can still type any model ID at runtime. |
+The **API format** selector in Settings defaults to `openai-compatible`, so existing custom
+provider setups continue to use Chat Completions.
+
+| `providerType`       | SDK adapter                    | Request endpoint       |
+| -------------------- | ------------------------------ | ---------------------- |
+| `openai-compatible`  | `@ai-sdk/openai-compatible`    | `/v1/chat/completions` |
+| `openai-responses`   | `@ai-sdk/openai` Responses API | `/v1/responses`        |
+| `anthropic-messages` | `@ai-sdk/anthropic`            | `/v1/messages`         |
+
+| Option         | Required | Description                                                                                        |
+| -------------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `providerType` | Yes      | API format for this custom provider. Use one of the three values above.                            |
+| `baseUrl`      | Yes      | API base URL. Xum normalizes it according to `providerType` before the SDK adds the endpoint path. |
+| `apiKey`       | No       | Optional API key. Keyless local servers do not need a placeholder key.                             |
+| `apiKeyFile`   | No       | Path to a file containing the API key. Supports `~` for home directory.                            |
+| `displayName`  | No       | Optional UI label shown instead of the provider ID.                                                |
+| `models`       | No       | Discovery list shown in the model picker. You can still type any model ID at runtime.              |
+
+Base URL normalization depends on the selected format:
+
+- `openai-compatible` and `openai-responses`: an origin-only URL such as
+  `http://localhost:8080` gains `/v1`. Explicit paths remain unchanged. A trailing slash, such as
+  `http://localhost:8080/`, keeps requests at the origin root.
+- `anthropic-messages`: trailing slashes are removed and `/v1` is appended unless the URL already
+  ends in `/v1`. For example, `https://gateway.example/anthropic` becomes
+  `https://gateway.example/anthropic/v1`.
+
+Base URLs must not contain a query string or fragment: the SDK appends endpoint paths directly to
+the base URL string, so a query would swallow the endpoint path. Pass authentication through
+`apiKey` or `apiKeyFile` instead of query parameters.
+
+To configure a single OpenAI-shaped gateway through the built-in `openai` provider instead, see
+[OpenAI wire format](#openai-wire-format).
 
 Provider IDs must use lowercase letters, digits, `_`, and `-`, and must start with a letter or digit. They must not collide with
 built-in provider names, and cannot contain `.`, `:`, `/`, or whitespace. Good examples are
@@ -172,14 +230,66 @@ built-in provider names, and cannot contain `.`, `:`, `/`, or whitespace. Good e
 
 Operational notes:
 
-- `baseUrl` is resolved from the Mux backend process. In desktop mode, this is your local
+- `baseUrl` is resolved from the Xum backend process. In desktop mode, this is your local
   machine. In server mode, the endpoint must be reachable from the server.
-- Most OpenAI-compatible servers require the `/v1` suffix in the URL.
-- Custom providers use Chat Completions via `@ai-sdk/openai-compatible`.
-- Keep the official `openai` provider for the Responses API, Codex OAuth, and OpenAI service
-  tiers. Custom providers do not inherit those features.
+- Most compatible servers require the `/v1` suffix in the URL. Use the normalization rules
+  above when a gateway mounts its API under another path.
+- Keep the official providers for provider-specific account features such as Codex OAuth and
+  OpenAI service tiers. Custom providers select the request format but do not inherit those
+  features.
 - Custom providers are direct-only and do not participate in gateway routing.
-- You no longer need to set a fake `apiKey` to point Mux at a keyless local server.
+- You no longer need to set a fake `apiKey` to point Xum at a keyless local server.
+
+### Coder (Login with Coder)
+
+The Coder provider routes requests through a [Coder](https://coder.com) deployment's
+AI Gateway (`/api/v2/aibridge`), so usage is authenticated, governed, and audited by the
+deployment instead of a personal API key.
+
+Deployment prerequisites (admin-side):
+
+- The OAuth2 provider experiment: start `coderd` with `--experiments=oauth2` (or `CODER_EXPERIMENTS=oauth2`)
+- AI Gateway entitlement and `--aibridge-enabled`, with at least one provider configured
+
+To connect:
+
+1. Open **Settings → Providers → Coder**
+2. Set the **Deployment URL** (e.g. `https://coder.example.com`)
+3. Click **Login with Coder** and approve the request in your browser
+
+Xum registers itself as an OAuth2 client on the deployment (RFC 7591 dynamic client
+registration), completes an authorization-code + PKCE flow, and stores the resulting tokens
+in `~/.xum/providers.jsonc`. Tokens refresh automatically; **Disconnect** revokes and clears
+them.
+
+After login, Xum discovers the deployment's configured AI Gateway providers and their model
+catalogs, listing models as `coder:<provider>/<model>` (e.g. `coder:anthropic/<model>`,
+`coder:my-openai/<model>`). Each provider's type (anthropic, openai, bedrock,
+openai-compat, ...) decides the wire protocol Xum speaks to its gateway route. Use the
+**Refresh models** button (or the "Settings: Refresh Coder Models" command) to re-discover
+without a re-login. You can also add model IDs manually under the provider's model list;
+manual edits are preserved across re-logins and catalog refreshes: added entries stay
+listed, and removed catalog entries stay removed.
+
+Listing the deployment's providers requires an admin-level API on some deployments; when it
+is unavailable Xum probes the default provider names instead. If your deployment uses
+custom-named provider instances that Xum cannot discover, declare them by hand in
+`~/.xum/providers.jsonc`:
+
+```jsonc
+{
+  "coder": {
+    "additionalProviders": [{ "name": "llm-proxy", "type": "openai-compat" }],
+    "models": ["llm-proxy/llama-3.3-70b"],
+  },
+}
+```
+
+Login works from the desktop app and from a browser connected to a Xum server, including a
+remote one: in the desktop app the OAuth callback lands on a loopback listener on your
+machine, while in the browser Xum registers a callback URL on the server's own origin
+(`/auth/coder/callback`) so the redirect reaches the server directly. A remote server must
+be reachable over HTTPS for Coder to accept that callback URL.
 
 ### Bedrock Authentication
 
@@ -189,7 +299,7 @@ Bedrock supports multiple authentication methods (tried in order):
 2. **Explicit Credentials** - `accessKeyId` + `secretAccessKey` in config
 3. **AWS Credential Chain** - Automatic resolution from environment, `~/.aws/credentials`, SSO, EC2/ECS roles
 
-If you're already authenticated with AWS CLI (`aws sso login`), Mux uses those credentials automatically.
+If you're already authenticated with AWS CLI (`aws sso login`), Xum uses those credentials automatically.
 
 ### OpenRouter Provider Routing
 
@@ -204,7 +314,7 @@ See [OpenRouter Provider Routing docs](https://openrouter.ai/docs/features/provi
 
 ### xAI Search Orchestration
 
-Grok models support live web search. Mux enables this by default with `mode: "auto"`. Customize via [`searchParameters`](https://docs.x.ai/docs/resources/search) for regional focus, time filters, or to disable search.
+Grok models support live web search. Xum enables this by default with `mode: "auto"`. Customize via [`searchParameters`](https://docs.x.ai/docs/resources/search) for regional focus, time filters, or to disable search.
 
 ### Model Parameter Overrides
 

@@ -79,6 +79,36 @@ describe("extractImagesFromToolResult", () => {
     expect(extractImagesFromToolResult({ type: "error", value: [] })).toEqual([]);
     expect(extractImagesFromToolResult({ type: "content", value: "not-array" })).toEqual([]);
   });
+
+  it("should retain string filenames from media parts", () => {
+    const result = {
+      type: "content",
+      value: [
+        { type: "media", data: "imagedata", mediaType: "image/png", filename: "screenshot.png" },
+      ],
+    };
+
+    const images = extractImagesFromToolResult(result);
+
+    expect(images).toHaveLength(1);
+    expect(images[0].filename).toBe("screenshot.png");
+  });
+
+  it("should normalize missing or malformed filenames to undefined without dropping the image", () => {
+    const result = {
+      type: "content",
+      value: [
+        { type: "media", data: "a", mediaType: "image/png" },
+        { type: "media", data: "b", mediaType: "image/png", filename: 42 },
+        { type: "media", data: "c", mediaType: "image/png", filename: "" },
+      ],
+    };
+
+    const images = extractImagesFromToolResult(result);
+
+    expect(images).toHaveLength(3);
+    expect(images.every((image) => image.filename === undefined)).toBe(true);
+  });
 });
 
 describe("sanitizeImageData", () => {

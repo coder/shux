@@ -105,9 +105,9 @@ node -e "
   require('fs').writeFileSync('$CHECK_DIR/package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
 
-if ! install_output=$(cd "$CHECK_DIR" && bun install --ignore-scripts 2>&1); then
-  echo "❌ Error: bun install (lockfile-free) failed:"
-  echo "$install_output"
+# Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+if ! (cd "$CHECK_DIR" && "$REPO_ROOT/scripts/retry.sh" 5 60 bun install --ignore-scripts); then
+  echo "❌ Error: bun install (lockfile-free) failed"
   exit 1
 fi
 

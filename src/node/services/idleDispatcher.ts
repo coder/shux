@@ -1,3 +1,4 @@
+import { Duration, Effect, type Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import { log } from "./log";
 
@@ -8,8 +9,6 @@ import { log } from "./log";
  * applies to every consumer (Coder-agents-review nit DEREM-30).
  */
 export const MAX_CONCURRENT_IDLE_DISPATCHES = 1;
-/** @deprecated Use MAX_CONCURRENT_IDLE_DISPATCHES — kept as alias to avoid churn for any out-of-tree imports. */
-export const MAX_CONCURRENT_GOAL_DISPATCHES = MAX_CONCURRENT_IDLE_DISPATCHES;
 
 export interface IdleDispatchPayload {
   dispatch(): Promise<void>;
@@ -29,7 +28,13 @@ interface IdleDispatcherOptions {
 interface PendingDispatchRequest {
   readonly sources: Set<string>;
   readonly resolvers: Array<() => void>;
-  debounceTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Debounce fiber: sleeps for `debounceMs` (Effect's clock registers a plain
+   * `setTimeout` under the hood), then marks the workspace ready. Non-null
+   * exactly while the debounce window is open — later requests for the same
+   * workspace coalesce into this pending entry instead of re-arming it.
+   */
+  debounceFiber: Fiber.Fiber<void> | null;
 }
 
 export class IdleDispatcher {
@@ -89,14 +94,24 @@ export class IdleDispatcher {
       pending.sources.add(source);
       pending.resolvers.push(resolve);
 
-      if (pending.debounceTimer != null) {
+      if (pending.debounceFiber != null) {
         return;
       }
 
-      pending.debounceTimer = setTimeout(() => {
-        pending.debounceTimer = null;
-        this.markWorkspaceReady(workspaceId);
-      }, this.debounceMs);
+      // Effect.runFork executes synchronously up to the sleep, so the debounce
+      // timer is registered before this callback returns (same observable
+      // ordering as the previous setTimeout call); a zero-duration sleep still
+      // defers to a timer tick rather than firing inline.
+      pending.debounceFiber = Effect.runFork(
+        Effect.sleep(Duration.millis(this.debounceMs)).pipe(
+          Effect.flatMap(() =>
+            Effect.sync(() => {
+              pending.debounceFiber = null;
+              this.markWorkspaceReady(workspaceId);
+            })
+          )
+        )
+      );
     });
   }
 
@@ -109,7 +124,7 @@ export class IdleDispatcher {
     const pending: PendingDispatchRequest = {
       sources: new Set<string>(),
       resolvers: [],
-      debounceTimer: null,
+      debounceFiber: null,
     };
     this.pendingByWorkspaceId.set(workspaceId, pending);
     return pending;

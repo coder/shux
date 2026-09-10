@@ -34,6 +34,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // State for project servers and workspace overrides
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [overrides, setOverrides] = useState<WorkspaceMCPOverrides>({});
+  // Revision of the loaded overrides snapshot. Saves pass it back so the
+  // backend can reject stale snapshots (e.g. after a plugin uninstall pruned
+  // this workspace's plugin: keys while the dialog was open).
+  const [overridesRevision, setOverridesRevision] = useState<string | null>(null);
   const [loadingTools, setLoadingTools] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -66,7 +70,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
           api.workspace.mcp.get({ workspaceId }),
         ]);
         setServers(projectServers ?? {});
-        setOverrides(workspaceOverrides ?? {});
+        setOverrides(workspaceOverrides.overrides ?? {});
+        setOverridesRevision(workspaceOverrides.revision);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load MCP configuration");
       } finally {
@@ -235,11 +240,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
   // Save overrides
   const handleSave = useCallback(async () => {
-    if (!api) return;
+    if (!api || overridesRevision === null) return;
     setSaving(true);
     setError(null);
     try {
-      const result = await api.workspace.mcp.set({ workspaceId, overrides });
+      const result = await api.workspace.mcp.set({
+        workspaceId,
+        overrides,
+        expectedRevision: overridesRevision,
+      });
       if (!result.success) {
         setError(result.error);
       } else {
@@ -250,7 +259,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     } finally {
       setSaving(false);
     }
-  }, [api, workspaceId, overrides, onOpenChange]);
+  }, [api, workspaceId, overrides, overridesRevision, onOpenChange]);
 
   const serverEntries = Object.entries(servers);
 

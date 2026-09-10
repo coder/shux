@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 import { type ReviewStats } from "./registry";
 import { useAPI } from "@/browser/contexts/API";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -347,8 +348,7 @@ export const TerminalTabLabel: React.FC<TerminalTabLabelProps> = ({
   onPopOut,
   onClose,
 }) => {
-  const fallbackName = terminalIndex === 0 ? "Terminal" : `Terminal ${terminalIndex + 1}`;
-  const displayName = dynamicTitle ?? fallbackName;
+  const displayName = dynamicTitle ?? getTerminalTabFallbackName(terminalIndex);
 
   return (
     <span className="inline-flex items-center gap-1">

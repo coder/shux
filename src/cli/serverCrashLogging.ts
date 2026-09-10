@@ -72,7 +72,7 @@ function formatCrashDetail(detail: unknown): string {
 
 export function buildServerCrashLogEntry(options: ServerCrashLogOptions): string {
   const lines = [
-    `${(options.timestamp ?? new Date()).toISOString()} [mux server crash] ${options.event}`,
+    `${(options.timestamp ?? new Date()).toISOString()} [xum server crash] ${options.event}`,
     `pid=${options.pid ?? process.pid} cwd=${options.cwd ?? process.cwd()}`,
     `argv=${JSON.stringify(redactServerArgvForLogs(options.argv ?? process.argv))}`,
   ];
@@ -95,7 +95,7 @@ export function appendServerCrashLogSync(options: ServerCrashLogOptions): string
   } catch (error) {
     // Crash hooks must survive even if the current working directory disappeared
     // or another formatting helper throws while we're already handling a fatal error.
-    entry = `${(options.timestamp ?? new Date()).toISOString()} [mux server crash] ${options.event}\nfailed_to_build_crash_entry=${getErrorMessage(error)}\n`;
+    entry = `${(options.timestamp ?? new Date()).toISOString()} [xum server crash] ${options.event}\nfailed_to_build_crash_entry=${getErrorMessage(error)}\n`;
   }
 
   const logFilePath = options.logFilePath ?? getLogFilePath();

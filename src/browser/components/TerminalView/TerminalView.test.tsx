@@ -121,6 +121,12 @@ void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
 }));
 
 import { TerminalView } from "./TerminalView";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
+  TERMINAL_BADGE_CONFIG_KEY,
+  type TerminalBadgeConfig,
+} from "@/common/constants/storage";
 
 function createRouter(): MockRouter {
   unsubscribeMock = mock(() => undefined);
@@ -203,5 +209,49 @@ describe("TerminalView", () => {
     expect(firstOnExit).toHaveBeenCalledTimes(0);
     expect(secondOnExit).toHaveBeenCalledTimes(1);
     expect(secondOnExit.mock.calls[0]?.[0]).toBe(7);
+  });
+
+  test("renders the badge overlay with substituted template when enabled", async () => {
+    updatePersistedState<TerminalBadgeConfig>(TERMINAL_BADGE_CONFIG_KEY, {
+      ...DEFAULT_TERMINAL_BADGE_CONFIG,
+      enabled: true,
+    });
+
+    const view = render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        workspaceName="my-feature"
+        projectName="xum"
+        tabName="Terminal 2"
+      />
+    );
+
+    await waitFor(() => {
+      expect(view.container.textContent).toContain("my-feature · Terminal 2");
+    });
+  });
+
+  test("renders no badge overlay by default", async () => {
+    const view = render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        workspaceName="my-feature"
+        projectName="xum"
+        tabName="Terminal 2"
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockRouter.subscribe).toHaveBeenCalledTimes(1);
+    });
+    expect(view.container.textContent).not.toContain("my-feature");
   });
 });

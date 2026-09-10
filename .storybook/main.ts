@@ -22,6 +22,10 @@ const config: StorybookConfig = {
       resolve: {
         alias: [
           {
+            find: "@novnc/novnc/lib/rfb",
+            replacement: path.join(process.cwd(), "src/browser/stories/mocks/desktopRfb.ts"),
+          },
+          {
             find: "@/version",
             replacement: path.join(process.cwd(), "src/browser/stories/mocks/version.ts"),
           },

@@ -211,12 +211,20 @@ export class PortableDesktopSession {
     timeoutMs: number
   ): Promise<{ stdout: string; stderr: string }> {
     assert(this.binaryPath, "PortableDesktop binary path is unavailable before startup");
-    using proc = execFileAsync(this.binaryPath, args);
-    return await withTimeout(
-      proc.result,
+    // Input ownership must not be released until a timed-out command and its descendants
+    // have stopped: a promise race plus synchronous disposal only sends SIGTERM.
+    using proc = execFileAsync(this.binaryPath, args, {
       timeoutMs,
-      `PortableDesktop ${commandLabel} timed out after ${timeoutMs}ms for workspace ${this.options.workspaceId}`
-    );
+      killTreeOnTermination: true,
+    });
+    try {
+      return await proc.result;
+    } catch (error) {
+      throw new Error(
+        `PortableDesktop ${commandLabel} failed for workspace ${this.options.workspaceId}: ${getErrorMessage(error)}`,
+        { cause: error }
+      );
+    }
   }
 
   private getNumericActionParam(params: Record<string, unknown>, name: string): string {
@@ -400,11 +408,6 @@ export class PortableDesktopSession {
     );
   }
 
-  getVncPort(): number {
-    assert(this.vncPort != null, "PortableDesktop session has not started yet");
-    return this.vncPort;
-  }
-
   getSessionInfo(): {
     width: number;
     height: number;
@@ -431,7 +434,7 @@ export class PortableDesktopSession {
     assert(this.height != null, "PortableDesktop screenshot height is unavailable before startup");
 
     const screenshotDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "mux-portable-desktop-screenshot-")
+      path.join(os.tmpdir(), "xum-portable-desktop-screenshot-")
     );
     const outputPath = path.join(screenshotDir, "screenshot.png");
 

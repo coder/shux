@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getModelKey } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { normalizeModelPreference } from "./buildSendMessageOptions";
 
 let cleanupDom: (() => void) | null = null;
@@ -18,6 +21,33 @@ describe("getSendOptionsFromStorage", () => {
     window.localStorage.clear();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test.each([true, false])(
+    "captures the latest memoryIntuition override %s before host persistence",
+    (enabled) => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), enabled);
+      const options = getSendOptionsFromStorage("ws-intuition");
+      expect(options.experiments?.memoryIntuition).toBe(enabled);
+      expect(
+        SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).experiments
+          ?.memoryIntuition
+      ).toBe(enabled);
+    }
+  );
+
+  test.each([true, false])("preserves explicit continuous compaction overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), enabled);
+    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBe(enabled);
+  });
+
+  test.each([true, false])("preserves explicit token-budget overrides (%s)", (enabled) => {
+    expect(getSendOptionsFromStorage("ws-1").experiments?.tokenBudget).toBeUndefined();
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), enabled);
+    const options = getSendOptionsFromStorage("ws-1");
+    expect(options.experiments?.tokenBudget).toBe(enabled);
+    expect(SendMessageOptionsSchema.parse(options).experiments?.tokenBudget).toBe(enabled);
   });
 
   test("preserves explicit gateway-scoped stored model preferences", () => {

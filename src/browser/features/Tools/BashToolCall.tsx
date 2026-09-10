@@ -209,11 +209,17 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             )}
           >
             timeout: {args.timeout_secs ?? BASH_DEFAULT_TIMEOUT_SECS}s
-            {result && ` • took ${formatDuration(result.wall_duration_ms)}`}
+            {/* Kernel-mode nested reloads reconstruct partial results without
+                wall_duration_ms/exitCode; skip those fields instead of
+                rendering "took —" and an empty exit-code pill. */}
+            {typeof result?.wall_duration_ms === "number" &&
+              ` • took ${formatDuration(result.wall_duration_ms)}`}
             {!result && <ElapsedTimeDisplay startedAt={startedAt} isActive={isPending} />}
           </span>
         )}
-        {!isBackground && result && <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />}
+        {!isBackground && typeof result?.exitCode === "number" && (
+          <ExitCodeBadge exitCode={result.exitCode} className="ml-2" />
+        )}
         <StatusIndicator status={effectiveStatus}>
           {getStatusDisplay(effectiveStatus)}
         </StatusIndicator>

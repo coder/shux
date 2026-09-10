@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
   STAGED_ATTACHMENT_DIR,
+  STAGED_ATTACHMENT_DIRS,
 } from "@/common/constants/stagedAttachments";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -136,13 +137,15 @@ export async function copyStagedWorkspaceAttachments(input: {
       return Ok(undefined);
     }
 
-    const excludeResult = await ensureGitInfoExclude({
-      runtime: input.targetRuntime,
-      workspacePath: input.targetWorkspacePath,
-      relativeDir: STAGED_ATTACHMENT_DIR,
-    });
-    if (excludeResult.status === "failed") {
-      return Err(`Could not mark staged attachments as ignored: ${excludeResult.error}`);
+    for (const relativeDir of STAGED_ATTACHMENT_DIRS) {
+      const excludeResult = await ensureGitInfoExclude({
+        runtime: input.targetRuntime,
+        workspacePath: input.targetWorkspacePath,
+        relativeDir,
+      });
+      if (excludeResult.status === "failed") {
+        return Err(`Could not mark staged attachments as ignored: ${excludeResult.error}`);
+      }
     }
 
     const shouldSkipUnreadableSource = input.stagedPaths != null;
@@ -179,7 +182,7 @@ export async function copyStagedWorkspaceAttachments(input: {
 
 export function extractStagedAttachmentPathsFromText(text: string): string[] {
   const paths = new Set<string>();
-  const pattern = /`(?<path>\.mux\/user-attachments\/[^`]+)`/gu;
+  const pattern = /`(?<path>\.(?:xum|mux)\/user-attachments\/[^`]+)`/gu;
   for (const match of text.matchAll(pattern)) {
     const stagedPath = match.groups?.path ? normalizeReadableStagedPath(match.groups.path) : null;
     if (stagedPath != null) {
@@ -224,7 +227,7 @@ function normalizeReadableStagedPath(stagedPath: string): string | null {
     normalized.includes("\0") ||
     normalized.includes("//") ||
     segments.includes("..") ||
-    !normalized.startsWith(`${STAGED_ATTACHMENT_DIR}/`) ||
+    !STAGED_ATTACHMENT_DIRS.some((dir) => normalized.startsWith(`${dir}/`)) ||
     (segments.at(-1)?.length ?? 0) === 0
   ) {
     return null;
@@ -247,11 +250,13 @@ async function listStagedAttachmentPaths(
   runtime: Runtime,
   workspacePath: string
 ): Promise<Result<string[], string>> {
-  const result = await execBuffered(
-    runtime,
-    `if [ ! -d ${shellQuote(STAGED_ATTACHMENT_DIR)} ]; then exit 0; fi; find ${shellQuote(STAGED_ATTACHMENT_DIR)} -type f -print`,
-    { cwd: workspacePath, timeout: 30 }
+  const findCommands = STAGED_ATTACHMENT_DIRS.map(
+    (dir) => `if [ -d ${shellQuote(dir)} ]; then find ${shellQuote(dir)} -type f -print; fi`
   );
+  const result = await execBuffered(runtime, findCommands.join("; "), {
+    cwd: workspacePath,
+    timeout: 30,
+  });
   if (result.exitCode !== 0) {
     return Err(result.stderr.trim() || "Failed to list staged attachments.");
   }

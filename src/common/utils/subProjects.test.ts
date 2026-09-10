@@ -25,6 +25,12 @@ describe("subProjects", () => {
     expect(isPathDescendant("C:\\Repo", "c:\\repo\\packages\\api")).toBe(true);
   });
 
+  test("treats Windows UNC paths as case-insensitive", () => {
+    expect(
+      isPathDescendant("\\\\server\\share\\Repo", "\\\\SERVER\\Share\\repo\\packages\\api")
+    ).toBe(true);
+  });
+
   test("derives one-level parentage from registered project paths", () => {
     const projects = new Map<string, ProjectConfig>([
       ["/repo", project()],
@@ -96,7 +102,7 @@ describe("subProjects", () => {
   test("orders sub-projects by display name and labels them with parent context", () => {
     const projects = deriveProjectHierarchy(
       new Map<string, ProjectConfig>([
-        ["/repo", project({ displayName: "Mux" })],
+        ["/repo", project({ displayName: "Xum" })],
         ["/repo/packages/web", project({ displayName: "Web" })],
         ["/repo/packages/api", project({ displayName: "API" })],
       ])
@@ -106,6 +112,6 @@ describe("subProjects", () => {
       "/repo/packages/api",
       "/repo/packages/web",
     ]);
-    expect(formatProjectHierarchyLabel("/repo/packages/api", projects)).toBe("Mux / API");
+    expect(formatProjectHierarchyLabel("/repo/packages/api", projects)).toBe("Xum / API");
   });
 });

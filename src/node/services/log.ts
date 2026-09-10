@@ -1,5 +1,5 @@
 /**
- * Unified logging for mux (backend + CLI)
+ * Unified logging for xum (backend + CLI)
  *
  * Features:
  * - Log levels: error, warn, info, debug (hierarchical)
@@ -8,8 +8,8 @@
  * - Colored output in TTY
  *
  * Log level selection (in priority order):
- * 1. MUX_LOG_LEVEL env var (error|warn|info|debug)
- * 2. MUX_DEBUG=1 → debug level
+ * 1. XUM_LOG_LEVEL env var (error|warn|info|debug); MUX_LOG_LEVEL is accepted
+ * 2. XUM_DEBUG=1 → debug level
  * 3. CLI mode (no Electron) → error level (quiet by default)
  * 4. Desktop mode → info level
  *
@@ -19,10 +19,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import chalk from "chalk";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { parseBoolEnv } from "@/common/utils/env";
 import { getErrorMessage } from "@/common/utils/errors";
-import { getMuxHome, getMuxLogsDir } from "@/common/constants/paths";
-import { hasDebugSubscriber, pushLogEntry } from "./logBuffer";
+import { getXumHome, getXumLogsDir } from "@/common/constants/paths";
+import { clearLogEntries, hasDebugSubscriber, pushLogEntry } from "./logBuffer";
 
 process.once("exit", () => {
   closeLogFile();
@@ -31,7 +32,7 @@ process.once("exit", () => {
 // Lazy-initialized to avoid circular dependency with config.ts
 let _debugObjDir: string | null = null;
 function getDebugObjDir(): string {
-  _debugObjDir ??= path.join(getMuxHome(), "debug_obj");
+  _debugObjDir ??= path.join(getXumHome(), "debug_obj");
   return _debugObjDir;
 }
 
@@ -64,13 +65,13 @@ const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
  */
 function getDefaultLogLevel(): LogLevel {
   // Explicit env var takes priority
-  const envLevel = process.env.MUX_LOG_LEVEL?.toLowerCase();
+  const envLevel = resolveXumEnvironmentValue("LOG_LEVEL", process.env)?.toLowerCase();
   if (envLevel && envLevel in LOG_LEVEL_PRIORITY) {
     return envLevel as LogLevel;
   }
 
-  // MUX_DEBUG=1 enables debug level
-  if (parseBoolEnv(process.env.MUX_DEBUG)) {
+  // XUM_DEBUG=1 enables debug level
+  if (parseBoolEnv(resolveXumEnvironmentValue("DEBUG", process.env))) {
     return "debug";
   }
 
@@ -189,7 +190,7 @@ function ensureSinkOpen(): void {
   }
 
   try {
-    const logsDir = getMuxLogsDir();
+    const logsDir = getXumLogsDir();
     const activeLogPath = path.join(logsDir, "mux.log");
 
     fs.mkdirSync(logsDir, { recursive: true });
@@ -274,11 +275,11 @@ function writeSink(cleanLineWithNewline: string): void {
 }
 
 export function getLogFilePath(): string {
-  return path.join(getMuxLogsDir(), "mux.log");
+  return path.join(getXumLogsDir(), "mux.log");
 }
 
 function clearSink(): Promise<void> {
-  const logsDir = getMuxLogsDir();
+  const logsDir = getXumLogsDir();
   const activeLogPath = path.join(logsDir, "mux.log");
 
   const openSink = fileSinkState.status === "open" ? fileSinkState : null;
@@ -316,6 +317,16 @@ function clearSink(): Promise<void> {
     const stream = createSafeStream(activeLogPath);
     fileSinkState = { status: "open", stream, path: activeLogPath, size: 0 };
   });
+}
+
+export async function clearLogsForApi() {
+  try {
+    await clearLogFiles();
+    clearLogEntries();
+    return { success: true as const };
+  } catch (error) {
+    return { success: false as const, error: getErrorMessage(error) };
+  }
 }
 
 export function clearLogFiles(): Promise<void> {
@@ -665,7 +676,6 @@ function debugObject(filename: string, obj: unknown): void {
     // Write the object as pretty-printed JSON
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
 
-    // Log that we dumped the object
     safePipeLog("debug", `Dumped object to ${filePath}`);
   } catch (error) {
     // Don't crash if we can't write debug files
@@ -737,7 +747,7 @@ function createLogger(boundFields?: LogFields): Logger {
 }
 
 /**
- * Unified logging interface for mux
+ * Unified logging interface for xum
  *
  * Log levels (hierarchical - each includes all levels above it):
  * - error: Critical failures only

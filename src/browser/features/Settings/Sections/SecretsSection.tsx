@@ -1,15 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { KeyRound, Loader2, Trash2 } from "lucide-react";
+import { Loader2, Trash2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
-import { isOpSecretValue, type Secret } from "@/common/types/secrets";
+import type { Secret } from "@/common/types/secrets";
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Button } from "@/browser/components/Button/Button";
-import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
-import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
-import { OnePasswordPicker } from "../Components/OnePasswordPicker";
 import {
   ToggleGroup,
   ToggleGroupItem,
@@ -86,10 +83,6 @@ function secretValuesEqual(a: Secret["value"], b: Secret["value"]): boolean {
     return a.secret === b.secret;
   }
 
-  if (isOpSecretValue(a) && isOpSecretValue(b)) {
-    return a.op === b.op && a.opLabel === b.opLabel;
-  }
-
   return false;
 }
 
@@ -100,10 +93,6 @@ function secretValueIsNonEmpty(value: Secret["value"]): boolean {
 
   if (isSecretReferenceValue(value)) {
     return value.secret.trim() !== "";
-  }
-
-  if (isOpSecretValue(value)) {
-    return value.op.trim() !== "";
   }
 
   return false;
@@ -153,11 +142,6 @@ export const SecretsSection: React.FC = () => {
   const [visibleSecrets, setVisibleSecrets] = useState<Set<number>>(() => new Set());
 
   const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
-  const [opAvailable, setOpAvailable] = useState(false);
-  const [opPickerIndex, setOpPickerIndex] = useState<number | null>(null);
-
-  const [opAccountName, setOpAccountName] = useState("");
-  const [opAvailabilityVersion, setOpAvailabilityVersion] = useState(0);
   const [injectedGlobalSecretKeys, setInjectedGlobalSecretKeys] = useState<string[]>([]);
 
   // Track the last plaintext value per row index so toggling Source back to
@@ -173,12 +157,10 @@ export const SecretsSection: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   const scopeLabel = scope === "global" ? "Global" : "Project";
-  const showSourceColumn = scope === "project" || opAvailable;
+  const showSourceColumn = scope === "project";
   const secretGridColumns =
     scope === "global"
-      ? showSourceColumn
-        ? "grid-cols-[1fr_auto_1fr_auto_auto_auto]"
-        : "grid-cols-[1fr_1fr_auto_auto_auto]"
+      ? "grid-cols-[1fr_1fr_auto_auto_auto]"
       : "grid-cols-[1fr_auto_1fr_auto_auto]";
 
   // When re-opened with a new project hint (e.g., clicking the secrets button again
@@ -229,7 +211,6 @@ export const SecretsSection: React.FC = () => {
       setSecrets([]);
       setInjectedGlobalSecretKeys([]);
       setVisibleSecrets(new Set());
-      setOpPickerIndex(null);
       setError(null);
       setLoading(false);
       return;
@@ -240,7 +221,6 @@ export const SecretsSection: React.FC = () => {
       setSecrets([]);
       setInjectedGlobalSecretKeys([]);
       setVisibleSecrets(new Set());
-      setOpPickerIndex(null);
       setError(null);
       setLoading(false);
       return;
@@ -297,7 +277,6 @@ export const SecretsSection: React.FC = () => {
         return;
       }
       setVisibleSecrets(new Set());
-      setOpPickerIndex(null);
       lastLiteralValuesRef.current = new Map();
     } catch (err) {
       if (isStaleRequest()) {
@@ -308,7 +287,6 @@ export const SecretsSection: React.FC = () => {
       setSecrets([]);
       setInjectedGlobalSecretKeys([]);
       setVisibleSecrets(new Set());
-      setOpPickerIndex(null);
       lastLiteralValuesRef.current = new Map();
       setError(message);
     } finally {
@@ -321,81 +299,6 @@ export const SecretsSection: React.FC = () => {
   useEffect(() => {
     void loadSecrets();
   }, [loadSecrets]);
-
-  useEffect(() => {
-    if (!api) {
-      setOpAvailable(false);
-      setOpPickerIndex(null);
-      return;
-    }
-
-    let cancelled = false;
-    void api.onePassword
-      .isAvailable()
-      .then((result) => {
-        if (cancelled) {
-          return;
-        }
-
-        setOpAvailable(result.available);
-        if (!result.available) {
-          setOpPickerIndex(null);
-        }
-      })
-      .catch(() => {
-        if (cancelled) {
-          return;
-        }
-
-        setOpAvailable(false);
-        setOpPickerIndex(null);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, opAvailabilityVersion]);
-
-  useEffect(() => {
-    if (!api) {
-      setOpAccountName("");
-      return;
-    }
-
-    let cancelled = false;
-    void api.config
-      .getConfig()
-      .then((config) => {
-        if (cancelled) {
-          return;
-        }
-
-        setOpAccountName(config.onePasswordAccountName ?? "");
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
-  const handleOpAccountNameChange = useCallback((value: string) => {
-    setOpAccountName(value);
-  }, []);
-
-  const handleOpAccountNameBlur = useCallback(
-    (value: string) => {
-      void api?.config
-        .updateOnePasswordAccountName({ onePasswordAccountName: value || null })
-        .then(() => {
-          // Trigger a fresh availability check after account changes.
-          setOpAvailabilityVersion((version) => version + 1);
-        });
-    },
-    [api]
-  );
 
   // Load global secret keys (used for {secret:"KEY"} project secret values).
   useEffect(() => {
@@ -442,18 +345,6 @@ export const SecretsSection: React.FC = () => {
         next.add(visibleIndex > index ? visibleIndex - 1 : visibleIndex);
       }
       return next;
-    });
-
-    setOpPickerIndex((prev) => {
-      if (prev == null) {
-        return prev;
-      }
-
-      if (prev === index) {
-        return null;
-      }
-
-      return prev > index ? prev - 1 : prev;
     });
 
     // Shift cached literal values the same way so the right value is restored
@@ -551,7 +442,6 @@ export const SecretsSection: React.FC = () => {
   const handleReset = useCallback(() => {
     setSecrets(loadedSecrets);
     setVisibleSecrets(new Set());
-    setOpPickerIndex(null);
     lastLiteralValuesRef.current = new Map();
     setError(null);
   }, [loadedSecrets]);
@@ -606,7 +496,6 @@ export const SecretsSection: React.FC = () => {
         }
       }
       setVisibleSecrets(new Set());
-      setOpPickerIndex(null);
       // Save compacts rows (filters out empty entries), which shifts indices.
       // Clear the cached literal values so stale entries can't be misattributed.
       lastLiteralValuesRef.current = new Map();
@@ -619,31 +508,10 @@ export const SecretsSection: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <div className="text-foreground text-sm">1Password Account</div>
-          <div className="text-muted text-xs">
-            Your 1Password account name (for example &apos;my-team.1password.com&apos;). Required
-            for 1Password integration.
-          </div>
-        </div>
-        <Input
-          value={opAccountName}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-            handleOpAccountNameChange(e.target.value)
-          }
-          onBlur={(e: React.FocusEvent<HTMLInputElement>) =>
-            handleOpAccountNameBlur(e.target.value)
-          }
-          placeholder="my-team.1password.com"
-          className="border-border-medium bg-background-secondary h-9 w-64"
-        />
-      </div>
-
       <div className="flex items-start justify-between gap-4">
         <div>
           <p className="text-muted text-xs">
-            Secrets are stored in <code className="text-accent">~/.mux/secrets.json</code> (kept out
+            Secrets are stored in <code className="text-accent">~/.xum/secrets.json</code> (kept out
             of source control).
           </p>
           <p className="text-muted mt-1 text-xs">
@@ -765,16 +633,9 @@ export const SecretsSection: React.FC = () => {
 
           {secrets.map((secret, index) => {
             const secretValue = secret.value;
-            const isOp = isOpSecretValue(secretValue);
             const isReference = scope === "project" && isSecretReferenceValue(secretValue);
-            const kind: "literal" | "global" | "op" = isOp
-              ? "op"
-              : isReference
-                ? "global"
-                : "literal";
+            const kind: "literal" | "global" = isReference ? "global" : "literal";
             const referencedKey = isSecretReferenceValue(secretValue) ? secretValue.secret : "";
-            const opReference = isOp ? secretValue.op : "";
-            const opLabel = isOp ? secretValue.opLabel : undefined;
             const availableKeys =
               referencedKey && !sortedGlobalSecretKeys.includes(referencedKey)
                 ? [referencedKey, ...sortedGlobalSecretKeys]
@@ -797,15 +658,6 @@ export const SecretsSection: React.FC = () => {
                   <Select
                     value={kind}
                     onValueChange={(value) => {
-                      if (value === "op") {
-                        if (!opAvailable) {
-                          return;
-                        }
-
-                        setOpPickerIndex(index);
-                        return;
-                      }
-
                       if (value !== "literal" && value !== "global") {
                         return;
                       }
@@ -814,7 +666,6 @@ export const SecretsSection: React.FC = () => {
                         return;
                       }
 
-                      setOpPickerIndex(null);
                       updateSecretValueKind(index, value);
                     }}
                     disabled={saving}
@@ -832,22 +683,11 @@ export const SecretsSection: React.FC = () => {
                           Global
                         </SelectItem>
                       )}
-                      {opAvailable && <SelectItem value="op">1Password</SelectItem>}
                     </SelectContent>
                   </Select>
                 )}
 
-                {isOp ? (
-                  <span className="text-foreground flex items-center gap-1 self-center px-2.5 font-mono text-[13px]">
-                    <KeyRound className="h-3 w-3 shrink-0" />
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span className="truncate">{opLabel ?? opReference}</span>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">{opReference}</TooltipContent>
-                    </Tooltip>
-                  </span>
-                ) : isReference ? (
+                {isReference ? (
                   <Select
                     value={referencedKey || undefined}
                     onValueChange={(value) => updateSecretValue(index, { secret: value })}
@@ -886,7 +726,7 @@ export const SecretsSection: React.FC = () => {
                   />
                 )}
 
-                {isReference || isOp ? (
+                {isReference ? (
                   <div />
                 ) : (
                   <button
@@ -922,26 +762,6 @@ export const SecretsSection: React.FC = () => {
                 >
                   <Trash2 className="h-4 w-4" />
                 </button>
-                {opPickerIndex === index && (
-                  <div className="col-span-full">
-                    <OnePasswordPicker
-                      onSelect={(opRef, opLabel) => {
-                        setOpPickerIndex(null);
-                        setVisibleSecrets((prev) => {
-                          if (!prev.has(index)) {
-                            return prev;
-                          }
-
-                          const next = new Set(prev);
-                          next.delete(index);
-                          return next;
-                        });
-                        updateSecretValue(index, { op: opRef, opLabel });
-                      }}
-                      onCancel={() => setOpPickerIndex(null)}
-                    />
-                  </div>
-                )}
               </React.Fragment>
             );
           })}

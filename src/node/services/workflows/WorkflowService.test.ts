@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
@@ -10,6 +11,12 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { WorkflowService } from "./WorkflowService";
+import {
+  acquireWorkflowArchiveAdmission,
+  hasInProcessWorkflowWork,
+  registerInProcessWorkflowRun,
+  setWorkflowArchiveAdmissionGuard,
+} from "./workflowArchiveAdmission";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
 function createScript(
@@ -25,6 +32,76 @@ function createScript(
     resolvedPath: "/workspace/workflows/demo.js",
     ...overrides,
   };
+}
+
+describe("WorkflowService archive admission", () => {
+  test("startWorkflow refuses admission while the workspace archive guard is armed", async () => {
+    using tmp = new DisposableTempDir("workflow-service-archive-admission");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_admission_refused",
+      runnerId: "runner-admission",
+    });
+
+    setWorkflowArchiveAdmissionGuard((workspaceId) =>
+      workspaceId === "workspace-archiving" ? "Workspace is being archived: refuse" : null
+    );
+    try {
+      await expectStartRefused(service, "workspace-archiving");
+      // Background checkpoint retry is a run-starting entry point too: admission is acquired
+      // at method entry, before the run lookup, so the refusal fires even for eligible runs.
+      try {
+        await service.retryRunFromCheckpointInBackground({
+          workspaceId: "workspace-archiving",
+          runId: "wfr_any",
+          projectTrusted: true,
+        });
+        expect.unreachable("retryRunFromCheckpointInBackground must refuse while archiving");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
+      // No durable run may be created for a refused admission.
+      expect(await runStore.listRuns()).toEqual([]);
+      expect(hasInProcessWorkflowWork("workspace-archiving")).toBe(false);
+    } finally {
+      setWorkflowArchiveAdmissionGuard(() => null);
+    }
+  });
+
+  test("admissions and in-process runs release their workspace work when disposed", () => {
+    expect(hasInProcessWorkflowWork("workspace-admission")).toBe(false);
+    {
+      using _admission = acquireWorkflowArchiveAdmission("workspace-admission");
+      expect(hasInProcessWorkflowWork("workspace-admission")).toBe(true);
+      const release = registerInProcessWorkflowRun("workspace-admission");
+      release();
+      // Idempotent release must not free the still-held admission.
+      release();
+      expect(hasInProcessWorkflowWork("workspace-admission")).toBe(true);
+    }
+    expect(hasInProcessWorkflowWork("workspace-admission")).toBe(false);
+  });
+});
+
+async function expectStartRefused(service: WorkflowService, workspaceId: string): Promise<void> {
+  try {
+    await service.startWorkflow({
+      script: createScript("export default function workflow() { return {}; }\n"),
+      workspaceId,
+      projectTrusted: true,
+      args: {},
+    });
+    expect.unreachable("startWorkflow must refuse while the workspace is being archived");
+  } catch (error) {
+    expect(String(error)).toContain("being archived");
+  }
 }
 
 describe("WorkflowService", () => {
@@ -666,6 +743,41 @@ export default function workflow({ args }) {
     expect(runs.map((run) => run.id)).toEqual(["wfr_workspace_1"]);
   });
 
+  test("getRun and listRuns hydrate the phase manifest on the service itself", async () => {
+    // workflow_run/workflow_resume call these directly (not the oRPC wrappers) and
+    // embed the result in persisted tool output that reloaded cards render as-is.
+    using tmp = new DisposableTempDir("workflow-service-hydrate");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    await runStore.createRun({
+      id: "wfr_hydrated",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "built-in", executable: true },
+      source:
+        'export const meta = { phases: [{ name: "a" }] };\n' +
+        'export default function workflow({ phase }) { phase("a"); return {}; }\n',
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      runnerId: "runner-a",
+    });
+
+    const expected = { provenance: "declared" as const, phases: [{ name: "a" }] };
+    const run = await service.getRun({ workspaceId: "workspace-1", runId: "wfr_hydrated" });
+    expect(run?.workflow.phaseManifest).toEqual(expected);
+    const [listed] = await service.listRuns({ workspaceId: "workspace-1" });
+    expect(listed?.workflow.phaseManifest).toEqual(expected);
+    // The store record itself stays manifest-free.
+    expect((await runStore.getRun("wfr_hydrated")).workflow.phaseManifest).toBeUndefined();
+  });
+
   test("rejects resuming untrusted workspace-file workflow runs", async () => {
     using tmp = new DisposableTempDir("workflow-service-trust");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
@@ -701,5 +813,232 @@ export default function workflow({ args }) {
         projectTrusted: false,
       })
     ).rejects.toThrow("Project trust is required");
+  });
+});
+
+describe("WorkflowRunStore.getRunStatusForLiveness", () => {
+  test("maps only definitively-missing records to null and rethrows read failures", async () => {
+    using tmp = new DisposableTempDir("workflow-service-liveness");
+    const source = `export default function workflow() {
+  return { reportMarkdown: "done" };
+}
+`;
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_liveness",
+      runnerId: "runner-liveness",
+    });
+    await service.startWorkflow({
+      script: createScript(source),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+
+    // Existing record: real status.
+    expect(
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).toBe("completed");
+    // Definitively missing record / wrong owner: null (settled for that ref).
+    expect(
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_absent" })
+    ).toBeNull();
+    expect(
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-2", runId: "wfr_liveness" })
+    ).toBeNull();
+
+    // A missing presentation-only file must not read as "run gone": liveness
+    // consults only the durable status snapshot, never source/step files.
+    await fs.rm(path.join(tmp.path, "workflows", "wfr_liveness", "source.js"));
+    expect(
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).toBe("completed");
+
+    // A transient read/parse failure must propagate (callers retry) instead of
+    // masquerading as a missing record — unlike getRun(), which maps it to null.
+    const runFile = path.join(tmp.path, "workflows", "wfr_liveness", "run.json");
+    await fs.writeFile(runFile, "{ not json", "utf-8");
+    await expect(
+      runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).rejects.toThrow();
+    expect(await service.getRun({ workspaceId: "workspace-1", runId: "wfr_liveness" })).toBeNull();
+  });
+});
+
+describe("WorkflowRunStore.listActiveRunSummaries", () => {
+  test("includes nested active runs and excludes settled or foreign-workspace runs", async () => {
+    using tmp = new DisposableTempDir("workflow-service-active-summaries");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_completed_run",
+      runnerId: "runner-active-summaries",
+    });
+    const descriptor = {
+      name: "deep-research",
+      description: "Research a topic",
+      scope: "built-in" as const,
+      executable: true,
+    };
+    const source = "export default async function workflow() { return 'ok'; }\n";
+    const now = "2026-05-29T00:00:00.000Z";
+    // Active (pending) top-level and NESTED runs — nested runs are deliberately
+    // absent from workspace activity, so this discovery read is the only way a
+    // cold-mounted tray can learn about them mid-gap.
+    await runStore.createRun({
+      id: "wfr_top_active",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now,
+    });
+    await runStore.createRun({
+      id: "wfr_nested_active",
+      workspaceId: "workspace-1",
+      workflow: { ...descriptor, name: "implementation-loop" },
+      source,
+      args: {},
+      parentWorkflow: { runId: "wfr_top_active", stepId: "step-1", inputHash: "hash-1", depth: 1 },
+      now,
+    });
+    await runStore.createRun({
+      id: "wfr_other_workspace",
+      workspaceId: "workspace-2",
+      workflow: descriptor,
+      source,
+      args: {},
+      now,
+    });
+    // A settled run must not be discovered.
+    await service.startWorkflow({
+      script: createScript(
+        'export default function workflow() {\n  return { reportMarkdown: "done" };\n}\n'
+      ),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+
+    const summaries = await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" });
+    summaries.sort((a, b) => a.runId.localeCompare(b.runId));
+    expect(summaries).toEqual([
+      { runId: "wfr_nested_active", workflowName: "implementation-loop", nested: true },
+      { runId: "wfr_top_active", workflowName: "deep-research", nested: false },
+    ]);
+  });
+
+  test("treats a missing workflows dir as empty", async () => {
+    using tmp = new DisposableTempDir("workflow-store-discovery-fresh");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    expect(await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })).toEqual([]);
+  });
+
+  // Root bypasses permission bits and Windows ignores POSIX modes, so the
+  // unreadable-dir scenario is only reproducible on non-root POSIX runs.
+  const canDropDirPermissions = process.platform !== "win32" && process.getuid?.() !== 0;
+  test.skipIf(!canDropDirPermissions)(
+    "rejects discovery when the workflows dir is unreadable instead of reporting empty",
+    async () => {
+      using tmp = new DisposableTempDir("workflow-store-discovery-unreadable");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      await runStore.createRun({
+        id: "wfr_unreadable",
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "deep-research",
+          description: "Research a topic",
+          scope: "built-in" as const,
+          executable: true,
+        },
+        source: "export default async function workflow() { return 'ok'; }\n",
+        args: {},
+        now: "2026-05-29T00:00:00.000Z",
+      });
+      const workflowsDir = path.join(tmp.path, "workflows");
+      await fs.chmod(workflowsDir, 0o000);
+      try {
+        // Strict discovery must surface the failure so callers retry…
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+        // …while lenient callers (activity/UI lists) still degrade to empty.
+        expect(await runStore.listRunStatusSnapshots()).toEqual([]);
+      } finally {
+        await fs.chmod(workflowsDir, 0o755);
+      }
+
+      // Per-record IO failures must also reject in strict mode: silently
+      // omitting an unreadable-but-active run would be a false success.
+      const runFile = path.join(workflowsDir, "wfr_unreadable", "run.json");
+      await fs.chmod(runFile, 0o000);
+      try {
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+      } finally {
+        await fs.chmod(runFile, 0o644);
+      }
+
+      // Journal IO failures must reject too: after a crash the active status
+      // can exist only in events.jsonl, so a swallowed journal read error
+      // would fall back to a stale run.json status and silently omit the run.
+      const eventsFile = path.join(workflowsDir, "wfr_unreadable", "events.jsonl");
+      await fs.chmod(eventsFile, 0o000);
+      try {
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+      } finally {
+        await fs.chmod(eventsFile, 0o644);
+      }
+    }
+  );
+
+  test("skips a corrupt run record instead of hiding every other run", async () => {
+    using tmp = new DisposableTempDir("workflow-store-discovery-corrupt");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const descriptor = {
+      name: "deep-research",
+      description: "Research a topic",
+      scope: "built-in" as const,
+      executable: true,
+    };
+    const source = "export default async function workflow() { return 'ok'; }\n";
+    await runStore.createRun({
+      id: "wfr_healthy",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.createRun({
+      id: "wfr_corrupt",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now: "2026-05-29T00:00:01.000Z",
+    });
+    // Permanent data corruption (not an IO error) self-heals by omission —
+    // one bad record must not turn discovery into a forever-rejecting call
+    // that hides the healthy run too.
+    await fs.writeFile(path.join(tmp.path, "workflows", "wfr_corrupt", "run.json"), "{ not json");
+    const summaries = await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" });
+    expect(summaries.map((summary) => summary.runId)).toEqual(["wfr_healthy"]);
   });
 });

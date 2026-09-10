@@ -14,20 +14,19 @@ import assert from "@/common/utils/assert";
  * MCP client adapter over the official TypeScript SDK v2
  * (@modelcontextprotocol/client).
  *
- * Mux previously used @ai-sdk/mcp, which only speaks MCP protocol revisions up
+ * Xum previously used @ai-sdk/mcp, which only speaks MCP protocol revisions up
  * to 2025-11-25 (initialize handshake + Mcp-Session-Id sessions) and has no
  * support for the stateless 2026-07-28 revision (SEP-2575/2567). The official
  * SDK v2 client implements both revisions; its default connect sequence is the
  * plain legacy `initialize` handshake, byte-identical to the previous wire
  * behavior, so existing user-configured servers see no change.
  *
- * This module intentionally mirrors the small surface mcpServerManager
- * consumed from @ai-sdk/mcp (createMCPClient -> { tools(), close() }) so the
- * manager's instance-cache/lease/recycle machinery stays unchanged.
+ * This module keeps transport and request details behind the small handle consumed by
+ * mcpServerManager, preserving its instance-cache, lease, and recycle machinery.
  */
 
 /** Client identity sent to servers (initialize request / clientInfo _meta). */
-const CLIENT_INFO = { name: "mux", version: "1.0.0" };
+const CLIENT_INFO = { name: "xum", version: "1.0.0" };
 
 /**
  * Maximum time a single MCP tool call may run.
@@ -41,12 +40,15 @@ export const MCP_TOOL_CALL_TIMEOUT_MS = 300_000;
  * SDK-level timeout for tools/call requests.
  *
  * @ai-sdk/mcp had no per-request timeouts; the official SDK defaults to 60s,
- * which would cut long-running tool calls that Mux intentionally allows (up to
+ * which would cut long-running tool calls that Xum intentionally allows (up to
  * MCP_TOOL_CALL_TIMEOUT_MS). Keep the SDK timeout slightly above the wrapper
  * deadline so wrapMCPTools' MCPDeadlineError (which drives client recycling)
  * always wins the race, while the SDK still cleans up abandoned requests.
  */
 const SDK_TOOL_CALL_TIMEOUT_MS = MCP_TOOL_CALL_TIMEOUT_MS + 5_000;
+const PROMPT_GET_TIMEOUT_MS = 30_000;
+// One hung server must not stall the whole slash/inline prompt catalog.
+const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";
@@ -83,9 +85,18 @@ export interface MCPClientConfig {
   prior?: PriorDiscovery;
 }
 
+export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
+export type MCPGetPromptResult = Awaited<ReturnType<Client["getPrompt"]>>;
+
 export interface MCPClientHandle {
   /** Fetch tools/list and build AI SDK tools whose execute calls tools/call. */
   tools(): Promise<Record<string, Tool>>;
+  prompts(options?: { signal?: AbortSignal }): Promise<MCPPrompt[]>;
+  getPrompt(
+    name: string,
+    args: Record<string, string>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPGetPromptResult>;
   /**
    * The MCP protocol revision negotiated at connect ("2026-07-28" once the
    * server/discover probe finds a modern server; "2025-11-25" or earlier on
@@ -154,7 +165,7 @@ function mcpToModelOutput({
   };
   // mcpServerManager's wrapMCPTools runs transformMCPResult over execute
   // results first — the single conversion layer for MCP binary content
-  // (image/audio/blob resources, size guard included) — producing Mux's
+  // (image/audio/blob resources, size guard included) — producing Xum's
   // canonical { type: "content", value: [text | media] } shape. Map its
   // media parts to model-output file parts here.
   if (
@@ -242,7 +253,7 @@ export function createMCPToolInputSchema(inputSchema: Record<string, unknown> | 
 }
 
 /**
- * Connect to an MCP server and return a handle exposing AI SDK tools.
+ * Connect to an MCP server and return a handle for tools and prompts.
  *
  * Version negotiation is per connection (and therefore per configured
  * server): connect() probes with `server/discover` and conservatively falls
@@ -300,6 +311,27 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       }
       return tools;
     },
+    prompts: async (options) => {
+      // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
+      // and forwards these options to each request; the integration test covers
+      // page two.
+      const result = await client.listPrompts(undefined, {
+        timeout: PROMPT_LIST_TIMEOUT_MS,
+        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      });
+      assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
+      return result.prompts;
+    },
+    getPrompt: (name, args, options) =>
+      client.getPrompt(
+        { name, arguments: args },
+        {
+          // Prompt expansion blocks send preparation, so use a shorter timeout than
+          // tool calls and honor send cancellation.
+          timeout: PROMPT_GET_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
     priorDiscovery: (): PriorDiscovery => {
       const discover = client.getDiscoverResult();

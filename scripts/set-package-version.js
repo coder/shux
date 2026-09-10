@@ -19,6 +19,11 @@ const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
 const version = nextVersion.trim();
 packageJson.version = version;
 
+const legacyCompatPackageJsonPath = "packages/mux-compat/package.json";
+const legacyCompatPackageJson = JSON.parse(fs.readFileSync(legacyCompatPackageJsonPath, "utf8"));
+legacyCompatPackageJson.version = version;
+legacyCompatPackageJson.dependencies = { [packageJson.name]: version };
+
 // When version includes a prerelease suffix like "-nightly.N", tell
 // electron-builder to generate channel-specific manifests (e.g. nightly.yml,
 // nightly-mac.yml) instead of the default latest.yml. electron-updater on
@@ -36,6 +41,10 @@ if (prereleaseMatch && packageJson.build?.publish) {
   console.log(`Set publish channel to "${channel}"`);
 }
 
+fs.writeFileSync(
+  legacyCompatPackageJsonPath,
+  `${JSON.stringify(legacyCompatPackageJson, null, 2)}\n`
+);
 fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
 
 console.log(`Set package.json version to ${packageJson.version}`);

@@ -10,11 +10,16 @@ description: Run one-off agent tasks and durable workflows from the command line
   Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) or similar TUIs.
 </Note>
 
-Mux provides a CLI for running one-off agent tasks without the desktop app. Unlike the interactive desktop experience, `mux run` normally executes a single request to completion and exits. The `--goal` option is an explicit exception: it starts a CLI Goal Run that may perform automatic continuations until the goal is complete or a limit is reached.
+Xum provides a CLI for running one-off agent tasks without the desktop app. Unlike the interactive desktop experience, `xum run` normally executes a single request to completion and exits. The `--goal` option is an explicit exception: it starts a CLI Goal Run that may perform automatic continuations until the goal is complete or a limit is reached.
 
 <Card title="GitHub Actions Guide" icon="github" href="/guides/github-actions">
-  Learn how to use `mux run` in CI/CD pipelines
+  Learn how to use `xum run` in CI/CD pipelines
 </Card>
+
+<Note>
+  Existing automation can continue invoking `mux`; the legacy package and binary forward to the same
+  Xum CLI. New scripts should use `xum`.
+</Note>
 
 ## Installation
 
@@ -22,34 +27,34 @@ The CLI is available via npm and can be run directly with `npx`:
 
 ```bash
 # Run without installing
-npx mux run "Fix the failing tests"
+npx @coder/xum run "Fix the failing tests"
 
 # Or install globally
-npm install -g mux
-mux run "Fix the failing tests"
+npm install -g @coder/xum
+xum run "Fix the failing tests"
 ```
 
-Using `npx mux` is especially convenient for CI/CD pipelines where you don't want to manage a global installation.
+Using `npx @coder/xum` is especially convenient for CI/CD pipelines where you don't want to manage a global installation.
 
-## `mux run`
+## `xum run`
 
 Execute a one-off agent task:
 
 ```bash
 # Basic usage - run in current directory
-npx mux run "Fix the failing tests"
+npx @coder/xum run "Fix the failing tests"
 
 # Specify a directory
-mux run --dir /path/to/project "Add authentication"
+xum run --dir /path/to/project "Add authentication"
 
 # Use SSH runtime
-mux run --runtime "ssh user@myserver" "Deploy changes"
+xum run --runtime "ssh user@myserver" "Deploy changes"
 
 # Pipe instructions via stdin
-echo "Add logging to all API endpoints" | mux run
+echo "Add logging to all API endpoints" | xum run
 
 # JSON output for scripts
-mux run --json "List all TypeScript files" | jq '.type'
+xum run --json "List all TypeScript files" | jq '.type'
 ```
 
 ### Options
@@ -75,16 +80,16 @@ Use `--goal` when a task should keep going across automatic continuations until 
 
 ```bash
 # Goal text is also used as the initial message when no message/stdin is provided
-mux run --goal "Fix the failing tests and verify the suite passes"
+xum run --goal "Fix the failing tests and verify the suite passes"
 
 # Provide separate kickoff instructions while keeping the objective active
-mux run --goal "Ship the migration safely" "Start by inspecting the schema and propose a plan"
+xum run --goal "Ship the migration safely" "Start by inspecting the schema and propose a plan"
 
 # Bound automatic continuations with a goal-specific budget and turn cap
-mux run --goal "Complete the refactor" --goal-budget 5.00 --goal-turns 10
+xum run --goal "Complete the refactor" --goal-budget 5.00 --goal-turns 10
 ```
 
-A CLI Goal Run is intentionally not a strict alias for interactive `/goal`. It is ephemeral to the `mux run` process, does not apply interactive goal defaults, bypasses the interactive continuation cooldown, and exits successfully only when the persisted goal status is `complete`. If neither `--goal-budget` nor `--goal-turns` is provided, Mux warns that the goal is uncapped.
+A CLI Goal Run is intentionally not a strict alias for interactive `/goal`. It is ephemeral to the `xum run` process, does not apply interactive goal defaults, bypasses the interactive continuation cooldown, and exits successfully only when the persisted goal status is `complete`. If neither `--goal-budget` nor `--goal-turns` is provided, Xum warns that the goal is uncapped.
 
 `--budget` remains the hard session spending limit in USD. `--goal-budget` is goal accounting, accepts forms like `$5`, `5.00`, and `500c`, and may allow a final budget-limit wrap-up turn. If the session `--budget` is exceeded, the run stops immediately.
 
@@ -101,7 +106,7 @@ Exit codes for CLI Goal Runs:
 ### Runtimes
 
 - **`local`** (default): Runs directly in the specified directory. Best for one-off tasks.
-- **`worktree`**: Creates an isolated git worktree under `~/.mux/src`. Useful for parallel work.
+- **`worktree`**: Creates an isolated git worktree under `~/.xum/src`. Useful for parallel work.
 - **`ssh <host>`**: Runs on a remote machine via SSH. Example: `--runtime "ssh user@myserver.com"`
 - **`docker <image>`**: Runs in a Docker container. Example: `--runtime "docker node:20"`
 
@@ -115,30 +120,30 @@ Exit codes for CLI Goal Runs:
 
 ```bash
 # Goal run with automatic continuations
-mux run --goal "Update dependencies, fix resulting tests, and verify the suite passes"
+xum run --goal "Update dependencies, fix resulting tests, and verify the suite passes"
 
 # Quick fix in current directory
-mux run "Fix the TypeScript errors"
+xum run "Fix the TypeScript errors"
 
 # Use a specific model with extended thinking
-mux run -m anthropic:claude-sonnet-4-5 -t high "Optimize database queries"
+xum run -m anthropic:claude-sonnet-4-5 -t high "Optimize database queries"
 
 # Run on remote server
-mux run -r "ssh dev@staging.example.com" -d /app "Update dependencies"
+xum run -r "ssh dev@staging.example.com" -d /app "Update dependencies"
 
 # Scripted usage with JSON output
-mux run --json "Generate API documentation" > output.jsonl
+xum run --json "Generate API documentation" > output.jsonl
 
 # Limit spending to $2.00
-mux run --budget 2.00 "Refactor the authentication module"
+xum run --budget 2.00 "Refactor the authentication module"
 ```
 
-## `mux workflow`
+## `xum workflow`
 
-Run a durable workflow JavaScript file from the command line without opening the desktop app. Workflows are addressed by explicit `script_path` values; there is no workflow discovery, `list`, or `show` command. Skill-packaged workflows use `skill://<skill-name>/<file.js>`, and local workflow files use an explicit workspace-contained `.js` path. `mux wf` is a shorthand alias for `mux workflow`.
+Run a durable workflow JavaScript file from the command line without opening the desktop app. Workflows are addressed by explicit `script_path` values; there is no workflow discovery, `list`, or `show` command. Skill-packaged workflows use `skill://<skill-name>/<file.js>`, and local workflow files use an explicit workspace-contained `.js` path. `xum wf` is a shorthand alias for `xum workflow`.
 
 <Note>
-  `mux workflow` is experimental. Invoking the command implicitly enables the `dynamic-workflows`
+  `xum workflow` is experimental. Invoking the command implicitly enables the `dynamic-workflows`
   experiment for that invocation only. The initial CLI runner supports the `local` runtime only;
   `worktree`, SSH, Docker, and devcontainer workflow execution are blocked until their workflow
   isolation and cleanup semantics are implemented.
@@ -148,23 +153,23 @@ Use local workflow files for cheap CLI smoke tests. `skill://` paths run the pac
 
 ```bash
 # Run a trusted local workflow file with explicit JSON args
-mux workflow run ./workflows/research.js --args-json '{"topic":"workflow runners"}'
+xum workflow run ./workflows/research.js --args-json '{"topic":"workflow runners"}'
 
 # Same as above, using the alias and machine-readable output
-mux wf run ./workflows/research.js --args-json '{"topic":"workflow runners"}' --json
+xum wf run ./workflows/research.js --args-json '{"topic":"workflow runners"}' --json
 ```
 
 ### Workflow commands
 
 | Command                          | Description                                       |
 | -------------------------------- | ------------------------------------------------- |
-| `mux workflow run <script_path>` | Run an explicit workflow script in the foreground |
+| `xum workflow run <script_path>` | Run an explicit workflow script in the foreground |
 
 ### Workflow options
 
 | Option                       | Description                                                                 |
 | ---------------------------- | --------------------------------------------------------------------------- |
-| `--dir <path>` / `-d`        | Project directory. When omitted, Mux uses the Git root for the current cwd. |
+| `--dir <path>` / `-d`        | Project directory. When omitted, Xum uses the Git root for the current cwd. |
 | `--runtime <runtime>` / `-r` | Runtime selection. Currently only `local` is supported for workflow runs.   |
 | `--model <model>` / `-m`     | Model used by workflow-owned child agents.                                  |
 | `--thinking <level>` / `-t`  | Thinking level used by workflow-owned child agents.                         |
@@ -188,34 +193,34 @@ Only one argument mode can be used per run:
 | `--args-file args.json`         | Exact JSON value read from a file         |
 | `--args-stdin`                  | Exact JSON value read from stdin          |
 
-Workspace-file workflow scripts are executable only after the project is trusted. If an explicit local `.js` script path points into an untrusted project, `mux workflow run` fails before executing repo-controlled workflow code. Linked git worktrees inherit trust from the main repository path. Grant trust headlessly with [`mux trust`](#mux-trust).
+Workspace-file workflow scripts are executable only after the project is trusted. If an explicit local `.js` script path points into an untrusted project, `xum workflow run` fails before executing repo-controlled workflow code. Linked git worktrees inherit trust from the main repository path. Grant trust headlessly with [`xum trust`](#xum-trust).
 
-## `mux trust`
+## `xum trust`
 
-Trust gates all repo-controlled automation: project workflows, hooks, and `.mux` configuration. The desktop app records trust via Settings → Security; `mux trust` writes the same entry in `~/.mux/config.json` headlessly — no desktop app or server required, registering the project if it was never added to mux. A running desktop instance picks the change up automatically.
+Trust gates all repo-controlled automation: project workflows, hooks, and `.mux` configuration. The desktop app records trust via Settings → Security; `xum trust` writes the same entry in `~/.xum/config.json` headlessly — no desktop app or server required, registering the project if it was never added to Xum. A running desktop instance picks the change up automatically.
 
 ```bash
 # Trust the project containing the current directory (git toplevel)
-mux trust
+xum trust
 
 # Trust an explicit directory
-mux trust --dir /path/to/repo
+xum trust --dir /path/to/repo
 
 # Revoke trust
-mux trust --revoke
+xum trust --revoke
 
 # Machine-readable output
-mux trust --json
+xum trust --json
 ```
 
-Run from a linked git worktree (for example a mux workspace checkout), trust is recorded for the main repository path rather than the ephemeral worktree path. Review a repository before trusting it: trusted projects can execute repo-controlled code.
+Run from a linked git worktree (for example a Xum workspace checkout), trust is recorded for the main repository path rather than the ephemeral worktree path. Review a repository before trusting it: trusted projects can execute repo-controlled code.
 
-## `mux server`
+## `xum server`
 
 Start the HTTP/WebSocket server for remote access (for example, from a phone or another machine):
 
 ```bash
-mux server --host 0.0.0.0 --port 3000
+xum server --host 0.0.0.0 --port 3000
 ```
 
 Options:
@@ -229,50 +234,50 @@ Options:
 - `--ssh-host <host>` - SSH hostname/alias used for editor deep links in browser mode
 - `--add-project <path>` - Add and open project at the specified path
 
-Use `--allow-http-origin` only when HTTPS is terminated by an upstream reverse proxy and mux receives rewritten `X-Forwarded-Proto=http` headers. This compatibility mode is disabled by default. For non-CLI server starts (for example desktop/browser mode), set `MUX_SERVER_ALLOW_HTTP_ORIGIN=1` to opt in.
+Use `--allow-http-origin` only when HTTPS is terminated by an upstream reverse proxy and Xum receives rewritten `X-Forwarded-Proto=http` headers. This compatibility mode is disabled by default. For non-CLI server starts (for example desktop/browser mode), set `XUM_SERVER_ALLOW_HTTP_ORIGIN=1` to opt in.
 
 Auth token precedence:
 
 1. `--no-auth`
 2. `--auth-token`
-3. `MUX_SERVER_AUTH_TOKEN`
+3. `XUM_SERVER_AUTH_TOKEN`
 4. Auto-generated token
 
-GitHub owner login for browser sessions is configured separately via `MUX_SERVER_AUTH_GITHUB_OWNER` or `serverAuthGithubOwner` in `~/.mux/config.json`. See [Server Access](/config/server-access).
+GitHub owner login for browser sessions is configured separately via `XUM_SERVER_AUTH_GITHUB_OWNER` or `serverAuthGithubOwner` in `~/.xum/config.json`. See [Server Access](/config/server-access).
 
-## `mux acp`
+## `xum acp`
 
 Start the ACP (Agent-Client Protocol) stdio bridge used by editor integrations:
 
 ```bash
-mux acp
+xum acp
 ```
 
 | Option                 | Description                                       |
 | ---------------------- | ------------------------------------------------- |
-| `--server-url <url>`   | URL of a running mux server                       |
+| `--server-url <url>`   | URL of a running xum server                       |
 | `--auth-token <token>` | Bearer token for authenticated server connections |
 | `--log-file <path>`    | Write ACP logs to a file instead of stderr        |
 
 For editor-specific setup (Zed, Neovim, JetBrains), see the
 [ACP Editor Integrations](/integrations/acp) guide.
 
-## `mux desktop`
+## `xum desktop`
 
 Launch the desktop app. This is automatically invoked when running the packaged app or via `electron .`:
 
 ```bash
-mux desktop
+xum desktop
 ```
 
-Note: Requires Electron. When running `mux` with no arguments under Electron, the desktop app launches automatically.
+Note: Requires Electron. When running `xum` with no arguments under Electron, the desktop app launches automatically.
 
-## `mux --version`
+## `xum --version`
 
 Print the version and git commit:
 
 ```bash
-mux --version
+xum --version
 # v0.8.4 (abc123)
 ```
 
@@ -282,12 +287,12 @@ These environment variables help diagnose issues with LLM requests and responses
 
 | Variable                | Purpose                                                                                                                                                                 |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_DEBUG_LLM_REQUEST` | Set to `1` to log the complete LLM request (system prompt, messages, tools, provider options) as formatted JSON to the debug logs. Useful for diagnosing prompt issues. |
+| `XUM_DEBUG_LLM_REQUEST` | Set to `1` to log the complete LLM request (system prompt, messages, tools, provider options) as formatted JSON to the debug logs. Useful for diagnosing prompt issues. |
 
 Example usage:
 
 ```bash
-MUX_DEBUG_LLM_REQUEST=1 mux run "Hello world"
+XUM_DEBUG_LLM_REQUEST=1 xum run "Hello world"
 ```
 
 The output includes:

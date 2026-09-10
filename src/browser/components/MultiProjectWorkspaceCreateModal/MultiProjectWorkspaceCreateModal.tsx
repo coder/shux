@@ -91,7 +91,7 @@ export function MultiProjectWorkspaceCreateModal(props: MultiProjectWorkspaceCre
         <DialogHeader>
           <DialogTitle>New Multi-Project Workspace</DialogTitle>
           <DialogDescription>
-            Select at least two projects. Mux will create a shared workspace across the selected
+            Select at least two projects. Xum will create a shared workspace across the selected
             projects.
           </DialogDescription>
         </DialogHeader>

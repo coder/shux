@@ -1,11 +1,11 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 
 import { mergeAdditionalSystemInstructions } from "@/common/utils/additionalSystemInstructions";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 
 interface SessionDirProvider {
-  getSessionDir(workspaceId: string): string;
+  sessionsDir: string;
 }
 
 export const ADDITIONAL_SYSTEM_CONTEXT_FILENAME = "additional-system-context.md";
@@ -26,14 +26,17 @@ export function getAdditionalSystemContextPath(
   config: SessionDirProvider,
   workspaceId: string
 ): string {
-  return path.join(config.getSessionDir(workspaceId), ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
+  return path.join(config.sessionsDir, workspaceId, ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
 }
 
 export function getAdditionalSystemContextDisabledPath(
   config: SessionDirProvider,
   workspaceId: string
 ): string {
-  return path.join(config.getSessionDir(workspaceId), ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME);
+  return path.join(
+    path.join(config.sessionsDir, workspaceId),
+    ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME
+  );
 }
 
 async function readContentFile(config: SessionDirProvider, workspaceId: string): Promise<string> {

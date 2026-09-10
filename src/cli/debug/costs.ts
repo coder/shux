@@ -1,5 +1,5 @@
-import * as fs from "fs";
 import * as path from "path";
+import * as fs from "fs";
 import { defaultConfig } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { calculateTokenStats } from "@/common/utils/tokens/tokenStatsCalculator";
@@ -14,7 +14,7 @@ export async function costsCommand(workspaceId: string) {
   console.log(`\n=== Cost Statistics for workspace: ${workspaceId} ===\n`);
 
   // Load chat history
-  const sessionDir = defaultConfig.getSessionDir(workspaceId);
+  const sessionDir = path.join(defaultConfig.sessionsDir, workspaceId);
   const chatHistoryPath = path.join(sessionDir, "chat.jsonl");
 
   if (!fs.existsSync(chatHistoryPath)) {

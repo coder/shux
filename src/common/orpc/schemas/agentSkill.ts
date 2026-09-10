@@ -109,6 +109,8 @@ export const AgentSkillDescriptorSchema = z.object({
   argumentHint: z.string().min(1).max(200).optional(),
   /** Normalized `when_to_use`/`when-to-use` frontmatter (extra model-facing index guidance). */
   whenToUse: z.string().min(1).max(1024).optional(),
+  /** Agent Plugins: contributing plugin name (absent for non-plugin skills). */
+  pluginName: z.string().min(1).optional(),
 });
 
 export const AgentSkillPackageSchema = z

@@ -6,6 +6,8 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
+import { type XumEnvironment } from "../src/common/compat/xumEnv";
+import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
   BEDROCK_AUTH_ENV_VARS,
@@ -40,18 +42,57 @@ export type SeedSources = {
   configPath: string | null;
 };
 
+export type ChooseSeedSourcesOptions = {
+  env?: XumEnvironment;
+  homeDir?: string;
+};
+
+function uniqueExpandedPaths(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const expanded = expandTilde(value);
+    if (seen.has(expanded)) continue;
+    seen.add(expanded);
+    result.push(expanded);
+  }
+  return result;
+}
+
 /**
- * Pick seed files for a sandbox MUX_ROOT.
+ * Seed-root order when no explicit SEED_XUM_ROOT / SEED_MUX_ROOT is set:
+ * XUM_ROOT, MUX_ROOT, ~/.xum[-dev], then legacy ~/.mux[-dev] / ~/.cmux.
+ */
+export function listSandboxSeedCandidateRoots(options: ChooseSeedSourcesOptions = {}): string[] {
+  const env = options.env ?? process.env;
+  const homeDir = options.homeDir ?? os.homedir();
+
+  return uniqueExpandedPaths([
+    env.XUM_ROOT,
+    env.MUX_ROOT,
+    path.join(homeDir, `${XUM_HOME_DIR_NAME}-dev`),
+    path.join(homeDir, XUM_HOME_DIR_NAME),
+    // Leftover local homes remain accepted; remote ~/.mux and Docker /var/mux are separate contracts.
+    path.join(homeDir, ".mux-dev"),
+    path.join(homeDir, ".mux"),
+    path.join(homeDir, ".cmux"),
+  ]);
+}
+
+/**
+ * Pick seed files for a sandbox XUM_ROOT.
  *
  * providers.jsonc and config.json are chosen *independently* from the first
- * candidate root that has each file. A root like ~/.mux-dev often has only
- * config.json while provider credentials live in ~/.mux/providers.jsonc;
+ * candidate root that has each file. A root like ~/.xum-dev often has only
+ * config.json while provider credentials live in ~/.xum/providers.jsonc;
  * picking a single root would silently drop provider config and push the
  * sandboxed server onto env-var credential fallback, which can pair a real
  * API key with an unrelated *_BASE_URL proxy (e.g. Coder AI bridge) and fail
  * auth. See sanitizeSandboxProviderEnv for the env-side guard.
  */
-export function chooseSeedSources(): SeedSources {
+export function chooseSeedSources(options: ChooseSeedSourcesOptions = {}): SeedSources {
+  const env = options.env ?? process.env;
   const findFirstFile = (roots: string[], fileName: string): string | null => {
     for (const root of roots) {
       const candidate = path.join(root, fileName);
@@ -60,10 +101,13 @@ export function chooseSeedSources(): SeedSources {
     return null;
   };
 
-  if (process.env.SEED_MUX_ROOT) {
-    const explicit = expandTilde(process.env.SEED_MUX_ROOT);
+  const explicitSeed = env.SEED_XUM_ROOT ?? env.SEED_MUX_ROOT;
+  if (explicitSeed) {
+    const explicit = expandTilde(explicitSeed);
     if (!dirExists(explicit)) {
-      throw new Error(`SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`);
+      throw new Error(
+        `SEED_XUM_ROOT/SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`
+      );
     }
     // Explicit seed root: only look there.
     return {
@@ -72,12 +116,7 @@ export function chooseSeedSources(): SeedSources {
     };
   }
 
-  const candidates = [
-    process.env.MUX_ROOT ? expandTilde(process.env.MUX_ROOT) : null,
-    path.join(os.homedir(), ".mux-dev"),
-    path.join(os.homedir(), ".mux"),
-  ].filter((value): value is string => Boolean(value));
-
+  const candidates = listSandboxSeedCandidateRoots(options);
   return {
     providersPath: findFirstFile(candidates, "providers.jsonc"),
     configPath: findFirstFile(candidates, "config.json"),

@@ -35,7 +35,7 @@ const createDebugLlmRequestSnapshot = (workspaceId: string): DebugLlmRequestSnap
   agentId: "exec",
   maxOutputTokens: 2048,
   systemMessage:
-    "You are Mux, a focused coding agent. Follow the user’s instructions and keep answers short.",
+    "You are Xum, a focused coding agent. Follow the user’s instructions and keep answers short.",
   messages: [
     {
       role: "user",

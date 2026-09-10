@@ -1,0 +1,89 @@
+---
+title: Mux compatibility
+sidebarTitle: Mux compatibility
+description: Upgrade, downgrade, storage, command, environment, and deep-link compatibility during the Xum rename
+---
+
+Xum is the canonical product, package, command, protocol, and local data-directory name. The rename keeps old Mux entry points connected to the same implementation and data so existing users can upgrade and later downgrade without copying state by hand.
+
+## Canonical and legacy names
+
+| Surface               | Canonical                         | Compatibility alias                                       |
+| --------------------- | --------------------------------- | --------------------------------------------------------- |
+| npm package           | `@coder/xum`                      | `mux` forwarding package                                  |
+| CLI                   | `xum`                             | `mux`                                                     |
+| Local data            | `~/.xum`                          | `~/.mux` and older `~/.cmux` links                        |
+| Development data      | `~/.xum-dev`                      | `~/.mux-dev` link                                         |
+| Electron user data    | platform app-data directory `xum` | sibling `mux` link                                        |
+| Environment variables | `XUM_*`                           | `MUX_*`; `CMUX_ALLOW_MULTIPLE_INSTANCES` is also accepted |
+| Project metadata      | `.xum/`                           | `.mux/` read fallback                                     |
+| Worktree ignore file  | `.xumignore`                      | `.muxignore` read fallback                                |
+| Deep links            | `xum://`                          | `mux://`                                                  |
+| Release artifacts     | `xum-*`                           | matching `mux-*` aliases                                  |
+
+When both a `XUM_*` variable and its `MUX_*` alias are set, the `XUM_*` value wins and is mirrored to child processes under both names.
+
+## Local data migration
+
+On startup, Xum performs one non-destructive directory transition before configuration or sessions are loaded:
+
+1. If only `~/.mux` exists, it is moved to `~/.xum`.
+2. `~/.mux` is recreated as a directory link pointing to `~/.xum`.
+3. The older `~/.cmux` name also points to `~/.xum`.
+4. Development builds apply the same behavior to `.mux-dev` and `.xum-dev`.
+
+Older Mux binaries therefore read and write the canonical Xum directory after a downgrade. Writes through either path are immediately visible through the other path.
+
+On Windows, Xum uses a directory junction so the alias normally works without Developer Mode or administrator privileges. On macOS and Linux, it uses a directory symlink.
+
+<Warning>
+  If `~/.xum` and `~/.mux` are independent existing directories, Xum does not merge, replace, or
+  delete either directory. It reports the conflict and keeps the canonical directory active. Resolve
+  the contents manually before relying on downgrade compatibility.
+
+If `~/.xum` exists but is not a usable directory (for example a regular file or broken symlink),
+Xum leaves that entry unchanged and falls back to the first healthy leftover tree. Transition
+`activePath` is never that unusable entry, so desktop `userData` is not pointed at a file.
+
+</Warning>
+
+Explicit `XUM_ROOT` or `MUX_ROOT` locations are never moved. Xum makes both variable names resolve to the same configured path instead.
+
+## Project metadata migration
+
+New project-local configuration is written under `.xum/`, including agents, skills, plugins, hooks, workflows, MCP overrides, and staged attachments. Xum still reads the corresponding `.mux/` locations when no canonical file or directory exists, but it does not dual-write project metadata. When both names exist, `.xum/` wins. The same preference applies to `.xumignore` over `.muxignore`.
+
+This forward-only fallback keeps existing repositories working without carrying a second canonical configuration tree. Move committed project metadata to `.xum/` when updating a repository.
+
+## Desktop state and downgrades
+
+Electron state such as window position, browser storage, and local preferences is moved from the platform `mux` app-data directory to `xum`, then the old directory name points forward. The stable application identifier remains `com.mux.app` during the transition so operating-system updater and uninstall identity does not fork.
+
+The supported flow is sequential: close one version before launching or installing the other. Running old Mux and new Xum processes concurrently against the same sessions is not supported.
+
+A manual macOS DMG downgrade may replace or coexist with `xum.app` as `Mux.app`, depending on where the user drags the bundle. The packaged directory is `xum.app` even though the display name is Xum. The shared data links preserve state, but Xum cannot create a system-wide `/Applications/Mux.app` alias without installation privileges. Windows and Linux installers likewise preserve data even when shortcut or executable filenames change.
+
+## Compatibility names that intentionally remain
+
+Some names are persisted protocols or externally managed infrastructure rather than display branding:
+
+- Provider/config identifiers such as `mux-gateway`
+- Internal persisted keys and extension IDs under `mux.*`
+- The VS Code Marketplace extension identity `coder.mux`
+- The stable desktop application ID `com.mux.app`
+- GitHub releases, documentation, Gateway, and OAuth URLs on existing `mux` domains
+- Docker storage at `/var/mux`
+- Existing SSH-host global storage at `~/.mux`; local startup cannot safely migrate arbitrary or offline hosts
+
+New user-visible labels use Xum even when one of these compatibility identifiers remains underneath.
+
+## Compatibility implementation ownership
+
+Transition-only behavior is intentionally concentrated in:
+
+- `src/common/compat/legacyMux.ts` for names, environment aliases, and accepted protocols
+- `src/node/compat/xumTransition.ts` for directory moves and forward links
+- `packages/mux-compat/` for the published legacy npm command
+- `scripts/create-legacy-mux-artifact-aliases.sh` for release filenames
+
+Canonical production code should not add new one-off `mux` fallbacks elsewhere. These boundaries can be removed together only in a release that explicitly ends downgrade support and after external package, URL, extension, remote-runtime, and persisted-key compatibility is no longer required.

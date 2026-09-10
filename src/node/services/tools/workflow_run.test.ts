@@ -9,10 +9,18 @@ import {
   WorkflowRunToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
 import { createWorkflowRunTool } from "./workflow_run";
-import { TestTempDir, createIsolatedAgentSkillsRoots, createTestToolConfig } from "./testHelpers";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import { TestTempDir, createTestToolConfig, writeProjectSkill } from "./testHelpers";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
+import type { TaskService } from "@/node/services/taskService";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+
+type BackgroundStartInput = Parameters<
+  NonNullable<NonNullable<ToolConfiguration["workflowService"]>["startWorkflowInBackground"]>
+>[0];
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -190,6 +198,60 @@ describe("workflow_run tool", () => {
     expect(capturedSource).not.toContain("stale");
   });
 
+  test("starts a skill workflow inherited by a subproject", async () => {
+    using checkout = new TestTempDir("test-workflow-run-tool-subproject-skill");
+    using xumHome = new TestTempDir("test-workflow-run-tool-subproject-mux-home");
+    const subprojectRoot = path.join(checkout.path, "packages", "app");
+    await fs.mkdir(subprojectRoot, { recursive: true });
+    await writeProjectSkill(checkout.path, "parent-flow", {
+      files: {
+        "workflow.js":
+          "export default function workflow() { return { reportMarkdown: 'parent workflow' }; }",
+      },
+    });
+
+    const startWorkflow = mock(async (input: { script: { source: string } }) => ({
+      runId: "wfr_parent_skill",
+      status: "completed" as const,
+      result: { reportMarkdown: input.script.source },
+    }));
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(subprojectRoot, {
+        workspaceId: "workspace-1",
+        xumScope: {
+          type: "project",
+          xumHome: xumHome.path,
+          projectRoot: subprojectRoot,
+          projectStorageAuthority: "host-local",
+          checkoutRoot: checkout.path,
+        },
+      }),
+      trusted: true,
+      workflowService: {
+        startWorkflow,
+        getRun: mock(async () => null),
+      },
+    });
+
+    await tool.execute!(
+      {
+        script_path: "skill://parent-flow/workflow.js",
+        args: {},
+        run_in_background: false,
+      },
+      mockToolCallOptions
+    );
+
+    expect(startWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        script: expect.objectContaining({
+          source: expect.stringContaining("parent workflow"),
+          scope: "project",
+        }),
+      })
+    );
+  });
+
   test("starts a built-in skill workflow by explicit skill script_path", async () => {
     using tempDir = new TestTempDir("test-workflow-run-tool-built-in-skill");
     const startWorkflow = mock(async () => ({
@@ -199,7 +261,6 @@ describe("workflow_run tool", () => {
     }));
     const tool = createWorkflowRunTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
-      agentSkillsRoots: createIsolatedAgentSkillsRoots(tempDir.path),
       trusted: false,
       workflowService: {
         startWorkflow,
@@ -589,15 +650,31 @@ describe("workflow_run tool", () => {
     const startWorkflow = mock(async () => {
       throw new Error("foreground start should not be used");
     });
-    const startWorkflowInBackground = mock(async () => ({
-      runId: "wfr_background",
-      status: "running" as const,
-      result: null,
-    }));
+    // Faithful to WorkflowService: onRunCreated is awaited at run creation, before the runner
+    // starts executing. The probe checks the sidecar reference is already durable at that
+    // point, so a fast run (or a crash) after launch cannot lose its terminal wake.
+    let referenceDurableBeforeRunnerStart = false;
+    const startWorkflowInBackground = mock(async (input: BackgroundStartInput) => {
+      await input.onRunCreated?.({
+        runId: "wfr_background",
+        status: "pending",
+        result: null,
+        run: null,
+      });
+      const references = await readAgentWorkflowRunReferences(tempDir.path);
+      referenceDurableBeforeRunnerStart = references.some(
+        (reference) => reference.runId === "wfr_background"
+      );
+      return { runId: "wfr_background", status: "running" as const, result: null };
+    });
     const getRun = mock(async () => null);
+    const getWorkflowInvocationBoundaryMessageId = mock(async () => "boundary-row-1");
     const tool = createWorkflowRunTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
       trusted: true,
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+      taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
       workflowService: {
         startWorkflow,
         startWorkflowInBackground,
@@ -610,8 +687,23 @@ describe("workflow_run tool", () => {
       mockToolCallOptions
     );
 
+    expect(referenceDurableBeforeRunnerStart).toBe(true);
+    // The reference must persist the invocation-boundary snapshot: currentness compares row
+    // identity, so a reference recorded without it fails safe and the wake is dropped.
     const references = await readAgentWorkflowRunReferences(tempDir.path);
-    expect(references.map((reference) => reference.runId)).toContain("wfr_background");
+    expect(references).toHaveLength(1);
+    expect(references[0]).toMatchObject({
+      runId: "wfr_background",
+      afterBoundaryMessageId: "boundary-row-1",
+      // The wake binds to the launching agent, so the reference must carry its identity
+      // and the launch turn's provenance pin.
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+    expect(getWorkflowInvocationBoundaryMessageId).toHaveBeenCalledWith(
+      "workspace-1",
+      "wfr_background"
+    );
 
     expect(startWorkflowInBackground).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -624,6 +716,83 @@ describe("workflow_run tool", () => {
     );
     expect(startWorkflow).not.toHaveBeenCalled();
     expect(result).toEqual({ status: "running", runId: "wfr_background", result: null });
+  });
+
+  test("records a rediscovery-only reference when the boundary snapshot fails", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-tool-boundary-error");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflowInBackground = mock(async (input: BackgroundStartInput) => {
+      await input.onRunCreated?.({
+        runId: "wfr_boundary_error",
+        status: "pending",
+        result: null,
+        run: null,
+      });
+      return { runId: "wfr_boundary_error", status: "running" as const, result: null };
+    });
+    const getWorkflowInvocationBoundaryMessageId = mock(async () => {
+      throw new Error("history read failed");
+    });
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
+      workflowService: {
+        startWorkflow: mock(async () => {
+          throw new Error("foreground start should not be used");
+        }),
+        startWorkflowInBackground,
+        getRun: mock(async () => null),
+      },
+    });
+
+    const result = await tool.execute!(
+      { script_path: scriptPath, args: { topic: "workflow tools" }, run_in_background: true },
+      mockToolCallOptions
+    );
+    expect(result).toEqual({ status: "running", runId: "wfr_boundary_error", result: null });
+
+    // A read failure must not persist a verified-empty boundary (null): the entry keeps the run
+    // rediscoverable while a later resume re-record can repair provenance.
+    const references = await readAgentWorkflowRunReferences(tempDir.path);
+    expect(references).toHaveLength(1);
+    expect(references[0]?.runId).toBe("wfr_boundary_error");
+    expect(references[0] != null && "afterBoundaryMessageId" in references[0]).toBe(false);
+  });
+
+  test("a sidecar write failure aborts the background launch before the runner starts", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-tool-sidecar-write-error");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    // The reference path exists as a directory, so every sidecar write fails.
+    await fs.mkdir(path.join(tempDir.path, "agent-workflow-runs.json"));
+    let runnerStarted = false;
+    const startWorkflowInBackground = mock(async (input: BackgroundStartInput) => {
+      await input.onRunCreated?.({
+        runId: "wfr_sidecar_write_error",
+        status: "pending",
+        result: null,
+        run: null,
+      });
+      runnerStarted = true;
+      return { runId: "wfr_sidecar_write_error", status: "running" as const, result: null };
+    });
+    const getRun = mock(async () => null);
+    const getWorkflowInvocationBoundaryMessageId = mock(async () => "boundary-row-1");
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      agentId: "plan",
+      taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
+      workflowService: { startWorkflowInBackground, getRun },
+    });
+
+    // Starting the runner without durable provenance would let a fast terminal run have its
+    // wake permanently superseded; the launch must fail loudly instead, leaving the run
+    // pending and resumable (workflow_resume re-records provenance).
+    await expect(
+      tool.execute!({ script_path: scriptPath, run_in_background: true }, mockToolCallOptions)
+    ).rejects.toThrow(/created durable run wfr_sidecar_write_error/);
+    expect(runnerStarted).toBe(false);
   });
 
   test("requires the workflow service", async () => {
@@ -642,5 +811,466 @@ describe("workflow_run tool", () => {
         )
       )
     ).rejects.toThrow(/workflowService/);
+  });
+});
+describe("workflow_run duplicate guard", () => {
+  const runningWorkflowDescriptor = (canonicalScriptPath: string) => ({
+    name: "deep-research",
+    description: "Deep research",
+    scope: "project" as const,
+    executable: true,
+    sourcePath: canonicalScriptPath,
+    canonicalScriptPath,
+    sourceKind: "workspace-file" as const,
+    sourceHash: "sha256:active",
+  });
+
+  function activeRunRecordFor(canonicalScriptPath: string, id = "wfr_active"): WorkflowRunRecord {
+    return createWorkflowRunRecord({
+      id,
+      status: "running",
+      workflow: runningWorkflowDescriptor(canonicalScriptPath),
+    });
+  }
+
+  const completedStart = () =>
+    mock(async () => ({ runId: "wfr_new", status: "completed" as const, result: null }));
+  const completedGetRun = async () => createWorkflowRunRecord({ status: "completed" });
+
+  test("refuses when the same script already has an active run", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [activeRunRecordFor(scriptPath)],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    const launch = Promise.resolve(
+      tool.execute!(
+        { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+        mockToolCallOptions
+      )
+    );
+    await expect(launch).rejects.toThrow(/already has an active run/);
+    await launch.catch((error: unknown) => {
+      expect(String(error)).toContain("wfr_active");
+      expect(String(error)).toContain("task_await");
+      expect(String(error)).toContain("allow_concurrent");
+    });
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("matches equivalent spellings of the same script path", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [activeRunRecordFor(scriptPath)],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    // Stored spelling is "./workflows/deep-research.js"; launch without the "./" prefix.
+    await expect(
+      Promise.resolve(
+        tool.execute!(
+          {
+            script_path: scriptPath.replace(/^\.\//, ""),
+            script_source: null,
+            args: {},
+            run_in_background: false,
+          },
+          mockToolCallOptions
+        )
+      )
+    ).rejects.toThrow(/already has an active run/);
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("allows a launch while a different script runs", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [activeRunRecordFor("./workflows/other.js")],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await tool.execute!(
+      { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+      mockToolCallOptions
+    );
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test("allows a relaunch when the previous same-script run is terminal", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const terminalRun = createWorkflowRunRecord({
+      id: "wfr_done",
+      status: "completed",
+      workflow: runningWorkflowDescriptor(scriptPath),
+    });
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [terminalRun],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await tool.execute!(
+      { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+      mockToolCallOptions
+    );
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test("allow_concurrent=true starts despite an active same-script run", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const listRuns = mock(async () => [activeRunRecordFor(scriptPath)]);
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: { listRuns, startWorkflow, getRun: completedGetRun },
+    });
+
+    await tool.execute!(
+      {
+        script_path: scriptPath,
+        script_source: null,
+        args: {},
+        run_in_background: false,
+        allow_concurrent: true,
+      },
+      mockToolCallOptions
+    );
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+    expect(listRuns).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when active runs cannot be listed", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => {
+          throw new Error("store unreadable");
+        },
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await expect(
+      Promise.resolve(
+        tool.execute!(
+          { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+          mockToolCallOptions
+        )
+      )
+    ).rejects.toThrow(/could not verify/);
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("refuses an inline script whose source already has an active run", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const inlineSource = "export default function workflow() { return 42; }\n";
+    const resolved = await resolveWorkflowScript({
+      scriptSource: inlineSource,
+      runtime: new LocalRuntime(tempDir.path),
+      workspacePath: tempDir.path,
+      projectTrusted: true,
+    });
+    const inlineRun = createWorkflowRunRecord({
+      id: "wfr_inline",
+      status: "running",
+      workflow: {
+        name: "inline",
+        description: "Inline workflow",
+        scope: "project",
+        executable: true,
+        sourceKind: "inline",
+        sourceHash: resolved.sourceHash,
+      },
+    });
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [inlineRun],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await expect(
+      Promise.resolve(
+        tool.execute!(
+          { script_path: null, script_source: inlineSource, args: {}, run_in_background: false },
+          mockToolCallOptions
+        )
+      )
+    ).rejects.toThrow(/already has an active run/);
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
+
+  test("serializes overlapping launches so only one creates a run", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const runs: WorkflowRunRecord[] = [];
+    let releaseFirstLaunch!: () => void;
+    const firstLaunchGate = new Promise<void>((resolve) => {
+      releaseFirstLaunch = resolve;
+    });
+    const startWorkflow = mock(
+      async (input: {
+        onRunCreated?: (event: {
+          runId: string;
+          status: "pending";
+          result: null;
+          run: unknown;
+        }) => Promise<void> | void;
+      }) => {
+        const isFirstAdmission = runs.length === 0;
+        const record = activeRunRecordFor(scriptPath, `wfr_${runs.length + 1}`);
+        runs.push(record);
+        await input.onRunCreated?.({
+          runId: record.id,
+          status: "pending",
+          result: null,
+          run: record,
+        });
+        // A broken guard must fail promptly rather than block both launches forever.
+        if (isFirstAdmission) await firstLaunchGate;
+        return { runId: record.id, status: "completed" as const, result: null };
+      }
+    );
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => runs,
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    const launchArgs = {
+      script_path: scriptPath,
+      script_source: null,
+      args: {},
+      run_in_background: false,
+    };
+    // Script reads can finish in either order. Handle both rejections immediately
+    // and assert the duplicate invariant without assuming which caller wins.
+    const launch = () =>
+      Promise.resolve()
+        .then(async () => {
+          await tool.execute!(launchArgs, mockToolCallOptions);
+        })
+        .then(
+          () => ({ status: "fulfilled" as const }),
+          (reason: unknown) => ({ status: "rejected" as const, reason })
+        );
+    const launches = [launch(), launch()];
+    const beforeRelease = await Promise.race(launches).finally(releaseFirstLaunch);
+    const outcomes = await Promise.all(launches);
+    expect(beforeRelease.status).toBe("rejected");
+    if (beforeRelease.status === "rejected") {
+      expect(beforeRelease.reason).toMatchObject({
+        message: expect.stringMatching(/already has an active run/),
+      });
+    }
+    expect(outcomes.map((outcome) => outcome.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test("serializes overlapping launches across equivalent path spellings", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+    // Signals when the Nth read of the workflow script finishes, marking the last async step
+    // of that launch's script resolution; everything from there to the duplicate check is
+    // microtasks, so one macrotask turn afterwards deterministically settles the launch at
+    // either the admission gate or the listRuns gate.
+    class ReadSignalingRuntime extends LocalRuntime {
+      scriptReads = 0;
+      onSecondScriptRead: (() => void) | null = null;
+      override readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+        const inner = super.readFile(path, abortSignal);
+        if (!path.includes("deep-research.js")) {
+          return inner;
+        }
+        this.scriptReads += 1;
+        const notify = this.scriptReads === 2 ? this.onSecondScriptRead : null;
+        const reader = inner.getReader();
+        return new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) {
+              notify?.();
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+          },
+        });
+      }
+    }
+    const runtime = new ReadSignalingRuntime(tempDir.path);
+    const secondScriptRead = deferred();
+    runtime.onSecondScriptRead = secondScriptRead.resolve;
+
+    const runs: WorkflowRunRecord[] = [];
+    const firstListReached = deferred();
+    const firstListGate = deferred();
+    const secondListGate = deferred();
+    let listRunsCalls = 0;
+    const listRuns = async () => {
+      listRunsCalls += 1;
+      // Snapshot at invocation time: a call that starts while the first launch still holds
+      // its gate must observe the pre-persist (empty) state, so an admission-key regression
+      // cannot be masked by the record landing before the gates are released below.
+      const snapshot = [...runs];
+      if (listRunsCalls === 1) {
+        firstListReached.resolve();
+        await firstListGate.promise;
+      } else {
+        await secondListGate.promise;
+      }
+      return snapshot;
+    };
+    const startWorkflow = mock(
+      async (input: {
+        onRunCreated?: (event: {
+          runId: string;
+          status: "pending";
+          result: null;
+          run: unknown;
+        }) => Promise<void> | void;
+      }) => {
+        const record = activeRunRecordFor(scriptPath, "wfr_first");
+        runs.push(record);
+        await input.onRunCreated?.({
+          runId: record.id,
+          status: "pending",
+          result: null,
+          run: record,
+        });
+        return { runId: record.id, status: "completed" as const, result: null };
+      }
+    );
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1", runtime }),
+      trusted: true,
+      workflowService: { listRuns, startWorkflow, getRun: completedGetRun },
+    });
+
+    const firstLaunch = Promise.resolve(
+      tool.execute!(
+        { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+        mockToolCallOptions
+      )
+    );
+    await firstListReached.promise;
+    // Same file, different spelling: must queue on the same admission gate instead of
+    // racing its own duplicate check before the first launch persists a run.
+    const secondLaunch = Promise.resolve(
+      tool.execute!(
+        {
+          script_path: scriptPath.replace(/^\.\//, ""),
+          script_source: null,
+          args: {},
+          run_in_background: false,
+        },
+        mockToolCallOptions
+      )
+    );
+    await secondScriptRead.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    // With the first launch still parked inside its listing, the second must be waiting on
+    // the shared admission gate rather than running its own duplicate check.
+    expect(listRunsCalls).toBe(1);
+    firstListGate.resolve();
+    secondListGate.resolve();
+    await expect(secondLaunch).rejects.toThrow(/already has an active run/);
+    await firstLaunch;
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test("matches a legacy inline run that omits workflow.sourceKind", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const inlineSource = "export default function workflow() { return 42; }\n";
+    const resolved = await resolveWorkflowScript({
+      scriptSource: inlineSource,
+      runtime: new LocalRuntime(tempDir.path),
+      workspacePath: tempDir.path,
+      projectTrusted: true,
+    });
+    // Legacy descriptor shape: no sourceKind/sourceHash/canonicalScriptPath on the workflow;
+    // only the run-level sourceHash identifies the source.
+    const legacyInlineRun = createWorkflowRunRecord({
+      id: "wfr_legacy_inline",
+      status: "running",
+      sourceHash: resolved.sourceHash,
+      workflow: {
+        name: "inline",
+        description: "Inline workflow",
+        scope: "project",
+        executable: true,
+      },
+    });
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [legacyInlineRun],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await expect(
+      Promise.resolve(
+        tool.execute!(
+          { script_path: null, script_source: inlineSource, args: {}, run_in_background: false },
+          mockToolCallOptions
+        )
+      )
+    ).rejects.toThrow(/already has an active run/);
+    expect(startWorkflow).not.toHaveBeenCalled();
   });
 });

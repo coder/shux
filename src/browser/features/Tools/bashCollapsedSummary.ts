@@ -49,8 +49,10 @@ export function buildBashCollapsedSummary(
     return { kind: "command", command };
   }
 
+  // typeof guard: kernel-mode nested reloads reconstruct partial results
+  // without wall_duration_ms; skip the label instead of rendering "for —".
   const durationLabel =
-    options.result && !options.isBackground
+    typeof options.result?.wall_duration_ms === "number" && !options.isBackground
       ? formatDuration(options.result.wall_duration_ms, "decimal")
       : undefined;
 
@@ -58,7 +60,7 @@ export function buildBashCollapsedSummary(
   return { kind: "intent-command", intent: displayIntent, command, durationLabel };
 }
 
-/** Models may echo `using <command>` and `for <duration>` despite schema guidance, so strip those since Mux appends them. */
+/** Models may echo `using <command>` and `for <duration>` despite schema guidance, so strip those since Xum appends them. */
 export function sanitizeModelIntent(rawIntent: unknown, command: string): string | undefined {
   if (typeof rawIntent !== "string") {
     return undefined;

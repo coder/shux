@@ -43,7 +43,7 @@ describe("AgentSession change detection", () => {
       await tracker.record(testFile, { content, timestamp: mtime });
 
       // Check for changes - should be empty since file is unchanged
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(0);
     });
 
@@ -68,7 +68,7 @@ describe("AgentSession change detection", () => {
       await utimes(testFile, newMtime / 1000, newMtime / 1000);
 
       // Check for changes - should detect the modification
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
 
       expect(attachments).toHaveLength(1);
       expect(attachments[0].type).toBe("edited_text_file");
@@ -78,7 +78,7 @@ describe("AgentSession change detection", () => {
       expect(attachments[0].snippet).toContain("New step");
     });
 
-    it("should update stored state after detecting change", async () => {
+    it("should update stored state only after commit()", async () => {
       const tracker = new FileChangeTracker();
       const testFile = join(tmpDir, "plan.md");
       const originalContent = "# Original";
@@ -97,12 +97,20 @@ describe("AgentSession change detection", () => {
 
       // First detection
       const firstCheck = await tracker.getChangedAttachments();
-      expect(firstCheck).toHaveLength(1);
+      expect(firstCheck.attachments).toHaveLength(1);
 
-      // Second check without further changes - should be empty
-      // because state was updated after first detection
-      const secondCheck = await tracker.getChangedAttachments();
-      expect(secondCheck).toHaveLength(0);
+      // Detection alone must not mutate tracked state: a retry after an
+      // aborted turn or failed history append re-detects the same change
+      // instead of silently dropping it.
+      const retryCheck = await tracker.getChangedAttachments();
+      expect(retryCheck.attachments).toHaveLength(1);
+      expect(retryCheck.attachments[0].snippet).toBe(firstCheck.attachments[0].snippet);
+
+      // After commit() (notification durably persisted), the change is
+      // acknowledged and no longer reported.
+      firstCheck.commit();
+      const afterCommit = await tracker.getChangedAttachments();
+      expect(afterCommit.attachments).toHaveLength(0);
     });
 
     it("should return empty when file deleted", async () => {
@@ -119,7 +127,7 @@ describe("AgentSession change detection", () => {
       await rm(testFile);
 
       // Should gracefully handle deleted file
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(0);
     });
 
@@ -149,7 +157,7 @@ describe("AgentSession change detection", () => {
       await utimes(file1, newMtime / 1000, newMtime / 1000);
       await utimes(file2, newMtime / 1000, newMtime / 1000);
 
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
 
       expect(attachments).toHaveLength(2);
       const filenames = attachments.map((a) => a.filename);
@@ -173,7 +181,7 @@ describe("AgentSession change detection", () => {
       await utimes(testFile, newMtime / 1000, newMtime / 1000);
 
       // Should not report change since content is identical
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(0);
     });
 
@@ -194,7 +202,7 @@ describe("AgentSession change detection", () => {
       const newMtime = Date.now() + 1000;
       await utimes(testFile, newMtime / 1000, newMtime / 1000);
 
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
 
       expect(attachments).toHaveLength(1);
       const diff = attachments[0].snippet;
@@ -226,7 +234,7 @@ describe("AgentSession change detection", () => {
       const newMtime = Date.now() + 1000;
       await utimes(realFile, newMtime / 1000, newMtime / 1000);
 
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
       const canonicalFilePath = await realpath(symlinkFile);
 
       expect(attachments).toHaveLength(1);
@@ -261,7 +269,7 @@ describe("AgentSession change detection", () => {
       const newMtime = Date.now() + 1000;
       await utimes(realFile, newMtime / 1000, newMtime / 1000);
 
-      const attachments = await tracker.getChangedAttachments();
+      const { attachments } = await tracker.getChangedAttachments();
       expect(attachments).toHaveLength(1);
       expect(attachments[0].filename).toBe(canonicalFilePath);
       expect(attachments[0].snippet).toContain(modifiedContent);

@@ -544,6 +544,7 @@ function getTaskAwaitResultEntries(message: OperationalBundleMemberMessage): obj
   return result.results.filter(isPlainObject);
 }
 
+// eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
 function isInterruptedTaskAwaitEntry(entry: object): boolean {
   if (!("status" in entry) || typeof entry.status !== "string") return false;
   if (entry.status === "interrupted") return true;

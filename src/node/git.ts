@@ -12,7 +12,7 @@ import { getErrorMessage } from "@/common/utils/errors";
  *
  * Git creates index.lock during operations that modify the index. If a process
  * is killed mid-operation (user cancel, crash, terminal closed), the lock file
- * gets orphaned. This is common in Mux when git operations are interrupted.
+ * gets orphaned. This is common in Xum when git operations are interrupted.
  *
  * We only remove locks older than STALE_LOCK_AGE_MS to avoid removing locks
  * from legitimately running processes.

@@ -9,7 +9,8 @@
  */
 
 import path from "path";
-import { getMuxHome } from "@/common/constants/paths";
+import { getLocalProductHomeTildeSuffix } from "@/common/compat/legacyMux";
+import { getXumHome } from "@/common/constants/paths";
 import { PlatformPaths } from "@/node/utils/paths.main";
 
 /**
@@ -29,25 +30,13 @@ import { PlatformPaths } from "@/node/utils/paths.main";
  * expandTilde("/abs/path")   // => "/abs/path"
  */
 export function expandTilde(filePath: string): string {
-  // Special-case mux's own default src dir path so it respects MUX_ROOT + NODE_ENV.
-  //
-  // DEFAULT_RUNTIME_CONFIG uses "~/.mux/src"; if we expand "~" to the OS home directory,
-  // we lose test isolation when MUX_ROOT is set.
-  const muxPrefixes = ["~/.mux", "~\\.mux", "~/.cmux", "~\\.cmux"] as const;
-  for (const prefix of muxPrefixes) {
-    if (!filePath.startsWith(prefix)) {
-      continue;
-    }
-
-    const nextChar = filePath.at(prefix.length);
-    if (nextChar !== undefined && nextChar !== "/" && nextChar !== "\\") {
-      continue;
-    }
-
-    const muxHome = getMuxHome();
-    const suffix = filePath.slice(prefix.length).replace(/^[/\\]+/, "");
-    const normalizedSuffix = suffix.replace(/[/\\]+/g, path.sep);
-    return normalizedSuffix ? path.join(muxHome, normalizedSuffix) : muxHome;
+  // Canonical and legacy local homes expand through getXumHome so XUM_ROOT/MUX_ROOT
+  // and development suffixes preserve test/sandbox isolation.
+  const productHomeSuffix = getLocalProductHomeTildeSuffix(filePath);
+  if (productHomeSuffix !== undefined) {
+    const xumHome = getXumHome();
+    const normalizedSuffix = productHomeSuffix.replace(/[/\\]+/g, path.sep);
+    return normalizedSuffix ? path.join(xumHome, normalizedSuffix) : xumHome;
   }
 
   return PlatformPaths.expandHome(filePath);

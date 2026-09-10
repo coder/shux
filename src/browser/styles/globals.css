@@ -106,6 +106,10 @@
     --color-runtime-devcontainer-text: #34d399; /* emerald-400 */
 
     /* Background & Layout */
+    /* iOS standalone PWA status-bar band backdrop. Deliberately NOT overridden by
+       light themes: black-translucent renders white status-bar glyphs in every
+       theme, so the exposed band needs a constant dark surface behind them. */
+    --color-ios-status-bar-backdrop: hsla(240, 10%, 4%, 1);
     --color-background: hsl(0 0% 12%);
     --color-background-secondary: hsl(60 1% 15%);
     --color-border: #262626; /* neutral-800 */
@@ -1127,7 +1131,54 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* Mobile improvements - only apply to touch devices */
+/* iOS standalone status-bar band (element lives in index.html). iOS 26 WebKit blurs the band
+   into the header unless a fixed, viewport-wide element with a solid background-color sits at
+   the top edge; pseudo-elements do not count. Glyphs stay white in every theme, so light themes
+   keep a constant dark band. The @supports gate excludes Android, whose dark glyphs would
+   vanish on it. */
+.ios-status-bar-band {
+  display: none;
+}
+
+@media (display-mode: standalone) {
+  @supports (-webkit-touch-callout: none) {
+    .ios-status-bar-band {
+      display: block;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: env(safe-area-inset-top, 0px);
+      background-color: var(--color-sidebar);
+      /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
+         the band. */
+      z-index: 1001;
+    }
+
+    :root[data-theme$="light"] .ios-status-bar-band {
+      background-color: var(--color-ios-status-bar-backdrop);
+    }
+  }
+}
+
+/* iPadOS reports pointer: coarse even with a trackpad attached, so selection suppression
+   must not be limited to phone widths. */
+@media (pointer: coarse) {
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Body selection is suppressed above, so editable controls must opt back in. */
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable="plaintext-only"] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}
+
 @media (max-width: 768px) and (pointer: coarse) {
   html {
     -webkit-text-size-adjust: 100%;
@@ -1136,18 +1187,6 @@ body,
 
   body {
     font-size: 15px;
-    /* User request: prevent accidental text highlighting while tapping/scrolling on touch devices. */
-    -webkit-user-select: none;
-    user-select: none;
-  }
-
-  /* Keep selection/caret behavior in editable controls on touch devices. */
-  input,
-  textarea,
-  [contenteditable="true"],
-  [contenteditable="plaintext-only"] {
-    -webkit-user-select: text;
-    user-select: text;
   }
 
   .mobile-hide-shortcut-hints {
@@ -1160,6 +1199,12 @@ body,
     /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
     min-height: 44px;
     min-width: 44px;
+  }
+
+  /* Full-width rows above the composer (TODO, sub-agents, background bash) read as a list;
+     44px each made a short stack taller than the composer. */
+  .mobile-touch-row {
+    min-height: 32px;
   }
 
   /* Keep workspace header visible when keyboard opens - fixed positioning
@@ -1198,12 +1243,12 @@ body,
 @media (max-width: 768px) {
   .mobile-menu-btn {
     display: inline-flex !important;
-    justify-content: flex-start !important;
-    padding-left: 12px !important;
   }
 
+  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
+     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
   .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+    padding-left: 0.5rem !important;
   }
 
   /* Hand the bottom inset to a column that reserves its own clearance (see ChatPane and
@@ -1253,6 +1298,21 @@ body,
   }
 }
 
+/* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
+   would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
+   Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
+   the hover pill against the window edge. */
+@media (max-width: 768px) and (pointer: coarse) {
+  .mobile-menu-btn {
+    justify-content: flex-start !important;
+    padding-left: 12px !important;
+  }
+
+  .mobile-sticky-header:has(.mobile-menu-btn) {
+    padding-left: 0 !important;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
@@ -1285,14 +1345,17 @@ body,
 
 /* Use dvh (dynamic viewport height) on supported browsers - this accounts for
    mobile browser chrome and keyboard accessory bars. Using @supports ensures
-   dvh takes precedence over the vh fallback above. */
+   dvh takes precedence over the vh fallback above.
+   --app-viewport-height (see installViewportHeightSync) overrides dvh on iOS standalone,
+   where iOS 26 sometimes sizes 100dvh as if a browser toolbar were present and strands a
+   blank band under the footer. */
 @supports (height: 100dvh) {
   html,
   body,
   #root,
   #storybook-root {
-    min-height: 100dvh;
-    height: 100dvh;
+    min-height: var(--app-viewport-height, 100dvh);
+    height: var(--app-viewport-height, 100dvh);
   }
 }
 

@@ -11,6 +11,7 @@ import {
   Bell,
   BookOpen,
   Brain,
+  BrainCircuit,
   CircleCheck,
   Database,
   FileText,
@@ -18,6 +19,7 @@ import {
   Globe,
   GraduationCap,
   Hand,
+  History,
   Keyboard,
   Layers,
   LayoutGrid,
@@ -37,6 +39,7 @@ import {
   ScanEye,
   Square,
   Target,
+  Trash2,
   Wrench,
 } from "lucide-react";
 import { EmojiIcon } from "@/browser/components/icons/EmojiIcon/EmojiIcon";
@@ -254,7 +257,9 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   advisor: Lightbulb,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
+  session_history: History,
   memory: Brain,
+  intuition: BrainCircuit,
   attach_file: Paperclip,
   desktop_screenshot: Monitor,
   desktop_move_mouse: Move,
@@ -277,6 +282,9 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   review_pane_update: Sparkles,
   review_pane_get: ScanEye,
   analytics_query: Database,
+  task_retitle: Pencil,
+  task_stop: Square,
+  task_remove: Trash2,
   task_send_message: MessageSquareMore,
   task_apply_git_patch: GitCommit,
   // Layers (stacked planes) reads as "manage the stack of child workspaces" — matches the

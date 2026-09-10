@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, test } from "bun:test";
 import {
   getExplicitGatewayPrefix,
   normalizeSelectedModel,
@@ -49,6 +49,27 @@ describe("normalizeToCanonical", () => {
 
   it("leaves github-copilot model IDs unchanged", () => {
     expect(normalizeToCanonical("github-copilot:gpt-5.5")).toBe("github-copilot:gpt-5.5");
+  });
+
+  it("normalizes only default-named canonical-route coder instances", () => {
+    // Default-named instances of the canonical routes carry canonical identity.
+    expect(normalizeToCanonical("coder:anthropic/claude-sonnet-4-5")).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+    expect(normalizeToCanonical("coder:openai/gpt-5")).toBe("openai:gpt-5");
+  });
+
+  it("keeps non-canonical coder instance names gateway-scoped", () => {
+    // Rewriting coder:google/x to google:x would route the request to the
+    // DIRECT provider, bypassing the gateway the user explicitly selected —
+    // the static route table cannot restore instance-name prefixes.
+    expect(normalizeToCanonical("coder:google/gemini-3-pro")).toBe("coder:google/gemini-3-pro");
+    expect(normalizeToCanonical("coder:openai-compat/llama-3.3-70b")).toBe(
+      "coder:openai-compat/llama-3.3-70b"
+    );
+    expect(normalizeToCanonical("coder:prod-anthropic/claude-sonnet-4-5")).toBe(
+      "coder:prod-anthropic/claude-sonnet-4-5"
+    );
   });
 
   it("leaves direct provider model IDs unchanged", () => {
@@ -146,12 +167,18 @@ describe("Anthropic 1M context classification", () => {
     expect(hasNative1MContext("anthropic:claude-sonnet-5")).toBe(true);
   });
 
-  it("treats Mythos-class Fable 5 / Mythos 5 as native 1M models", () => {
+  it("treats Mythos-class Fable 5 / Fable 5.1 / Mythos 5 / Mythos 5.1 as native 1M models", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5")).toBe("native");
+    expect(getAnthropic1MContextMode("anthropic:claude-fable-5-1")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-mythos-5")).toBe("native");
-    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-fable-5")).toBe("native");
+    expect(getAnthropic1MContextMode("anthropic:claude-mythos-5-1")).toBe("native");
+    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-fable-5-1")).toBe("native");
+    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-mythos-5-1")).toBe("native");
     expect(hasNative1MContext("anthropic:claude-fable-5")).toBe(true);
-    expect(supports1MContext("anthropic:claude-fable-5")).toBe(false);
+    expect(hasNative1MContext("anthropic:claude-fable-5-1")).toBe(true);
+    expect(hasNative1MContext("anthropic:claude-mythos-5-1")).toBe(true);
+    expect(supports1MContext("anthropic:claude-fable-5-1")).toBe(false);
+    expect(supports1MContext("anthropic:claude-mythos-5-1")).toBe(false);
   });
 
   it("returns none for models without Anthropic 1M support", () => {
@@ -162,6 +189,67 @@ describe("Anthropic 1M context classification", () => {
     expect(supports1MContext("openai:gpt-5.5")).toBe(false);
     expect(supports1MContext("anthropic:claude-haiku-4-5")).toBe(false);
     expect(hasNative1MContext("openai:gpt-5.5")).toBe(false);
+  });
+});
+
+describe("supports1MContext for Coder gateway instances", () => {
+  const coderConfig = {
+    coder: {
+      discoveredProviders: [
+        { name: "prod-anthropic", type: "anthropic" },
+        { name: "anthropic", type: "openai-compat" },
+      ],
+    },
+  };
+
+  test("custom-named anthropic instances inherit the upstream's 1M beta capability", () => {
+    expect(supports1MContext("coder:prod-anthropic/claude-sonnet-4-5", coderConfig)).toBe(true);
+  });
+
+  test("cross-typed anthropic-named instances do not get the 1M beta", () => {
+    // The name says anthropic but the upstream is an OpenAI-compat proxy;
+    // metadata must win over the name convention.
+    expect(supports1MContext("coder:anthropic/claude-sonnet-4-5", coderConfig)).toBe(false);
+  });
+
+  test("without a config the name === type default applies", () => {
+    expect(supports1MContext("coder:anthropic/claude-sonnet-4-5")).toBe(true);
+    expect(supports1MContext("coder:prod-anthropic/claude-sonnet-4-5")).toBe(false);
+  });
+
+  test("treat-as mappings still do not confer the 1M beta", () => {
+    // mappedToModel overrides are metadata-only; a custom model cannot
+    // accept the Anthropic beta header just because it is "treated as" one.
+    const config = {
+      ollama: { models: [{ id: "custom", mappedToModel: "anthropic:claude-sonnet-4-5" }] },
+    };
+    expect(supports1MContext("ollama:custom", config)).toBe(false);
+  });
+
+  test("the 1M beta requires an Anthropic-capable wire", () => {
+    const config = {
+      coder: {
+        discoveredProviders: [
+          { name: "vercel", type: "vercel" },
+          { name: "bedrock", type: "bedrock" },
+        ],
+      },
+    };
+    // A vercel-typed instance maps Claude vendor models to anthropic:* for
+    // pricing/metadata, but speaks openai-chat on the wire: the anthropic-beta
+    // header cannot be attached, so the beta must not be conferred.
+    expect(getAnthropic1MContextMode("coder:vercel/anthropic/claude-sonnet-4-5", config)).toBe(
+      "none"
+    );
+    expect(supports1MContext("coder:vercel/anthropic/claude-sonnet-4-5", config)).toBe(false);
+    // Bedrock-typed instances speak the Anthropic wire and carry the header.
+    expect(getAnthropic1MContextMode("coder:bedrock/anthropic.claude-sonnet-4-5", config)).toBe(
+      "beta"
+    );
+    // Native 1M is standard model metadata (no header) and is not wire-gated.
+    expect(getAnthropic1MContextMode("coder:vercel/anthropic/claude-sonnet-4-6", config)).toBe(
+      "native"
+    );
   });
 });
 

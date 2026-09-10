@@ -8,12 +8,28 @@ export interface SubagentReportEnvelope {
   status: SubagentReportStatus;
   title: string;
   reportMarkdown: string;
+  executionVersion?: string;
+  executionId?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   structuredOutput?: unknown;
 }
 
 export const SUBAGENT_FAILURE_ENVELOPE_TAG = "<mux_subagent_failure>";
+
+// Fallback titles for untitled reports; the matcher lives here so consumers (timeline dedupe) can
+// treat them as absent titles without drifting from the builders.
+export function subagentUpdateFallbackTitle(agentType: string): string {
+  return `Subagent (${agentType}) update`;
+}
+
+export function subagentReportFallbackTitle(agentType: string): string {
+  return `Subagent (${agentType}) report`;
+}
+
+export function isSubagentFallbackTitle(title: string): boolean {
+  return /^Subagent \(.+\) (?:update|report)$/.test(title);
+}
 
 const ROOT_OPEN = "<mux_subagent_report>";
 const ROOT_CLOSE = "</mux_subagent_report>";
@@ -72,6 +88,10 @@ function parseJsonEnvelope(inner: string): SubagentReportEnvelope | null {
     status: record.status,
     title: record.title,
     reportMarkdown: record.reportMarkdown,
+    ...(isNonEmptyString(record.executionVersion)
+      ? { executionVersion: record.executionVersion }
+      : {}),
+    ...(isNonEmptyString(record.executionId) ? { executionId: record.executionId } : {}),
     // Model/thinking are display metadata: tolerate absent or malformed values so a bad
     // producer can never invalidate an otherwise well-formed report.
     ...(isNonEmptyString(record.model) ? { model: record.model } : {}),

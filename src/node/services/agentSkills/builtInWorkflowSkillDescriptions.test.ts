@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { getBuiltInSkillDefinitions, readBuiltInSkillFile } from "./builtInSkillDefinitions";
+import {
+  getBuiltInSkillByName,
+  getBuiltInSkillDefinitions,
+  readBuiltInSkillFile,
+} from "./builtInSkillDefinitions";
 
 function hasPackagedWorkflow(name: string): boolean {
   try {
@@ -13,6 +17,13 @@ function hasPackagedWorkflow(name: string): boolean {
     throw err;
   }
 }
+
+describe("legacy built-in skill aliases", () => {
+  test("resolves mux skill names to canonical xum packages and files", () => {
+    expect(getBuiltInSkillByName("mux-docs")?.frontmatter.name).toBe("xum-docs");
+    expect(readBuiltInSkillFile("mux-docs", "SKILL.md").content).toContain("name: xum-docs");
+  });
+});
 
 describe("built-in workflow skill descriptions", () => {
   test("prefixes skills that ship a workflow script", () => {

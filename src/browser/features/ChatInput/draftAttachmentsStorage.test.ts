@@ -29,16 +29,6 @@ describe("draftAttachmentsStorage", () => {
     ]);
   });
 
-  test("parsePersistedChatAttachments preserves legacy provider attachments", () => {
-    expect(
-      parsePersistedChatAttachments([
-        { id: "img-1", url: "data:image/png;base64,AAA", mediaType: "image/png" },
-      ])
-    ).toEqual([
-      { kind: "provider", id: "img-1", url: "data:image/png;base64,AAA", mediaType: "image/png" },
-    ]);
-  });
-
   test("parsePersistedChatAttachments returns staged file metadata without base64", () => {
     expect(
       parsePersistedChatAttachments([

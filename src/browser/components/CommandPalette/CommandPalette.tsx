@@ -10,6 +10,7 @@ import {
   formatKeybind,
   KEYBINDS,
   isEditableElement,
+  isDesktopViewportFocused,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -67,6 +68,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
   );
+  const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
+  const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const slashContext = getSlashContext?.();
   const slashWorkspaceId = slashContext?.workspaceId;
 
@@ -111,6 +114,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   // Close palette with Escape
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (matchesKeybind(e, KEYBINDS.CANCEL) && isOpen) {
         // Intercept Escape in capture phase so it doesn't reach global bubble handlers
         // (e.g., stream interrupt).
@@ -299,6 +303,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
             workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
             memory: memoryExperimentEnabled,
             memoryConsolidation: memoryConsolidationExperimentEnabled,
+            rlm: rlmExperimentEnabled,
+            programmaticToolCalling: ptcExperimentEnabled,
           }),
       });
       const section = "Slash Commands";
@@ -375,6 +381,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     workspaceHeartbeatsExperimentEnabled,
     memoryExperimentEnabled,
     memoryConsolidationExperimentEnabled,
+    rlmExperimentEnabled,
+    ptcExperimentEnabled,
   ]);
 
   useEffect(() => {
@@ -559,13 +567,18 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   return (
     <div
-      className="fixed inset-0 z-[2000] flex items-start justify-center bg-black/40 pt-[10vh]"
+      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+      // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
+      className="fixed inset-0 z-[2000] flex items-start justify-center pt-[10vh] before:absolute before:inset-0 before:bg-black/40"
       onMouseDown={dismissPalette}
     >
       <Command
         label={currentField?.label ?? "Command palette"}
         ref={commandPanelRef}
-        className="font-primary w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
+        // relative keeps the panel painted above (and hit-tested before) the wrapper's
+        // absolutely positioned ::before backdrop, so clicks land on the palette instead
+        // of the wrapper's dismiss handler.
+        className="font-primary relative w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
         onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
         onKeyDown={trapPromptFocus}
         shouldFilter={false}

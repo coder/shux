@@ -2,7 +2,7 @@
  * MemoryMetaService — host-local sidecar for user/UI-owned memory metadata:
  * pins and usage stats ({lastAccessedAt, accessCount, lastWriteAt}).
  *
- * Lives at <muxHome>/memory-meta.json. Pins and stats NEVER live in the memory
+ * Lives at <xumHome>/memory-meta.json. Pins and stats NEVER live in the memory
  * files themselves: pinning is a per-user UI action and usage is per-user
  * signal, so the sidecar stays host-local and never git-tracked.
  *
@@ -13,8 +13,9 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
+import { Effect, Schema, Semaphore } from "effect";
 import type { MemoryScope } from "@/common/constants/memory";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 
 /**
@@ -37,7 +38,7 @@ function encodeKeyComponent(value: string): string {
  * Components are escaped so embedded ':' cannot alias another memory's key
  * (the sidecar drives pins, stats, hot ranking, and rename/delete cleanup).
  *
- * projectId is the project root path from Mux config (the stable project
+ * projectId is the project root path from Xum config (the stable project
  * identity available today — never the per-workspace checkout path). Phase 3
  * may refine this for remote runtimes (host identity + normalized root).
  */
@@ -118,97 +119,221 @@ function sanitizeMetaFile(raw: unknown): MemoryMetaFile {
   return { entries };
 }
 
+/**
+ * Typed failure for sidecar persistence (disk full, permissions, path
+ * conflicts). Reads never fail — malformed or missing data self-heals to
+ * empty — so writes are the only failure channel this service exposes.
+ *
+ * `Schema.TaggedError` gives us an `Error` subclass that is simultaneously a
+ * schema (usable in oRPC error payloads), a tagged union member (usable with
+ * `Effect.catchTag`), and yieldable in `Effect.gen`.
+ */
+export class MemoryMetaWriteError extends Schema.TaggedError<MemoryMetaWriteError>()(
+  "MemoryMetaWriteError",
+  {
+    metaPath: Schema.String,
+    reason: Schema.String,
+  }
+) {}
+
 export class MemoryMetaService {
   private readonly metaPath: string;
-  /** Serializes read-modify-write cycles against the (single) sidecar file. */
-  private readonly lock = new MutexMap<"meta">();
+  /**
+   * Serializes read-modify-write cycles against the (single) sidecar file.
+   * An Effect `Semaphore` rather than a promise-based mutex so lock
+   * acquisition participates in interruption — a fiber cancelled while
+   * waiting for the permit never runs its critical section.
+   */
+  private readonly writeLock = Semaphore.makeUnsafe(1);
   private cache: MemoryMetaFile | null = null;
 
-  constructor(muxHome: string) {
-    this.metaPath = path.join(muxHome, "memory-meta.json");
-  }
+  /**
+   * Effect-native API. The Promise methods below are thin `Effect.runPromise`
+   * facades over these, so pre-Effect callers keep working unchanged while
+   * Effect callers (oRPC `handlerGen` handlers, other migrated services)
+   * compose these directly and see typed errors in the `E` channel instead of
+   * untyped rejections.
+   */
+  readonly effects = {
+    /** Logical keys of all pinned memory files. */
+    getPinnedKeys: (): Effect.Effect<Set<string>> =>
+      Effect.map(
+        this.load(),
+        (meta) =>
+          new Set(
+            Object.entries(meta.entries)
+              .filter(([, entry]) => entry.pinned)
+              .map(([key]) => key)
+          )
+      ),
 
-  private async load(): Promise<MemoryMetaFile> {
-    if (this.cache !== null) return this.cache;
-    let parsed: unknown = null;
-    try {
-      parsed = JSON.parse(await fsPromises.readFile(this.metaPath, "utf-8"));
-    } catch (error) {
-      // Missing file is the normal first-run case; anything else is healed to empty.
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
-      }
-    }
-    this.cache = sanitizeMetaFile(parsed);
-    return this.cache;
+    /** All entries (pins + usage stats) keyed by logical memory identity. */
+    getEntries: (): Effect.Effect<Map<string, MemoryMetaEntry>> =>
+      Effect.map(
+        this.load(),
+        (meta) => new Map(Object.entries(meta.entries).map(([key, entry]) => [key, { ...entry }]))
+      ),
+
+    setPinned: (logicalKey: string, pinned: boolean): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        const current = entries[logicalKey] ?? EMPTY_ENTRY;
+        if (pinned) {
+          // Pinning counts as a use: it is an explicit signal the file matters,
+          // and it feeds the same recency/frequency ranking as reads/writes.
+          entries[logicalKey] = {
+            ...current,
+            pinned: true,
+            accessCount: current.accessCount + 1,
+            lastAccessedAt: Date.now(),
+          };
+        } else {
+          // Unpinning preserves usage stats; mutate() drops the entry if empty.
+          entries[logicalKey] = { ...current, pinned: false };
+        }
+      }),
+
+    /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
+    recordAccess: (
+      logicalKey: string,
+      options: { write: boolean }
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        const current = entries[logicalKey] ?? EMPTY_ENTRY;
+        const now = Date.now();
+        entries[logicalKey] = {
+          ...current,
+          accessCount: current.accessCount + 1,
+          lastAccessedAt: now,
+          lastWriteAt: options.write ? now : current.lastWriteAt,
+        };
+      }),
+
+    /**
+     * Move all entries for a renamed file or directory subtree so pins and
+     * stats follow the file. Stale entries at the destination are overwritten.
+     */
+    renameKeys: (
+      oldLogicalKey: string,
+      newLogicalKey: string
+    ): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        for (const [key, entry] of Object.entries(entries)) {
+          if (!keyInSubtree(key, oldLogicalKey)) continue;
+          delete entries[key];
+          entries[`${newLogicalKey}${key.slice(oldLogicalKey.length)}`] = entry;
+        }
+      }),
+
+    /**
+     * Drop all entries for a deleted file or directory subtree so a future file
+     * at the same path never resurrects stale pins or stats.
+     */
+    removeKeys: (logicalKey: string): Effect.Effect<void, MemoryMetaWriteError> =>
+      this.mutate((entries) => {
+        for (const key of Object.keys(entries)) {
+          if (keyInSubtree(key, logicalKey)) delete entries[key];
+        }
+      }),
+  };
+
+  constructor(xumHome: string) {
+    this.metaPath = path.join(xumHome, "memory-meta.json");
   }
 
   /**
-   * Read-modify-write cycle under the sidecar mutex. Persists before updating
-   * the in-memory cache so observers never see state that didn't make it to
-   * disk. Entries that end up entirely default are dropped.
+   * Load + cache the sidecar. The error channel is `never` by design, not an
+   * oversight: per the self-healing rule, a missing or unreadable sidecar must
+   * never brick memory routes, so read failures degrade to "no metadata"
+   * (logged for diagnosis) and only writes can fail.
    */
-  private async mutate(update: (entries: Record<string, MemoryMetaEntry>) => void): Promise<void> {
-    await this.lock.withLock("meta", async () => {
-      const meta = await this.load();
-      const entries = { ...meta.entries };
-      update(entries);
-      for (const [key, entry] of Object.entries(entries)) {
-        if (isEmptyEntry(entry)) delete entries[key];
-      }
-      const next: MemoryMetaFile = { entries };
-      await writeFileAtomic(this.metaPath, JSON.stringify(next, null, 2), { encoding: "utf-8" });
-      this.cache = next;
+  private load(): Effect.Effect<MemoryMetaFile> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (self.cache !== null) return self.cache;
+      const parsed = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> =>
+          JSON.parse(await fsPromises.readFile(self.metaPath, "utf-8")),
+        catch: (error) => error,
+      }).pipe(
+        Effect.catch((error) => {
+          // Missing file is the normal first-run case; anything else is healed to empty.
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            log.debug("[MemoryMetaService] healing unreadable sidecar", { error });
+          }
+          return Effect.succeed<unknown>(null);
+        })
+      );
+      self.cache = sanitizeMetaFile(parsed);
+      return self.cache;
     });
   }
 
+  /**
+   * Read-modify-write cycle under the sidecar semaphore. Persists before
+   * updating the in-memory cache so observers never see state that didn't make
+   * it to disk. Entries that end up entirely default are dropped.
+   */
+  private mutate(
+    update: (entries: Record<string, MemoryMetaEntry>) => void
+  ): Effect.Effect<void, MemoryMetaWriteError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return this.writeLock.withPermit(
+      Effect.gen(function* () {
+        const meta = yield* self.load();
+        const entries = { ...meta.entries };
+        update(entries);
+        for (const [key, entry] of Object.entries(entries)) {
+          if (isEmptyEntry(entry)) delete entries[key];
+        }
+        const next: MemoryMetaFile = { entries };
+        // The atomic write cannot be cancelled once started, so the write and
+        // the cache update form one uninterruptible unit: a fiber interrupted
+        // mid-write (e.g. client abort) must still reconcile the in-memory
+        // cache with what landed on disk. Otherwise the next mutation would
+        // rebuild disk state from a stale cache and silently lose this write.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* Effect.tryPromise({
+              try: () =>
+                writeFileAtomic(self.metaPath, JSON.stringify(next, null, 2), {
+                  encoding: "utf-8",
+                }),
+              catch: (cause) =>
+                new MemoryMetaWriteError({
+                  metaPath: self.metaPath,
+                  reason: getErrorMessage(cause),
+                }),
+            });
+            self.cache = next;
+          })
+        );
+      })
+    );
+  }
+
+  // Legacy Promise facade — signatures unchanged for pre-Effect callers.
+  // Failures reject with MemoryMetaWriteError (an Error subclass), matching the
+  // old behavior of surfacing the underlying write rejection.
+
   /** Logical keys of all pinned memory files. */
   async getPinnedKeys(): Promise<Set<string>> {
-    const meta = await this.load();
-    return new Set(
-      Object.entries(meta.entries)
-        .filter(([, entry]) => entry.pinned)
-        .map(([key]) => key)
-    );
+    return Effect.runPromise(this.effects.getPinnedKeys());
   }
 
   /** All entries (pins + usage stats) keyed by logical memory identity. */
   async getEntries(): Promise<Map<string, MemoryMetaEntry>> {
-    const meta = await this.load();
-    return new Map(Object.entries(meta.entries).map(([key, entry]) => [key, { ...entry }]));
+    return Effect.runPromise(this.effects.getEntries());
   }
 
   async setPinned(logicalKey: string, pinned: boolean): Promise<void> {
-    await this.mutate((entries) => {
-      const current = entries[logicalKey] ?? EMPTY_ENTRY;
-      if (pinned) {
-        // Pinning counts as a use: it is an explicit signal the file matters,
-        // and it feeds the same recency/frequency ranking as reads/writes.
-        entries[logicalKey] = {
-          ...current,
-          pinned: true,
-          accessCount: current.accessCount + 1,
-          lastAccessedAt: Date.now(),
-        };
-      } else {
-        // Unpinning preserves usage stats; mutate() drops the entry if empty.
-        entries[logicalKey] = { ...current, pinned: false };
-      }
-    });
+    await Effect.runPromise(this.effects.setPinned(logicalKey, pinned));
   }
 
   /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
   async recordAccess(logicalKey: string, options: { write: boolean }): Promise<void> {
-    await this.mutate((entries) => {
-      const current = entries[logicalKey] ?? EMPTY_ENTRY;
-      const now = Date.now();
-      entries[logicalKey] = {
-        ...current,
-        accessCount: current.accessCount + 1,
-        lastAccessedAt: now,
-        lastWriteAt: options.write ? now : current.lastWriteAt,
-      };
-    });
+    await Effect.runPromise(this.effects.recordAccess(logicalKey, options));
   }
 
   /**
@@ -216,13 +341,7 @@ export class MemoryMetaService {
    * stats follow the file. Stale entries at the destination are overwritten.
    */
   async renameKeys(oldLogicalKey: string, newLogicalKey: string): Promise<void> {
-    await this.mutate((entries) => {
-      for (const [key, entry] of Object.entries(entries)) {
-        if (!keyInSubtree(key, oldLogicalKey)) continue;
-        delete entries[key];
-        entries[`${newLogicalKey}${key.slice(oldLogicalKey.length)}`] = entry;
-      }
-    });
+    await Effect.runPromise(this.effects.renameKeys(oldLogicalKey, newLogicalKey));
   }
 
   /**
@@ -230,10 +349,6 @@ export class MemoryMetaService {
    * at the same path never resurrects stale pins or stats.
    */
   async removeKeys(logicalKey: string): Promise<void> {
-    await this.mutate((entries) => {
-      for (const key of Object.keys(entries)) {
-        if (keyInSubtree(key, logicalKey)) delete entries[key];
-      }
-    });
+    await Effect.runPromise(this.effects.removeKeys(logicalKey));
   }
 }

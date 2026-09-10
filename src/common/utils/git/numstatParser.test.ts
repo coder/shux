@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { extractNewPath } from "./numstatParser";
+import { extractNewPath, parseNumstat } from "./numstatParser";
+
+describe("parseNumstat", () => {
+  test("preserves trailing whitespace in the last line's file path", () => {
+    // A whole-output trim would rewrite a file literally named ".env " to ".env",
+    // pointing downstream file reads (copy, overlay) at the wrong file.
+    const stats = parseNumstat("0\t0\t.env \n");
+    expect(stats).toEqual([{ filePath: ".env ", additions: 0, deletions: 0 }]);
+  });
+});
 
 describe("extractNewPath", () => {
   test("returns unchanged path for normal files", () => {

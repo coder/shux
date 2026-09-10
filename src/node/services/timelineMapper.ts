@@ -1,4 +1,4 @@
-import { subagentReportSourceKey } from "@/common/orpc/schemas/timeline";
+import { subagentReportSourceKey, truncateTimelineRowDigest } from "@/common/orpc/schemas/timeline";
 import type {
   TimelineAnchor,
   TimelineEventData,
@@ -46,11 +46,6 @@ function eventKey(...parts: Array<string | number | undefined>): string {
 
 function streamKey(workspaceId: string, messageId: string): string {
   return eventKey(workspaceId, messageId);
-}
-
-function truncateDigest(value: string): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length <= 120 ? normalized : `${normalized.slice(0, 117)}...`;
 }
 
 function messageTimestamp(
@@ -123,7 +118,11 @@ function isUnloggedMachineTurn(
   if (metadata?.synthetic !== true) {
     return false;
   }
-  if (metadata.agentSkillSnapshot != null || metadata.fileAtMentionSnapshot != null) {
+  if (
+    metadata.agentSkillSnapshot != null ||
+    metadata.fileAtMentionSnapshot != null ||
+    metadata.mcpPromptSnapshot != null
+  ) {
     return true;
   }
   if (metadata.kind === GOAL_CONTINUATION_KIND || metadata.kind === GOAL_BUDGET_LIMIT_KIND) {
@@ -207,7 +206,7 @@ function classifyMachineTurn(
       ...(completed ? { key: subagentReportSourceKey(report.taskId) } : {}),
       status: completed ? "completed" : "started",
       anchor: { taskId: report.taskId, childWorkspaceId: report.taskId },
-      data: { title: report.title, digest: truncateDigest(report.reportMarkdown) },
+      data: { title: report.title, digest: truncateTimelineRowDigest(report.reportMarkdown) },
     };
   }
 
@@ -234,7 +233,7 @@ function mapMessage(
   const epoch = event.metadata?.compactionEpoch;
 
   if (event.role === "user") {
-    // A /compact request is persisted as a user message, but it is Mux asking for a summary, not a
+    // A /compact request is persisted as a user message, but it is Xum asking for a summary, not a
     // prompt the human wrote, so it must not appear among their prompts.
     if (readMuxMetadataField(event.metadata, "type") === "compaction-request") {
       const compactionSource = readMuxMetadataField(event.metadata, "source");
@@ -262,7 +261,7 @@ function mapMessage(
       .join("\n");
 
     if (!machineAuthored) {
-      const digest = truncateDigest(text);
+      const digest = truncateTimelineRowDigest(text);
       return [
         {
           ts,
@@ -278,7 +277,7 @@ function mapMessage(
     // An unrecognized machine turn still belongs on the feed: its prompt is the only record of what
     // was dispatched on the agent's behalf.
     const row = classifyMachineTurn(event, text) ?? { kind: "turn.synthetic" };
-    const digest = row.data?.digest ?? truncateDigest(text);
+    const digest = row.data?.digest ?? truncateTimelineRowDigest(text);
     const data: TimelineEventData = { ...row.data, ...(digest !== "" ? { digest } : {}) };
     return [
       {
@@ -506,20 +505,6 @@ export function mapChatEventToTimeline(
               toolCallId: event.toolCallId,
             },
             data: { runId: event.runId },
-          },
-        ],
-        state,
-      };
-
-    case "history-cleared":
-      return {
-        drafts: [
-          {
-            ts: receivedAt,
-            kind: "history.cleared",
-            source: { system: "chat", key: eventKey("history-cleared", receivedAt) },
-            status: "completed",
-            data: { reason: event.reason },
           },
         ],
         state,

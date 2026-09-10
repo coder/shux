@@ -1,3 +1,4 @@
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   SELECTED_WORKSPACE_KEY,
@@ -52,4 +53,13 @@ export function collapseLeftSidebar(): void {
 /** Expand the right sidebar (for stories testing it) */
 export function expandRightSidebar(): void {
   localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
+}
+
+/**
+ * Expand the left sidebar (project tree). The app defaults it to collapsed at
+ * mobile widths, so stories whose play functions click sidebar controls must
+ * force it open to pass under Pixel's phone viewport.
+ */
+export function expandLeftSidebar(): void {
+  updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
 }

@@ -42,4 +42,54 @@ describe("getExplicitCompactionSuggestion", () => {
       modelId: `github-copilot:${KNOWN_MODELS.GPT_54_MINI.providerModelId}`,
     });
   });
+
+  test("validates cross-typed Coder compaction models against the Coder catalog", () => {
+    // {name:"openai", type:"anthropic"}: name-only canonicalization rewrites
+    // coder:openai/<claude> to openai:<claude> and rejects it against the
+    // direct OpenAI catalog even though the Coder gateway exposes it.
+    const providersConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: "openai", type: "anthropic" }],
+        discoveredModels: ["openai/claude-opus-4-1"],
+      },
+    };
+
+    expect(
+      getExplicitCompactionSuggestion({
+        providersConfig,
+        policy: null,
+        routePriority: ["direct"],
+        routeOverrides: {},
+        modelId: "coder:openai/claude-opus-4-1",
+      })
+    ).toMatchObject({
+      kind: "preferred",
+      modelId: "coder:openai/claude-opus-4-1",
+    });
+  });
+
+  test("rejects Coder compaction models missing from the Coder catalog", () => {
+    const providersConfig: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        additionalProviders: [{ name: "openai", type: "anthropic" }],
+        discoveredModels: ["openai/claude-opus-4-1"],
+      },
+    };
+
+    expect(
+      getExplicitCompactionSuggestion({
+        providersConfig,
+        policy: null,
+        routePriority: ["direct"],
+        routeOverrides: {},
+        modelId: "coder:openai/claude-sonnet-4-5",
+      })
+    ).toBeNull();
+  });
 });

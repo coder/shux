@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from "fs";
 
-import { getMuxExtensionMetadataPath } from "@/common/constants/paths";
+import { getXumExtensionMetadataPath } from "@/common/constants/paths";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
 import { GoalSnapshotSchema } from "@/common/orpc/schemas/goal";
@@ -30,6 +30,20 @@ export interface ExtensionMetadata {
   // Persists the latest display-status URL so later updates without a URL
   // can still carry the last deep link even after displayStatus is cleared.
   lastStatusUrl?: string | null;
+  // Backend-only dedup state for AgentStatusService: hash of the input that
+  // produced the persisted AI sidebar status. Seeds the in-memory dedup after
+  // a restart so unchanged chats are not regenerated. Never exposed on
+  // WorkspaceActivitySnapshot (IPC shape).
+  sidebarStatusInputHash?: string | null;
+  // Backend-only monotonic write counter, advanced by every persisted
+  // mutation of this entry. Recovery merges cannot order metadata copies by
+  // `recency` — that is a USER-INTERACTION timestamp which status/goal/
+  // streaming writers deliberately preserve — so cross-copy ordering uses
+  // this generation instead (see recoverStrandedRecreatedLeftover). Never
+  // exposed on WorkspaceActivitySnapshot (IPC shape). Builds without this
+  // field drop it on their writes; ordering then degrades to the recency
+  // tiebreak, never resurrecting against a generation-less newer write.
+  writeGeneration?: number;
   goal?: GoalSnapshot | null;
 }
 
@@ -121,6 +135,12 @@ export function coerceExtensionMetadata(value: unknown): ExtensionMetadata | nul
     ...(todoStatus !== undefined ? { todoStatus } : {}),
     ...(typeof record.hasTodos === "boolean" ? { hasTodos: record.hasTodos } : {}),
     lastStatusUrl: coerceStatusUrl(record.lastStatusUrl),
+    ...(typeof record.sidebarStatusInputHash === "string"
+      ? { sidebarStatusInputHash: record.sidebarStatusInputHash }
+      : {}),
+    ...(typeof record.writeGeneration === "number" && Number.isFinite(record.writeGeneration)
+      ? { writeGeneration: record.writeGeneration }
+      : {}),
     ...(goal !== undefined ? { goal } : {}),
   };
 }
@@ -159,7 +179,7 @@ export function toWorkspaceActivitySnapshot(
  * Used by both the main app and VS Code extension (vscode/src/muxConfig.ts).
  */
 export function readExtensionMetadata(): Map<string, ExtensionMetadata> {
-  const metadataPath = getMuxExtensionMetadataPath();
+  const metadataPath = getXumExtensionMetadataPath();
 
   if (!existsSync(metadataPath)) {
     return new Map();

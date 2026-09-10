@@ -34,7 +34,9 @@ export const createBashBackgroundTerminateTool: ToolFactory = (config: ToolConfi
         };
       }
 
-      const result = await config.backgroundProcessManager.terminate(process_id);
+      const result = await config.backgroundProcessManager.terminate(process_id, {
+        monitorDisposition: "discard",
+      });
       if (result.success) {
         return {
           success: true,

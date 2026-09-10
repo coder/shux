@@ -161,6 +161,30 @@ describe("AgentModePicker", () => {
     });
   });
 
+  test("numbered guest shortcuts do not select a host agent", async () => {
+    const view = renderPicker({ showAgentId: true });
+    fireEvent.click(view.getByLabelText("Select agent"));
+    await waitFor(() => expect(view.getAllByTestId("agent-option").length).toBe(3));
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "3",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByTestId("agentId").textContent).toBe("exec");
+    expect(view.getAllByTestId("agent-option").length).toBe(3);
+
+    fireEvent.keyDown(document.body, { key: "3", ctrlKey: true });
+    expect(view.getByTestId("agentId").textContent).toBe("review");
+  });
+
   test("does not render auto agent affordances", async () => {
     const { getByLabelText, queryByLabelText, queryByText } = renderPicker();
     const autoSelectLabel = ["Auto-select", "agent"].join(" ");
@@ -169,7 +193,7 @@ describe("AgentModePicker", () => {
 
     await waitFor(() => {
       expect(queryByLabelText(autoSelectLabel)).toBeNull();
-      expect(queryByText("Mux chooses the best agent")).toBeNull();
+      expect(queryByText("Xum chooses the best agent")).toBeNull();
     });
   });
 });

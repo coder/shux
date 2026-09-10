@@ -10,12 +10,8 @@ import {
   BashMonitorRegistryStore,
 } from "@/node/services/bashMonitorRegistryStore";
 
-function makeConfig(rootDir: string): {
-  sessionsDir: string;
-  getSessionDir: (id: string) => string;
-} {
-  const sessionsDir = path.join(rootDir, "sessions");
-  return { sessionsDir, getSessionDir: (id: string) => path.join(sessionsDir, id) };
+function makeConfig(rootDir: string): { sessionsDir: string } {
+  return { sessionsDir: path.join(rootDir, "sessions") };
 }
 
 function armedPayload(overrides: Partial<MonitorArmedPayload> = {}): MonitorArmedPayload {
@@ -57,11 +53,26 @@ describe("BashMonitorRegistryStore", () => {
       script: "echo hi",
     });
 
-    await store.remove("owner-1", "proc-1");
+    await store.remove("owner-1", "proc-1", "2026-01-01T00:00:00.000Z");
     expect((await store.listAll("owner-1")).map((record) => record.processId)).toEqual(["proc-2"]);
 
     // remove is idempotent for already-deleted records
-    await store.remove("owner-1", "proc-1");
+    await store.remove("owner-1", "proc-1", "2026-01-01T00:00:00.000Z");
+  });
+
+  test("registry directory owns records with mismatched embedded owners", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload());
+    const file = path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR, "proc-1.json");
+    const record = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    await fsPromises.writeFile(
+      file,
+      JSON.stringify({ ...record, ownerWorkspaceId: "other-owner" }),
+      "utf-8"
+    );
+
+    expect((await store.listAll("owner-1"))[0].ownerWorkspaceId).toBe("owner-1");
   });
 
   test("upsert replaces an existing record for the same process", async () => {
@@ -74,11 +85,55 @@ describe("BashMonitorRegistryStore", () => {
     expect(records[0].filter).toBe("READY");
   });
 
+  test("remove preserves a newer generation for the same process ID", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const oldCreatedAt = "2026-08-31T12:00:00.000Z";
+    const newCreatedAt = "2026-08-31T12:01:00.000Z";
+    await store.upsert(armedPayload({ createdAt: oldCreatedAt }));
+    await store.upsert(armedPayload({ createdAt: newCreatedAt, filter: "NEW" }));
+
+    await store.remove("owner-1", "proc-1", oldCreatedAt);
+
+    expect(await store.listAll("owner-1")).toMatchObject([
+      { processId: "proc-1", createdAt: newCreatedAt, filter: "NEW" },
+    ]);
+  });
+
+  test("terminal and lost writes preserve a re-armed generation", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const oldCreatedAt = "2026-08-31T12:00:00.000Z";
+    const newCreatedAt = "2026-08-31T12:01:00.000Z";
+    await store.upsert(armedPayload({ createdAt: oldCreatedAt }));
+    await store.upsert(armedPayload({ createdAt: newCreatedAt, filter: "NEW" }));
+
+    await store.recordTerminal("owner-1", "proc-1", oldCreatedAt, {
+      status: "exited",
+      exitCode: 1,
+      settledAt: "2026-08-31T12:02:00.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
+    await store.recordLost("owner-1", "proc-1", oldCreatedAt, {
+      reason: "runtime-failure",
+      failedAt: "2026-08-31T12:02:00.000Z",
+    });
+
+    const records = await store.listAll("owner-1");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      processId: "proc-1",
+      createdAt: newCreatedAt,
+      filter: "NEW",
+    });
+    expect(records[0].terminal).toBeUndefined();
+    expect(records[0].lost).toBeUndefined();
+  });
+
   test("skips malformed records when listing", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload());
-    const dir = path.join(config.getSessionDir("owner-1"), BASH_MONITOR_REGISTRY_DIR);
+    const dir = path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR);
     await fsPromises.writeFile(path.join(dir, "bad.json"), "not json", "utf-8");
     await fsPromises.writeFile(
       path.join(dir, "wrong-shape.json"),
@@ -90,36 +145,100 @@ describe("BashMonitorRegistryStore", () => {
     expect(records.map((record) => record.processId)).toEqual(["proc-1"]);
   });
 
+  test("listAll propagates transient record read failures", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload());
+    await fsPromises.mkdir(
+      path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR, "unreadable.json")
+    );
+
+    const result = await store.listAll("owner-1").catch((error: unknown) => error);
+
+    expect(result).toMatchObject({ code: "EISDIR" });
+  });
+
   test("listOwnerWorkspaceIds returns only owners with records", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload({ workspaceId: "owner-b" }));
     await store.upsert(armedPayload({ workspaceId: "owner-a" }));
-    await store.remove("owner-b", "proc-1");
+    await store.remove("owner-b", "proc-1", "2026-01-01T00:00:00.000Z");
     // Session dir without a registry dir must be skipped, not crash the walk.
-    await fsPromises.mkdir(config.getSessionDir("owner-empty"), { recursive: true });
+    await fsPromises.mkdir(path.join(config.sessionsDir, "owner-empty"), { recursive: true });
 
-    expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-a"]);
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-a"],
+      scanFailed: false,
+    });
   });
 
-  test("consumeIfArmedBefore takes stale records but preserves live replacements", async () => {
+  test("one unreadable session does not block owner discovery for others", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload({ workspaceId: "owner-good" }));
+    // A plain file where the registry directory should be makes listAll reject with ENOTDIR.
+    const badSession = path.join(config.sessionsDir, "owner-bad");
+    await fsPromises.mkdir(badSession, { recursive: true });
+    await fsPromises.writeFile(path.join(badSession, BASH_MONITOR_REGISTRY_DIR), "not a dir");
+
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-good"],
+      scanFailed: true,
+    });
+  });
+
+  test("keeps terminal disposition until delivery removes the row", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
-    const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");
+    await store.upsert(armedPayload());
 
-    // Stale record (armed before cutoff) is consumed and returned.
-    await store.upsert(armedPayload({ createdAt: "2026-01-01T00:00:00.000Z" }));
-    const consumed = await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs);
-    expect(consumed?.processId).toBe("proc-1");
-    expect(await store.listAll("owner-1")).toHaveLength(0);
+    await store.recordTerminal("owner-1", "proc-1", "2026-01-01T00:00:00.000Z", {
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-01-01T00:00:01.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
 
-    // Live record (re-armed at/after cutoff, e.g. by a workspace resumed during recovery)
-    // must survive and yield null so no false monitor-lost wake is enqueued for it.
-    await store.upsert(armedPayload({ createdAt: "2026-06-01T00:00:00.000Z" }));
-    expect(await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs)).toBeNull();
-    expect(await store.listAll("owner-1")).toHaveLength(1);
+    expect((await store.listAll("owner-1"))[0].terminal).toEqual({
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-01-01T00:00:01.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
+  });
 
-    // Missing record yields null.
-    expect(await store.consumeIfArmedBefore("owner-1", "proc-missing", cutoffMs)).toBeNull();
+  test("persists bounded runtime failure evidence until delivery", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    await store.upsert(armedPayload());
+    await store.recordLost("owner-1", "proc-1", "2026-01-01T00:00:00.000Z", {
+      reason: "runtime-failure",
+      failureMessage: "\u001b[31mtransport unavailable\u001b[0m",
+      failedOperations: ["readOutput", "getExitCode"],
+      failedMatch: {
+        lines: Array.from({ length: 60 }, (_, index) => `line-${index}`),
+        totalMatches: 60,
+        droppedLines: 2,
+        matchedThroughOffset: 120,
+      },
+      failedAt: "2026-01-01T00:00:02.000Z",
+    });
+
+    const lost = (await store.listAll("owner-1"))[0].lost;
+    expect(lost).toMatchObject({
+      reason: "runtime-failure",
+      failureMessage: "transport unavailable",
+      failedOperations: ["readOutput", "getExitCode"],
+      failedAt: "2026-01-01T00:00:02.000Z",
+      failedMatch: {
+        totalMatches: 60,
+        droppedLines: 12,
+        matchedThroughOffset: 120,
+      },
+    });
+    expect(lost?.failedMatch?.lines).toHaveLength(50);
+    expect(lost?.failedMatch?.lines[0]).toBe("line-10");
   });
 
   test("bounds persisted script length", async () => {

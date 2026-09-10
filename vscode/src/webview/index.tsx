@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 
-import { ErrorBoundary } from "mux/browser/components/ErrorBoundary/ErrorBoundary";
+import { ErrorBoundary } from "xum/browser/components/ErrorBoundary/ErrorBoundary";
 import { App } from "./App";
 import { getVscodeBridge } from "./vscodeBridge";
 

@@ -48,6 +48,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   FOCUS_CHAT: "Focus chat input",
   CLOSE_TAB: "Close tab",
   REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
+  OPEN_TIMELINE_DIALOG: "Open timeline dialog (small viewports)",
+  REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
   SIDEBAR_TAB_3: "Tab 3",
@@ -75,6 +77,14 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   TOGGLE_DRIFT_MODE: "Toggle git drift lines/commits",
   SHOW_WORKSPACE_DETAILS: "Show workspace details",
   SHOW_LAST_PROMPT: "Show last prompt",
+  SETTINGS_BACKUP_SAVE: "Save backup settings",
+  SETTINGS_BACKUP_VALIDATE: "Validate backup repository",
+  SETTINGS_BACKUP_PREVIEW: "Preview settings backup",
+  SETTINGS_BACKUP_PUSH: "Back up settings",
+  SETTINGS_BACKUP_RESTORE: "Restore settings backup",
+  SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: "Toggle secret scan override",
+  SETTINGS_BACKUP_APPROVE_COMMANDS: "Toggle MCP command approval",
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -91,13 +101,24 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVIEW_QUICK_DISLIKE: "Quick dislike (immersive)",
   REVIEW_COMMENT: "Add comment (immersive)",
   REVIEW_FOCUS_NOTES: "Focus notes sidebar (immersive)",
+  REVIEW_COPY_FILE: "Copy file contents (immersive)",
   TOGGLE_PLAN_ANNOTATE: "Toggle plan annotate mode",
+  // Transcript-menu-only actions show their shortcuts in that menu.
+  COPY_MARKDOWN: "Copy Markdown (transcript context menu)",
+  // Image-viewer-scoped keybinds (lightbox / image context menu); intentionally
+  // omitted from KEYBIND_GROUPS because they only apply while an image surface
+  // is focused.
+  IMAGE_COPY: "Copy image (image viewer)",
+  IMAGE_DOWNLOAD: "Download image (image viewer)",
   // Easter egg keybind; intentionally omitted from KEYBIND_GROUPS.
   TOGGLE_POWER_MODE: "",
 };
 
 /** Groups for organizing keybinds in the UI */
-const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> }> = [
+const KEYBIND_GROUPS: Array<{
+  label: string;
+  keys: Array<keyof typeof KEYBINDS>;
+}> = [
   {
     label: "General",
     keys: [
@@ -134,6 +155,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "RESUME_STREAM",
       "TOGGLE_VOICE_INPUT",
       "SHOW_LAST_PROMPT",
+      "REVEAL_LAST_PROMPT",
     ],
   },
   {
@@ -170,6 +192,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "SIDEBAR_TAB_9",
       "CLOSE_TAB",
       "REVEAL_TIMELINE_EVENT",
+      "OPEN_TIMELINE_DIALOG",
     ],
   },
   {
@@ -198,6 +221,20 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "REVIEW_QUICK_DISLIKE",
       "REVIEW_COMMENT",
       "REVIEW_FOCUS_NOTES",
+      "REVIEW_COPY_FILE",
+    ],
+  },
+  {
+    label: "Settings backup",
+    keys: [
+      "SETTINGS_BACKUP_SAVE",
+      "SETTINGS_BACKUP_VALIDATE",
+      "SETTINGS_BACKUP_PREVIEW",
+      "SETTINGS_BACKUP_PUSH",
+      "SETTINGS_BACKUP_RESTORE",
+      "SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN",
+      "SETTINGS_BACKUP_APPROVE_COMMANDS",
+      "SETTINGS_BACKUP_TOGGLE_PROJECTS",
     ],
   },
   {
@@ -217,7 +254,6 @@ export function KeybindsSection() {
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const visibleKeybindGroups = KEYBIND_GROUPS.map((group) => ({
     ...group,
-    // Hide deprecated keybinds from the generated reference, plus experiment-gated rows.
     keys: group.keys.filter(
       (key) =>
         !isKeybindDeprecated(KEYBINDS[key]) &&

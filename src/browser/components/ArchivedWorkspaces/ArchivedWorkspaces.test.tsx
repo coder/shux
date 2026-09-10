@@ -1,6 +1,6 @@
 import "../../../../tests/ui/dom";
 
-import { type ReactNode } from "react";
+import { type ComponentProps, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
@@ -13,7 +13,7 @@ import * as ForceDeleteModalModule from "@/browser/components/ForceDeleteModal/F
 import * as RuntimeBadgeModule from "@/browser/components/RuntimeBadge/RuntimeBadge";
 import * as SkeletonModule from "@/browser/components/Skeleton/Skeleton";
 import * as OptimisticBatchLRUModule from "@/browser/hooks/useOptimisticBatchLRU";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
 
@@ -49,11 +49,18 @@ describe("ArchivedWorkspaces", () => {
   const deleteWorktreeMock = mock(() => Promise.resolve({ success: true }));
   const getSessionUsageBatchMock = mock(() => Promise.resolve({}));
   const unarchiveWorkspaceMock = mock(() => Promise.resolve({ success: true }));
-  const removeWorkspaceMock = mock(() => Promise.resolve({ success: true }));
+  const removeWorkspaceMock = mock(
+    (
+      _workspaceId: string,
+      _options?: { force?: boolean; acknowledgedDescendantIds?: string[] }
+    ): Promise<WorkspaceRemoveResult> => Promise.resolve({ success: true })
+  );
+  let modalProps: ComponentProps<typeof ForceDeleteModalModule.ForceDeleteModal> | undefined;
   const setSelectedWorkspaceMock = mock(() => undefined);
   const onWorkspacesChangedMock = mock(() => undefined);
 
   beforeEach(() => {
+    modalProps = undefined;
     installTestDoubles();
     cleanupDom = installDom();
     deleteWorktreeMock.mockClear();
@@ -95,9 +102,10 @@ describe("ArchivedWorkspaces", () => {
     spyOn(TooltipModule, "TooltipContent").mockImplementation(((props: { children: ReactNode }) => (
       <>{props.children}</>
     )) as unknown as typeof TooltipModule.TooltipContent);
-    spyOn(ForceDeleteModalModule, "ForceDeleteModal").mockImplementation(
-      (() => null) as unknown as typeof ForceDeleteModalModule.ForceDeleteModal
-    );
+    spyOn(ForceDeleteModalModule, "ForceDeleteModal").mockImplementation((props) => {
+      modalProps = props;
+      return null;
+    });
     spyOn(RuntimeBadgeModule, "RuntimeBadge").mockImplementation((() => (
       <span data-testid="runtime-badge" />
     )) as unknown as typeof RuntimeBadgeModule.RuntimeBadge);
@@ -150,6 +158,101 @@ describe("ArchivedWorkspaces", () => {
     const alert = await waitFor(() => view.getByRole("alert"));
     expect(alert.textContent).toContain("Failed to restore workspace");
     expect(alert.textContent).toContain("Restore failed");
+  });
+
+  test("bulk deletion removes selected descendants before their parent", async () => {
+    const parent = createWorkspace({
+      id: "parent",
+      name: "parent",
+    });
+    const child = createWorkspace({
+      id: "child",
+      name: "child",
+      parentWorkspaceId: parent.id,
+    });
+
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={parent.projectPath}
+        projectName={parent.projectName}
+        workspaces={[parent, child]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Select parent")));
+    fireEvent.click(view.getByLabelText("Select child"));
+    fireEvent.click(view.getByLabelText("Delete selected"));
+    fireEvent.click(view.getByRole("button", { name: "Yes, delete 2" }));
+
+    await waitFor(() => {
+      expect(removeWorkspaceMock).toHaveBeenCalledTimes(2);
+    });
+    expect(removeWorkspaceMock.mock.calls.map((call) => call[0])).toEqual([child.id, parent.id]);
+    expect(removeWorkspaceMock.mock.calls.every((call) => call[1]?.force === true)).toBe(true);
+  });
+
+  test("Shift-click requires descendant confirmation and forwards retry results", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    const descendants = [{ workspaceId: "child", title: "Child", active: false }];
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Confirm children",
+      descendants,
+    });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+    await waitFor(() => expect(modalProps?.descendants).toEqual(descendants));
+    expect(removeWorkspaceMock).toHaveBeenCalledTimes(1);
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id);
+    expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
+    if (!modalProps) throw new Error("Expected deletion confirmation");
+    const retryFailure = {
+      success: false,
+      error: "Child starts running",
+      descendants: [{ ...descendants[0], active: true }],
+    };
+    removeWorkspaceMock.mockResolvedValueOnce(retryFailure);
+    expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual(retryFailure);
+    expect(removeWorkspaceMock).toHaveBeenLastCalledWith(workspace.id, {
+      force: true,
+      acknowledgedDescendantIds: ["child"],
+    });
+    expect(onWorkspacesChangedMock).not.toHaveBeenCalled();
+    expect(await modalProps.onForceDelete(workspace.id, ["child"])).toEqual({ success: true });
+    expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("Shift-click still forces deletion without descendants", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    removeWorkspaceMock.mockResolvedValueOnce({ success: false, error: "Dirty checkout" });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+    await waitFor(() => expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1));
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(1, workspace.id);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, { force: true });
+    expect(modalProps).toBeUndefined();
   });
 
   test("shows delete worktree for archived worktree workspaces and calls the API", async () => {
@@ -217,7 +320,7 @@ describe("ArchivedWorkspaces", () => {
     expect(alert.textContent).toContain("Permission denied");
   });
 
-  test("hides delete worktree for transcript-only and non-worktree archived workspaces", async () => {
+  test("hides delete worktree when an archived workspace does not own a managed checkout", async () => {
     const transcriptOnlyWorkspace = createWorkspace({
       id: "ws-transcript-only",
       name: "transcript-only",
@@ -230,11 +333,18 @@ describe("ArchivedWorkspaces", () => {
       transcriptOnly: false,
     });
 
+    const sharedCheckoutWorkspace = createWorkspace({
+      id: "ws-shared-checkout",
+      name: "shared-checkout",
+      taskIsolation: "none",
+      transcriptOnly: false,
+    });
+
     const view = render(
       <ArchivedWorkspaces
         projectPath={transcriptOnlyWorkspace.projectPath}
         projectName={transcriptOnlyWorkspace.projectName}
-        workspaces={[transcriptOnlyWorkspace, localWorkspace]}
+        workspaces={[transcriptOnlyWorkspace, localWorkspace, sharedCheckoutWorkspace]}
       />
     );
 
@@ -246,6 +356,9 @@ describe("ArchivedWorkspaces", () => {
       ).toBeNull();
       expect(
         view.queryByLabelText(`Remove local checkout for workspace ${localWorkspace.name}`)
+      ).toBeNull();
+      expect(
+        view.queryByLabelText(`Remove local checkout for workspace ${sharedCheckoutWorkspace.name}`)
       ).toBeNull();
     });
   });

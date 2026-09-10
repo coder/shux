@@ -17,7 +17,7 @@ DUCKDB_NODE_API_PATH="$PROJECT_ROOT/node_modules/@duckdb/node-api"
 DUCKDB_NODE_BINDINGS_PATH="$PROJECT_ROOT/node_modules/@duckdb/node-bindings"
 
 # 1) Skip in headless/benchmark mode (no Electron UI needed)
-if [ "${MUX_HEADLESS:-}" = "1" ]; then
+if [ "${XUM_HEADLESS:-${MUX_HEADLESS:-}}" = "1" ]; then
   echo "🖥️  Headless mode – skipping native rebuild"
   exit 0
 fi

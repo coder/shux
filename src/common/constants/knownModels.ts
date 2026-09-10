@@ -4,7 +4,7 @@
 
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai";
+type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -27,13 +27,14 @@ interface KnownModel extends KnownModelDefinition {
 // Model definitions. Note we avoid listing legacy models here. These represent the focal models
 // of the community.
 const MODEL_DEFINITIONS = {
-  // Claude Fable 5 - Mythos-class model (a tier above Opus) released June 9, 2026.
-  // It is the generally-available variant of the Mythos 5 model, shipped with safeguards
-  // enabled (a small fraction of flagged requests fall back to Opus 4.8 server-side, which
-  // is transparent to API clients). API id `claude-fable-5`; $10/M input, $50/M output.
+  // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
+  // (released June 9, 2026) as the generally-available safeguarded variant, at the same
+  // pricing ($10/M input, $50/M output) except cheaper cache reads (0.025x input).
+  // API id `claude-fable-5-1`; Fable 5 stays usable as the custom model string
+  // `anthropic:claude-fable-5`.
   FABLE: {
     provider: "anthropic",
-    providerModelId: "claude-fable-5",
+    providerModelId: "claude-fable-5-1",
     aliases: ["fable"],
     warm: true,
     // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
@@ -42,15 +43,17 @@ const MODEL_DEFINITIONS = {
     // same text, so real usage can run ~1.0-1.3x higher than this estimate.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Mythos 5 - released June 9, 2026 alongside Fable 5. Same underlying model,
-  // specs, and pricing as Fable 5 ($10/M input, $50/M output) but with safeguards lifted
-  // in some areas. Limited availability: restricted to approved Project Glasswing /
-  // trusted-access customers (no self-serve sign-up). API id `claude-mythos-5`.
+  // Claude Mythos 5.1 - successor to Mythos 5 (released June 9, 2026 alongside Fable 5)
+  // as the restricted-access, safeguards-lifted twin of Fable 5.1, with identical specs
+  // and pricing ($10/M input, $50/M output, 0.025x-input cache reads) and unchanged
+  // availability (approved Project Glasswing customers only, no self-serve sign-up).
+  // API id `claude-mythos-5-1`; Mythos 5 stays usable as the custom model string
+  // `anthropic:claude-mythos-5`.
   // Not warmed: most users cannot access it, and its tokenizer override is already
   // warmed via FABLE.
   MYTHOS: {
     provider: "anthropic",
-    providerModelId: "claude-mythos-5",
+    providerModelId: "claude-mythos-5-1",
     aliases: ["mythos"],
     // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
     // approximate counting; real usage can run ~1.0-1.3x higher.
@@ -119,6 +122,19 @@ const MODEL_DEFINITIONS = {
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
+  // GPT-6 Astra - Released September 3, 2026; OpenAI's frontier tier above the
+  // GPT-5.6 family (API id `gpt-6-astra`, no bare `gpt-6` alias). The bare `gpt`
+  // alias stays on Sol: Astra bills 2x Sol's rates, and ordering after the GPT-5.6
+  // tiers keeps Sol as the first 1.05M-context candidate for compaction "switch
+  // model" suggestions. Not warmed: its tokenizer override is already warmed via GPT.
+  GPT_6_ASTRA: {
+    provider: "openai",
+    providerModelId: "gpt-6-astra",
+    aliases: ["astra", "gpt-6-astra"],
+    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate
+    // counting (same approach as the GPT-5.6 family).
+    tokenizerOverride: "openai/gpt-5",
+  },
   // GPT Pro alias tracks the latest GPT-5 Pro tier.
   GPT_PRO: {
     provider: "openai",
@@ -170,6 +186,16 @@ const MODEL_DEFINITIONS = {
     warm: true,
     tokenizerOverride: "openai/gpt-5",
   },
+  DAYBREAK_BLUE: {
+    provider: "openai",
+    providerModelId: "daybreak-blue-latest",
+    tokenizerOverride: "openai/gpt-5",
+  },
+  DAYBREAK_RED: {
+    provider: "openai",
+    providerModelId: "daybreak-red-latest",
+    tokenizerOverride: "openai/gpt-5",
+  },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
     provider: "google",
@@ -177,26 +203,26 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini", "gemini-pro"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Gemini Flash alias tracks the latest stable Flash tier (3.6 Flash, GA July 21, 2026).
-  // 3.5 Flash stays usable as the custom model string `google:gemini-3.5-flash`.
+  // Gemini Flash alias tracks the latest stable Flash tier (3.8 Flash, GA September 2, 2026).
+  // Older Flash tiers stay usable as custom model strings (e.g. `google:gemini-3.7-flash`).
   GEMINI_FLASH: {
     provider: "google",
-    providerModelId: "gemini-3.6-flash",
+    providerModelId: "gemini-3.8-flash",
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Grok 4.5 - xAI's flagship coding and agentic model, released July 2026.
-  // Legacy Grok 4.1 Fast and Grok Code remain usable as custom model strings but are
-  // intentionally omitted from the curated index after their May 15, 2026 retirement.
-  GROK_45: {
+  // Grok 4.6 - xAI's frontier coding and agentic model, released August 12, 2026.
+  // Supersedes Grok 4.5 at the same headline price; Grok 4.5 remains usable as the
+  // custom model string `xai:grok-4.5`.
+  GROK_46: {
     provider: "xai",
-    providerModelId: "grok-4.5",
-    aliases: ["grok", "grok-4.5"],
+    providerModelId: "grok-4.6",
+    aliases: ["grok", "grok-4.6"],
   },
   // DeepSeek V4 Pro is the flagship V4 tier (1.6T total / 49B active params, 1M context,
   // 384K max output). Bare `deepseek` alias points here per the convention that the
   // shortest alias tracks each provider's flagship model (mirrors `gemini` → Gemini Pro,
-  // `grok` → Grok 4.5).
+  // `grok` → Grok 4.6).
   DEEPSEEK_V4_PRO: {
     provider: "deepseek",
     providerModelId: "deepseek-v4-pro",
@@ -224,6 +250,13 @@ const MODEL_DEFINITIONS = {
     // K3's tokenizer isn't published in ai-tokenizer yet; reuse Kimi K2 (the newest
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
+  },
+  GLM_53_FLASH: {
+    provider: "zai",
+    providerModelId: "glm-5.3-flash",
+    aliases: ["glm", "glm-flash", "glm-5.3-flash"],
+    // GLM 5.3 is not in ai-tokenizer yet; use the closest published GLM encoding.
+    tokenizerOverride: "zai/glm-4.5",
   },
 } as const satisfies Record<string, KnownModelDefinition>;
 
@@ -265,6 +298,8 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
+export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
+
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)
   .map((model) => model.id);
@@ -275,11 +310,24 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
     .sort(([a], [b]) => a.localeCompare(b))
 );
 
-export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = Object.fromEntries(
-  Object.values(KNOWN_MODELS)
-    .filter((model) => Boolean(model.tokenizerOverride))
-    .map((model) => [model.id, model.tokenizerOverride!])
-);
+// Retired first-class models stay documented as custom model strings (see the
+// FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
+// lookup does not fall back to the generic per-provider tokenizer.
+const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+};
+
+export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  ...LEGACY_TOKENIZER_MODEL_OVERRIDES,
+  // Spread current models last so a returning id always wins over its legacy entry.
+  ...Object.fromEntries(
+    Object.values(KNOWN_MODELS)
+      .filter((model) => Boolean(model.tokenizerOverride))
+      .map((model) => [model.id, model.tokenizerOverride!])
+  ),
+};
 
 /** Tooltip-friendly abbreviation examples: show representative shortcuts */
 export const MODEL_ABBREVIATION_EXAMPLES = (["opus", "sonnet"] as const).map((abbrev) => ({

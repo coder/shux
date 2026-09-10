@@ -149,7 +149,7 @@ describeIntegration("MCP global configuration", () => {
       const initial = await client.mcp.list({ projectPath: repoPath });
       expect(initial).toEqual({});
 
-      // Add server (writes to global <muxHome>/mcp.jsonc)
+      // Add server (writes to global <xumHome>/mcp.jsonc)
       const addResult = await client.mcp.add({
         name: "chrome-devtools",
         command: CHROME_DEVTOOLS_MCP_NPX,

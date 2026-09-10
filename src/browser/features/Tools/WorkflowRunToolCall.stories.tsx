@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { fireEvent, waitFor, within } from "@storybook/test";
 
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -453,6 +454,103 @@ export const RunningBackgroundWithRun: Story = {
       runId: "wfr_story_foreground",
       result: null,
       run: foregroundDiscoveryRun,
+    },
+  },
+};
+
+export const LiveRunningTimeline: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+  },
+  render: (args) => (
+    <div data-testid="live-workflow-card" style={{ width: 360 }}>
+      <WorkflowRunToolCall {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // "implementation" is both the workflow name (header + script card spans) and the
+    // phase label; only the phase disclosure is a button, so query by role.
+    await fireEvent.click(await canvas.findByRole("button", { name: /implementation/ }));
+    await canvas.findByText("Summarize source 16");
+    await canvas.findByText("extract-claims");
+    const container = canvas.getByTestId("live-workflow-card");
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    if (container.scrollWidth > container.clientWidth + 1) {
+      throw new Error(
+        `Workflow card overflowed its ${container.clientWidth}px container by ` +
+          `${container.scrollWidth - container.clientWidth}px`
+      );
+    }
+  },
+  args: {
+    ...taskActionsProps,
+    status: "executing",
+  },
+};
+
+/**
+ * Narrow-container regression: a long workflow name must truncate instead of
+ * starving the collapsed header's progress summary. No API provider, so the
+ * static run record renders without polling. The dynamic-workflows experiment
+ * is off in this lightweight story and the run is still running, so the card
+ * mounts expanded — the play collapses it via the header toggle so the
+ * snapshot pins the collapsed narrow header this story exists to cover.
+ */
+export const RunningNarrowLongName: Story = {
+  render: (args) => (
+    <div data-testid="narrow-workflow-card" style={{ width: 360 }}>
+      <WorkflowRunToolCall {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const canvas = within(canvasElement);
+    // The expanded body repeats the workflow name, so take the header instance
+    // (first in DOM order) — clicking it bubbles to the ToolHeader toggle.
+    const [name] = await canvas.findAllByText(
+      "deep-research-competitive-landscape-and-pricing-teardown"
+    );
+    await fireEvent.click(name);
+    // Collapsed header must keep the progress summary (the run's active phase)
+    // visible next to the truncated long name.
+    await waitFor(() => canvas.getByText("scope"));
+    const container = canvasElement.querySelector('[data-testid="narrow-workflow-card"]');
+    if (!(container instanceof HTMLElement)) {
+      throw new Error("Narrow workflow story container not found");
+    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    if (container.scrollWidth > container.clientWidth + 1) {
+      throw new Error(
+        `Workflow card overflowed its ${container.clientWidth}px container by ` +
+          `${container.scrollWidth - container.clientWidth}px`
+      );
+    }
+  },
+  args: {
+    args: {
+      script_path: DEEP_RESEARCH_SCRIPT_PATH,
+      args: { topic: "workflow run cards" },
+      run_in_background: true,
+    },
+    status: "completed",
+    result: {
+      status: "running",
+      runId: "wfr_story_foreground",
+      result: null,
+      run: {
+        ...foregroundDiscoveryRun,
+        workflow: {
+          ...foregroundDiscoveryRun.workflow,
+          name: "deep-research-competitive-landscape-and-pricing-teardown",
+        },
+      },
     },
   },
 };

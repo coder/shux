@@ -6,6 +6,9 @@ import { applyCompactionOverrides } from "./compactionOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { CompactionRequestData } from "@/common/types/message";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { installDom } from "../../../../tests/ui/dom";
 
 describe("applyCompactionOverrides", () => {
   const baseOptions: SendMessageOptions = {
@@ -107,5 +110,21 @@ describe("applyCompactionOverrides", () => {
     expect(result.maxOutputTokens).toBe(5000);
     expect(result.agentId).toBe("compact");
     expect(result.thinkingLevel).toBe("medium"); // Non-Anthropic preserves original
+  });
+
+  it("inherits compact's reasoning mode through its configured base chain", () => {
+    // Compact has no direct override; exec's configured pro must apply
+    // (matching the Settings card display) instead of falling through to the
+    // active workspace agent's mode.
+    const restoreDom = installDom();
+    try {
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+        exec: { reasoningMode: "pro" },
+      });
+      const result = applyCompactionOverrides({ ...baseOptions, reasoningMode: "standard" }, {});
+      expect(result.reasoningMode).toBe("pro");
+    } finally {
+      restoreDom();
+    }
   });
 });

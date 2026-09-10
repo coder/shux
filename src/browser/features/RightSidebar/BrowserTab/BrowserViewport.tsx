@@ -8,6 +8,7 @@ import {
   type WheelEvent,
 } from "react";
 import { TriangleAlert } from "lucide-react";
+import { useDevicePixelRatio } from "@/browser/hooks/useDevicePixelRatio";
 import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
@@ -71,6 +72,7 @@ interface QueuedPointerMove {
 export function BrowserViewport(props: BrowserViewportProps) {
   assert(props.workspaceId.trim().length > 0, "BrowserViewport requires a workspaceId");
 
+  const devicePixelRatio = useDevicePixelRatio();
   const [hasFocus, setHasFocus] = useState(false);
   const [frameImageSnapshot, setFrameImageSnapshot] = useState<BrowserFrameImageSnapshot | null>(
     null
@@ -173,7 +175,7 @@ export function BrowserViewport(props: BrowserViewportProps) {
       queuedMove.clientY,
       currentSurface.getBoundingClientRect(),
       session.frameMetadata,
-      { clampOutsideContent: true, frameImageSize }
+      { clampOutsideContent: true, frameImageSize, devicePixelRatio }
     );
     if (mappedPoint == null) {
       return;
@@ -292,7 +294,7 @@ export function BrowserViewport(props: BrowserViewportProps) {
       event.clientY,
       event.currentTarget.getBoundingClientRect(),
       props.session.frameMetadata,
-      { frameImageSize }
+      { frameImageSize, devicePixelRatio }
     );
     if (mappedPoint == null) {
       return;
@@ -369,7 +371,7 @@ export function BrowserViewport(props: BrowserViewportProps) {
       event.clientY,
       event.currentTarget.getBoundingClientRect(),
       props.session.frameMetadata,
-      { clampOutsideContent: true, frameImageSize }
+      { clampOutsideContent: true, frameImageSize, devicePixelRatio }
     );
     if (mappedPoint != null) {
       sendInput(
@@ -405,7 +407,7 @@ export function BrowserViewport(props: BrowserViewportProps) {
       event.clientY,
       event.currentTarget.getBoundingClientRect(),
       props.session.frameMetadata,
-      { frameImageSize }
+      { frameImageSize, devicePixelRatio }
     );
     if (mappedPoint == null) {
       return;
@@ -508,8 +510,16 @@ export function BrowserViewport(props: BrowserViewportProps) {
           src={props.screenshotSrc}
           alt="Browser session screenshot"
           onLoad={handleScreenshotLoad}
-          // agent-browser may cap screencast frames below the viewport size; rendering the
-          // captured bitmap at intrinsic size avoids making that capped stream blurrier.
+          // Capture caps can make the bitmap smaller than its CSS viewport. Avoid rendering it
+          // larger in physical pixels, even when that leaves a smaller preview (issue #3115).
+          style={
+            frameImageSize == null
+              ? undefined
+              : {
+                  maxWidth: `min(100%, ${frameImageSize.width / devicePixelRatio}px)`,
+                  maxHeight: `min(100%, ${frameImageSize.height / devicePixelRatio}px)`,
+                }
+          }
           className="pointer-events-none absolute top-1/2 left-1/2 max-h-full max-w-full -translate-x-1/2 -translate-y-1/2 select-none"
           draggable={false}
         />
@@ -698,7 +708,11 @@ export function mapDomPointToViewport(
   clientY: number,
   surfaceRect: MeasuredViewportRect,
   metadata: BrowserViewportMetadata | null,
-  options?: { clampOutsideContent?: boolean; frameImageSize?: BrowserFrameImageSize | null }
+  options?: {
+    clampOutsideContent?: boolean;
+    devicePixelRatio?: number;
+    frameImageSize?: BrowserFrameImageSize | null;
+  }
 ): ViewportPoint | null {
   assert(metadata != null, "BrowserViewport requires frame metadata to map viewport coordinates");
   assert(Number.isFinite(metadata.deviceWidth), "BrowserViewport deviceWidth must be finite");
@@ -708,7 +722,17 @@ export function mapDomPointToViewport(
   assert(surfaceRect.width > 0, "BrowserViewport surface width must be positive");
   assert(surfaceRect.height > 0, "BrowserViewport surface height must be positive");
 
-  const renderedFrameRect = getRenderedFrameRect(surfaceRect, metadata, options?.frameImageSize);
+  const requestedDevicePixelRatio = options?.devicePixelRatio ?? 1;
+  const devicePixelRatio =
+    Number.isFinite(requestedDevicePixelRatio) && requestedDevicePixelRatio > 0
+      ? requestedDevicePixelRatio
+      : 1;
+  const renderedFrameRect = getRenderedFrameRect(
+    surfaceRect,
+    metadata,
+    options?.frameImageSize,
+    devicePixelRatio
+  );
   const relativeX = clientX - renderedFrameRect.left;
   const relativeY = clientY - renderedFrameRect.top;
   const clampOutsideContent = options?.clampOutsideContent ?? false;
@@ -743,7 +767,8 @@ export function mapDomPointToViewport(
 function getRenderedFrameRect(
   surfaceRect: MeasuredViewportRect,
   metadata: BrowserViewportMetadata,
-  frameImageSize: BrowserFrameImageSize | null | undefined
+  frameImageSize: BrowserFrameImageSize | null | undefined,
+  devicePixelRatio: number
 ): MeasuredViewportRect {
   if (frameImageSize != null) {
     assert(
@@ -753,7 +778,7 @@ function getRenderedFrameRect(
     const renderedScale = Math.min(
       surfaceRect.width / frameImageSize.width,
       surfaceRect.height / frameImageSize.height,
-      1
+      Math.min(1, 1 / devicePixelRatio)
     );
     const renderedWidth = frameImageSize.width * renderedScale;
     const renderedHeight = frameImageSize.height * renderedScale;

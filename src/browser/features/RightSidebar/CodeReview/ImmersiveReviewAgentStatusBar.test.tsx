@@ -41,6 +41,7 @@ function buildState(workspaceId: string, input: SeedInput): WorkspaceState {
     name: workspaceId,
     messages: [],
     queuedMessage: null,
+    pendingSend: null,
     canInterrupt: input.canInterrupt ?? false,
     isCompacting: false,
     isStreamStarting: input.isStarting ?? false,
@@ -183,7 +184,7 @@ describe("ImmersiveReviewAgentStatusBar", () => {
   test("surfaces a prominent prompt when the agent awaits a question", () => {
     seed("ws-question", { todos, awaitingUserQuestion: true });
     const result = renderBar("ws-question");
-    expect(result.getByText("Mux has a question")).toBeTruthy();
+    expect(result.getByText("Xum has a question")).toBeTruthy();
     // The question chip wins over the streaming label.
     expect(result.queryByText("Streaming…")).toBeNull();
   });
@@ -220,6 +221,6 @@ describe("ImmersiveReviewAgentStatusBar", () => {
       patchState(workspaceId, { awaitingUserQuestion: true });
     });
     expect(commits).toBeGreaterThan(committedAfterMount);
-    expect(result.getByText("Mux has a question")).toBeTruthy();
+    expect(result.getByText("Xum has a question")).toBeTruthy();
   });
 });

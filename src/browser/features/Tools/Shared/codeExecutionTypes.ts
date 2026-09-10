@@ -1,35 +1,9 @@
-/**
- * Shared types for code_execution tool UI components.
- *
- * These mirror the backend PTCExecutionResult/PTCConsoleRecord shapes
- * but are defined separately to avoid browser → node imports.
- */
+import type { WorkflowRunToolAttachment } from "@/common/orpc/schemas/message";
 
-/** Console output record from code execution */
-export interface ConsoleRecord {
-  level: "log" | "warn" | "error";
-  args: unknown[];
-  timestamp: number;
-}
-
-/** Record of a tool call made during code execution */
-export interface ToolCallRecord {
-  toolName: string;
-  args: unknown;
-  result?: unknown;
-  error?: string;
-  duration_ms: number;
-}
-
-/** Result of code execution (matches PTCExecutionResult) */
-export interface CodeExecutionResult {
-  success: boolean;
-  result?: unknown;
-  error?: string;
-  toolCalls: ToolCallRecord[];
-  consoleOutput: ConsoleRecord[];
-  duration_ms: number;
-}
+export type {
+  CodeExecutionConsoleRecord as ConsoleRecord,
+  CodeExecutionResult,
+} from "@/common/types/codeExecution";
 
 /** Nested tool call shape from streaming aggregator */
 export interface NestedToolCall {
@@ -40,4 +14,6 @@ export interface NestedToolCall {
   state: "input-available" | "output-available" | "output-redacted";
   failed?: boolean;
   timestamp?: number;
+  /** Durable run identity persisted for nested workflow tool calls. */
+  workflowRun?: WorkflowRunToolAttachment;
 }

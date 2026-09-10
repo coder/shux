@@ -9,7 +9,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { describe, expect, test, beforeEach, afterEach } from "@jest/globals";
-import { execAsync, execFileAsync } from "./disposableExec";
+import { execAsync, execFileAsync, killProcessTree } from "./disposableExec";
 
 /**
  * Tests for DisposableExec - verifies no process leaks under any scenario
@@ -164,6 +164,16 @@ describe("disposableExec", () => {
     // Still exited, not killed
     expect(childProc.exitCode).toBe(0);
     expect(childProc.killed).toBe(false);
+  });
+
+  test("cwd option runs the command in the requested directory", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "disposable-exec-cwd-"));
+    try {
+      using command = execFileAsync("node", ["-p", "process.cwd()"], { cwd });
+      expect((await command.result).stdout.trim()).toBe(await fs.realpath(cwd));
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 
   test("stdout and stderr are captured correctly", async () => {
@@ -337,6 +347,271 @@ describe("disposableExec", () => {
 
     // Result should reject since we killed it
     await expect(proc.result).rejects.toThrow();
+  });
+
+  test("maxOutputBytes rejects and kills a process when stdout outruns the cap", async () => {
+    // The final exec avoids a shell wrapper that could survive and hold the inherited pipes.
+    using proc = execFileAsync("sh", ["-c", "yes abcdefghij | head -c 200000; exec sleep 15"], {
+      maxOutputBytes: 1024,
+    });
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+
+    await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);
+    expect(child.signalCode).toBe("SIGKILL");
+  });
+
+  test("maxOutputBytes rejects after an overflowing command exits cleanly", async () => {
+    using proc = execFileAsync("sh", ["-c", "printf '%02000d' 0"], {
+      maxOutputBytes: 1024,
+    });
+    const child = (proc as unknown as { child: ChildProcess }).child;
+
+    await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);
+    expect(child.exitCode).toBe(0);
+    expect(child.signalCode).toBeNull();
+  });
+
+  test("maxOutputBytes rejects when stderr pushes cumulative output over the cap", async () => {
+    using proc = execFileAsync(
+      "sh",
+      ["-c", "printf '%0800d' 0; printf '%0800d' 0 >&2; exec sleep 15"],
+      { maxOutputBytes: 1024 }
+    );
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+
+    await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);
+    expect(child.signalCode).toBe("SIGKILL");
+  });
+
+  test("maxOutputBytes kills descendants of the capped command", async () => {
+    if (process.platform === "win32") return;
+    const marker = `mux-cap-descendant-${process.pid}-${Date.now()}`;
+    using proc = execFileAsync(
+      "sh",
+      ["-c", `bash -c 'exec -a ${marker} sleep 30' & yes abcdefghij | head -c 200000; wait`],
+      { maxOutputBytes: 1024 }
+    );
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+
+    await expect(proc.result).rejects.toThrow(/more than 1024 bytes of output/);
+    expect(child.signalCode).toBe("SIGKILL");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    using survivors = execFileAsync("pgrep", ["-fc", marker]);
+    const found = await survivors.result.then(
+      (ok) => ok.stdout.trim(),
+      () => "0" // pgrep exits non-zero when nothing matches
+    );
+    expect(found).toBe("0");
+  });
+
+  test("timeout kills descendants of a capped command without waiting for inherited pipes", async () => {
+    if (process.platform === "win32") return;
+    const pidFile = path.join(os.tmpdir(), `mux-timeout-descendant-${process.pid}-${Date.now()}`);
+    using proc = execFileAsync("sh", ["-c", 'sleep 30 & echo $! > "$1"; wait', "sh", pidFile], {
+      maxOutputBytes: 1024,
+      timeoutMs: 100,
+    });
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+    let passed = false;
+
+    try {
+      const rejected = await Promise.race([
+        proc.result.then(
+          () => {
+            throw new Error("Expected the timeout to reject");
+          },
+          (error: unknown) => error
+        ),
+        new Promise<never>((_, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("timeout result did not settle promptly")),
+            2_000
+          );
+          timeout.unref?.();
+        }),
+      ]);
+      expect((rejected as { signal?: string }).signal).toMatch(/SIGKILL/);
+
+      const descendantPid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+      let descendantRunning = true;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          process.kill(descendantPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } catch {
+          descendantRunning = false;
+          break;
+        }
+      }
+      expect(descendantRunning).toBe(false);
+      passed = true;
+    } finally {
+      if (!passed && child.pid !== undefined) killProcessTree(child.pid);
+      if (!passed) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+      await fs.rm(pidFile, { force: true });
+    }
+  });
+
+  test("timeout kills descendants when tree termination is requested without waiting for inherited pipes", async () => {
+    if (process.platform === "win32") return;
+    const pidFile = path.join(
+      os.tmpdir(),
+      `mux-tree-timeout-descendant-${process.pid}-${Date.now()}`
+    );
+    using proc = execFileAsync("sh", ["-c", 'sleep 30 & echo $! > "$1"; wait', "sh", pidFile], {
+      killTreeOnTermination: true,
+      timeoutMs: 100,
+    });
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+    let descendantPid: number | undefined;
+    let passed = false;
+
+    try {
+      const rejected = await Promise.race([
+        proc.result.then(
+          () => {
+            throw new Error("Expected the timeout to reject");
+          },
+          (error: unknown) => error
+        ),
+        new Promise<never>((_, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("timeout result did not settle promptly")),
+            2_000
+          );
+          timeout.unref?.();
+        }),
+      ]);
+      expect((rejected as { signal?: string }).signal).toMatch(/SIGKILL/);
+
+      descendantPid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+      let descendantRunning = true;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          process.kill(descendantPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } catch {
+          descendantRunning = false;
+          break;
+        }
+      }
+      expect(descendantRunning).toBe(false);
+      passed = true;
+    } finally {
+      if (!passed && child.pid !== undefined) killProcessTree(child.pid);
+      if (!passed && descendantPid === undefined) {
+        descendantPid = await fs
+          .readFile(pidFile, "utf-8")
+          .then((value) => Number(value.trim()))
+          .catch(() => undefined);
+      }
+      if (!passed && descendantPid !== undefined) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {
+          // The descendant may already have exited.
+        }
+      }
+      if (!passed) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+      await fs.rm(pidFile, { force: true });
+    }
+  });
+
+  test("timeout kills a capped command's group after the leader already exited", async () => {
+    if (process.platform === "win32") return;
+    const pidFile = path.join(os.tmpdir(), `mux-leader-exited-${process.pid}-${Date.now()}`);
+    using proc = execFileAsync("sh", ["-c", 'sleep 30 & echo $! > "$1"', "sh", pidFile], {
+      maxOutputBytes: 1024,
+      timeoutMs: 100,
+    });
+    const child = (proc as unknown as { child: ChildProcess }).child;
+    activeProcesses.add(child);
+    let passed = false;
+
+    try {
+      // The exited leader resolves successfully; the timeout prevents delayed settlement.
+      await Promise.race([
+        proc.result,
+        new Promise<never>((_, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("timeout result did not settle promptly")),
+            2_000
+          );
+          timeout.unref?.();
+        }),
+      ]);
+      expect(child.exitCode).toBe(0);
+
+      const descendantPid = Number((await fs.readFile(pidFile, "utf-8")).trim());
+      let descendantRunning = true;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        try {
+          process.kill(descendantPid, 0);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } catch {
+          descendantRunning = false;
+          break;
+        }
+      }
+      expect(descendantRunning).toBe(false);
+      passed = true;
+    } finally {
+      if (!passed && child.pid !== undefined) killProcessTree(child.pid);
+      if (!passed) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+      await fs.rm(pidFile, { force: true });
+    }
+  });
+
+  test("an uncapped command stays in this process's group", async () => {
+    // Reads /proc rather than spawning ps, so the assertion cannot be slower than the process it
+    // is inspecting. Linux-only, which is where the unit suite runs.
+    if (process.platform !== "linux") return;
+    const groupOf = async (pid: number) => {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf-8");
+      // Everything after the executable name, whose parens can contain spaces; pgrp is field 5.
+      return stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[2];
+    };
+
+    const proc = execFileAsync("sleep", ["30"]);
+    const child: ChildProcess = (proc as any).child;
+    activeProcesses.add(child);
+    void proc.result.catch(() => undefined);
+
+    try {
+      // Detaching would give it its own group, where a signal sent to this process's group (a
+      // terminal interrupt) would never reach it. Only the capped path pays that cost, because
+      // it is the one that needs a group to kill.
+      expect(await groupOf(child.pid!)).toBe(await groupOf(process.pid));
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  test("maxOutputBytes leaves output under the cap untouched", async () => {
+    using proc = execFileAsync("sh", ["-c", "printf 'small output'; printf 'small error' >&2"], {
+      maxOutputBytes: 1024,
+    });
+    activeProcesses.add((proc as unknown as { child: ChildProcess }).child);
+
+    const { stdout, stderr } = await proc.result;
+
+    expect(stdout).toBe("small output");
+    expect(stderr).toBe("small error");
   });
 
   test("close event waits for stdio to flush", async () => {

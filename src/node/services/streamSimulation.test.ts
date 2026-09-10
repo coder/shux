@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { createMuxMessage, type MuxMetadata } from "@/common/types/message";
@@ -90,6 +90,51 @@ describe("streamSimulation", () => {
       expect(historyResult.data[0]?.metadata?.agentId).toBe("exec");
       expect(historyResult.data[0]?.metadata?.mode).toBe("exec");
     } finally {
+      await cleanup();
+    }
+  });
+  test("returns its terminal payload only after final history while preserving raw emission order", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const events: CapturedEvent[] = [];
+    const ctx = createSimulationContext(events);
+    let run: Promise<StreamEndEvent> | undefined;
+    try {
+      await historyService.appendToHistory(
+        ctx.workspaceId,
+        createMuxMessage(ctx.assistantMessageId, "assistant", "", {
+          historySequence: ctx.historySequence,
+        })
+      );
+      const update = historyService.updateHistory.bind(historyService);
+      spyOn(historyService, "updateHistory").mockImplementationOnce(async (id, message) => {
+        entered.resolve();
+        await release.promise;
+        return update(id, message);
+      });
+      let finished = false;
+      run = simulateToolPolicyNoop(ctx, undefined, historyService);
+      const observed = run.then(() => {
+        finished = true;
+      });
+      await entered.promise;
+      expect(events.map((event) => event.event)).toEqual([
+        "stream-start",
+        "stream-delta",
+        "stream-end",
+      ]);
+      expect(finished).toBe(false);
+      release.resolve();
+      const terminal = await run;
+      await observed;
+      expect(terminal).toBe(getCapturedEvent<StreamEndEvent>(events, "stream-end"));
+      const history = await historyService.getHistoryFromLatestBoundary(ctx.workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data[0].parts).toEqual(terminal.parts);
+    } finally {
+      release.resolve();
+      await run;
       await cleanup();
     }
   });

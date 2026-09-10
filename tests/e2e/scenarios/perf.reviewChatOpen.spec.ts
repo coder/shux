@@ -1,5 +1,6 @@
 import { type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import {
   REVIEW_SORT_ORDER_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -15,7 +16,7 @@ import {
 } from "../utils/perfProfile";
 import { disableReviewTutorial, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const REVIEW_CHANGED_LINES_PER_FILE = 50;
 const MIN_REVIEW_FILE_COUNT = 1_000;
 const MIN_REVIEW_CHANGED_LINES = 50_000;
@@ -58,7 +59,7 @@ test.skip(
 );
 
 test.describe("chat open with review sidebar performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: open large chat with a huge review already selected", async ({
     page,

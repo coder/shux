@@ -15,8 +15,11 @@ import {
   useToolExpansion,
   getStatusDisplay,
   isToolErrorResult,
+  normalizeToolResultForRendering,
   type ToolStatus,
 } from "./Shared/toolUtils";
+import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
+import { TaskSendMessageToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 import { useOptionalMessageListContext } from "../Messages/MessageListContext";
 import { useStickyExpand } from "../Messages/useStickyExpand";
@@ -42,6 +45,12 @@ import type {
   TaskListToolSuccessResult,
   TaskSendMessageToolArgs,
   TaskSendMessageToolSuccessResult,
+  TaskRetitleToolArgs,
+  TaskRetitleToolSuccessResult,
+  TaskStopToolArgs,
+  TaskStopToolSuccessResult,
+  TaskRemoveToolArgs,
+  TaskRemoveToolSuccessResult,
   TaskTerminateToolArgs,
   TaskTerminateToolSuccessResult,
   ToolErrorResult,
@@ -50,17 +59,10 @@ import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinki
 import { formatGitPatchArtifactSummary } from "./taskPatchSummary";
 import { sanitizeDisplayableModelIntent } from "./bashCollapsedSummary";
 import {
-  formatTaskGroupCreationLabel,
   formatTaskGroupHeader,
-  formatTaskGroupItemsLabel,
   formatTaskGroupMemberLabel,
   formatTaskGroupSummary,
   getTaskGroupCount,
-  getTaskGroupKindFromArgs,
-  getTaskGroupKindFromMetadata,
-  getTaskGroupLabelAtIndex,
-  normalizeTaskGroupLabel,
-  type TaskGroupKind,
 } from "@/common/utils/tools/taskGroups";
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { formatDuration } from "@/common/utils/formatDuration";
@@ -105,6 +107,7 @@ const TaskStatusBadge: React.FC<{
   const getStatusStyle = () => {
     switch (status) {
       case "accepted":
+      case "retitled":
       case "completed":
       case "reported":
         return "bg-success/20 text-success";
@@ -112,6 +115,7 @@ const TaskStatusBadge: React.FC<{
       case "backgrounded":
         return "bg-pending/20 text-pending";
       case "awaiting_report":
+      case "rate_limited":
         return "bg-warning/20 text-warning";
       case "queued":
         return "bg-muted/20 text-muted";
@@ -122,6 +126,7 @@ const TaskStatusBadge: React.FC<{
         return "bg-interrupted/20 text-interrupted";
       case "not_found":
       case "invalid_scope":
+      case "refused":
       case "error":
       case "failed":
         // Workflow-run terminal failure status (task_list rows).
@@ -131,7 +136,12 @@ const TaskStatusBadge: React.FC<{
     }
   };
 
-  const label = status === "awaiting_report" ? "awaiting report" : status;
+  const label =
+    status === "awaiting_report"
+      ? "awaiting report"
+      : status === "rate_limited"
+        ? "rate limited"
+        : status;
 
   return (
     <span
@@ -300,6 +310,8 @@ interface TaskRowProps {
   agentType?: string;
   title?: string;
   depth?: number;
+  /** Tree relationship to the calling workspace (task_list scope:"tree" rows). */
+  relationship?: string;
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
@@ -364,6 +376,9 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
                 openWorkspaceId={props.openWorkspaceId}
               />
             )}
+            {props.relationship && (
+              <span className="text-muted text-[10px]">{props.relationship}</span>
+            )}
             {typeof props.depth === "number" && props.depth > 0 && (
               <span className="text-muted text-[10px]">depth {props.depth}</span>
             )}
@@ -391,6 +406,7 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
       {props.title && (
         <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
       )}
+      {props.relationship && <span className="text-muted text-[10px]">{props.relationship}</span>}
       {typeof props.depth === "number" && props.depth > 0 && (
         <span className="text-muted text-[10px]">depth: {props.depth}</span>
       )}
@@ -503,8 +519,6 @@ interface TaskToolDisplayEntry {
   title?: string;
   reportMarkdown?: string;
   openWorkspaceId?: string;
-  groupKind?: TaskGroupKind;
-  label?: string;
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
 }
@@ -545,8 +559,6 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
 interface TaskToolOwnReport {
   reportMarkdown: string;
   title?: string;
-  groupKind?: TaskGroupKind;
-  label?: string;
 }
 
 function hasNonEmptyText(value: unknown): value is string {
@@ -567,8 +579,6 @@ interface TaskToolWorkspaceEntry {
   status?: string;
   title?: string;
   createdAtMs?: number;
-  groupKind?: TaskGroupKind;
-  label?: string;
 }
 
 function normalizeTaskAgent(value: string | undefined): string | null {
@@ -637,7 +647,6 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
   requestedAgentType: string;
   requestedTitle: string | undefined;
   requestedCandidateCount: number;
-  requestedGroupKind: TaskGroupKind;
   knownTaskIds: readonly string[];
   toolStartedAt: number | undefined;
   workspaceMetadata: ReadonlyMap<string, FrontendWorkspaceMetadata> | undefined;
@@ -655,9 +664,6 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
       continue;
     }
     if (metadata.bestOf?.total !== params.requestedCandidateCount) {
-      continue;
-    }
-    if (getTaskGroupKindFromMetadata(metadata.bestOf) !== params.requestedGroupKind) {
       continue;
     }
     if (requestedAgentType) {
@@ -683,8 +689,6 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
       status: getTaskToolWorkspaceStatus(metadata.taskStatus),
       title: metadataTitle,
       createdAtMs: parseWorkspaceCreatedAtMs(metadata.createdAt),
-      groupKind: getTaskGroupKindFromMetadata(metadata.bestOf),
-      label: normalizeTaskGroupLabel(metadata.bestOf.label),
     });
     groupedCandidates.set(metadata.bestOf.groupId, candidates);
   }
@@ -743,14 +747,12 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   taskIds: string[];
   statusByTaskId: Map<string, string>;
   ownReportsByTaskId: Map<string, TaskToolOwnReport>;
-  taskGroupsByTaskId: Map<string, { groupKind?: TaskGroupKind; label?: string }>;
   workspaceIdByTaskId: Map<string, string>;
   aiSettingsByTaskId: Map<string, TaskAiSettingsInfo>;
 } {
   const taskIds = new Set<string>();
   const statusByTaskId = new Map<string, string>();
   const ownReportsByTaskId = new Map<string, TaskToolOwnReport>();
-  const taskGroupsByTaskId = new Map<string, { groupKind?: TaskGroupKind; label?: string }>();
   const workspaceIdByTaskId = new Map<string, string>();
   const aiSettingsByTaskId = new Map<string, TaskAiSettingsInfo>();
   if (!result) {
@@ -758,7 +760,6 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
       taskIds: [],
       statusByTaskId,
       ownReportsByTaskId,
-      taskGroupsByTaskId,
       workspaceIdByTaskId,
       aiSettingsByTaskId,
     };
@@ -770,20 +771,6 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
       taskIds.add(normalizedTaskId);
     }
     return normalizedTaskId;
-  };
-
-  const rememberTaskGroup = (
-    taskId: string,
-    details: { groupKind?: TaskGroupKind; label?: string | null }
-  ): void => {
-    const label = normalizeTaskGroupLabel(details.label);
-    if (!details.groupKind && !label) {
-      return;
-    }
-    taskGroupsByTaskId.set(taskId, {
-      groupKind: details.groupKind,
-      ...(label ? { label } : {}),
-    });
   };
 
   const rememberWorkspace = (taskId: string, workspaceId: unknown): void => {
@@ -830,7 +817,6 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
       if (taskId) {
         statusByTaskId.set(taskId, task.status);
         rememberWorkspace(taskId, task.workspaceId);
-        rememberTaskGroup(taskId, { groupKind: task.groupKind, label: task.label });
         rememberAiSettings(taskId, task);
       }
     }
@@ -843,11 +829,8 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
         ownReportsByTaskId.set(taskId, {
           reportMarkdown: report.reportMarkdown,
           title: report.title,
-          groupKind: report.groupKind,
-          label: normalizeTaskGroupLabel(report.label),
         });
         rememberWorkspace(taskId, report.workspaceId);
-        rememberTaskGroup(taskId, { groupKind: report.groupKind, label: report.label });
         rememberAiSettings(taskId, report);
       }
     }
@@ -864,7 +847,6 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     taskIds: Array.from(taskIds),
     statusByTaskId,
     ownReportsByTaskId,
-    taskGroupsByTaskId,
     workspaceIdByTaskId,
     aiSettingsByTaskId,
   };
@@ -905,16 +887,11 @@ const TaskToolCandidateCard: React.FC<{
   entry: TaskToolDisplayEntry;
   index: number;
   total: number;
-  groupKind: TaskGroupKind;
   onOpenTranscript: (taskId: string) => void;
-}> = ({ entry, index, total, groupKind, onOpenTranscript }) => {
+}> = ({ entry, index, total, onOpenTranscript }) => {
   const canViewTranscript = entry.status === "completed";
   const hasReport = hasNonEmptyText(entry.reportMarkdown);
-  const memberLabel = formatTaskGroupMemberLabel({
-    kind: entry.groupKind ?? groupKind,
-    index,
-    label: entry.label,
-  });
+  const memberLabel = formatTaskGroupMemberLabel(index);
 
   return (
     <div className="bg-code-bg rounded-sm p-2">
@@ -969,13 +946,11 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     taskIds: resultTaskIds,
     statusByTaskId,
     ownReportsByTaskId,
-    taskGroupsByTaskId,
     workspaceIdByTaskId,
     aiSettingsByTaskId,
   } = collectTaskToolResultDisplayData(successResult);
 
   const requestedTaskGroupCount = getTaskGroupCount(args);
-  const taskGroupKind = getTaskGroupKindFromArgs(args);
   const title = args.title ?? "Task";
   const prompt = args.prompt ?? "";
   const taskKindLabel =
@@ -989,7 +964,6 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     requestedAgentType: taskKindLabel,
     requestedTitle: title,
     requestedCandidateCount: requestedTaskGroupCount,
-    requestedGroupKind: taskGroupKind,
     knownTaskIds: [...resultTaskIds, ...liveTaskIds, ...recoveredTaskIdsRef.current],
     // Prefer the true execution start; fall back to the model-emission timestamp for
     // parts without execution-start tracking (history replay). Both are valid lower
@@ -1017,12 +991,11 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
   const isBackground = args.run_in_background;
 
-  const displayEntries: TaskToolDisplayEntry[] = taskIds.map((taskId, index) => {
+  const displayEntries: TaskToolDisplayEntry[] = taskIds.map((taskId) => {
     const ownReport = ownReportsByTaskId.get(taskId);
     const linkedReport = taskReportLinking?.reportByTaskId.get(taskId);
     const openWorkspaceId = workspaceIdByTaskId.get(taskId);
     const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId, openWorkspaceId);
-    const resultTaskGroup = taskGroupsByTaskId.get(taskId);
     const reportMarkdown = hasNonEmptyText(ownReport?.reportMarkdown)
       ? ownReport.reportMarkdown
       : linkedReport?.reportMarkdown;
@@ -1041,16 +1014,6 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
       title: reportTitle ?? getTaskToolWorkspaceTitle(metadata) ?? title,
       reportMarkdown,
       openWorkspaceId,
-      groupKind:
-        ownReport?.groupKind ??
-        resultTaskGroup?.groupKind ??
-        (metadata?.bestOf ? getTaskGroupKindFromMetadata(metadata.bestOf) : undefined) ??
-        taskGroupKind,
-      label:
-        ownReport?.label ??
-        resultTaskGroup?.label ??
-        normalizeTaskGroupLabel(metadata?.bestOf?.label) ??
-        getTaskGroupLabelAtIndex(args, index),
       // Prefer live metadata while the workspace exists: a plan child's auto-handoff to
       // exec rewrites its settings after launch, so a spawn snapshot can go stale. After
       // cleanup, a linked task_await report carries report-time settings; the spawn
@@ -1090,7 +1053,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
   const [transcriptTaskId, setTranscriptTaskId] = useState<string | null>(null);
   const preview = prompt.length > 60 ? prompt.slice(0, 60).trim() + "…" : prompt.split("\n")[0];
   const collapsedPreview = isTaskGroup
-    ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, preview)
+    ? formatTaskGroupHeader(totalTaskGroupCount, preview)
     : preview;
   const singleEntry = !isTaskGroup ? displayEntries[0] : undefined;
   const kindBadge = (
@@ -1116,7 +1079,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
         {kindBadge}
         {isTaskGroup && (
           <span className="text-muted text-[10px]">
-            {formatTaskGroupSummary(taskGroupKind, totalTaskGroupCount).toLowerCase()}
+            {formatTaskGroupSummary(totalTaskGroupCount).toLowerCase()}
           </span>
         )}
         {isBackground && (
@@ -1146,7 +1109,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
             <div className="task-divider mb-2 flex flex-wrap items-center gap-2 border-b pb-2">
               <span className="text-task-mode text-[12px] font-semibold">
                 {isTaskGroup
-                  ? formatTaskGroupHeader(taskGroupKind, totalTaskGroupCount, title)
+                  ? formatTaskGroupHeader(totalTaskGroupCount, title)
                   : (singleEntry?.title ?? title)}
               </span>
               {isTaskGroup ? (
@@ -1191,7 +1154,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
             {isTaskGroup ? (
               <div className="task-divider border-t pt-2">
                 <div className="text-muted mb-2 text-[10px] tracking-wide uppercase">
-                  {formatTaskGroupItemsLabel(taskGroupKind)}
+                  Candidates
                 </div>
                 <div className="space-y-2">
                   {displayEntries.map((entry, index) => (
@@ -1200,7 +1163,6 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
                       entry={entry}
                       index={index}
                       total={totalTaskGroupCount}
-                      groupKind={taskGroupKind}
                       onOpenTranscript={setTranscriptTaskId}
                     />
                   ))}
@@ -1217,8 +1179,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
 
             {shouldShowCreationProgress && (
               <div className="text-muted mt-2 text-[11px] italic">
-                {formatTaskGroupCreationLabel(taskGroupKind)} ({createdTaskGroupCount}/
-                {totalTaskGroupCount})
+                Creating candidates ({createdTaskGroupCount}/{totalTaskGroupCount})
                 <LoadingDots />
               </div>
             )}
@@ -1698,6 +1659,12 @@ export const TaskListToolCall: React.FC<TaskListToolCallProps> = ({
               </div>
             )}
 
+            {result?.note && (
+              <div className="bg-code-bg text-muted mb-2 rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
+                {result.note}
+              </div>
+            )}
+
             {tasks.length > 0 ? (
               <div className="space-y-2">
                 {tasks.map((task) => (
@@ -1729,6 +1696,9 @@ const TaskListItem: React.FC<{
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
     title={task.title}
     depth={task.depth}
+    // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
+    // self) — the key context for interpreting the tree view and addressing peer messages.
+    relationship={task.relationship}
     openWorkspaceId={task.workspaceId}
   />
 );
@@ -1739,22 +1709,109 @@ const TaskListItem: React.FC<{
 
 interface TaskSendMessageToolCallProps {
   args: TaskSendMessageToolArgs;
-  result?: TaskSendMessageToolSuccessResult;
+  result?: unknown;
   status?: ToolStatus;
 }
 
+const MESSAGE_DELIVERY: Record<
+  TaskSendMessageToolSuccessResult["status"],
+  { status: ToolStatus; label: string }
+> = {
+  accepted: { status: "completed", label: "Accepted" },
+  queued: { status: "backgrounded", label: "Queued" },
+  reactivated: { status: "completed", label: "Sent · Agent reactivated" },
+  not_found: { status: "failed", label: "Target not found" },
+  invalid_scope: { status: "failed", label: "Invalid target" },
+  not_active: { status: "failed", label: "Agent inactive" },
+  error: { status: "failed", label: "Not sent" },
+  refused: { status: "failed", label: "Refused" },
+  rate_limited: { status: "failed", label: "Rate limited" },
+};
+
 export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
+  const workspaceContext = useOptionalWorkspaceContext();
+  const workspace = findWorkspaceForTaskTarget(
+    workspaceContext?.workspaceMetadata,
+    props.args.task_id
+  );
+  // Persisted output is unknown even when the tool arguments have passed validation.
+  const normalizedResult = normalizeToolResultForRendering(props.result);
+  const parsed = TaskSendMessageToolResultSchema.safeParse(normalizedResult);
+  const result = parsed.success ? parsed.data : undefined;
+  const toolError = isToolErrorResult(normalizedResult) ? normalizedResult : undefined;
+  const invalidResult =
+    (props.result != null || props.status === "completed") && result == null && toolError == null;
+  // A finished tool call can still mean delivery was refused or queued, not sent.
+  const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
+  const error = toolError?.error ?? (result && "error" in result ? result.error : undefined);
+
+  return (
+    <AgentCommunicationCard
+      toolName="task_send_message"
+      title={workspace ? `Message to ${workspace.title ?? workspace.name}` : "Message to agent"}
+      destination={
+        <>
+          To {relation && `${relation} `}
+          <TaskId id={props.args.task_id} className="text-xs opacity-100" />
+        </>
+      }
+      status={
+        toolError || invalidResult ? "failed" : (delivery?.status ?? props.status ?? "pending")
+      }
+      statusLabel={invalidResult ? "Result unavailable" : delivery?.label}
+      preview={props.args.message}
+      initiallyExpanded={false}
+      error={
+        <>
+          {error && (
+            <ErrorBox className="mt-2" role="alert">
+              {error}
+            </ErrorBox>
+          )}
+          {result?.status === "refused" && (
+            <ErrorBox className="mt-2" role="alert">
+              {result.reason}
+            </ErrorBox>
+          )}
+          {result?.status === "rate_limited" && result.retryAfterMs != null && (
+            <div className="text-warning mt-2 text-xs">
+              Retry in {Math.ceil(result.retryAfterMs / 1000)}s
+            </div>
+          )}
+        </>
+      }
+    >
+      <div
+        role="region"
+        aria-label="Message content"
+        tabIndex={0}
+        className="focus-visible:ring-ring max-h-[40vh] overflow-y-auto rounded-sm whitespace-pre-wrap focus-visible:ring-2 focus-visible:outline-none"
+      >
+        {props.args.message}
+      </div>
+    </AgentCommunicationCard>
+  );
+};
+
+interface TaskRetitleToolCallProps {
+  args: TaskRetitleToolArgs;
+  result?: TaskRetitleToolSuccessResult;
+  status?: ToolStatus;
+}
+
+export const TaskRetitleToolCall: React.FC<TaskRetitleToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const status = props.status ?? "pending";
-  const summary = props.result?.status ?? "sending";
+  const summary = props.result?.status ?? "retitling";
 
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <TaskIcon toolName="task_send_message" />
-        <ToolName>task_send_message</ToolName>
-        <span className="text-muted text-[10px]">{summary}</span>
+        <TaskIcon toolName="task_retitle" />
+        <ToolName>task_retitle</ToolName>
+        <span className="text-muted min-w-0 truncate text-[10px]">{props.args.title}</span>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
       </ToolHeader>
 
@@ -1763,10 +1820,10 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
           <div className="task-surface mt-1 space-y-2 rounded-md p-3">
             <div className="flex items-center gap-2">
               <TaskId id={props.args.task_id} />
-              {props.result && <TaskStatusBadge status={props.result.status} />}
+              <TaskStatusBadge status={summary} />
             </div>
-            <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
-              {props.args.message}
+            <div className="text-foreground bg-code-bg rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
+              {props.result?.status === "retitled" ? props.result.title : props.args.title}
             </div>
             {props.result && "error" in props.result && props.result.error && (
               <div className="text-danger text-[11px]">{props.result.error}</div>
@@ -1778,6 +1835,102 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   );
 };
 
+interface TaskStopToolCallProps {
+  args: TaskStopToolArgs;
+  result?: TaskStopToolSuccessResult;
+  status?: ToolStatus;
+}
+
+export const TaskStopToolCall: React.FC<TaskStopToolCallProps> = (props) => {
+  const { expanded, toggleExpanded } = useToolExpansion(false);
+  const results = props.result?.results ?? [];
+  const displayResults: Array<{ taskId: string; status?: string; note?: string; error?: string }> =
+    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const stopped = results.filter((result) => result.status === "stopped").length;
+  const inactive = results.filter((result) => result.status === "already_inactive").length;
+  return (
+    <ToolContainer expanded={expanded}>
+      <ToolHeader onClick={toggleExpanded}>
+        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <TaskIcon toolName="task_stop" />
+        <ToolName>task_stop</ToolName>
+        <span className="text-interrupted text-[10px]">
+          {stopped > 0 || inactive > 0
+            ? `${stopped} stopped${inactive > 0 ? `, ${inactive} already inactive` : ""}`
+            : `${props.args.task_ids.length} to stop`}
+        </span>
+        <StatusIndicator status={props.status ?? "pending"}>
+          {getStatusDisplay(props.status ?? "pending")}
+        </StatusIndicator>
+      </ToolHeader>
+      {expanded && (
+        <ToolDetails>
+          <div className="task-surface mt-1 space-y-2 rounded-md p-3">
+            {displayResults.map((result, index) => (
+              <div key={result.taskId ?? index} className="bg-code-bg rounded-sm p-2">
+                <TaskId id={result.taskId} />
+                {result.status != null && <TaskStatusBadge status={result.status} />}
+                {result.note != null && (
+                  <div className="text-muted mt-1 text-[11px]">{result.note}</div>
+                )}
+                {result.error != null && (
+                  <div className="text-danger mt-1 text-[11px]">{result.error}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </ToolDetails>
+      )}
+    </ToolContainer>
+  );
+};
+
+interface TaskRemoveToolCallProps {
+  args: TaskRemoveToolArgs;
+  result?: TaskRemoveToolSuccessResult;
+  status?: ToolStatus;
+}
+
+export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
+  const { expanded, toggleExpanded } = useToolExpansion(false);
+  const results = props.result?.results ?? [];
+  const displayResults: Array<{ taskId: string; status?: string; error?: string }> =
+    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const removed = results.filter((result) => result.status === "removed").length;
+  return (
+    <ToolContainer expanded={expanded}>
+      <ToolHeader onClick={toggleExpanded}>
+        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
+        <TaskIcon toolName="task_remove" />
+        <ToolName>task_remove</ToolName>
+        <span className="text-danger text-[10px]">
+          {removed > 0 ? `${removed} removed` : `${props.args.task_ids.length} to remove`}
+        </span>
+        <StatusIndicator status={props.status ?? "pending"}>
+          {getStatusDisplay(props.status ?? "pending")}
+        </StatusIndicator>
+      </ToolHeader>
+      {expanded && (
+        <ToolDetails>
+          <div className="task-surface mt-1 space-y-2 rounded-md p-3">
+            {displayResults.map((result, index) => (
+              <div key={result.taskId ?? index} className="bg-code-bg rounded-sm p-2">
+                <TaskId id={result.taskId} />
+                {result.status != null && <TaskStatusBadge status={result.status} />}
+                {result.error != null && (
+                  <div className="text-danger mt-1 text-[11px]">{result.error}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </ToolDetails>
+      )}
+    </ToolContainer>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEGACY TASK TERMINATE TOOL CALL
 // ═══════════════════════════════════════════════════════════════════════════════
 // TASK TERMINATE TOOL CALL
 // ═══════════════════════════════════════════════════════════════════════════════

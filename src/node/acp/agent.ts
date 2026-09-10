@@ -27,6 +27,9 @@ import type {
   Usage,
 } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
+import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import {
   DEFAULT_COMPACTION_WORD_TARGET,
   WORDS_TO_TOKENS_RATIO,
@@ -47,14 +50,20 @@ import {
 } from "@/common/utils/subProjects";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { negotiateCapabilities, type NegotiatedCapabilities } from "./capabilities";
-import { AGENT_MODE_CONFIG_ID, buildConfigOptions, handleSetConfigOption } from "./configOptions";
+import { buildConfigOptions, handleSetConfigOption } from "./configOptions";
 import { forkSessionFromWorkspace } from "./experimental/sessionFork";
 import {
   canonicalizePathForWorkspaceMatch,
   loadSessionFromWorkspace,
 } from "./experimental/sessionResume";
 import { convertToAcpUsage } from "./experimental/sessionUsage";
-import { resolveAgentAiSettings, type ResolvedAiSettings } from "./resolveAgentAiSettings";
+import {
+  resolveAcpAgentAiSettings,
+  resolveAgentAiSettings,
+  type ResolvedAiSettings,
+} from "./resolveAgentAiSettings";
+import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
+import { InvalidExplicitAiSettingError } from "@/common/utils/ai/resolveAgentAiSettings";
 import type { ServerConnection } from "./serverConnection";
 import { SessionManager } from "./sessionManager";
 import {
@@ -85,7 +94,7 @@ const ACP_DELEGATION_CANDIDATE_TOOLS = [
 ] as const;
 const DEFAULT_DISCONNECT_CLEANUP_MAX_WAIT_MS = 10_000;
 /**
- * Mux does not implement the session/close RPC yet. Keep idle sessions bounded so
+ * Xum does not implement the session/close RPC yet. Keep idle sessions bounded so
  * long-lived editor connections cannot leak subscriptions and per-session caches forever.
  */
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
@@ -155,8 +164,9 @@ type MetaRecord = Record<string, unknown>;
 type WorkspaceInfo = NonNullable<
   Awaited<ReturnType<ServerConnection["client"]["workspace"]["getInfo"]>>
 >;
-type WorkspaceActivityById = Awaited<
-  ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>
+// NonNullable: the null read-failure signal is normalized to {} at the call site.
+type WorkspaceActivityById = NonNullable<
+  Awaited<ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>>
 >;
 
 export class MuxAgent implements Agent {
@@ -261,7 +271,7 @@ export class MuxAgent implements Agent {
     this.connection.signal.addEventListener(
       "abort",
       () => {
-        const disconnectError = new Error("Mux ACP connection closed");
+        const disconnectError = new Error("Xum ACP connection closed");
         const activeTurnSessionIds = [...this.turnCompletions.keys()];
         for (const sessionId of activeTurnSessionIds) {
           this.rejectTurn(sessionId, disconnectError);
@@ -293,8 +303,8 @@ export class MuxAgent implements Agent {
     return Promise.resolve({
       protocolVersion: params.protocolVersion,
       agentInfo: {
-        name: "mux",
-        version: process.env.MUX_VERSION ?? "dev",
+        name: XUM_PRODUCT_SLUG,
+        version: resolveXumEnvironmentValue("VERSION", process.env) ?? "dev",
       },
       agentCapabilities: {
         loadSession: true,
@@ -363,7 +373,6 @@ export class MuxAgent implements Agent {
 
       const agentId = meta.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
       const aiSettings = await resolveAgentAiSettings(this.server.client, agentId, workspaceId);
-      await this.persistAiSettings(workspaceId, agentId, aiSettings);
 
       this.sessionStateById.set(sessionId, {
         workspaceId,
@@ -379,6 +388,7 @@ export class MuxAgent implements Agent {
         sessionId,
         configOptions: await buildConfigOptions(this.server.client, workspaceId, {
           activeAgentId: agentId,
+          aiSettings,
         }),
       };
 
@@ -397,16 +407,14 @@ export class MuxAgent implements Agent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     this.assertInitialized("loadSession");
 
-    // Pass any prior in-memory agent selection so mode switches survive
-    // reconnect/reload (agent mode set via set_config_option is only stored
-    // in ACP session state, not persisted as the workspace's active agent).
+    // Preserve unsent picker choices when reloading this adapter's active session.
     const existingState = this.sessionStateById.get(params.sessionId);
     const resumed = await loadSessionFromWorkspace(params, {
       server: this.server,
       sessionManager: this.sessionManager,
       negotiatedCapabilities: this.negotiatedCapabilities,
       defaultAgentId: DEFAULT_AGENT_ID,
-      existingSessionAgentId: existingState?.agentId,
+      existingSessionState: existingState,
     });
 
     this.sessionStateById.set(resumed.sessionId, {
@@ -433,11 +441,13 @@ export class MuxAgent implements Agent {
     const normalizedCwd = normalizeOptionalPath(params.cwd);
     const offset = parseSessionListCursor(params.cursor);
 
-    const [activeWorkspaces, archivedWorkspaces, workspaceActivity] = await Promise.all([
+    const [activeWorkspaces, archivedWorkspaces, workspaceActivityList] = await Promise.all([
       this.server.client.workspace.list({ archived: false }),
       this.server.client.workspace.list({ archived: true }),
       this.server.client.workspace.activity.list(),
     ]);
+    // null = backend activity read failure; session ordering degrades to metadata-only.
+    const workspaceActivity = workspaceActivityList ?? {};
 
     const allWorkspaces = dedupeWorkspacesById([...activeWorkspaces, ...archivedWorkspaces]);
     const filteredWorkspaces =
@@ -487,7 +497,7 @@ export class MuxAgent implements Agent {
         sessionManager: this.sessionManager,
         negotiatedCapabilities: this.negotiatedCapabilities,
         defaultAgentId: DEFAULT_AGENT_ID,
-        existingSessionAgentId: existingState?.agentId,
+        existingSessionState: existingState,
       }
     );
 
@@ -540,8 +550,6 @@ export class MuxAgent implements Agent {
       meta.forkName
     );
 
-    await this.persistAiSettings(forked.workspaceId, forked.agentId, forked.aiSettings);
-
     this.sessionStateById.set(forked.sessionId, {
       workspaceId: forked.workspaceId,
       runtimeMode: forked.runtimeMode,
@@ -587,8 +595,7 @@ export class MuxAgent implements Agent {
       options: {
         model: sessionState.aiSettings.model,
         thinkingLevel: sessionState.aiSettings.thinkingLevel,
-        // Per-workspace pro mode from workspace metadata; the send path
-        // re-gates per model/route so this is inert for unsupported models.
+        // The send path re-gates pro mode for the selected model and route.
         reasoningMode: sessionState.aiSettings.reasoningMode,
         agentId: sessionState.agentId,
       },
@@ -604,20 +611,26 @@ export class MuxAgent implements Agent {
 
     this.touchSession(sessionId);
     const workspaceId = this.sessionManager.getWorkspaceId(sessionId);
-    const interruptResult = await this.server.client.workspace.interruptStream({ workspaceId });
-
-    if (!interruptResult.success) {
-      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
-    }
+    const interruptResult = await this.server.client.workspace.interruptStream({
+      workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
 
     // Resolve any pending prompt immediately after a successful interrupt request.
     // Backend abort events can be dropped or synthesized without a messageId when no
     // active stream exists; waiting exclusively for terminal chat events can leave
-    // ACP prompt requests hanging indefinitely.
-    this.resolveTurn(sessionId, {
-      stopReason: "cancelled",
-      usage: this.latestUsageBySessionId.get(sessionId),
-    });
+    // ACP prompt requests hanging indefinitely. STOP_UNRECORDED_MESSAGE reports a stream
+    // that did stop (only its durable Stop records failed), so the prompt settles as
+    // cancelled before that failure is reported below.
+    if (interruptResult.success || interruptResult.error === STOP_UNRECORDED_MESSAGE) {
+      this.resolveTurn(sessionId, {
+        stopReason: "cancelled",
+        usage: this.latestUsageBySessionId.get(sessionId),
+      });
+    }
+    if (!interruptResult.success) {
+      throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
+    }
   }
 
   async setSessionConfigOption(
@@ -644,23 +657,20 @@ export class MuxAgent implements Agent {
       );
     }
 
-    const activeAgentId = this.sessionStateById.get(sessionId)?.agentId;
+    const sessionState = this.sessionStateById.get(sessionId);
     const configOptions = await handleSetConfigOption(
       this.server.client,
       workspaceId,
       params.configId,
       params.value,
       {
-        activeAgentId,
+        activeAgentId: sessionState?.agentId,
+        aiSettings: sessionState?.aiSettings,
         onAgentModeChanged: (agentId, aiSettings) => {
           this.updateSessionAgentState(sessionId, agentId, aiSettings);
         },
       }
     );
-
-    if (trimmedConfigId !== AGENT_MODE_CONFIG_ID) {
-      await this.refreshSessionState(sessionId);
-    }
 
     return { configOptions };
   }
@@ -852,11 +862,20 @@ export class MuxAgent implements Agent {
       }
 
       case "compact": {
-        const compactionPayload = this.buildCompactionPayload(
-          parsedCommand,
-          parsedPrompt,
-          sessionState
-        );
+        let compactionPayload: { message: string; options: SendMessageOptions };
+        try {
+          compactionPayload = await this.buildCompactionPayload(
+            parsedCommand,
+            parsedPrompt,
+            sessionState,
+            workspaceId
+          );
+        } catch (error) {
+          if (error instanceof InvalidExplicitAiSettingError) {
+            return this.respondToCommand(sessionId, error.message);
+          }
+          throw error;
+        }
 
         return this.sendWorkspaceMessageAndAwaitTurn({
           sessionId,
@@ -1004,11 +1023,12 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private buildCompactionPayload(
+  private async buildCompactionPayload(
     command: Extract<ParsedAcpSlashCommand, { kind: "compact" }>,
     parsedPrompt: ParsedPrompt,
-    sessionState: SessionState
-  ): { message: string; options: SendMessageOptions } {
+    sessionState: SessionState,
+    workspaceId: string
+  ): Promise<{ message: string; options: SendMessageOptions }> {
     const targetWords =
       command.maxOutputTokens != null
         ? Math.round(command.maxOutputTokens / WORDS_TO_TOKENS_RATIO)
@@ -1034,7 +1054,25 @@ export class MuxAgent implements Agent {
         }
       : undefined;
 
-    const compactionModel = command.model ?? sessionState.aiSettings.model;
+    // Unified resolution as agent "compact": the -m flag is an explicit
+    // override (invalid values throw instead of silently falling back), the
+    // workspace's compact bucket and configured compact defaults win over the
+    // live session settings (parent runtime), and a model override reclamps
+    // thinking against the compaction model.
+    const workspace = await this.server.client.workspace.getInfo({ workspaceId });
+    const compactBucket = workspace?.aiSettingsByAgent?.compact;
+    const resolved = await resolveAcpAgentAiSettings(this.server.client, "compact", workspaceId, {
+      explicit: { model: command.model ?? undefined },
+      targetWorkspaceSettings: compactBucket
+        ? targetWorkspaceBucketToLayer(compactBucket)
+        : undefined,
+      parentRuntime: {
+        model: sessionState.aiSettings.model,
+        thinkingLevel: sessionState.aiSettings.thinkingLevel,
+        reasoningMode: sessionState.aiSettings.reasoningMode,
+      },
+    });
+    const compactionModel = resolved.selected.model;
 
     const compactData: CompactionRequestData = {
       model: compactionModel,
@@ -1051,8 +1089,8 @@ export class MuxAgent implements Agent {
 
     const options: SendMessageOptions = {
       model: compactionModel,
-      thinkingLevel: sessionState.aiSettings.thinkingLevel,
-      reasoningMode: sessionState.aiSettings.reasoningMode,
+      thinkingLevel: resolved.effective.thinkingLevel,
+      reasoningMode: resolved.selected.reasoningMode,
       agentId: "compact",
       maxOutputTokens: command.maxOutputTokens,
       skipAiSettingsPersistence: true,
@@ -2104,7 +2142,9 @@ export class MuxAgent implements Agent {
     // selection lives in sessionStateById and must not be reverted by a
     // workspace.agentId value from the backend.
     const agentId = existing?.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
+    // Picker choices remain session-local until the next user message sends them.
     const aiSettings =
+      existing?.aiSettings ??
       workspace.aiSettingsByAgent?.[agentId] ??
       workspace.aiSettings ??
       (await resolveAgentAiSettings(this.server.client, agentId, workspaceId));
@@ -2118,36 +2158,6 @@ export class MuxAgent implements Agent {
 
     this.sessionStateById.set(sessionId, nextState);
     return nextState;
-  }
-
-  private async persistAiSettings(
-    workspaceId: string,
-    agentId: string,
-    aiSettings: ResolvedAiSettings
-  ): Promise<void> {
-    if (agentId === "plan" || agentId === "exec") {
-      const updateModeResult = await this.server.client.workspace.updateModeAISettings({
-        workspaceId,
-        mode: agentId,
-        aiSettings,
-      });
-
-      if (!updateModeResult.success) {
-        throw new Error(`workspace.updateModeAISettings failed: ${updateModeResult.error}`);
-      }
-
-      return;
-    }
-
-    const updateAgentResult = await this.server.client.workspace.updateAgentAISettings({
-      workspaceId,
-      agentId,
-      aiSettings,
-    });
-
-    if (!updateAgentResult.success) {
-      throw new Error(`workspace.updateAgentAISettings failed: ${updateAgentResult.error}`);
-    }
   }
 
   async waitForDisconnectCleanup(): Promise<void> {

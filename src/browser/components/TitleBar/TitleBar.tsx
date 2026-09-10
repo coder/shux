@@ -44,8 +44,11 @@ import {
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
-// Update check interval
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+// Tooltip CTAs mirror their triggers so pointer users can act on the copy directly.
+const TOOLTIP_CTA_CLASSNAME =
+  "text-muted hover:text-foreground cursor-pointer border-0 bg-transparent p-0 text-left underline underline-offset-2 transition-colors";
 
 interface VersionRecord {
   git?: unknown;
@@ -119,6 +122,18 @@ export function TitleBar(props: TitleBarProps) {
 
   const gitDescribe = getGitDescribe(VERSION satisfies unknown);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ type: "idle" });
+  const [versionTooltipOpen, setVersionTooltipOpen] = useState(false);
+  const [routeTooltipOpen, setRouteTooltipOpen] = useState(false);
+
+  const handleOpenAboutDialog = () => {
+    setVersionTooltipOpen(false);
+    openAboutDialog();
+  };
+
+  const handleOpenRouteSettings = () => {
+    setRouteTooltipOpen(false);
+    openSettings("providers", { expandProvider: activeRouteProvider });
+  };
 
   useEffect(() => {
     // Skip update checks in browser mode - app updates only apply to Electron
@@ -204,7 +219,7 @@ export function TitleBar(props: TitleBarProps) {
           leftInset > 0 ? "flex-col" : "items-center gap-2"
         )}
       >
-        <Tooltip>
+        <Tooltip open={versionTooltipOpen} onOpenChange={setVersionTooltipOpen}>
           <TooltipTrigger asChild>
             <button
               type="button"
@@ -215,7 +230,7 @@ export function TitleBar(props: TitleBarProps) {
                 "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity hover:opacity-70",
                 isDesktop && "titlebar-no-drag"
               )}
-              onClick={openAboutDialog}
+              onClick={handleOpenAboutDialog}
             >
               <div
                 className={cn(
@@ -232,16 +247,20 @@ export function TitleBar(props: TitleBarProps) {
               )}
             </button>
           </TooltipTrigger>
-          <TooltipContent align="start">Click for more details</TooltipContent>
+          <TooltipContent align="start">
+            <button type="button" className={TOOLTIP_CTA_CLASSNAME} onClick={handleOpenAboutDialog}>
+              Click for more details
+            </button>
+          </TooltipContent>
         </Tooltip>
       </div>
       <div className={cn("flex shrink-0 items-center gap-1.5", isDesktop && "titlebar-no-drag")}>
         {isNonDirectRoute && (
-          <Tooltip>
+          <Tooltip open={routeTooltipOpen} onOpenChange={setRouteTooltipOpen}>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                onClick={() => openSettings("providers", { expandProvider: activeRouteProvider })}
+                onClick={handleOpenRouteSettings}
                 onMouseEnter={() => {
                   if (isMuxGatewayRoute) {
                     void refreshMuxGatewayAccountStatus();
@@ -288,10 +307,16 @@ export function TitleBar(props: TitleBarProps) {
                   Requests for this model route via {activeRoute.displayName}.
                 </div>
               )}
-              <div className="text-muted border-separator-light mt-2 border-t pt-1.5 text-[10px]">
-                {isMuxGatewayRoute
-                  ? "Click to open gateway settings"
-                  : "Click to open provider settings"}
+              <div className="border-separator-light mt-2 border-t pt-1.5 text-[10px]">
+                <button
+                  type="button"
+                  className={TOOLTIP_CTA_CLASSNAME}
+                  onClick={handleOpenRouteSettings}
+                >
+                  {isMuxGatewayRoute
+                    ? "Click to open gateway settings"
+                    : "Click to open provider settings"}
+                </button>
               </div>
             </TooltipContent>
           </Tooltip>

@@ -1,3 +1,8 @@
+import type { z } from "zod";
+import type { DesktopViewerEventSchema } from "@/common/orpc/schemas/api";
+
+export type DesktopViewerEvent = z.infer<typeof DesktopViewerEventSchema>;
+
 /**
  * Shared types for PortableDesktop integration.
  * Used by backend services and (future) oRPC routes.
@@ -13,7 +18,13 @@ export type DesktopPrereqStatus =
 
 /** Capability check result for a workspace's desktop support. */
 export type DesktopCapability =
-  | { available: true; width: number; height: number; sessionId: string }
+  | {
+      available: true;
+      width: number;
+      height: number;
+      sessionId: string;
+      sharedDesktop?: { ownerWorkspaceId: string; ownerName: string };
+    }
   | {
       available: false;
       reason:

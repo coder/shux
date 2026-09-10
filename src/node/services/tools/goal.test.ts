@@ -1,6 +1,6 @@
+import * as path from "path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "fs/promises";
-import * as path from "path";
 import type { ToolExecutionOptions } from "ai";
 
 import type { Config } from "@/node/config";
@@ -598,7 +598,7 @@ describe("goal tools", () => {
       tool.execute!({ summary: "Implemented and verified." }, mockToolCallOptions)
     );
     const storedRaw = await fs.readFile(
-      path.join(config.getSessionDir(workspaceId), "goal.json"),
+      path.join(config.sessionsDir, workspaceId, "goal.json"),
       "utf-8"
     );
     const storedGoal = JSON.parse(storedRaw) as GoalRecordV1;

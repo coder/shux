@@ -1,16 +1,22 @@
 {
   "projectId": "6135a989-4a89-4567-8d48-531d88e66152",
   "shape": "storybook",
-  "pkg": "mux",
-  "globalName": "Mux",
+  "pkg": "xum",
+  "globalName": "Xum",
   "storybookConfigDir": ".storybook",
   "storybookStatic": ".design-sync/sb-reference",
   "entry": "./.design-sync/ds-barrel.ts",
-  "extraEntries": ["./.design-sync/ds-barrel.ts"],
+  "extraEntries": [
+    "./.design-sync/ds-barrel.ts"
+  ],
   "tsconfig": "./.design-sync/tsconfig.ds.json",
   "storyImports": {
-    "shim": ["/src/browser/"],
-    "bundle": ["/src/browser/stories/"]
+    "shim": [
+      "/src/browser/"
+    ],
+    "bundle": [
+      "/src/browser/stories/"
+    ]
   },
   "provider": {
     "component": "ThemeProvider",
@@ -81,7 +87,9 @@
   "overrides": {
     "StreamingBarrierView": {
       "cardMode": "column",
-      "skip": ["app-chat-barriers-streaming--loading-tools-diagnostic"]
+      "skip": [
+        "app-chat-barriers-streaming--loading-tools-diagnostic"
+      ]
     },
     "DebugLlmRequestModal": {
       "cardMode": "single",
@@ -91,7 +99,9 @@
     "ProjectCreateModal": {
       "cardMode": "single",
       "primaryStory": "LocalFolder",
-      "skip": ["components-projectcreatemodal--clone-repo"]
+      "skip": [
+        "components-projectcreatemodal--clone-repo"
+      ]
     },
     "CoderWorkspaceForm": {
       "skip": [
@@ -108,19 +118,29 @@
       ]
     },
     "CompactingMessageContent": {
-      "skip": ["app-chat-messages-compaction--streaming-compaction-with-configure-hint"]
+      "skip": [
+        "app-chat-messages-compaction--streaming-compaction-with-configure-hint"
+      ]
     },
     "ContextUsageIndicatorButton": {
-      "skip": ["app-chat-components-contextusageindicator--context-meter-hover-summary-tooltip"]
+      "skip": [
+        "app-chat-components-contextusageindicator--context-meter-hover-summary-tooltip"
+      ]
     },
     "GoalTab": {
-      "skip": ["features-rightsidebar-goaltab--complete-with-board"]
+      "skip": [
+        "features-rightsidebar-goaltab--complete-with-board"
+      ]
     },
     "HookOutputDisplay": {
-      "skip": ["app-chat-tools-hookoutput--tool-hooks-output-expanded"]
+      "skip": [
+        "app-chat-tools-hookoutput--tool-hooks-output-expanded"
+      ]
     },
     "MemorySection": {
-      "skip": ["settings-sections-memorysection--empty"]
+      "skip": [
+        "settings-sections-memorysection--empty"
+      ]
     },
     "PRLinkBadge": {
       "skip": [
@@ -129,7 +149,9 @@
       ]
     },
     "TitleBar": {
-      "skip": ["components-titlebar--browser-mode"]
+      "skip": [
+        "components-titlebar--browser-mode"
+      ]
     },
     "MCPSettingsSection": {
       "skip": [
@@ -199,7 +221,10 @@
       "skip": []
     },
     "Input": {
-      "skip": ["app-chat-input--voice-input-no-api-key", "app-chat-input--editing-message"]
+      "skip": [
+        "app-chat-input--voice-input-no-api-key",
+        "app-chat-input--editing-message"
+      ]
     },
     "Checkbox": {
       "skip": []
@@ -208,7 +233,9 @@
       "skip": []
     },
     "Select": {
-      "skip": ["components-select--open"]
+      "skip": [
+        "components-select--open"
+      ]
     },
     "Dialog": {
       "cardMode": "single",

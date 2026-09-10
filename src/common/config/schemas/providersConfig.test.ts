@@ -27,13 +27,61 @@ describe("ProvidersConfigSchema", () => {
     expect(ProvidersConfigSchema.safeParse(valid).success).toBe(true);
   });
 
-  it("allows unknown provider keys with custom OpenAI-compatible metadata", () => {
+  it("allows every custom provider API format", () => {
+    for (const providerType of [
+      "openai-compatible",
+      "openai-responses",
+      "anthropic-messages",
+    ] as const) {
+      const parsed = ProvidersConfigSchema.safeParse({
+        "custom-provider": {
+          apiKey: "key",
+          baseUrl: "http://localhost:8080",
+          providerType,
+          displayName: "Custom Provider",
+        },
+      });
+
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data["custom-provider"]?.providerType).toBe(providerType);
+        expect(parsed.data["custom-provider"]?.displayName).toBe("Custom Provider");
+      }
+    }
+  });
+
+  it("rejects unknown custom provider API formats", () => {
+    expect(
+      ProvidersConfigSchema.safeParse({
+        "custom-provider": { providerType: "unknown-format" },
+      }).success
+    ).toBe(false);
+  });
+
+  it("rejects empty custom provider display names", () => {
+    const invalid = {
+      "custom-provider": { providerType: "openai-compatible", displayName: "" },
+    };
+
+    expect(ProvidersConfigSchema.safeParse(invalid).success).toBe(false);
+  });
+
+  it("round-trips coder deploymentUrl, OAuth blob, models, and unknown fields", () => {
     const valid = {
-      "custom-provider": {
-        apiKey: "key",
-        baseUrl: "http://localhost:8080",
-        providerType: "openai-compatible",
-        displayName: "Custom Provider",
+      coder: {
+        deploymentUrl: "https://coder.example.com",
+        coderOauth: {
+          type: "oauth",
+          access: "at",
+          refresh: "rt",
+          expires: 1730000000000,
+          clientId: "c",
+          clientSecret: "s",
+        },
+        models: ["anthropic/claude-sonnet-4-5", { id: "openai/gpt-5.2" }],
+        // Unknown fields written by future versions must survive parsing
+        // (upgrade↔downgrade safety).
+        futureField: "keep-me",
       },
     };
 
@@ -41,14 +89,15 @@ describe("ProvidersConfigSchema", () => {
 
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data["custom-provider"]?.providerType).toBe("openai-compatible");
-      expect(parsed.data["custom-provider"]?.displayName).toBe("Custom Provider");
+      expect(parsed.data.coder?.deploymentUrl).toBe("https://coder.example.com");
+      expect((parsed.data.coder?.coderOauth as { access?: string })?.access).toBe("at");
+      expect((parsed.data.coder as { futureField?: string })?.futureField).toBe("keep-me");
     }
   });
 
-  it("rejects empty custom provider display names", () => {
+  it("rejects non-string coder deploymentUrl", () => {
     const invalid = {
-      "custom-provider": { providerType: "openai-compatible", displayName: "" },
+      coder: { deploymentUrl: 42 },
     };
 
     expect(ProvidersConfigSchema.safeParse(invalid).success).toBe(false);

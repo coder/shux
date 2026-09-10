@@ -45,6 +45,7 @@ export interface BuildMockStreamEventsOptions {
   messageId: string;
   model?: string;
   mode?: "plan" | "exec" | "compact";
+  agentId?: string;
   thinkingLevel?: MockStreamStartEvent["thinkingLevel"];
 
   /** Chunk size for stream-delta events. */
@@ -77,6 +78,7 @@ export function buildMockStreamEventsFromReply(
     messageId: options.messageId,
     model,
     ...(mode && { mode }),
+    ...(options.agentId && { agentId: options.agentId }),
     ...(options.thinkingLevel && { thinkingLevel: options.thinkingLevel }),
   });
 

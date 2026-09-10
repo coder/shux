@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createServer } from "http";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -11,14 +11,25 @@ import {
   probeServerForBearerChallenge,
   resolveOAuthScope,
 } from "./mcpOauthService";
-import type { MCPOAuthClientInformation, MCPOAuthTokens } from "@/common/types/mcpOauth";
+import type { OAuthDiscoveryState } from "@modelcontextprotocol/client";
+import { Ok } from "@/common/types/result";
+import type {
+  MCPOAuthClientInformation,
+  MCPOAuthStoredCredentials,
+  MCPOAuthTokens,
+} from "@/common/types/mcpOauth";
 
-function getStoreFilePath(muxHome: string): string {
-  return path.join(muxHome, "mcp-oauth.json");
+interface StoreSnapshot {
+  version: 2;
+  entries: Record<string, MCPOAuthStoredCredentials>;
+}
+
+function getStoreFilePath(xumHome: string): string {
+  return path.join(xumHome, "mcp-oauth.json");
 }
 
 describe("McpOauthService store", () => {
-  let muxHome: string;
+  let xumHome: string;
   let projectPath: string;
   let config: Config;
   let mcpConfigService: MCPConfigService;
@@ -26,12 +37,23 @@ describe("McpOauthService store", () => {
 
   const serverName = "test-server";
   const serverUrl = "https://example.com";
+  const authorizationServerUrl = "https://auth.example.com/";
+  const tokenEndpoint = "https://auth.example.com/token";
+  const discoveryState: OAuthDiscoveryState = {
+    authorizationServerUrl,
+    authorizationServerMetadata: {
+      issuer: authorizationServerUrl,
+      authorization_endpoint: "https://auth.example.com/authorize",
+      token_endpoint: tokenEndpoint,
+      response_types_supported: ["code"],
+    },
+  };
 
   beforeEach(async () => {
-    muxHome = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-home-"));
+    xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-home-"));
     projectPath = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-project-"));
 
-    config = new Config(muxHome);
+    config = new Config(xumHome);
     mcpConfigService = new MCPConfigService(config);
     service = new McpOauthService(config, mcpConfigService);
 
@@ -44,17 +66,38 @@ describe("McpOauthService store", () => {
 
   afterEach(async () => {
     await service.dispose();
-    await fs.rm(muxHome, { recursive: true, force: true });
+    await fs.rm(xumHome, { recursive: true, force: true });
     await fs.rm(projectPath, { recursive: true, force: true });
   });
 
-  async function readStoreFile(): Promise<unknown> {
-    const raw = await fs.readFile(getStoreFilePath(muxHome), "utf-8");
-    return JSON.parse(raw) as unknown;
+  async function readStoreFile(): Promise<StoreSnapshot> {
+    const raw = await fs.readFile(getStoreFilePath(xumHome), "utf-8");
+    return JSON.parse(raw) as StoreSnapshot;
+  }
+
+  async function seedStoredCredentials(input: {
+    clientInformation: MCPOAuthClientInformation;
+    tokens: MCPOAuthTokens;
+  }): Promise<void> {
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          "https://example.com/": {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: input.clientInformation,
+            tokens: input.tokens,
+          },
+        },
+      }),
+      "utf-8"
+    );
   }
 
   test("reading corrupt JSON store self-heals to empty", async () => {
-    await fs.writeFile(getStoreFilePath(muxHome), "{ definitely not valid json", "utf-8");
+    await fs.writeFile(getStoreFilePath(xumHome), "{ definitely not valid json", "utf-8");
 
     const status = await service.getAuthStatus({ serverUrl });
     expect(status).toEqual({
@@ -120,7 +163,7 @@ describe("McpOauthService store", () => {
         },
       };
 
-      await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(v1Store), "utf-8");
+      await fs.writeFile(getStoreFilePath(xumHome), JSON.stringify(v1Store), "utf-8");
 
       // Trigger store load + migration.
       await service.getAuthStatus({ serverUrl });
@@ -177,7 +220,7 @@ describe("McpOauthService store", () => {
         },
       },
     };
-    await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(populatedStore), "utf-8");
+    await fs.writeFile(getStoreFilePath(xumHome), JSON.stringify(populatedStore), "utf-8");
 
     expect(
       await service.hasAuthTokens({
@@ -213,7 +256,7 @@ describe("McpOauthService store", () => {
   // during store parsing made auth() invalidate the tokens and demand
   // interactive re-login after every app restart. The official SDK v2 ignores
   // these fields (it stamps `issuer` instead), but the store must keep
-  // round-tripping them so downgrading Mux does not break token refresh.
+  // round-tripping them so downgrading Xum does not break token refresh.
   test("authorization server binding survives store round-trip", async () => {
     const populatedStore = {
       version: 2,
@@ -236,13 +279,13 @@ describe("McpOauthService store", () => {
         },
       },
     };
-    await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(populatedStore), "utf-8");
+    await fs.writeFile(getStoreFilePath(xumHome), JSON.stringify(populatedStore), "utf-8");
 
     const provider = await service.getAuthProviderForServer({ serverUrl });
     expect(provider).toBeDefined();
 
     // The SDK types no longer carry the legacy binding fields; read them via
-    // Mux's storage type, which is what the provider actually returns.
+    // Xum's storage type, which is what the provider actually returns.
     const tokens = (await provider!.tokens()) as MCPOAuthTokens | undefined;
     expect(tokens?.refresh_token).toBe("refresh-token");
     expect(tokens?.authorization_server).toBe("https://auth.example.com/");
@@ -254,6 +297,138 @@ describe("McpOauthService store", () => {
     expect(clientInformation?.authorization_server).toBe("https://auth.example.com/");
     expect(clientInformation?.token_endpoint).toBe("https://auth.example.com/token");
   });
+
+  test("saveTokens stamps the legacy binding from discovery state", async () => {
+    await seedStoredCredentials({
+      clientInformation: { client_id: "client-id", issuer: authorizationServerUrl },
+      tokens: {
+        access_token: "access-token",
+        token_type: "Bearer",
+        refresh_token: "refresh-token",
+        issuer: authorizationServerUrl,
+      },
+    });
+
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(provider).toBeDefined();
+
+    await provider!.saveDiscoveryState?.(discoveryState);
+    await provider!.saveTokens({
+      access_token: "new-access-token",
+      token_type: "Bearer",
+      refresh_token: "new-refresh-token",
+      issuer: authorizationServerUrl,
+    });
+
+    const stored = (await readStoreFile()).entries["https://example.com/"];
+    expect(stored.tokens).toEqual({
+      access_token: "new-access-token",
+      token_type: "Bearer",
+      refresh_token: "new-refresh-token",
+      issuer: authorizationServerUrl,
+      authorization_server: authorizationServerUrl,
+      token_endpoint: tokenEndpoint,
+    });
+  });
+
+  test("saveTokens preserves the legacy binding without discovery state", async () => {
+    await seedStoredCredentials({
+      clientInformation: { client_id: "client-id" },
+      tokens: {
+        access_token: "access-token",
+        token_type: "Bearer",
+        refresh_token: "refresh-token",
+        authorization_server: authorizationServerUrl,
+        token_endpoint: tokenEndpoint,
+      },
+    });
+
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(provider).toBeDefined();
+
+    await provider!.saveTokens({
+      access_token: "new-access-token",
+      token_type: "Bearer",
+      refresh_token: "new-refresh-token",
+      issuer: authorizationServerUrl,
+    });
+
+    const stored = (await readStoreFile()).entries["https://example.com/"];
+    expect(stored.tokens).toEqual({
+      access_token: "new-access-token",
+      token_type: "Bearer",
+      refresh_token: "new-refresh-token",
+      issuer: authorizationServerUrl,
+      authorization_server: authorizationServerUrl,
+      token_endpoint: tokenEndpoint,
+    });
+  });
+
+  test("saveClientInformation stamps the legacy binding from discovery state", async () => {
+    await seedStoredCredentials({
+      clientInformation: { client_id: "client-id", issuer: authorizationServerUrl },
+      tokens: {
+        access_token: "access-token",
+        token_type: "Bearer",
+        refresh_token: "refresh-token",
+        issuer: authorizationServerUrl,
+      },
+    });
+
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(provider).toBeDefined();
+
+    await provider!.saveDiscoveryState?.(discoveryState);
+    await provider!.saveClientInformation?.({ client_id: "new-client-id" });
+
+    const stored = (await readStoreFile()).entries["https://example.com/"];
+    expect(stored.clientInformation).toEqual({
+      client_id: "new-client-id",
+      authorization_server: authorizationServerUrl,
+      token_endpoint: tokenEndpoint,
+    });
+  });
+
+  test.each([true, false])(
+    "partial discovery preserves only an existing complete binding (existing: %s)",
+    async (hasExistingBinding) => {
+      const existingBinding = hasExistingBinding
+        ? {
+            authorization_server: authorizationServerUrl,
+            token_endpoint: tokenEndpoint,
+          }
+        : {};
+      await seedStoredCredentials({
+        clientInformation: { client_id: "client-id" },
+        tokens: {
+          access_token: "access-token",
+          token_type: "Bearer",
+          refresh_token: "refresh-token",
+          ...existingBinding,
+        },
+      });
+
+      const provider = await service.getAuthProviderForServer({ serverUrl });
+      expect(provider).toBeDefined();
+
+      await provider!.saveDiscoveryState?.({ authorizationServerUrl });
+      await provider!.saveTokens({
+        access_token: "new-access-token",
+        token_type: "Bearer",
+        refresh_token: "new-refresh-token",
+        issuer: authorizationServerUrl,
+      });
+
+      const stored = (await readStoreFile()).entries["https://example.com/"];
+      expect(stored.tokens).toEqual({
+        access_token: "new-access-token",
+        token_type: "Bearer",
+        refresh_token: "new-refresh-token",
+        issuer: authorizationServerUrl,
+        ...existingBinding,
+      });
+    }
+  );
 
   test.each([
     // Corrupted: not a parseable URL.
@@ -283,7 +458,7 @@ describe("McpOauthService store", () => {
         },
       },
     };
-    await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(populatedStore), "utf-8");
+    await fs.writeFile(getStoreFilePath(xumHome), JSON.stringify(populatedStore), "utf-8");
 
     const provider = await service.getAuthProviderForServer({ serverUrl });
     expect(provider).toBeDefined();
@@ -426,26 +601,49 @@ describe("probeServerForBearerChallenge", () => {
   });
 });
 
-describe("McpOauthService.startDesktopFlow", () => {
-  let muxHome: string;
+describe("McpOauthService OAuth flows", () => {
+  let xumHome: string;
   let projectPath: string;
   let config: Config;
   let mcpConfigService: MCPConfigService;
   let service: McpOauthService;
 
   beforeEach(async () => {
-    muxHome = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-flow-home-"));
+    xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-flow-home-"));
     projectPath = await fs.mkdtemp(path.join(os.tmpdir(), "mcp-oauth-flow-project-"));
 
-    config = new Config(muxHome);
+    config = new Config(xumHome);
     mcpConfigService = new MCPConfigService(config);
     service = new McpOauthService(config, mcpConfigService);
   });
 
   afterEach(async () => {
     await service.dispose();
-    await fs.rm(muxHome, { recursive: true, force: true });
+    await fs.rm(xumHome, { recursive: true, force: true });
     await fs.rm(projectPath, { recursive: true, force: true });
+  });
+
+  test("API helpers default global scope and derive callback origins", async () => {
+    const flow = { flowId: "id", authorizeUrl: "https://auth", redirectUri: "https://callback" };
+    const startServerFlow = spyOn(service, "startServerFlow").mockResolvedValue(Ok(flow));
+
+    await service.startServerFlowForApi(
+      { serverName: "server" },
+      { origin: "https://app.example.com/settings" }
+    );
+    expect(startServerFlow).toHaveBeenCalledWith({
+      projectPath: xumHome,
+      serverName: "server",
+      redirectUri: "https://app.example.com/auth/mcp-oauth/callback",
+    });
+
+    await service.startServerFlowForApi(
+      { projectPath, serverName: "server" },
+      { "x-forwarded-host": "proxy.example.com", "x-forwarded-proto": "https" }
+    );
+    expect(startServerFlow).toHaveBeenLastCalledWith(
+      expect.objectContaining({ redirectUri: "https://proxy.example.com/auth/mcp-oauth/callback" })
+    );
   });
 
   test("generates an authorizeUrl with PKCE S256 + RFC 8707 resource", async () => {
@@ -548,6 +746,141 @@ describe("McpOauthService.startDesktopFlow", () => {
       await service.cancelDesktopFlow(startResult.data.flowId);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("reuses authorization server discovery when exchanging the callback code", async () => {
+    let authorizationServerUrl = "";
+    let resourceServerUrl = "";
+    let resourceMetadataUrl = "";
+    let tokenRequest: URLSearchParams | undefined;
+
+    const authorizationServer = createServer((req, res) => {
+      void (async () => {
+        const pathname = (req.url ?? "/").split("?")[0];
+
+        if (pathname === "/.well-known/oauth-authorization-server") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              issuer: authorizationServerUrl,
+              authorization_endpoint: `${authorizationServerUrl}/authorize`,
+              token_endpoint: `${authorizationServerUrl}/token`,
+              registration_endpoint: `${authorizationServerUrl}/register`,
+              response_types_supported: ["code"],
+              code_challenge_methods_supported: ["S256"],
+            })
+          );
+          return;
+        }
+
+        if (pathname === "/register") {
+          let raw = "";
+          for await (const chunk of req) {
+            raw += Buffer.from(chunk as Uint8Array).toString("utf-8");
+          }
+
+          const clientMetadata = JSON.parse(raw) as Record<string, unknown>;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ...clientMetadata, client_id: "test-client-id" }));
+          return;
+        }
+
+        if (pathname === "/token") {
+          let raw = "";
+          for await (const chunk of req) {
+            raw += Buffer.from(chunk as Uint8Array).toString("utf-8");
+          }
+          tokenRequest = new URLSearchParams(raw);
+
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              access_token: "test-access-token",
+              token_type: "Bearer",
+              refresh_token: "test-refresh-token",
+            })
+          );
+          return;
+        }
+
+        res.statusCode = 404;
+        res.end("Not found");
+      })();
+    });
+
+    const resourceServer = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+
+      if (pathname === "/oauth-resource") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            resource: resourceServerUrl,
+            authorization_servers: [authorizationServerUrl],
+          })
+        );
+        return;
+      }
+
+      res.statusCode = 401;
+      res.setHeader(
+        "WWW-Authenticate",
+        `Bearer scope="mcp.read" resource_metadata="${resourceMetadataUrl}"`
+      );
+      res.end("Unauthorized");
+    });
+
+    await new Promise<void>((resolve) => authorizationServer.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => resourceServer.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const authorizationAddress = authorizationServer.address();
+      const resourceAddress = resourceServer.address();
+      if (
+        !authorizationAddress ||
+        typeof authorizationAddress === "string" ||
+        !resourceAddress ||
+        typeof resourceAddress === "string"
+      ) {
+        throw new Error("Failed to bind OAuth test servers");
+      }
+
+      authorizationServerUrl = `http://127.0.0.1:${authorizationAddress.port}`;
+      resourceServerUrl = `http://127.0.0.1:${resourceAddress.port}/mcp`;
+      resourceMetadataUrl = `http://127.0.0.1:${resourceAddress.port}/oauth-resource`;
+
+      const serverName = "oauth-server-separate-issuer";
+      const addResult = await mcpConfigService.addServer(serverName, {
+        transport: "http",
+        url: resourceServerUrl,
+      });
+      expect(addResult).toEqual({ success: true, data: undefined });
+
+      const startResult = await service.startServerFlow({
+        projectPath,
+        serverName,
+        redirectUri: "https://xum.example/callback",
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) {
+        throw new Error(startResult.error);
+      }
+
+      const callbackResult = await service.handleServerCallbackAndExchange({
+        state: startResult.data.flowId,
+        code: "test-authorization-code",
+        error: null,
+      });
+
+      expect(callbackResult).toEqual({ success: true, data: undefined });
+      expect(tokenRequest?.get("code")).toBe("test-authorization-code");
+      expect(tokenRequest?.get("code_verifier")).toBeTruthy();
+    } finally {
+      await Promise.all([
+        new Promise<void>((resolve) => authorizationServer.close(() => resolve())),
+        new Promise<void>((resolve) => resourceServer.close(() => resolve())),
+      ]);
     }
   });
 
@@ -659,7 +992,7 @@ describe("McpOauthService.startDesktopFlow", () => {
       expect(seenPaths).toContain("/mcp/.well-known/oauth-protected-resource");
 
       // Stored credentials should continue to use a normalized URL for keying.
-      const storeRaw = await fs.readFile(getStoreFilePath(muxHome), "utf-8");
+      const storeRaw = await fs.readFile(getStoreFilePath(xumHome), "utf-8");
       const serverUrlKey = baseUrl.slice(0, -1);
       expect(JSON.parse(storeRaw)).toMatchObject({
         version: 2,

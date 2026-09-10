@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
+import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import {
@@ -36,9 +37,9 @@ function createRemoteRuntimeConfig(tempDirPath: string) {
   const baseConfig = createTestToolConfig(tempDirPath, {
     workspaceId: "regular-workspace",
     runtime,
-    muxScope: {
+    xumScope: {
       type: "project",
-      muxHome: tempDirPath,
+      xumHome: tempDirPath,
       projectRoot: tempDirPath,
       projectStorageAuthority: "runtime",
     },
@@ -52,6 +53,131 @@ function createRemoteRuntimeConfig(tempDirPath: string) {
 }
 
 describe("agent_skill_read_file", () => {
+  it("enforces managed skill imports on referenced-file reads and preserves same-name source fallback", async () => {
+    using tmp = new TestTempDir("plugin-read-file-imports");
+    const container = path.join(tmp.path, "plugins");
+    for (const [plugin, names] of [
+      ["a-managed", ["allowed", "blocked", "shared"]],
+      ["b-unmanaged", ["shared"]],
+    ] as const) {
+      const root = path.join(container, plugin);
+      await fs.mkdir(root, { recursive: true });
+      await fs.writeFile(
+        path.join(root, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: plugin,
+        })
+      );
+      for (const name of names) {
+        const dir = path.join(root, "skills", name);
+        await fs.mkdir(dir, { recursive: true });
+        await fs.writeFile(
+          path.join(dir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: fixture\n---\nBody\n`
+        );
+        await fs.writeFile(path.join(dir, "data.txt"), plugin);
+      }
+    }
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+        ],
+      })
+    );
+    const tool = createAgentSkillReadFileTool({
+      ...createTestToolConfig(tmp.path, {
+        workspaceId: GLOBAL_WORKSPACE_ID,
+        xumScope: { type: "global", xumHome: tmp.path },
+      }),
+      experiments: { agentPlugins: true },
+    });
+    expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
+      success: false,
+    });
+    expect(
+      await executeReadFile(tool, { name: "allowed", filePath: "../blocked/data.txt" })
+    ).toMatchObject({ success: false });
+    expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\ta-managed",
+    });
+    expect(await executeReadFile(tool, { name: "shared", filePath: "data.txt" })).toMatchObject({
+      success: true,
+      content: "1\tb-unmanaged",
+    });
+  });
+
+  it.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "overlapping %s project roots enforce managed sibling-file read imports (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
+      using home = new TestTempDir("plugin-read-file-overlap");
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
+      const pluginRoot = path.join(xumHome, "plugins", "managed");
+      await fs.mkdir(pluginRoot, { recursive: true });
+      await fs.writeFile(
+        path.join(pluginRoot, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "managed",
+        })
+      );
+      for (const name of ["allowed", "blocked"]) {
+        const skillDir = path.join(pluginRoot, "skills", name);
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          `---\nname: ${name}\ndescription: fixture\n---\nBody\n`
+        );
+        await fs.writeFile(path.join(skillDir, "data.txt"), name);
+      }
+      const registryPath = path.join(xumHome, "plugins.json");
+      await fs.writeFile(
+        registryPath,
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+          ],
+        })
+      );
+      const tool = createAgentSkillReadFileTool({
+        ...createTestToolConfig(home.path, {
+          xumScope: {
+            type: "project",
+            xumHome,
+            projectRoot: home.path,
+            projectStorageAuthority: "host-local",
+          },
+        }),
+        experiments: { agentPlugins: true },
+      });
+      expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+      expect(
+        await executeReadFile(tool, { name: "allowed", filePath: "../blocked/data.txt" })
+      ).toMatchObject({ success: false });
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: true,
+        content: "1\tallowed",
+      });
+      await fs.writeFile(registryPath, "{");
+      expect(await executeReadFile(tool, { name: "allowed", filePath: "data.txt" })).toMatchObject({
+        success: false,
+      });
+    }
+  );
+
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
     const baseConfig = createTestToolConfig(tempDir.path, {
@@ -61,14 +187,14 @@ describe("agent_skill_read_file", () => {
     const tool = createAgentSkillReadFileTool(baseConfig);
 
     const result = await executeReadFile(tool, {
-      name: "mux-docs",
+      name: "xum-docs",
       filePath: "SKILL.md",
       offset: 1,
       limit: 25,
     });
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.content).toMatch(/name:\s*mux-docs/i);
+      expect(result.content).toMatch(/name:\s*xum-docs/i);
     }
   });
 
@@ -137,9 +263,9 @@ describe("agent_skill_read_file", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot: tempDir.path,
         projectStorageAuthority: "host-local",
       },
@@ -183,9 +309,9 @@ describe("agent_skill_read_file", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       },
@@ -201,21 +327,21 @@ describe("agent_skill_read_file", () => {
     }
   });
 
-  it("reads project skill file via muxScope when cwd differs (remote-like split root)", async () => {
+  it("reads project skill file via xumScope when cwd differs (remote-like split root)", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-project-split-root");
     const hostProjectRoot = tempDir.path;
     const remoteStyleCwd = "/remote/workspace/path";
 
     await writeProjectSkill(hostProjectRoot, "my-skill");
-    const skillDir = path.join(hostProjectRoot, ".mux", "skills", "my-skill");
+    const skillDir = path.join(hostProjectRoot, ".xum", "skills", "my-skill");
     await fs.mkdir(path.join(skillDir, "references"), { recursive: true });
     await fs.writeFile(path.join(skillDir, "references", "data.txt"), "hello from host", "utf-8");
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       workspaceId: "regular-workspace",
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot: hostProjectRoot,
         projectStorageAuthority: "host-local",
       },
@@ -239,7 +365,7 @@ describe("agent_skill_read_file", () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-split-root-runtime-preserved");
     const hostProjectRoot = tempDir.path;
 
-    const remoteSkillDir = path.join(tempDir.path, ".mux", "skills", "test-skill");
+    const remoteSkillDir = path.join(tempDir.path, ".xum", "skills", "test-skill");
     await fs.mkdir(remoteSkillDir, { recursive: true });
     await fs.writeFile(
       path.join(remoteSkillDir, "SKILL.md"),
@@ -252,9 +378,9 @@ describe("agent_skill_read_file", () => {
 
     const baseConfig = createTestToolConfig(tempDir.path, {
       runtime: remoteRuntime,
-      muxScope: {
+      xumScope: {
         type: "project",
-        muxHome: path.join(tempDir.path, "mux-home"),
+        xumHome: path.join(tempDir.path, "mux-home"),
         projectRoot: hostProjectRoot,
         projectStorageAuthority: "runtime",
       },
@@ -297,9 +423,9 @@ describe("agent_skill_read_file", () => {
       const remoteRuntime = new TrueRemotePathMappedRuntime(tempDir.path, REMOTE_WORKSPACE_ROOT);
       const baseConfig = createTestToolConfig(tempDir.path, {
         runtime: remoteRuntime,
-        muxScope: {
+        xumScope: {
           type: "project",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
           projectRoot: tempDir.path,
           projectStorageAuthority: "runtime",
         },
@@ -340,7 +466,7 @@ describe("agent_skill_read_file", () => {
       using tempDir = new TestTempDir("test-agent-skill-read-file-remote-runtime-read");
       await writeProjectSkill(tempDir.path, "remote-skill");
 
-      const skillDir = path.join(tempDir.path, ".mux", "skills", "remote-skill");
+      const skillDir = path.join(tempDir.path, ".xum", "skills", "remote-skill");
       await fs.writeFile(path.join(skillDir, "extra.txt"), "extra content", "utf-8");
 
       const baseConfig = createRemoteRuntimeConfig(tempDir.path);
@@ -410,7 +536,7 @@ describe("agent_skill_read_file", () => {
       using tempDir = new TestTempDir("test-agent-skill-read-file-remote-runtime-symlinked-file");
       await writeProjectSkill(tempDir.path, "real-skill");
 
-      const skillDir = path.join(tempDir.path, ".mux", "skills", "real-skill");
+      const skillDir = path.join(tempDir.path, ".xum", "skills", "real-skill");
       const externalFile = path.join(tempDir.path, "external-secret.txt");
       await fs.writeFile(externalFile, "outside skill", "utf-8");
       await fs.symlink(externalFile, path.join(skillDir, "link.txt"), "file");
@@ -470,7 +596,7 @@ describe("agent_skill_read_file", () => {
       );
       await writeProjectSkill(tempDir.path, "symlink-ancestor");
 
-      const skillDir = path.join(tempDir.path, ".mux", "skills", "symlink-ancestor");
+      const skillDir = path.join(tempDir.path, ".xum", "skills", "symlink-ancestor");
       const externalDir = path.join(tempDir.path, "external-linked-root");
       await fs.mkdir(externalDir, { recursive: true });
       await fs.symlink(
@@ -526,9 +652,9 @@ describe("agent_skill_read_file", () => {
 
       const baseConfig = createTestToolConfig(tempDir.path, {
         workspaceId: "regular-workspace",
-        muxScope: {
+        xumScope: {
           type: "project",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
           projectRoot: tempDir.path,
           projectStorageAuthority: "host-local",
         },
@@ -556,16 +682,16 @@ describe("agent_skill_read_file", () => {
       using tempDir = new TestTempDir("test-agent-skill-read-file-symlinked-file");
       await writeProjectSkill(tempDir.path, "real-skill");
 
-      const skillDir = path.join(tempDir.path, ".mux", "skills", "real-skill");
+      const skillDir = path.join(tempDir.path, ".xum", "skills", "real-skill");
       const externalFile = path.join(tempDir.path, "external-secret.txt");
       await fs.writeFile(externalFile, "outside skill", "utf-8");
       await fs.symlink(externalFile, path.join(skillDir, "link.txt"), "file");
 
       const baseConfig = createTestToolConfig(tempDir.path, {
         workspaceId: "regular-workspace",
-        muxScope: {
+        xumScope: {
           type: "project",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
           projectRoot: tempDir.path,
           projectStorageAuthority: "host-local",
         },

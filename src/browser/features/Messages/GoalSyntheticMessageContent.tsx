@@ -42,7 +42,7 @@ function extractFirstParagraph(content: string): string | null {
  * facing goal event.
  *
  * Aesthetic rationale (this is the card the user sees in the
- * transcript when Mux auto-continues an active goal or wraps up at a
+ * transcript when Xum auto-continues an active goal or wraps up at a
  * budget limit):
  *
  *  • The card renders INSIDE the user-message bubble — the parent
@@ -67,12 +67,12 @@ function extractFirstParagraph(content: string): string | null {
 export function GoalSyntheticMessageContent(props: GoalSyntheticMessageContentProps): ReactElement {
   const objective = extractObjective(props.content);
   let title = "Continuing active goal";
-  let description = "Mux is taking the next step automatically.";
+  let description = "Xum is taking the next step automatically.";
   let Icon: typeof Target = Target;
 
   if (props.kind === "budget-limit") {
     title = "Goal limit reached";
-    description = extractFirstParagraph(props.content) ?? "Mux is wrapping up the current goal.";
+    description = extractFirstParagraph(props.content) ?? "Xum is wrapping up the current goal.";
     Icon = CircleStop;
   }
 

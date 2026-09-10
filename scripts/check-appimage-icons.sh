@@ -66,20 +66,20 @@ else
   ERRORS=$((ERRORS + 1))
 fi
 
-# Check .desktop file has Icon=mux
+# Check .desktop file has canonical Icon=xum
 shopt -s nullglob
 desktop_files=("$ROOT_DIR"/*.desktop)
 shopt -u nullglob
 if ((${#desktop_files[@]} > 0)); then
   desktop_file="${desktop_files[0]}"
-  if grep -qx 'Icon=mux' "$desktop_file"; then
-    echo "✓ Desktop file has Icon=mux"
+  if grep -qx 'Icon=xum' "$desktop_file"; then
+    echo "✓ Desktop file has Icon=xum"
   else
     icon_value="$(grep '^Icon=' "$desktop_file" || true)"
     if [[ -z "$icon_value" ]]; then
       icon_value='none'
     fi
-    echo "✗ Desktop file missing Icon=mux (found: $icon_value)"
+    echo "✗ Desktop file missing Icon=xum (found: $icon_value)"
     ERRORS=$((ERRORS + 1))
   fi
 else
@@ -89,16 +89,16 @@ fi
 
 # Check hicolor icon directories
 for size in 256x256 512x512; do
-  icon_path="$ROOT_DIR/usr/share/icons/hicolor/$size/apps/mux.png"
+  icon_path="$ROOT_DIR/usr/share/icons/hicolor/$size/apps/xum.png"
   if [[ -f "$icon_path" ]]; then
-    echo "✓ Icon exists: hicolor/$size/apps/mux.png"
+    echo "✓ Icon exists: hicolor/$size/apps/xum.png"
   else
-    alt_path="$ROOT_DIR/usr/share/icons/hicolor/$size/mux.png"
+    alt_path="$ROOT_DIR/usr/share/icons/hicolor/$size/xum.png"
     if [[ -f "$alt_path" ]]; then
-      echo "⚠ Icon at hicolor/$size/mux.png (missing /apps/ subdirectory — electron-builder bug #4617)"
+      echo "⚠ Icon at hicolor/$size/xum.png (missing /apps/ subdirectory — electron-builder bug #4617)"
       ERRORS=$((ERRORS + 1))
     else
-      echo "✗ Icon missing: hicolor/$size/apps/mux.png"
+      echo "✗ Icon missing: hicolor/$size/apps/xum.png"
       ERRORS=$((ERRORS + 1))
     fi
   fi

@@ -1,4 +1,5 @@
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 import {
   getEditorDeepLink,
   getDockerDeepLink,
@@ -21,8 +22,12 @@ export interface OpenInEditorResult {
   error?: string;
 }
 
-// Browser mode: window.api is not set (only exists in Electron via preload)
-const isBrowserMode = typeof window !== "undefined" && !window.api;
+// Browser mode: window.api is not set (only exists in Electron via preload). Evaluated at
+// call time so tests can install a window; in production the preload bridge exists before
+// any renderer code runs, so this is equivalent to a load-time constant.
+function isBrowserModeNow(): boolean {
+  return typeof window !== "undefined" && !window.api;
+}
 
 // Helper for opening URLs - allows testing in Node environment
 function openUrl(url: string): void {
@@ -33,6 +38,18 @@ function openUrl(url: string): void {
 
 function trimTrailingSlash(path: string): string {
   return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+}
+
+// Guarded token generator (mirrors createLayoutPresetId/createHeaderRowId): Crypto.randomUUID
+// exists only in secure contexts, and Xum's browser UI can be served from a plain-HTTP remote
+// origin. Throwing here would reject every built-in editor open before the recording RPC's
+// try/catch; the fallback distinguishes placeholder frames and each launch's rollback.
+function createEditorLaunchToken(): string {
+  const maybeCrypto = globalThis.crypto;
+  if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
+    return maybeCrypto.randomUUID();
+  }
+  return `editor_launch_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function isAbsolutePath(path: string): boolean {
@@ -83,7 +100,7 @@ function getParentDirectory(path: string): string {
   return isRootLevelPath ? "/" : path.substring(0, lastSlash) || "/";
 }
 
-export async function openInEditor(args: {
+interface OpenInEditorArgs {
   api: APIClient | null | undefined;
   openSettings?: (section?: string) => void;
   workspaceId: string;
@@ -96,11 +113,147 @@ export async function openInEditor(args: {
    * open folders/workspaces, so we fall back to opening the parent directory.
    */
   isFile?: boolean;
-}): Promise<OpenInEditorResult> {
+}
+
+export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditorResult> {
   const editorConfig = normalizeEditorConfig(
     readPersistedState<EditorConfig>(EDITOR_CONFIG_KEY, DEFAULT_EDITOR_CONFIG)
   );
 
+  // Browser mode: window.open must run while the click's transient user activation is still
+  // valid — the awaited backend lookups and the open-recording RPC below can outlast that
+  // window, after which the deep link would be popup-blocked even though we would report
+  // success and have persisted a durable editor-open marker. Open a blank placeholder
+  // synchronously (before any await) and navigate it once admission succeeds; close it on
+  // any refusal. If the placeholder itself is blocked, refuse now — before anything is
+  // recorded — because the post-await fallback would be blocked too, silently: reporting
+  // success then would persist a sticky editor-open marker for an editor that never opened,
+  // permanently refusing model-driven snapshot/Coder-stop archives. Electron routes
+  // window.open through the main-process window-open handler (no transient-activation
+  // gating), and custom editors never deep-link, so neither needs a placeholder.
+  let placeholder: Window | null = null;
+  if (isBrowserModeNow() && editorConfig.editor !== "custom") {
+    try {
+      // Remote wrappers reject this frame before recording.
+      // Unique names prevent ordinary browsers from reusing a previous editor window.
+      const frameName = `${REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX}${createEditorLaunchToken()}`;
+      placeholder =
+        typeof window !== "undefined" && window.open ? window.open("about:blank", frameName) : null;
+    } catch {
+      placeholder = null;
+    }
+    if (placeholder == null) {
+      return {
+        success: false,
+        error:
+          "The browser blocked the editor window (popup blocked). Allow popups for this site and retry.",
+      };
+    }
+  }
+  let launched = false;
+
+  // Record the open immediately before launching a deep link: external editors are
+  // untrackable once open (deep links leave no process handle), so model-driven snapshot
+  // archives consult this durable record — and an archive already in progress must refuse
+  // the open. Called after every deterministic compatibility check so a refused open can
+  // never persist a sticky marker that permanently gates future archives. Fail closed: a
+  // transient client disconnect (api null while reconnecting) or a failed recording RPC
+  // does not stop backend agents, so launching unrecorded would let a concurrent archive
+  // remove the checkout under the new editor. Custom-editor opens are recorded by the
+  // backend route instead.
+  const recordOpenBeforeLaunch = async (): Promise<{ launchToken: string } | { error: string }> => {
+    if (!args.api) {
+      return {
+        error:
+          "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.",
+      };
+    }
+    // Generated client-side BEFORE admission so it survives response loss: if the backend
+    // commits the reservation but the connection drops before the response arrives, this
+    // token is the only handle that can still redeem the rollback.
+    const launchToken = createEditorLaunchToken();
+    try {
+      const recorded = await args.api.general.recordEditorOpen({
+        workspaceId: args.workspaceId,
+        launchToken,
+      });
+      if (!recorded.success) {
+        return { error: recorded.error };
+      }
+      return { launchToken };
+    } catch (error) {
+      // Ambiguous outcome: the backend may have committed the reservation even though the
+      // response was lost, and this open will not launch. Best-effort reconciliation with
+      // the client-known token — an idempotent no-op if nothing was committed; if this
+      // also fails, the durable marker stays (fail closed).
+      try {
+        await args.api.general.rollbackEditorOpen({
+          workspaceId: args.workspaceId,
+          launchToken,
+        });
+      } catch {
+        // Fail closed.
+      }
+      return {
+        error: `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`,
+      };
+    }
+  };
+
+  const placeholderClosedError =
+    "The editor window was closed before the editor could open. Retry to reopen it.";
+  // Read through a call so TypeScript cannot narrow the readonly `closed` across awaits —
+  // the user can flip it at any time.
+  const isPlaceholderClosed = (): boolean => placeholder?.closed === true;
+
+  const recordThenLaunch = async (deepLink: string): Promise<OpenInEditorResult> => {
+    // The user can close the blank placeholder during any await that ran before this point
+    // (devcontainer/SSH discovery); refuse before recording so no marker needs rolling back.
+    if (isPlaceholderClosed()) {
+      return { success: false, error: placeholderClosedError };
+    }
+    const admission = await recordOpenBeforeLaunch();
+    if ("error" in admission) {
+      return { success: false, error: admission.error };
+    }
+    // Closed while the recording RPC was awaiting: navigating the dead WindowProxy would be
+    // silently ignored, so no editor can open — redeem the launch token to roll the durable
+    // marker back (best-effort: a failed rollback keeps the sticky marker, fail closed).
+    if (isPlaceholderClosed()) {
+      try {
+        await args.api?.general.rollbackEditorOpen({
+          workspaceId: args.workspaceId,
+          launchToken: admission.launchToken,
+        });
+      } catch {
+        // Fail closed: the marker stays until the next successful open or restart.
+      }
+      return { success: false, error: placeholderClosedError };
+    }
+    launched = true;
+    if (placeholder != null) {
+      placeholder.location.href = deepLink;
+    } else {
+      // Electron: no placeholder was needed.
+      openUrl(deepLink);
+    }
+    return { success: true };
+  };
+
+  try {
+    return await openInEditorWithLaunch(args, editorConfig, recordThenLaunch);
+  } finally {
+    if (placeholder != null && !launched) {
+      placeholder.close();
+    }
+  }
+}
+
+async function openInEditorWithLaunch(
+  args: OpenInEditorArgs,
+  editorConfig: EditorConfig,
+  launch: (deepLink: string) => Promise<OpenInEditorResult>
+): Promise<OpenInEditorResult> {
   const isSSH = isSSHRuntime(args.runtimeConfig);
   const isDocker = isDockerRuntime(args.runtimeConfig);
 
@@ -150,8 +303,7 @@ export async function openInEditor(args: {
       return { success: false, error: `${editorConfig.editor} does not support Docker containers` };
     }
 
-    openUrl(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // Devcontainer workspaces use deep links with container info from backend
@@ -204,8 +356,7 @@ export async function openInEditor(args: {
       return { success: false, error: `${editorConfig.editor} does not support Dev Containers` };
     }
 
-    openUrl(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // VS Code / Cursor / Zed: always use deep links (works in browser + Electron)
@@ -218,7 +369,7 @@ export async function openInEditor(args: {
       if (editorConfig.editor === "zed" && args.runtimeConfig.port != null) {
         sshHost = sshHost + ":" + args.runtimeConfig.port;
       }
-    } else if (isBrowserMode && !isLocalhost(window.location.hostname)) {
+    } else if (isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
       // Remote server + local workspace: need SSH to reach server's files
       const serverSshHost = await args.api?.server.getSshHost();
       sshHost = serverSshHost ?? window.location.hostname;
@@ -241,14 +392,13 @@ export async function openInEditor(args: {
       };
     }
 
-    openUrl(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // Custom editor:
   // - Browser mode: can't spawn processes on the server
   // - Electron mode: spawn via backend API
-  if (isBrowserMode) {
+  if (isBrowserModeNow()) {
     return {
       success: false,
       error: "Custom editors are not supported in browser mode. Use VS Code, Cursor, or Zed.",

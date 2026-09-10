@@ -8,10 +8,11 @@ import { CoderSSHRuntime } from "./CoderSSHRuntime";
 import { createSSHTransport } from "./transports";
 import { DockerRuntime, getContainerName } from "./DockerRuntime";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
+import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { RuntimeConfig, RuntimeMode, RuntimeAvailabilityStatus } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
-import { execFileAsync } from "@/node/utils/disposableExec";
+import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
@@ -49,20 +50,28 @@ export async function runFullInit(
 /**
  * Fire-and-forget init with standardized error handling.
  * Use this for background init after workspace creation (workspaceService, taskService).
+ *
+ * Returns a promise that SETTLES (never rejects) when init terminates, so
+ * error paths that must tear down the checkout can await termination first —
+ * deleting a worktree while init still runs against it races its writes and
+ * open handles. Callers that never tear down may ignore it with `void`.
  */
-
 export function runBackgroundInit(
   runtime: Runtime,
   params: WorkspaceInitParams,
   workspaceId: string,
+  // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
-): void {
-  void runFullInit(runtime, params).catch((error: unknown) => {
-    const errorMsg = getErrorMessage(error);
-    logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
-    params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
-    params.initLogger.logComplete(-1);
-  });
+): Promise<void> {
+  return runFullInit(runtime, params).then(
+    () => undefined,
+    (error: unknown) => {
+      const errorMsg = getErrorMessage(error);
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
+      params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
+      params.initLogger.logComplete(-1);
+    }
+  );
 }
 
 function shouldUseSSH2Runtime(): boolean {
@@ -77,7 +86,7 @@ function shouldUseSSH2Runtime(): boolean {
 
 /**
  * Error thrown when a workspace has an incompatible runtime configuration,
- * typically from a newer version of mux that added new runtime types.
+ * typically from a newer version of Xum that added new runtime types.
  */
 export class IncompatibleRuntimeError extends Error {
   constructor(message: string) {
@@ -127,8 +136,8 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
   // Check for incompatible configs from newer versions
   if (isIncompatibleRuntimeConfig(config)) {
     throw new IncompatibleRuntimeError(
-      `This workspace uses a runtime configuration from a newer version of mux. ` +
-        `Please upgrade mux to use this workspace.`
+      `This workspace uses a runtime configuration from a newer version of ${XUM_PRODUCT_NAME}. ` +
+        `Please upgrade ${XUM_PRODUCT_NAME} to use this workspace.`
     );
   }
 
@@ -246,25 +255,6 @@ async function isGitRepository(projectPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Check if Docker daemon is running and accessible.
- */
-async function isDockerAvailable(): Promise<boolean> {
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  try {
-    using proc = execFileAsync("docker", ["info"]);
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new Error("timeout")), 5000);
-    });
-    await Promise.race([proc.result, timeout]);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-  }
-}
-
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 /**
@@ -274,12 +264,17 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 export async function checkRuntimeAvailability(
   projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
-  const [isGit, dockerAvailable, devcontainerCliInfo, devcontainerConfigs] = await Promise.all([
-    isGitRepository(projectPath),
-    isDockerAvailable(),
-    checkDevcontainerCliVersion(),
-    scanDevcontainerConfigs(projectPath),
-  ]);
+  const [isGit, containerEngine, dockerResponsive, devcontainerCliInfo, devcontainerConfigs] =
+    await Promise.all([
+      isGitRepository(projectPath),
+      detectContainerEngine(),
+      // The devcontainer CLI shells out to the literal `docker` binary regardless
+      // of which engine the Docker runtime resolved (e.g. an XUM_CONTAINER_CLI
+      // override), so Dev Container availability needs its own docker probe.
+      isEngineResponsive("docker"),
+      checkDevcontainerCliVersion(),
+      scanDevcontainerConfigs(projectPath),
+    ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
 
@@ -294,8 +289,11 @@ export async function checkRuntimeAvailability(
       available: false,
       reason: "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
     };
-  } else if (!dockerAvailable) {
-    devcontainerAvailability = { available: false, reason: "Docker daemon not running" };
+  } else if (!dockerResponsive) {
+    devcontainerAvailability = {
+      available: false,
+      reason: "Dev Containers require Docker; Docker daemon not running",
+    };
   } else if (devcontainerConfigInfo.length === 0) {
     devcontainerAvailability = { available: false, reason: "No devcontainer.json found" };
   } else {
@@ -312,8 +310,8 @@ export async function checkRuntimeAvailability(
     ssh: isGit ? { available: true } : { available: false, reason: gitRequiredReason },
     docker: !isGit
       ? { available: false, reason: gitRequiredReason }
-      : !dockerAvailable
-        ? { available: false, reason: "Docker daemon not running" }
+      : !containerEngine.available
+        ? { available: false, reason: containerEngine.reason }
         : { available: true },
     devcontainer: devcontainerAvailability,
   };

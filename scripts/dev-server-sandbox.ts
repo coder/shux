@@ -4,8 +4,8 @@
  *
  * Why:
  * - `make dev-server` starts the mux backend server which uses a lockfile at:
- *     <muxHome>/server.lock
- *   (default muxHome is ~/.mux-dev in development)
+ *     <xumHome>/server.lock
+ *   (default xumHome is ~/.mux-dev in development)
  * - This prevents running multiple dev servers concurrently.
  *
  * This script creates a fresh temporary mux root dir, copies over the user's
@@ -20,11 +20,12 @@
  *   - --help
  *
  * Optional env vars:
- *   - SEED_MUX_ROOT=/path/to/mux/home   # where to copy providers.jsonc/config.json from
- *   - KEEP_SANDBOX=1                   # don't delete temp MUX_ROOT on exit
- *   - BACKEND_PORT=3001                # override picked backend port
- *   - VITE_PORT=5174                   # override picked Vite port
- *   - MUX_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
+ *   - SEED_XUM_ROOT=/path/to/xum/home # where to copy providers.jsonc/config.json from
+ *   - SEED_MUX_ROOT=/path/to/mux/home   # legacy alias for SEED_XUM_ROOT
+ *   - KEEP_SANDBOX=1                   # don't delete temp XUM_ROOT on exit
+ *   - XUM_BACKEND_PORT / BACKEND_PORT # override picked backend port
+ *   - XUM_VITE_PORT / VITE_PORT       # override picked Vite port
+ *   - XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
  *   - MAKE=gmake                       # override make binary
  */
 
@@ -33,6 +34,10 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
+import {
+  assignXumEnvironmentValue,
+  resolveXumEnvironmentValue,
+} from "../src/common/compat/xumEnv";
 import {
   chooseSeedSources,
   copyConfigClearingProjectsIfExists,
@@ -75,11 +80,11 @@ Optional CLI flags:
   --clean-projects    Do not import projects from config.json (projects will be empty)
 
 Optional env vars:
-  MUX_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
 
 Examples:
   make dev-server-sandbox DEV_SERVER_SANDBOX_ARGS="--clean-providers --clean-projects"
-  MUX_ENABLE_TUTORIALS_IN_SANDBOX=1 BACKEND_PORT=3900 VITE_PORT=5174 make dev-server-sandbox`);
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 XUM_BACKEND_PORT=3900 XUM_VITE_PORT=5174 make dev-server-sandbox`);
 }
 
 async function main(): Promise<number> {
@@ -100,8 +105,12 @@ async function main(): Promise<number> {
   const shouldSeed = !(cleanProviders && cleanProjects);
   const seedSources = shouldSeed ? chooseSeedSources() : { providersPath: null, configPath: null };
 
-  const backendPortOverride = parseOptionalPort(process.env.BACKEND_PORT);
-  const vitePortOverride = parseOptionalPort(process.env.VITE_PORT);
+  const backendPortOverride = parseOptionalPort(
+    resolveXumEnvironmentValue("BACKEND_PORT", process.env) ?? process.env.BACKEND_PORT
+  );
+  const vitePortOverride = parseOptionalPort(
+    resolveXumEnvironmentValue("VITE_PORT", process.env) ?? process.env.VITE_PORT
+  );
 
   if (
     backendPortOverride !== null &&
@@ -153,7 +162,7 @@ async function main(): Promise<number> {
       : false;
 
     console.log("\nStarting mux dev-server sandbox...");
-    console.log(`  MUX_ROOT:        ${muxRoot}`);
+    console.log(`  XUM_ROOT:       ${muxRoot}`);
     console.log(`  Seed config:     ${copiedConfig && seedConfigPath ? seedConfigPath : "(none)"}`);
     console.log(
       `  Seed providers:  ${copiedProviders && seedProvidersPath ? seedProvidersPath : "(none)"}`
@@ -175,24 +184,29 @@ async function main(): Promise<number> {
       cleanProviders,
       seededProvidersPath: copiedProviders ? sandboxProvidersPath : null,
     });
+    assignXumEnvironmentValue(childEnv, "ROOT", muxRoot);
+    assignXumEnvironmentValue(childEnv, "BACKEND_PORT", String(backendPort));
+    assignXumEnvironmentValue(childEnv, "VITE_PORT", String(vitePort));
+    assignXumEnvironmentValue(
+      childEnv,
+      "VITE_ALLOWED_HOSTS",
+      process.env.VITE_ALLOWED_HOSTS ?? "all"
+    );
+    assignXumEnvironmentValue(
+      childEnv,
+      "ENABLE_TUTORIALS_IN_SANDBOX",
+      resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", process.env) ?? "0"
+    );
+    // Keep unprefixed Make fallbacks working for older invocations.
+    childEnv.BACKEND_PORT = String(backendPort);
+    childEnv.VITE_PORT = String(vitePort);
+    childEnv.VITE_ALLOWED_HOSTS = process.env.VITE_ALLOWED_HOSTS ?? "all";
 
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(makeCmd, ["dev-server"], {
         stdio: "inherit",
-        env: {
-          ...childEnv,
-
-          // Allow access via reverse proxies / port-forwarding domains.
-          // This sets the Makefile's `VITE_ALLOWED_HOSTS`, which is forwarded to
-          // `MUX_VITE_ALLOWED_HOSTS` and then consumed by `vite.config.ts`.
-          VITE_ALLOWED_HOSTS: process.env.VITE_ALLOWED_HOSTS ?? "all",
-
-          MUX_ROOT: muxRoot,
-          BACKEND_PORT: String(backendPort),
-          VITE_PORT: String(vitePort),
-          MUX_ENABLE_TUTORIALS_IN_SANDBOX: process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX ?? "0",
-        },
+        env: childEnv,
       });
     } catch (err) {
       console.error(`Failed to start ${makeCmd} dev-server:`, err);

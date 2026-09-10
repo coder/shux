@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/unbound-method */
+import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -6,7 +6,8 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import * as fs from "fs/promises";
-import * as path from "path";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "@/node/services/workspaceRemoval";
 
 describe("HistoryService partial persistence - Error Recovery", () => {
   let partialService: HistoryService;
@@ -39,34 +40,141 @@ describe("HistoryService partial persistence - Error Recovery", () => {
       ],
     };
 
-    // Mock readPartial to return errored partial
-    partialService.readPartial = mock(() => Promise.resolve(erroredPartial));
+    expect((await partialService.writePartial(workspaceId, erroredPartial)).success).toBe(true);
 
-    // Mock deletePartial
-    partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
-
-    // Spy on partialService methods to verify calls
-    const appendSpy = spyOn(partialService, "appendToHistory");
-
-    // Call commitPartial
     const result = await partialService.commitPartial(workspaceId);
-
-    // Should succeed
     expect(result.success).toBe(true);
 
-    // Should have called appendToHistory with cleaned metadata (no error/errorType)
-    expect(appendSpy).toHaveBeenCalledTimes(1);
-    const appendedMessage = appendSpy.mock.calls[0][1];
+    // Committed with cleaned metadata (no error/errorType), then the partial is deleted.
+    const committed = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(committed.success && committed.data.map((m) => m.id)).toEqual(["msg-1"]);
+    const appendedMessage = committed.success ? committed.data[0] : undefined;
+    expect(appendedMessage?.parts).toEqual(erroredPartial.parts);
+    expect(appendedMessage?.metadata?.error).toBeUndefined();
+    expect(appendedMessage?.metadata?.errorType).toBeUndefined();
+    expect(appendedMessage?.metadata?.historySequence).toBe(1);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
+  });
 
-    expect(appendedMessage.id).toBe("msg-1");
-    expect(appendedMessage.parts).toEqual(erroredPartial.parts);
-    expect(appendedMessage.metadata?.error).toBeUndefined();
-    expect(appendedMessage.metadata?.errorType).toBeUndefined();
-    expect(appendedMessage.metadata?.historySequence).toBe(1);
+  test("updatePartialIfMessageIdMatches waits out a commitPartial transaction and declines", async () => {
+    const workspaceId = "test-workspace";
+    const partial: MuxMessage = {
+      id: "msg-1",
+      role: "assistant",
+      metadata: { historySequence: 1, timestamp: Date.now(), model: "test-model" },
+      parts: [{ type: "text", text: "Hello" }],
+    };
+    expect((await partialService.writePartial(workspaceId, partial)).success).toBe(true);
 
-    // Should have deleted the partial after committing
-    const deletePartial = partialService.deletePartial as ReturnType<typeof mock>;
-    expect(deletePartial).toHaveBeenCalledWith(workspaceId);
+    // Park the commit inside its transaction: call 1 is its lock-free probe, call 2 the snapshot
+    // it takes once it holds both locks.
+    let releaseCommitRead: (() => void) | undefined;
+    const commitReadGate = new Promise<void>((resolve) => {
+      releaseCommitRead = resolve;
+    });
+    let commitReadReached: (() => void) | undefined;
+    const commitReadReachedGate = new Promise<void>((resolve) => {
+      commitReadReached = resolve;
+    });
+    const readPartial = partialService.readPartial.bind(partialService);
+    let readCalls = 0;
+    const readSpy = spyOn(partialService, "readPartial").mockImplementation(
+      async (targetWorkspaceId: string) => {
+        if (++readCalls === 2) {
+          commitReadReached?.();
+          await commitReadGate;
+        }
+        return readPartial(targetWorkspaceId);
+      }
+    );
+    try {
+      const commit = partialService.commitPartial(workspaceId);
+      await commitReadReachedGate;
+
+      const cas = partialService.updatePartialIfMessageIdMatches(
+        workspaceId,
+        "msg-1",
+        (current) => ({
+          ...current,
+          parts: [...current.parts, { type: "text", text: " (finalized)" }],
+        })
+      );
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          cas,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 100)),
+        ])
+      ).toBe(sentinel);
+
+      releaseCommitRead?.();
+      expect((await commit).success).toBe(true);
+      expect(await cas).toEqual(Ok(false));
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    // The commit landed exactly what it snapshotted, and the CAS did not write anything.
+    const committed = await partialService.getLastMessages(workspaceId, 1);
+    expect(committed.success && committed.data[0]?.parts).toEqual(partial.parts);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("commitPartial snapshots the partial after an in-flight updatePartialIfMessageIdMatches lands", async () => {
+    const workspaceId = "test-workspace";
+    const partial: MuxMessage = {
+      id: "msg-1",
+      role: "assistant",
+      metadata: { historySequence: 1, timestamp: Date.now(), model: "test-model" },
+      parts: [{ type: "text", text: "Hello" }],
+    };
+    expect((await partialService.writePartial(workspaceId, partial)).success).toBe(true);
+    const finalizedParts = [...partial.parts, { type: "text" as const, text: " (finalized)" }];
+
+    // Park the CAS inside its critical section (after it took both locks, before it writes).
+    let releaseCasRead: (() => void) | undefined;
+    const casReadGate = new Promise<void>((resolve) => {
+      releaseCasRead = resolve;
+    });
+    let casReadReached: (() => void) | undefined;
+    const casReadReachedGate = new Promise<void>((resolve) => {
+      casReadReached = resolve;
+    });
+    const readPartial = partialService.readPartial.bind(partialService);
+    let readCalls = 0;
+    const readSpy = spyOn(partialService, "readPartial").mockImplementation(
+      async (targetWorkspaceId: string) => {
+        if (readCalls++ === 0) {
+          casReadReached?.();
+          await casReadGate;
+        }
+        return readPartial(targetWorkspaceId);
+      }
+    );
+    try {
+      const cas = partialService.updatePartialIfMessageIdMatches(
+        workspaceId,
+        "msg-1",
+        (current) => ({
+          ...current,
+          parts: finalizedParts,
+        })
+      );
+      await casReadReachedGate;
+
+      const commit = partialService.commitPartial(workspaceId);
+      releaseCasRead?.();
+
+      expect(await cas).toEqual(Ok(true));
+      expect((await commit).success).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    // The commit waited for the CAS and committed the finalized partial, not its pre-update state.
+    const committed = await partialService.getLastMessages(workspaceId, 1);
+    expect(committed.success && committed.data[0]?.parts).toEqual(finalizedParts);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
 
   test("commitPartial should update existing placeholder when errored partial has more parts", async () => {
@@ -106,38 +214,21 @@ describe("HistoryService partial persistence - Error Recovery", () => {
       parts: [], // Empty placeholder
     };
 
-    // Mock readPartial to return errored partial
-    partialService.readPartial = mock(() => Promise.resolve(erroredPartial));
-
-    // Mock deletePartial
-    partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
-
-    // Seed existing placeholder into history so getHistoryFromLatestBoundary finds it
+    // Seed the existing placeholder into history so the commit finds it by historySequence.
     await partialService.appendToHistory(workspaceId, existingPlaceholder);
+    expect((await partialService.writePartial(workspaceId, erroredPartial)).success).toBe(true);
 
-    // Spy on partialService methods AFTER seeding to verify only commitPartial calls
-    const appendSpy = spyOn(partialService, "appendToHistory");
-    const updateSpy = spyOn(partialService, "updateHistory");
-
-    // Call commitPartial
     const result = await partialService.commitPartial(workspaceId);
-
-    // Should succeed
     expect(result.success).toBe(true);
 
-    // Should have called updateHistory (not append) with cleaned metadata
-    expect(updateSpy).toHaveBeenCalledTimes(1);
-    expect(appendSpy).not.toHaveBeenCalled();
-
-    const updatedMessage = updateSpy.mock.calls[0][1];
-
-    expect(updatedMessage.parts).toEqual(erroredPartial.parts);
-    expect(updatedMessage.metadata?.error).toBeUndefined();
-    expect(updatedMessage.metadata?.errorType).toBeUndefined();
-
-    // Should have deleted the partial after updating
-    const deletePartial = partialService.deletePartial as ReturnType<typeof mock>;
-    expect(deletePartial).toHaveBeenCalledWith(workspaceId);
+    // The placeholder row is updated in place (no second row) with cleaned metadata.
+    const committed = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(committed.success && committed.data.map((m) => m.id)).toEqual(["msg-1"]);
+    const updatedMessage = committed.success ? committed.data[0] : undefined;
+    expect(updatedMessage?.parts).toEqual(erroredPartial.parts);
+    expect(updatedMessage?.metadata?.error).toBeUndefined();
+    expect(updatedMessage?.metadata?.errorType).toBeUndefined();
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
 
   test("commitPartial should skip tool-only incomplete partials", async () => {
@@ -164,21 +255,15 @@ describe("HistoryService partial persistence - Error Recovery", () => {
       ],
     };
 
-    partialService.readPartial = mock(() => Promise.resolve(toolOnlyPartial));
-    partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
-
-    // Spy on partialService methods to verify calls
-    const appendSpy = spyOn(partialService, "appendToHistory");
-    const updateSpy = spyOn(partialService, "updateHistory");
+    expect((await partialService.writePartial(workspaceId, toolOnlyPartial)).success).toBe(true);
 
     const result = await partialService.commitPartial(workspaceId);
     expect(result.success).toBe(true);
 
-    expect(appendSpy).not.toHaveBeenCalled();
-    expect(updateSpy).not.toHaveBeenCalled();
-
-    const deletePartial = partialService.deletePartial as ReturnType<typeof mock>;
-    expect(deletePartial).toHaveBeenCalledWith(workspaceId);
+    // Nothing committed, partial still cleaned up.
+    const committed = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(committed.success && committed.data).toEqual([]);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
   test("commitPartial should skip empty errored partial", async () => {
     const workspaceId = "test-workspace";
@@ -196,27 +281,15 @@ describe("HistoryService partial persistence - Error Recovery", () => {
       parts: [], // Empty - no content accumulated before error
     };
 
-    // Mock readPartial to return empty errored partial
-    partialService.readPartial = mock(() => Promise.resolve(emptyErrorPartial));
+    expect((await partialService.writePartial(workspaceId, emptyErrorPartial)).success).toBe(true);
 
-    // Mock deletePartial
-    partialService.deletePartial = mock(() => Promise.resolve(Ok(undefined)));
-
-    // Spy on partialService methods to verify calls
-    const appendSpy = spyOn(partialService, "appendToHistory");
-
-    // Call commitPartial
     const result = await partialService.commitPartial(workspaceId);
-
-    // Should succeed
     expect(result.success).toBe(true);
 
-    // Should NOT call appendToHistory for empty message (no value to preserve)
-    expect(appendSpy).not.toHaveBeenCalled();
-
-    // Should still delete the partial (cleanup)
-    const deletePartial = partialService.deletePartial as ReturnType<typeof mock>;
-    expect(deletePartial).toHaveBeenCalledWith(workspaceId);
+    // No value to preserve: nothing committed, partial still cleaned up.
+    const committed = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(committed.success && committed.data).toEqual([]);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
 
   test("commitPartial deletes a blank assistant placeholder after an empty errored partial", async () => {
@@ -249,11 +322,8 @@ describe("HistoryService partial persistence - Error Recovery", () => {
       } satisfies MuxMessage)
     );
 
-    const deleteMessageSpy = spyOn(partialService, "deleteMessage");
-
     const result = await partialService.commitPartial(workspaceId);
     expect(result.success).toBe(true);
-    expect(deleteMessageSpy).toHaveBeenCalledWith(workspaceId, "msg-1");
 
     const historyResult = await partialService.getHistoryFromLatestBoundary(workspaceId);
     expect(historyResult.success).toBe(true);
@@ -311,6 +381,83 @@ describe("HistoryService partial persistence - Error Recovery", () => {
   });
 });
 
+describe("HistoryService partial persistence - Foreign backend", () => {
+  let config: Config;
+  let partialService: HistoryService;
+  let cleanup: () => Promise<void>;
+  const workspaceId = "foreign-ws";
+  const partial: MuxMessage = {
+    id: "msg-1",
+    role: "assistant",
+    metadata: { historySequence: 1, timestamp: 1, model: "test-model", partial: true },
+    parts: [{ type: "text", text: "Hello" }],
+  };
+  const stillPending = Symbol("still-pending");
+
+  beforeEach(async () => {
+    ({ config, historyService: partialService, cleanup } = await createTestHistoryService());
+    expect((await partialService.writePartial(workspaceId, partial)).success).toBe(true);
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) holds the session-dir write lock.
+  const holdForeignLock = () =>
+    acquireProcessFileLock({
+      lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+      timeoutMs: 5_000,
+      label: "test foreign backend",
+    });
+  const overwritePartialOnDisk = (message: MuxMessage) =>
+    fs.writeFile(
+      path.join(config.sessionsDir, workspaceId, "partial.json"),
+      JSON.stringify(message)
+    );
+  const raceWithTimeout = <T>(promise: Promise<T>) =>
+    Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(stillPending), 250))]);
+
+  test("commitPartial snapshots the partial only once it holds the cross-process lock", async () => {
+    const foreign = await holdForeignLock();
+    const commit = partialService.commitPartial(workspaceId);
+    expect(await raceWithTimeout(commit)).toBe(stillPending);
+
+    // The foreign holder finalizes the partial before releasing the lock.
+    const finalizedParts = [...partial.parts, { type: "text" as const, text: " (finalized)" }];
+    await overwritePartialOnDisk({ ...partial, parts: finalizedParts });
+    await foreign[Symbol.asyncDispose]();
+
+    expect((await commit).success).toBe(true);
+    const committed = await partialService.getLastMessages(workspaceId, 1);
+    expect(committed.success && committed.data[0]?.parts).toEqual(finalizedParts);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("updatePartialIfMessageIdMatches reads the partial only once it holds the cross-process lock", async () => {
+    const foreign = await holdForeignLock();
+    const cas = partialService.updatePartialIfMessageIdMatches(workspaceId, "msg-1", (current) => ({
+      ...current,
+      parts: [...current.parts, { type: "text", text: " (finalized)" }],
+    }));
+    expect(await raceWithTimeout(cas)).toBe(stillPending);
+
+    // The foreign holder committed msg-1 and started a new stream under msg-2.
+    const foreignPartial: MuxMessage = {
+      ...partial,
+      id: "msg-2",
+      parts: [{ type: "text", text: "Next" }],
+    };
+    await overwritePartialOnDisk(foreignPartial);
+    await foreign[Symbol.asyncDispose]();
+
+    expect(await cas).toEqual(Ok(false));
+    const onDisk = await partialService.readPartial(workspaceId);
+    expect(onDisk?.id).toBe("msg-2");
+    expect(onDisk?.parts).toEqual(foreignPartial.parts);
+  });
+});
+
 describe("HistoryService partial persistence - Legacy compatibility", () => {
   let config: Config;
   let partialService: HistoryService;
@@ -326,7 +473,7 @@ describe("HistoryService partial persistence - Legacy compatibility", () => {
 
   test("readPartial upgrades legacy cmuxMetadata", async () => {
     const workspaceId = "legacy-ws";
-    const workspaceDir = config.getSessionDir(workspaceId);
+    const workspaceDir = path.join(config.sessionsDir, workspaceId);
     await fs.mkdir(workspaceDir, { recursive: true });
 
     const partialMessage = createMuxMessage("partial-1", "assistant", "legacy", {

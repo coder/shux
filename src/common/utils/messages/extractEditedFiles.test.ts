@@ -5,7 +5,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { extractEditedFileDiffs, extractEditedFilePaths } from "./extractEditedFiles";
 
 /**
- * Helper to create a mock MuxMessage with file edit tool results.
+ * Helper to create a mock XumMessage with file edit tool results.
  */
 function createAssistantMessage(
   toolCalls: Array<{
@@ -49,6 +49,265 @@ function createAssistantMessage(
 function makeDiff(filePath: string, oldContent: string, newContent: string): string {
   return createPatch(filePath, oldContent, newContent, "", "", { context: 3 });
 }
+
+/**
+ * Helper to create an assistant message with one code_execution part whose
+ * output carries nested PTC tool-call records (exclusive posture).
+ */
+function createCodeExecutionMessage(toolCalls: unknown[]): MuxMessage {
+  return {
+    id: `msg-${Math.random().toString(36).slice(2)}`,
+    role: "assistant",
+    parts: [
+      {
+        type: "dynamic-tool" as const,
+        toolCallId: `tc-${Math.random().toString(36).slice(2)}`,
+        toolName: "code_execution",
+        state: "output-available" as const,
+        input: { code: "..." },
+        output: { success: true, toolCalls },
+      },
+    ],
+  };
+}
+
+describe("nested PTC edit records (exclusive posture)", () => {
+  it("extracts paths and diffs from successful nested file_edit_* records", () => {
+    const nestedDiff = makeDiff("/nested.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/nested.ts" },
+          result: { success: true, diff: nestedDiff },
+        },
+        // Failed nested edits (bridge error, resolved failure, kernel ok bit)
+        // are all skipped.
+        { toolName: "file_edit_insert", args: { path: "/errored.ts" }, error: "denied" },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/resolved-failed.ts" },
+          result: { success: false },
+        },
+        { toolName: "file_edit_insert", args: { path: "/kernel-failed.ts" }, ok: false },
+        // Non-edit nested calls are ignored.
+        { toolName: "bash", args: { script: "true" }, result: { success: true } },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/nested.ts"]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/nested.ts");
+    expect(diffs[0].diff).toBe(nestedDiff);
+  });
+
+  it("returns edits from the newest code_execution part first when one message has several", () => {
+    // Successive SDK steps append separate code_execution parts to one
+    // assistant message; the later execution's edits must fill the
+    // MAX_EDITED_FILES cap first.
+    const older = createCodeExecutionMessage([
+      { toolName: "file_edit_insert", args: { path: "/older.ts" }, ok: true },
+    ]);
+    const newer = createCodeExecutionMessage([
+      { toolName: "file_edit_insert", args: { path: "/newer.ts" }, ok: true },
+    ]);
+    const combined: MuxMessage = { ...older, parts: [...older.parts, ...newer.parts] };
+
+    expect(extractEditedFilePaths([combined])).toEqual(["/newer.ts", "/older.ts"]);
+  });
+
+  it("returns nested batch paths newest-first", () => {
+    // The surrounding scan walks history backward to keep the LATEST edits
+    // under MAX_EDITED_FILES; nested records are chronological, so a batch
+    // must be traversed in reverse.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/first.ts" }, ok: true },
+        { toolName: "file_edit_insert", args: { path: "/second.ts" }, ok: true },
+        { toolName: "file_edit_insert", args: { path: "/third.ts" }, ok: true },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/third.ts", "/second.ts", "/first.ts"]);
+  });
+
+  it("skips malformed records (null or primitive result) instead of throwing", () => {
+    // History rows are untrusted persisted JSON; compaction preparation and
+    // post-compaction attachment tracking both run this extractor, so one
+    // corrupt nested result must not repeatedly fail those flows.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/null-result.ts" }, result: null },
+        { toolName: "file_edit_insert", args: { path: "/string-result.ts" }, result: "corrupt" },
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/good.ts" },
+          result: { success: true, diff: makeDiff("/good.ts", "old", "new") },
+        },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/good.ts"]);
+    expect(extractEditedFileDiffs(messages)).toHaveLength(1);
+  });
+
+  it("propagates capture-time diff truncation to the combined diff", () => {
+    // A kernel-retained record whose oversized diff was hunk-bounded at
+    // capture (diffTruncated) makes every combined diff for that file
+    // incomplete — even when a later small edit combines cleanly, the result
+    // must not look like a complete original→final snapshot.
+    const laterDiff = makeDiff("/big.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/big.ts" },
+          result: { success: true, diffTruncated: true },
+        },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/big.ts" },
+          result: { success: true, diff: laterDiff },
+        },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/big.ts"]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].diff).toBe(laterDiff);
+    expect(diffs[0].truncated).toBe(true);
+  });
+
+  it("skips non-string diffs (nested and direct) instead of throwing in parsePatch", () => {
+    // Untrusted persisted JSON: a successful record can carry an array (or
+    // object) diff, which passes truthiness/length checks and would throw in
+    // parsePatch/applyPatch on every compaction/recovery pass (round 14).
+    // The edit still counts for path tracking; only the diff is dropped.
+    const goodDiff = makeDiff("/good.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/array-diff.ts" },
+          result: { success: true, diff: ["not", "a", "string"] },
+        },
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/good.ts" },
+          result: { success: true, diff: goodDiff },
+        },
+      ]),
+      {
+        id: "msg-direct-corrupt-diff",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool" as const,
+            toolCallId: "tc-direct-corrupt-diff",
+            toolName: "file_edit_replace_string",
+            state: "output-available" as const,
+            input: { path: "/direct-array-diff.ts" },
+            output: { success: true, diff: { corrupt: true } },
+          },
+        ],
+      },
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual([
+      "/direct-array-diff.ts",
+      "/good.ts",
+      "/array-diff.ts",
+    ]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/good.ts");
+  });
+
+  it("does not report records lacking both a result and an ok bit as edits", () => {
+    // Success must be positive: kernel-compacted records always carry an
+    // explicit boolean ok and classic records carry a result, so a malformed
+    // row with neither must not be reported by crash-safe tracking as a
+    // completed edit (round 16).
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/unmodified.ts" } },
+        { toolName: "file_edit_insert", args: { path: "/kernel-ok.ts" }, ok: true },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/kernel-ok.ts"]);
+  });
+
+  it("kernel-compacted records surface the path but no diff", () => {
+    // Current kernel compaction exempts file_edit_* records (results kept for
+    // exactly this extractor), but result-less compact records still exist in
+    // history persisted by earlier builds and must degrade to path-only
+    // tracking instead of being dropped.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_replace_string", args: { path: "/kernel.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/kernel.ts"]);
+    expect(extractEditedFileDiffs(messages)).toEqual([]);
+  });
+
+  it("marks the combined diff truncated when a result-less edit's diff did not survive", () => {
+    // A kernel execution that exhausts the retained-result budget compacts a
+    // later successful edit to a result-less {ok: true} record: the earlier
+    // retained diff no longer describes the final file content, so the
+    // surviving combined diff must not present itself as complete (round 26).
+    const earlierDiff = makeDiff("/kernel.ts", "old", "mid");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/kernel.ts" },
+          result: { success: true, diff: earlierDiff },
+        },
+        { toolName: "file_edit_replace_string", args: { path: "/kernel.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/kernel.ts");
+    expect(diffs[0].diff).toBe(earlierDiff);
+    expect(diffs[0].truncated).toBe(true);
+  });
+
+  it("moves recency to a later result-less edit so the file keeps its rank", () => {
+    // The result-less record is the file's LATEST edit: without a recency
+    // bump it stays ranked by its older retained diff and can fall off the
+    // MAX_EDITED_FILES cut once enough other files are edited in between
+    // (round 27).
+    const aDiff = makeDiff("/a.ts", "old", "new");
+    const bDiff = makeDiff("/b.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/a.ts" },
+          result: { success: true, diff: aDiff },
+        },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/b.ts" },
+          result: { success: true, diff: bDiff },
+        },
+        { toolName: "file_edit_replace_string", args: { path: "/a.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs.map((d) => d.path)).toEqual(["/a.ts", "/b.ts"]);
+    expect(diffs[0].truncated).toBe(true);
+    expect(diffs[1].truncated).toBe(false);
+  });
+});
 
 describe("extractEditedFilePaths", () => {
   it("should extract file paths from successful edits", () => {

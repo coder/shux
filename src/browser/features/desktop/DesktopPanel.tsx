@@ -1,7 +1,12 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AlertCircle, Loader2, MonitorOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { assertNever } from "@/common/utils/assertNever";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { DESKTOP_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
+import { useAPI } from "@/browser/contexts/API";
+import { getDesktopPopout } from "./desktopPopout";
+import { DesktopToolbar } from "./DesktopToolbar";
 import { useDesktopConnection, type UseDesktopConnectionResult } from "./useDesktopConnection";
 
 interface StatusPresentation {
@@ -80,23 +85,175 @@ function StatusOverlay(props: { desktop: UseDesktopConnectionResult }) {
   );
 }
 
-export function DesktopPanel(props: { workspaceId: string }) {
-  const desktop = useDesktopConnection(props.workspaceId);
+export function DesktopViewer(props: {
+  workspaceId: string;
+  onDetach?: () => void;
+  onBringBack?: () => void;
+  attach?: (desktop: UseDesktopConnectionResult) => () => void;
+  onStartupError?: () => void;
+  /** See UseDesktopConnectionOptions.nativeWindowCleanup. */
+  nativeWindowCleanup?: boolean;
+  /** See UseDesktopConnectionOptions.unmountKeepsGrace. */
+  unmountKeepsGrace?: () => boolean;
+  /**
+   * Mounted while the desktop is shown in a popout: do not connect; the popout coordinator
+   * registers the pane once it has confirmed a live child and resumes the connection when the
+   * desktop comes back.
+   */
+  suspended?: boolean;
+  /**
+   * Mounted while the popout coordinator is still reconciling (Electron `checking`): register
+   * as a viewer right away, without connecting. The manager lookup is a round trip during which
+   * nothing else would mark the pane attached, and an agent-driven archive could close the
+   * desktop the user just opened; a popout found meanwhile keeps this registration (a suspended
+   * inline pane behind a live child is attached too), and no popout resumes into it.
+   */
+  reserve?: boolean;
+  hidden?: boolean;
+}) {
+  const desktop = useDesktopConnection(props.workspaceId, {
+    nativeWindowCleanup: props.nativeWindowCleanup,
+    unmountKeepsGrace: props.unmountKeepsGrace,
+  });
 
   useEffect(() => {
-    desktop.connect();
+    const detach = props.attach?.(desktop);
+    if (!props.suspended) desktop.connect();
+    // register() never rejects; it reports whether a lease exists, which nothing awaits here.
+    else if (props.reserve) void desktop.register();
+    return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const onStartupError = props.onStartupError;
+  useEffect(() => {
+    if (desktop.state === "error" || desktop.state === "unavailable") onStartupError?.();
+  }, [desktop.state, onStartupError]);
+
   return (
-    <div className="bg-background flex h-full flex-col">
+    <div
+      className="bg-background @container flex h-full min-h-0 min-w-0 flex-col"
+      hidden={props.hidden}
+    >
+      {desktop.sharedDesktop && (
+        <div className="text-muted-foreground border-border shrink-0 truncate border-b px-3 py-1.5 text-xs">
+          Shared desktop · {desktop.sharedDesktop.ownerName}
+        </div>
+      )}
+      <DesktopToolbar
+        connected={desktop.state === "connected"}
+        controlling={desktop.controlling}
+        scaleToFit={desktop.scaleToFit}
+        onToggleControl={() => desktop.setControlling(!desktop.controlling)}
+        onToggleScale={() => desktop.setScaleToFit(!desktop.scaleToFit)}
+        onDetach={props.onDetach}
+        onBringBack={props.onBringBack}
+      />
       {desktop.state === "connected" ? null : <StatusOverlay desktop={desktop} />}
       <div
         ref={desktop.containerRef}
-        className="bg-background flex-1 overflow-hidden"
+        {...{ [DESKTOP_VIEWPORT_ATTR]: "" }}
+        className="bg-background min-h-0 min-w-0 flex-1 overflow-hidden"
         style={{ display: desktop.state === "connected" ? "block" : "none" }}
       />
+    </div>
+  );
+}
+
+export function DesktopPanel(props: { workspaceId: string }) {
+  // A workspace switch disposes its viewer, token, and shared-target label together.
+  return <WorkspaceDesktopPanel key={props.workspaceId} workspaceId={props.workspaceId} />;
+}
+
+function WorkspaceDesktopPanel(props: { workspaceId: string }) {
+  const { api } = useAPI();
+  const [popout] = useState(() => getDesktopPopout(props.workspaceId));
+  const snapshot = useSyncExternalStore(popout.subscribe, popout.getSnapshot);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const reportError = (error: unknown) =>
+    setActionError(error instanceof Error ? error.message : String(error));
+  useEffect(() => {
+    if (!api) return;
+    const reconcile = () => {
+      popout.reconcile(api.desktop).catch(reportError);
+    };
+    reconcile();
+    window.addEventListener("focus", reconcile);
+    return () => window.removeEventListener("focus", reconcile);
+  }, [api, popout]);
+  // A new user action supersedes the previous failure, regardless of whether it came
+  // from a button or its keyboard shortcut. Keep open() in the synchronous gesture.
+  const detach = () => {
+    setActionError(null);
+    if (api) popout.open(api.desktop).catch(reportError);
+  };
+  const bringBack = () => {
+    setActionError(null);
+    popout.bringBack().catch(reportError);
+  };
+  const recover = () => {
+    setActionError(null);
+    if (api) popout.recover(api.desktop).catch(reportError);
+  };
+  const inline = snapshot.state === "inline" || snapshot.state === "opening";
+  return (
+    <div className="bg-background flex h-full min-h-0 min-w-0 flex-col">
+      {(snapshot.error ?? actionError) ? (
+        <p role="alert" className="text-destructive p-2 text-xs">
+          {snapshot.error ?? actionError}
+        </p>
+      ) : null}
+      {/* The viewer stays mounted (hidden) while detached so its viewer registration keeps the
+          pane attached across the inline↔popout handoff; otherwise nothing would mark the
+          desktop as in use between the source disconnecting and the destination registering,
+          and an agent-driven archive could close it mid-handoff. It also mounts while the
+          coordinator is still checking for a popout, reserving the pane (see `reserve`). */}
+      <DesktopViewer
+        workspaceId={props.workspaceId}
+        attach={(desktop) =>
+          popout.attach(desktop.suspend, desktop.connect, !inline, desktop.register)
+        }
+        // Unmounting while a popout is opening (or a confirmed child shows the desktop) is not
+        // this pane giving the desktop up: the child takes over, so leave the grace for the
+        // gap. A reservation abandoned while still checking for a popout is given up for good.
+        unmountKeepsGrace={() => popout.handoffInProgress()}
+        onDetach={detach}
+        suspended={!inline}
+        reserve={snapshot.state === "checking"}
+        hidden={!inline}
+      />
+      {inline ? null : (
+        <div
+          className="text-muted-foreground flex h-full flex-col items-center justify-center gap-3 p-4 text-center"
+          onKeyDown={(event) => {
+            if (
+              ["b", "r"].includes(event.key.toLowerCase()) &&
+              !event.ctrlKey &&
+              !event.metaKey &&
+              !event.altKey
+            ) {
+              event.preventDefault();
+              stopKeyboardPropagation(event);
+              if (event.key.toLowerCase() === "b") bringBack();
+              else recover();
+            }
+          }}
+        >
+          <MonitorOff aria-hidden className="h-8 w-8" />
+          <p className="text-sm">
+            {snapshot.state === "checking"
+              ? "Checking desktop window…"
+              : "Desktop is open in a separate window"}
+          </p>
+          <Button size="sm" variant="outline" onClick={bringBack} aria-keyshortcuts="B">
+            Bring back
+          </Button>
+          <Button size="sm" variant="ghost" aria-keyshortcuts="R" onClick={recover}>
+            Reconnect here
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

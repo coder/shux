@@ -363,6 +363,7 @@ export class PowerModeEngine {
 
     const AudioContextConstructor =
       window.AudioContext ??
+      // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
     if (!AudioContextConstructor) {

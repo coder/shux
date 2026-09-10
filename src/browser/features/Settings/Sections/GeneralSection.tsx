@@ -10,23 +10,33 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
+import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   EDITOR_CONFIG_KEY,
   DEFAULT_EDITOR_CONFIG,
   TERMINAL_FONT_CONFIG_KEY,
   DEFAULT_TERMINAL_FONT_CONFIG,
+  TERMINAL_BADGE_CONFIG_KEY,
+  TERMINAL_BADGE_POSITIONS,
+  DEFAULT_TERMINAL_BADGE_CONFIG,
   LAUNCH_BEHAVIOR_KEY,
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
   BASH_COLLAPSED_SUMMARY_MODES,
   CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
   DEFAULT_BASH_COLLAPSED_SUMMARY_MODE,
   SIDEBAR_AGE_GROUPING_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
   TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
   normalizeEditorConfig,
+  normalizeTerminalBadgeConfig,
   normalizeTerminalFontConfig,
   normalizeTranscriptDensity,
   type BashCollapsedSummaryMode,
@@ -34,6 +44,8 @@ import {
   type EditorConfig,
   type EditorType,
   type LaunchBehavior,
+  type TerminalBadgeConfig,
+  type TerminalBadgePosition,
   type TerminalFontConfig,
 } from "@/common/constants/storage";
 import {
@@ -93,6 +105,13 @@ function getTerminalFontAvailabilityWarning(config: TerminalFontConfig): string 
   return undefined;
 }
 
+const COMPACTION_STRATEGIES = [
+  { value: "summarize", label: "Summarize" },
+  { value: "continuous", label: "Continuous" },
+  { value: "token-budget", label: "Token Budget" },
+] as const;
+type CompactionStrategy = (typeof COMPACTION_STRATEGIES)[number]["value"];
+
 const EDITOR_OPTIONS: Array<{ value: EditorType; label: string }> = [
   { value: "vscode", label: "VS Code" },
   { value: "cursor", label: "Cursor" },
@@ -125,6 +144,16 @@ const TRANSCRIPT_DENSITY_OPTIONS = TRANSCRIPT_DENSITIES.map((value) => ({
   value,
   label: TRANSCRIPT_DENSITY_LABELS[value],
 }));
+const TERMINAL_BADGE_POSITION_LABELS: Record<TerminalBadgePosition, string> = {
+  "top-left": "Top left",
+  "top-right": "Top right",
+  "bottom-left": "Bottom left",
+  "bottom-right": "Bottom right",
+};
+const TERMINAL_BADGE_POSITION_OPTIONS = TERMINAL_BADGE_POSITIONS.map((value) => ({
+  value,
+  label: TERMINAL_BADGE_POSITION_LABELS[value],
+}));
 const ARCHIVE_BEHAVIOR_OPTIONS = [
   { value: "keep", label: "Keep running" },
   { value: "stop", label: "Stop workspace" },
@@ -145,6 +174,58 @@ const isBrowserMode = typeof window !== "undefined" && !window.api;
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
   const { api } = useAPI();
+  const telemetry = useTelemetry();
+  const [continuousCompaction, setContinuousCompaction] = useExperiment(
+    EXPERIMENT_IDS.CONTINUOUS_COMPACTION
+  );
+  const [tokenBudget, setTokenBudget] = useExperiment(EXPERIMENT_IDS.TOKEN_BUDGET);
+  const ptc = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const rlm = useExperimentValue(EXPERIMENT_IDS.RLM);
+  // Preserve legacy both-enabled precedence without rewriting preferences on load.
+  const compactionStrategy: CompactionStrategy = continuousCompaction
+    ? "continuous"
+    : tokenBudget
+      ? "token-budget"
+      : "summarize";
+  const tokenBudgetInactive = compactionStrategy === "token-budget" && ptc && rlm;
+  const [compactionOpen, setCompactionOpen] = useState(false);
+  const sameStrategyActivation = useRef<CompactionStrategy | null>(null);
+  const markCompactionActivation = (value: CompactionStrategy) => {
+    if (value !== compactionStrategy) return;
+    // Radix omits onValueChange for an unchanged value. Only normalize if its
+    // activation also closes the menu, not on Escape or a typeahead-only Space.
+    sameStrategyActivation.current = value;
+    queueMicrotask(() => {
+      sameStrategyActivation.current = null;
+    });
+  };
+  const handleCompactionStrategyChange = (value: string) => {
+    assert(
+      value === "summarize" || value === "continuous" || value === "token-budget",
+      `Unexpected compaction strategy: ${value}`
+    );
+    switch (value) {
+      case "continuous":
+        setContinuousCompaction(true);
+        setTokenBudget(false);
+        break;
+      case "token-budget":
+        setTokenBudget(true);
+        setContinuousCompaction(false);
+        break;
+      case "summarize":
+        setTokenBudget(false);
+        setContinuousCompaction(false);
+        break;
+      default: {
+        const exhaustive: never = value;
+        return exhaustive;
+      }
+    }
+    // Retain the override events previously emitted by the individual experiment switches.
+    telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
+    telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");
+  };
   const [launchBehavior, setLaunchBehavior] = usePersistedState<LaunchBehavior>(
     LAUNCH_BEHAVIOR_KEY,
     "dashboard"
@@ -157,6 +238,18 @@ export function GeneralSection() {
   const [sidebarAgeGrouping, setSidebarAgeGrouping] = usePersistedState<boolean>(
     SIDEBAR_AGE_GROUPING_KEY,
     true
+  );
+  const [sidebarFlatMode, setSidebarFlatMode] = usePersistedState<boolean>(
+    SIDEBAR_FLAT_MODE_KEY,
+    false,
+    { listener: true }
+  );
+  // The command palette also toggles this key, so stay subscribed to
+  // external updates while Settings is mounted.
+  const [sidebarHideSubAgents, setSidebarHideSubAgents] = usePersistedState<boolean>(
+    SIDEBAR_HIDE_SUBAGENTS_KEY,
+    false,
+    { listener: true }
   );
   const [transcriptDensity, setTranscriptDensity] = useTranscriptDensity();
   const [rawTerminalFontConfig, setTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
@@ -175,6 +268,15 @@ export function GeneralSection() {
     String.fromCodePoint(0xe725), // dev-git_branch
     String.fromCodePoint(0xf135), // fa-rocket
   ].join(" ");
+
+  // The command palette also toggles this key, so stay subscribed to
+  // external updates while Settings is mounted.
+  const [rawTerminalBadgeConfig, setTerminalBadgeConfig] = usePersistedState<TerminalBadgeConfig>(
+    TERMINAL_BADGE_CONFIG_KEY,
+    DEFAULT_TERMINAL_BADGE_CONFIG,
+    { listener: true }
+  );
+  const terminalBadgeConfig = normalizeTerminalBadgeConfig(rawTerminalBadgeConfig);
 
   const [rawEditorConfig, setEditorConfig] = usePersistedState<EditorConfig>(
     EDITOR_CONFIG_KEY,
@@ -447,6 +549,39 @@ export function GeneralSection() {
     setEditorConfig((prev) => ({ ...normalizeEditorConfig(prev), customCommand }));
   };
 
+  const handleTerminalBadgeEnabledChange = (enabled: boolean) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), enabled }));
+  };
+
+  const handleTerminalBadgeTemplateChange = (template: string) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), template }));
+  };
+
+  const handleTerminalBadgePositionChange = (position: TerminalBadgePosition) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), position }));
+  };
+
+  const handleTerminalBadgeOpacityChange = (rawValue: string) => {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+      return;
+    }
+
+    setTerminalBadgeConfig((prev) => ({
+      ...normalizeTerminalBadgeConfig(prev),
+      opacity: parsed / 100,
+    }));
+  };
+
+  const handleTerminalBadgeFontSizeChange = (rawValue: string) => {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), fontSize: parsed }));
+  };
+
   const handleSshHostChange = useCallback(
     (value: string) => {
       setSshHost(value);
@@ -511,7 +646,7 @@ export function GeneralSection() {
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
               <div className="text-foreground text-sm">Launch behavior</div>
-              <div className="text-muted text-xs">What to show when Mux starts</div>
+              <div className="text-muted text-xs">What to show when Xum starts</div>
             </div>
             <Select
               value={launchBehavior}
@@ -529,18 +664,23 @@ export function GeneralSection() {
               </SelectContent>
             </Select>
           </div>
+        </div>
+      </div>
 
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Sidebar</h3>
+        <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
-              <div className="text-foreground text-sm">Full-width chat transcript</div>
+              <div className="text-foreground text-sm">Flat chat list</div>
               <div className="text-muted text-xs">
-                Let messages use the full chat pane instead of the default readable column.
+                Show all chats in a single list with project badges instead of project folders.
               </div>
             </div>
             <Switch
-              checked={chatTranscriptFullWidth}
-              onCheckedChange={handleChatTranscriptFullWidthChange}
-              aria-label="Toggle full-width chat transcript"
+              checked={sidebarFlatMode}
+              onCheckedChange={setSidebarFlatMode}
+              aria-label="Toggle flat chat list"
             />
           </div>
 
@@ -556,6 +696,40 @@ export function GeneralSection() {
               checked={sidebarAgeGrouping}
               onCheckedChange={setSidebarAgeGrouping}
               aria-label="Toggle sidebar workspace age grouping"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Hide sub-agents in the sidebar</div>
+              <div className="text-muted text-xs">
+                Show only top-level workspaces. Parents summarize hidden sub-agent and workflow
+                activity in their status line.
+              </div>
+            </div>
+            <Switch
+              checked={sidebarHideSubAgents}
+              onCheckedChange={setSidebarHideSubAgents}
+              aria-label="Toggle hiding sub-agents in the sidebar"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Transcript</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Full-width chat transcript</div>
+              <div className="text-muted text-xs">
+                Let messages use the full chat pane instead of the default readable column.
+              </div>
+            </div>
+            <Switch
+              checked={chatTranscriptFullWidth}
+              onCheckedChange={handleChatTranscriptFullWidthChange}
+              aria-label="Toggle full-width chat transcript"
             />
           </div>
 
@@ -610,7 +784,64 @@ export function GeneralSection() {
               </SelectContent>
             </Select>
           </div>
+        </div>
+      </div>
 
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Compaction</h3>
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="text-foreground text-sm">Compaction strategy</div>
+            <div className="text-muted text-xs">How to manage context as conversations grow.</div>
+          </div>
+          <Select
+            value={compactionStrategy}
+            onValueChange={handleCompactionStrategyChange}
+            open={compactionOpen}
+            onOpenChange={(open) => {
+              setCompactionOpen(open);
+              const activated = sameStrategyActivation.current;
+              sameStrategyActivation.current = null;
+              if (!open && activated) handleCompactionStrategyChange(activated);
+            }}
+          >
+            <SelectTrigger
+              aria-label="Compaction strategy"
+              aria-describedby={tokenBudgetInactive ? "token-budget-inactive" : undefined}
+              className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto shrink-0 cursor-pointer rounded-md border px-3 text-sm transition-colors"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {COMPACTION_STRATEGIES.map((strategy) => (
+                <SelectItem
+                  key={strategy.value}
+                  value={strategy.value}
+                  onPointerUp={() => markCompactionActivation(strategy.value)}
+                  onClick={() => markCompactionActivation(strategy.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      markCompactionActivation(strategy.value);
+                    }
+                  }}
+                >
+                  {strategy.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {tokenBudgetInactive && (
+          <div id="token-budget-inactive" role="status" className="text-warning mt-2 text-xs">
+            Token Budget is saved but inactive while Programmatic Tool Calling and RLM Mode are both
+            enabled. Disable either in Experiments to use it.
+          </div>
+        )}
+      </div>
+
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Terminal</h3>
+        <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
               <div className="text-foreground text-sm">Terminal Font</div>
@@ -652,14 +883,219 @@ export function GeneralSection() {
               className="border-border-medium bg-background-secondary h-9 w-28"
             />
           </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Terminal Badge</div>
+              <div className="text-muted text-xs">
+                Show a scroll-fixed workspace/tab watermark over the terminal
+              </div>
+            </div>
+            <Switch
+              checked={terminalBadgeConfig.enabled}
+              onCheckedChange={handleTerminalBadgeEnabledChange}
+              aria-label="Toggle Terminal Badge"
+            />
+          </div>
+
+          {terminalBadgeConfig.enabled && (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Template</div>
+                  <div className="text-muted text-xs">
+                    Tokens: {"{workspace}"}, {"{tab}"}, {"{project}"}, {"{index}"}
+                  </div>
+                  <div className="text-muted text-xs">
+                    {"{tab}"} follows the tab label (shell titles); {"{index}"} is the stable tab
+                    number
+                  </div>
+                </div>
+                <Input
+                  value={terminalBadgeConfig.template}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeTemplateChange(e.target.value)
+                  }
+                  placeholder={DEFAULT_TERMINAL_BADGE_CONFIG.template}
+                  aria-label="Terminal Badge Template"
+                  className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Position</div>
+                  <div className="text-muted text-xs">
+                    Corner of the terminal to pin the badge to
+                  </div>
+                </div>
+                <Select
+                  value={terminalBadgeConfig.position}
+                  onValueChange={(value) =>
+                    handleTerminalBadgePositionChange(value as TerminalBadgePosition)
+                  }
+                >
+                  <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TERMINAL_BADGE_POSITION_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Opacity</div>
+                  <div className="text-muted text-xs">Percent (1-100)</div>
+                </div>
+                <Input
+                  type="number"
+                  value={Math.round(terminalBadgeConfig.opacity * 100)}
+                  min={1}
+                  max={100}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeOpacityChange(e.target.value)
+                  }
+                  aria-label="Terminal Badge Opacity"
+                  className="border-border-medium bg-background-secondary h-9 w-28"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Font Size</div>
+                  <div className="text-muted text-xs">Font size for the badge text</div>
+                </div>
+                <Input
+                  type="number"
+                  value={terminalBadgeConfig.fontSize}
+                  min={6}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeFontSizeChange(e.target.value)
+                  }
+                  aria-label="Terminal Badge Font Size"
+                  className="border-border-medium bg-background-secondary h-9 w-28"
+                />
+              </div>
+            </>
+          )}
         </div>
       </div>
 
-      <div>
-        <h3 className="text-foreground mb-4 text-sm font-medium">Workspace insights</h3>
-        <div className="divide-border-light divide-y">
-          <div className="flex items-center justify-between py-3">
-            <div className="flex-1 pr-4">
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Coder workspace on archive</div>
+              <div className="text-muted text-xs">
+                Action to take on dedicated Coder workspaces when archiving a chat. Delete is
+                permanent.
+              </div>
+            </div>
+            <Select
+              value={archiveBehavior}
+              onValueChange={(value) =>
+                handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
+              }
+              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+            >
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Worktree archive behavior</div>
+              <div className="text-muted text-xs">
+                Control whether archived xum-managed worktrees stay on disk, are deleted, or are
+                snapshotted so they can be restored on unarchive.
+              </div>
+            </div>
+            <Select
+              value={worktreeArchiveBehavior}
+              onValueChange={(value) =>
+                handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
+              }
+              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+            >
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </div>
+
+      <div className="border-border-light border-t pt-6">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Editor & debugging</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-foreground text-sm">Editor</div>
+              <div className="text-muted text-xs">Editor to open files in</div>
+            </div>
+            <Select value={editorConfig.editor} onValueChange={handleEditorChange}>
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {EDITOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {editorConfig.editor === "custom" && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-foreground text-sm">Custom Command</div>
+                  <div className="text-muted text-xs">Command to run (path will be appended)</div>
+                </div>
+                <Input
+                  value={editorConfig.customCommand ?? ""}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleCustomCommandChange(e.target.value)
+                  }
+                  placeholder="e.g., nvim"
+                  className="border-border-medium bg-background-secondary h-9 w-40"
+                />
+              </div>
+              {isBrowserMode && (
+                <div className="text-warning text-xs">
+                  Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="flex items-center justify-between">
+            <div>
               <div className="text-foreground text-sm">API Debug Logs</div>
               <div className="text-muted mt-0.5 text-xs">
                 Record the full input and output of every AI API call
@@ -671,127 +1107,29 @@ export function GeneralSection() {
               aria-label="Toggle API Debug Logs"
             />
           </div>
-        </div>
-      </div>
 
-      <div className="flex items-center justify-between">
-        <div>
-          <div className="text-foreground text-sm">Editor</div>
-          <div className="text-muted text-xs">Editor to open files in</div>
-        </div>
-        <Select value={editorConfig.editor} onValueChange={handleEditorChange}>
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {EDITOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {editorConfig.editor === "custom" && (
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-foreground text-sm">Custom Command</div>
-              <div className="text-muted text-xs">Command to run (path will be appended)</div>
-            </div>
-            <Input
-              value={editorConfig.customCommand ?? ""}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                handleCustomCommandChange(e.target.value)
-              }
-              placeholder="e.g., nvim"
-              className="border-border-medium bg-background-secondary h-9 w-40"
-            />
-          </div>
-          {isBrowserMode && (
-            <div className="text-warning text-xs">
-              Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
+          {isBrowserMode && sshHostLoaded && (
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-foreground text-sm">SSH Host</div>
+                <div className="text-muted text-xs">
+                  SSH hostname for &apos;Open in Editor&apos; deep links
+                </div>
+              </div>
+              <Input
+                value={sshHost}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  handleSshHostChange(e.target.value)
+                }
+                placeholder={window.location.hostname}
+                className="border-border-medium bg-background-secondary h-9 w-40"
+              />
             </div>
           )}
         </div>
-      )}
-
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <div className="text-foreground text-sm">Coder workspace on archive</div>
-          <div className="text-muted text-xs">
-            Action to take on dedicated Coder workspaces when archiving a chat. Delete is permanent.
-          </div>
-        </div>
-        <Select
-          value={archiveBehavior}
-          onValueChange={(value) =>
-            handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
-          }
-          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
-        >
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
       </div>
 
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <div className="text-foreground text-sm">Worktree archive behavior</div>
-          <div className="text-muted text-xs">
-            Control whether archived mux-managed worktrees stay on disk, are deleted, or are
-            snapshotted so they can be restored on unarchive.
-          </div>
-        </div>
-        <Select
-          value={worktreeArchiveBehavior}
-          onValueChange={(value) =>
-            handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
-          }
-          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
-        >
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {isBrowserMode && sshHostLoaded && (
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-foreground text-sm">SSH Host</div>
-            <div className="text-muted text-xs">
-              SSH hostname for &apos;Open in Editor&apos; deep links
-            </div>
-          </div>
-          <Input
-            value={sshHost}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              handleSshHostChange(e.target.value)
-            }
-            placeholder={window.location.hostname}
-            className="border-border-medium bg-background-secondary h-9 w-40"
-          />
-        </div>
-      )}
-
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Projects</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
@@ -807,7 +1145,7 @@ export function GeneralSection() {
                 setDefaultProjectDir(e.target.value)
               }
               onBlur={handleCloneDirBlur}
-              placeholder="~/.mux/projects"
+              placeholder="~/.xum/projects"
               disabled={!cloneDirLoaded}
               className="border-border-medium bg-background-secondary h-9 w-80"
             />

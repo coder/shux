@@ -60,11 +60,21 @@ const MuxToolPartBase = z.object({
 export const NestedToolCallSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
-  input: z.unknown(),
+  // Optional: kernel guests can invoke a capability with zero arguments
+  // (mux.tool()), and JSON.stringify drops the resulting `input: undefined`
+  // key on persist. Requiring the key here made onChat replay of such
+  // persisted rows fail oRPC output validation and permanently brick
+  // workspace fetch (one corrupt row killed the whole subscription).
+  input: z.unknown().optional(),
   output: z.unknown().optional(),
   state: z.enum(["input-available", "output-available", "output-redacted"]),
   failed: z.boolean().optional(),
   timestamp: z.number().optional(),
+  // Durable run identity for nested workflow_run/workflow_resume calls, set
+  // by streamManager when the workflow-run-attached event targets a nested
+  // call. Kernel bounding can replace the nested args/result with a marker,
+  // so without this the transcript card loses the run after reload.
+  workflowRun: WorkflowRunToolAttachmentSchema.optional(),
 });
 
 export type NestedToolCall = z.infer<typeof NestedToolCallSchema>;
@@ -75,12 +85,12 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
-export const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
+const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
-export const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
+const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
   state: z.literal("output-redacted"),
   failed: z.boolean().optional(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
@@ -101,7 +111,6 @@ export const MuxFilePartSchema = FilePartSchema.extend({
 
 // Export types inferred from schemas for reuse across app/test code.
 export type FilePart = z.infer<typeof FilePartSchema>;
-export type MuxFilePart = z.infer<typeof MuxFilePartSchema>;
 
 const CompactionEpochSchema = z.optional(
   z.preprocess(
@@ -127,22 +136,33 @@ const TranscriptAnchorSchema = z.object({
   partIndex: z.number().int().nonnegative(),
 });
 
-// MuxMessage (simplified)
+const MuxMessagePartsSchema = z.array(
+  z.discriminatedUnion("type", [
+    MuxTextPartSchema,
+    MuxReasoningPartSchema,
+    MuxToolPartSchema,
+    MuxFilePartSchema,
+  ])
+);
+
+export const ContextBudgetRejectedMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  parts: MuxMessagePartsSchema,
+  // Original metadata stays inert until explicitly validated for display.
+  metadata: z.any().optional(),
+});
+
+// XumMessage (simplified)
 export const MuxMessageSchema = z.object({
   id: z.string(),
   role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(
-    z.discriminatedUnion("type", [
-      MuxTextPartSchema,
-      MuxReasoningPartSchema,
-      MuxToolPartSchema,
-      MuxFilePartSchema,
-    ])
-  ),
+  parts: MuxMessagePartsSchema,
   createdAt: z.date().optional(),
   metadata: z
     .object({
       historySequence: z.number().optional(),
+      // Step cuts are an optimization; malformed legacy metadata must not block chat replay.
+      stepStartPartIndices: z.array(z.number()).optional().catch(undefined),
       timestamp: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),
@@ -182,8 +202,14 @@ export const MuxMessageSchema = z.object({
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
+      contextBudgetRejected: z.literal(true).optional(),
+      contextBudgetRejectedMessage: ContextBudgetRejectedMessageSchema.optional().catch(undefined),
+      requestPreludeMessageIds: z.array(z.string()).optional(),
+      // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.
+      rlmPreservedTailCopy: z.boolean().optional(),
       transcriptAnchor: TranscriptAnchorSchema.optional().catch(undefined),
 
+      // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.
       agentSkillSnapshot: z
         .object({
           skillName: SkillNameSchema,
@@ -191,7 +217,18 @@ export const MuxMessageSchema = z.object({
           sha256: z.string(),
           frontmatterYaml: z.string().optional(),
         })
-        .optional(),
+        .optional()
+        .catch(undefined),
+      mcpPromptSnapshot: z
+        .object({
+          serverName: z.string(),
+          promptName: z.string(),
+          commandKey: z.string(),
+          invokingMessageId: z.string().optional(),
+          description: z.string().optional(),
+        })
+        .optional()
+        .catch(undefined),
       // Marks the hidden @file snapshot turn, which the timeline skips as context plumbing.
       fileAtMentionSnapshot: z.array(z.string()).optional(),
       error: z.string().optional(),

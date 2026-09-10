@@ -15,15 +15,21 @@
  * Build: `bun build src/desktop/preload.ts --format=cjs --target=node --external=electron`
  */
 
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { contextBridge, ipcRenderer } from "electron";
-import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
+import type { DeepLinkPayload } from "@/common/types/deepLink";
+import type { RemoteConnectionApi, RemoteConnectionState } from "@/common/types/remoteConnection";
+import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 
-// mux:// deep links can arrive before the React app subscribes.
+const getXumEnv = (suffix: string): string | undefined =>
+  resolveXumEnvironmentValue(suffix, process.env);
+
+// xum:// and legacy mux:// deep links can arrive before the React app subscribes.
 // Buffer them here so the renderer can consume them on mount.
-const pendingDeepLinks: MuxDeepLinkPayload[] = [];
-const deepLinkSubscribers = new Set<(payload: MuxDeepLinkPayload) => void>();
+const pendingDeepLinks: DeepLinkPayload[] = [];
+const deepLinkSubscribers = new Set<(payload: DeepLinkPayload) => void>();
 
-ipcRenderer.on("mux:deep-link", (_event: unknown, payload: MuxDeepLinkPayload) => {
+ipcRenderer.on("mux:deep-link", (_event: unknown, payload: DeepLinkPayload) => {
   if (deepLinkSubscribers.size === 0) {
     pendingDeepLinks.push(payload);
   }
@@ -39,7 +45,7 @@ ipcRenderer.on("mux:deep-link", (_event: unknown, payload: MuxDeepLinkPayload) =
 });
 
 function getEnableTutorialsInSandbox(): boolean | undefined {
-  const raw = process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX;
+  const raw = getXumEnv("ENABLE_TUTORIALS_IN_SANDBOX");
   if (raw == null) {
     return undefined;
   }
@@ -49,25 +55,37 @@ function getEnableTutorialsInSandbox(): boolean | undefined {
 
 // Forward ORPC MessagePort from renderer to main process
 window.addEventListener("message", (event) => {
-  if (event.data === "start-orpc-client" && event.ports?.[0]) {
+  if (event.source === window && event.data === "start-orpc-client" && event.ports?.[0]) {
     ipcRenderer.postMessage("start-orpc-server", null, [...event.ports]);
   }
 });
 
+const remoteConnection: RemoteConnectionApi = {
+  getState: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.getState),
+  connect: (url) => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.connect, url),
+  disconnect: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.disconnect),
+  onStateChanged: (callback) => {
+    const listener = (_event: unknown, state: RemoteConnectionState) => callback(state);
+    ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+    return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+  },
+};
+
 contextBridge.exposeInMainWorld("api", {
+  remoteConnection,
   platform: process.platform,
   versions: {
     node: process.versions.node,
     chrome: process.versions.chrome,
     electron: process.versions.electron,
   },
-  isE2E: process.env.MUX_E2E === "1",
-  enableReactPerfProfile: process.env.MUX_PROFILE_REACT === "1",
-  enableTelemetryInDev: process.env.MUX_ENABLE_TELEMETRY_IN_DEV === "1",
+  isE2E: getXumEnv("E2E") === "1",
+  enableReactPerfProfile: getXumEnv("PROFILE_REACT") === "1",
+  enableTelemetryInDev: getXumEnv("ENABLE_TELEMETRY_IN_DEV") === "1",
   enableTutorialsInSandbox: getEnableTutorialsInSandbox(),
   // Note: When debugging LLM requests, we also want to see synthetic/request-only
   // messages in the chat history so the UI matches what was sent to the provider.
-  debugLlmRequest: process.env.MUX_DEBUG_LLM_REQUEST === "1",
+  debugLlmRequest: getXumEnv("DEBUG_LLM_REQUEST") === "1",
   // NOTE: This is intentionally async so the preload script does not rely on Node builtins
   // like `child_process` (which can break in hardened/sandboxed environments).
   getIsRosetta: () => ipcRenderer.invoke("mux:get-is-rosetta"),
@@ -82,7 +100,7 @@ contextBridge.exposeInMainWorld("api", {
     };
   },
   consumePendingDeepLinks: () => pendingDeepLinks.splice(0, pendingDeepLinks.length),
-  onDeepLink: (callback: (payload: MuxDeepLinkPayload) => void) => {
+  onDeepLink: (callback: (payload: DeepLinkPayload) => void) => {
     deepLinkSubscribers.add(callback);
     return () => {
       deepLinkSubscribers.delete(callback);

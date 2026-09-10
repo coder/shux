@@ -8,6 +8,10 @@ import type {
   MuxToolPart,
 } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import {
+  type AgentMessageRelationship,
+  formatAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import {
@@ -124,6 +128,53 @@ export function createBashMonitorWakeMessage(
   };
 }
 
+/** Create the synthetic envelope used for intra-tree agent peer messages. */
+export function createAgentPeerMessage(
+  id: string,
+  opts: {
+    historySequence: number;
+    timestamp?: number;
+    fromWorkspaceId: string;
+    fromTitle?: string;
+    relationship: AgentMessageRelationship;
+    message: string;
+  }
+): ChatMuxMessage {
+  return {
+    type: "message",
+    id,
+    // SECURITY parity with sendAgentPeerMessage: payloads are assistant-role synthetic pre-turn
+    // rows so peer bytes never gain user-role authority; the turn is triggered separately by a
+    // fixed-content user message.
+    role: "assistant",
+    parts: [
+      {
+        type: "text",
+        text: formatAgentMessageEnvelope({
+          from: opts.fromWorkspaceId,
+          ...(opts.fromTitle != null ? { fromTitle: opts.fromTitle } : {}),
+          relationship: opts.relationship,
+          message: opts.message,
+        }),
+      },
+    ],
+    metadata: {
+      historySequence: opts.historySequence,
+      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
+      // Match the backend send path: synthetic sends are marked uiVisible so the
+      // aggregator does not hide them from the transcript (agentSession internal sends).
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: {
+        type: "agent-peer-message",
+        fromWorkspaceId: opts.fromWorkspaceId,
+        ...(opts.fromTitle != null ? { fromTitle: opts.fromTitle } : {}),
+        relationship: opts.relationship,
+      },
+    },
+  };
+}
+
 /** Create the synthetic protocol envelope used to wake a parent with sub-agent findings. */
 export function createSubagentReportMessage(
   id: string,
@@ -158,29 +209,6 @@ export function createSubagentReportMessage(
       synthetic: true,
     }
   );
-}
-
-/** Create a compaction request user message (triggers shimmer effect on streaming response) */
-export function createCompactionRequestMessage(
-  id: string,
-  opts: { historySequence: number; timestamp?: number; rawCommand?: string }
-): ChatMuxMessage {
-  const rawCommand = opts.rawCommand ?? "/compact";
-  return {
-    type: "message",
-    id,
-    role: "user",
-    parts: [{ type: "text", text: rawCommand }],
-    metadata: {
-      historySequence: opts.historySequence,
-      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
-      muxMetadata: {
-        type: "compaction-request",
-        rawCommand,
-        parsed: {},
-      },
-    },
-  };
 }
 
 export function createAssistantMessage(

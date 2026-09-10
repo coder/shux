@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
   DEFAULT_MODEL_FALLBACKS,
   MODEL_FALLBACK_CHAIN_LIMIT,
+  normalizeFallbackModelKey,
   resolveModelFallbackChain,
   sanitizeModelFallbackChain,
   sanitizeModelFallbacks,
@@ -78,6 +79,74 @@ describe("resolveModelFallbackChain", () => {
         "mux-gateway:anthropic/claude-sonnet-4-5"
       )
     ).toEqual([FALLBACK_A]);
+  });
+});
+
+describe("Coder gateway fallback keys", () => {
+  // {name: "openai", type: "anthropic"}: the selection routes through the
+  // gateway on the Anthropic wire — its refusal chain must be independent
+  // of chains configured for direct OpenAI.
+  const crossTypedConfig = {
+    coder: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      discoveredProviders: [{ name: "openai", type: "anthropic" }],
+    },
+  };
+
+  it("normalizeFallbackModelKey keeps cross-typed selections gateway-scoped", () => {
+    expect(normalizeFallbackModelKey("coder:openai/claude-opus-4-5", crossTypedConfig)).toBe(
+      "coder:openai/claude-opus-4-5"
+    );
+    // Default-typed (or metadata-less) canonical routes share the direct key.
+    expect(normalizeFallbackModelKey("coder:anthropic/claude-opus-4-5", crossTypedConfig)).toBe(
+      "anthropic:claude-opus-4-5"
+    );
+    expect(normalizeFallbackModelKey("coder:openai/gpt-5.5")).toBe("openai:gpt-5.5");
+    // Non-canonical instance names are already gateway-scoped.
+    expect(normalizeFallbackModelKey("coder:prod-anthropic/claude-opus-4-5")).toBe(
+      "coder:prod-anthropic/claude-opus-4-5"
+    );
+  });
+
+  it("cross-typed selections never resolve the direct provider's chain", () => {
+    const fallbacks = { "openai:claude-opus-4-5": { models: [FALLBACK_A] } };
+    expect(
+      resolveModelFallbackChain(fallbacks, "coder:openai/claude-opus-4-5", crossTypedConfig)
+    ).toEqual([]);
+  });
+
+  it("gateway-scoped chains resolve for the raw selection", () => {
+    const fallbacks = { "coder:openai/claude-opus-4-5": { models: [FALLBACK_A] } };
+    expect(
+      resolveModelFallbackChain(fallbacks, "coder:openai/claude-opus-4-5", crossTypedConfig)
+    ).toEqual([FALLBACK_A]);
+    // Raw-first: the stored gateway-scoped chain stays reachable even when
+    // instance metadata is unavailable (e.g. logged out).
+    expect(resolveModelFallbackChain(fallbacks, "coder:openai/claude-opus-4-5")).toEqual([
+      FALLBACK_A,
+    ]);
+  });
+
+  it("default-typed canonical-route selections share the direct provider's chain", () => {
+    const fallbacks = { [SOURCE]: { models: [FALLBACK_A] } };
+    expect(
+      resolveModelFallbackChain(fallbacks, "coder:anthropic/claude-sonnet-4-5", crossTypedConfig)
+    ).toEqual([FALLBACK_A]);
+  });
+
+  it("sanitize preserves Coder keys and chain entries verbatim", () => {
+    // Sanitize runs on every config read where metadata may be missing;
+    // rewriting coder: strings by name there would merge a gateway-scoped
+    // chain into the direct provider's.
+    expect(
+      sanitizeModelFallbacks({
+        "coder:openai/claude-opus-4-5": { models: ["coder:openai/gpt-5.5", FALLBACK_B] },
+      })
+    ).toEqual({
+      "coder:openai/claude-opus-4-5": { models: ["coder:openai/gpt-5.5", FALLBACK_B] },
+    });
   });
 });
 

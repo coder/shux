@@ -2,16 +2,16 @@ import React, { useEffect, useRef, useState } from "react";
 
 import { Check, ChevronDown } from "lucide-react";
 
-import { cn } from "mux/common/lib/utils";
+import { cn } from "xum/common/lib/utils";
 import {
   LocalIcon,
   SSHIcon,
   WorktreeIcon,
-} from "mux/browser/components/icons/RuntimeIcons/RuntimeIcons";
-import { Shimmer } from "mux/browser/features/AIElements/Shimmer";
-import { Button } from "mux/browser/components/Button/Button";
-import { Input } from "mux/browser/components/Input/Input";
-import { Popover, PopoverContent, PopoverTrigger } from "mux/browser/components/Popover/Popover";
+} from "xum/browser/components/icons/RuntimeIcons/RuntimeIcons";
+import { Shimmer } from "xum/browser/features/AIElements/Shimmer";
+import { Button } from "xum/browser/components/Button/Button";
+import { Input } from "xum/browser/components/Input/Input";
+import { Popover, PopoverContent, PopoverTrigger } from "xum/browser/components/Popover/Popover";
 
 import type { UiWorkspace } from "./protocol";
 

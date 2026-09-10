@@ -29,12 +29,8 @@ export function resolveGhToken(env?: Record<string, string>): string | null {
   return env?.GH_TOKEN ?? process.env.GH_TOKEN ?? null;
 }
 
-export function getHostGitconfigPath(): string {
-  return path.join(os.homedir(), ".gitconfig");
-}
-
-export function hasHostGitconfig(): boolean {
-  return existsSync(getHostGitconfigPath());
+function getHostGitconfigPath(): string {
+  return path.join(process.env.HOME ?? os.homedir(), ".gitconfig");
 }
 
 export async function readHostGitconfig(): Promise<Buffer | null> {

@@ -20,12 +20,17 @@ import {
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
+  resolveHeadlessAgentModelString,
+  resolveHeadlessAgentSettings,
+  resolveHeadlessAgentBody,
+  resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -188,7 +193,7 @@ function projectMutationModel(): MockLanguageModelV3 {
 }
 
 interface Fixture extends Disposable {
-  muxHome: string;
+  xumHome: string;
   config: Config;
   service: MemoryConsolidationService;
   historyService: HistoryService;
@@ -211,10 +216,10 @@ async function createFixture(options?: {
   withSessionUsage?: boolean;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation-service");
-  const muxHome = path.join(tempDir.path, "mux-home");
-  await fsPromises.mkdir(path.join(muxHome, "memory"), { recursive: true });
+  const xumHome = path.join(tempDir.path, "mux-home");
+  await fsPromises.mkdir(path.join(xumHome, "memory"), { recursive: true });
 
-  const config = new Config(muxHome);
+  const config = new Config(xumHome);
   // Register a workspace so config.findWorkspace resolves it.
   await config.editConfig((cfg) => {
     cfg.projects.set("/projects/demo", {
@@ -224,7 +229,7 @@ async function createFixture(options?: {
   });
 
   const historyService = new HistoryService(config);
-  const metaService = new MemoryMetaService(muxHome);
+  const metaService = new MemoryMetaService(xumHome);
   const memoryService = new MemoryService(config, metaService);
 
   let enabled = true;
@@ -238,13 +243,15 @@ async function createFixture(options?: {
     metaService,
     historyService,
     {
-      createModel: async () => {
+      createModelWithPinnedMetadata: async (modelString: string) => {
         modelCalls.push(Date.now());
         if (options?.modelGate) await options.modelGate;
-        return Ok(
-          options?.modelFactory?.() ??
-            (streamFailing ? failingScriptedModel(capturePrompt) : scriptedModel(capturePrompt))
-        );
+        return Ok({
+          model:
+            options?.modelFactory?.() ??
+            (streamFailing ? failingScriptedModel(capturePrompt) : scriptedModel(capturePrompt)),
+          metadataModel: modelString,
+        });
       },
     },
     {
@@ -255,7 +262,7 @@ async function createFixture(options?: {
   );
 
   return {
-    muxHome,
+    xumHome,
     config,
     service,
     historyService,
@@ -339,6 +346,69 @@ async function seedCompactionEpoch(
 }
 
 describe("MemoryConsolidationService", () => {
+  it("teardown blocks follow-on consolidation runs (r61)", async () => {
+    // The one-shot abort loop cannot reach runs registered after it (the
+    // post-harvest sweep, retryable-harvest recovery): entry must refuse
+    // once teardown began, locally or via a foreign backend's durable
+    // removal tombstone.
+    using fixture = await createFixture();
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const followOn = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(followOn.success).toBe(false);
+    if (!followOn.success) expect(followOn.error).toContain("being removed");
+
+    // Durable tombstone alone (removal performed by another backend).
+    await fixture.addWorkspace("ws-foreign");
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-foreign");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-foreign", removedAt: Date.now() })
+    );
+    const foreign = await fixture.service.maybeRun("ws-foreign", "manual");
+    expect(foreign.success).toBe(false);
+    if (!foreign.success) expect(foreign.error).toContain("being removed");
+  });
+
+  it("workspace removal aborts and drains an in-flight consolidation run (r60)", async () => {
+    // Removal only ever raced the run's hard timeout before: the drain must
+    // abort the stream itself, settle the run, and return promptly so
+    // removal is never wedged behind an open provider stream.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            // Emits nothing and never closes; like a real provider stream it
+            // errors only when the request's abort signal fires.
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    const run = fixture.service.maybeRun("ws-dream", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    // The run settled (abort surfaced as a stream failure) instead of
+    // holding the in-flight lock until its multi-minute timeout.
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("stream failed");
+    }
+    // Idempotent with nothing in flight (the phantom-metadata removal path).
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+  });
+
   it("runs, persists the journal record, and reports it via getRecord", async () => {
     using fixture = await createFixture();
     const result = await fixture.service.maybeRun("ws-dream", "compaction");
@@ -352,7 +422,7 @@ describe("MemoryConsolidationService", () => {
     expect(record?.trigger).toBe("compaction");
     // Persisted to the sidecar, not just memory.
     const raw = await fsPromises.readFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       "utf-8"
     );
     expect(raw).toContain("ws-dream");
@@ -393,7 +463,7 @@ describe("MemoryConsolidationService", () => {
     // the sweep itself must request the ingest.
     expect(ingests).toEqual([{ workspaceId: "ws-dream" }]);
     const sidecar = await fsPromises.readFile(
-      path.join(fixture.config.getSessionDir("ws-dream"), "headless-usage.jsonl"),
+      path.join(fixture.config.sessionsDir, "ws-dream", "headless-usage.jsonl"),
       "utf-8"
     );
     expect(sidecar).toContain('"source":"memory_consolidation"');
@@ -406,7 +476,7 @@ describe("MemoryConsolidationService", () => {
     expect(result.success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown> };
     expect(raw.projects?.["/projects/demo"]).toBeDefined();
   });
@@ -419,7 +489,7 @@ describe("MemoryConsolidationService", () => {
     expect(result.success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown>; workspaces?: Record<string, unknown> };
     expect(raw.workspaces?.["ws-multi"]).toBeDefined();
     expect(raw.projects?.["/projects/demo"]).toBeUndefined();
@@ -439,7 +509,7 @@ describe("MemoryConsolidationService", () => {
     }
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown>; workspaces?: Record<string, unknown> };
     expect(raw.workspaces?.["ws-task"]).toBeDefined();
     expect(raw.projects?.["/projects/demo"]).toBeUndefined();
@@ -464,7 +534,7 @@ describe("MemoryConsolidationService", () => {
   it("does not treat older workspace-only records as project coverage", async () => {
     using fixture = await createFixture();
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -487,7 +557,7 @@ describe("MemoryConsolidationService", () => {
   it("preserves consolidation status when a harvest sidecar record is malformed", async () => {
     using fixture = await createFixture();
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -559,14 +629,14 @@ describe("MemoryConsolidationService", () => {
       ])
     );
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({ workspaces: {}, harvestsByWorkspace: { "ws-dream": oldRecords } })
     );
 
     expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { harvestsByWorkspace?: Record<string, Record<string, unknown>> };
     const records = raw.harvestsByWorkspace?.["ws-dream"] ?? {};
     expect(Object.keys(records).length).toBeLessThanOrEqual(20);
@@ -979,7 +1049,7 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         harvestsByWorkspace: {
@@ -1013,7 +1083,7 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         harvestsByWorkspace: {
@@ -1146,7 +1216,7 @@ describe("MemoryConsolidationService", () => {
 
   it("self-heals a corrupt sidecar instead of failing every later read", async () => {
     using fixture = await createFixture();
-    const sidecarPath = path.join(fixture.muxHome, "memory-consolidation.json");
+    const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
     // typeof null === "object": this once passed a hand-rolled validity check
     // and then blew up getRecord/saveRecord with a TypeError forever.
     await fsPromises.writeFile(sidecarPath, JSON.stringify({ workspaces: null }));
@@ -1162,20 +1232,20 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture();
     // Resolution is rooted at the provided mux root (Config.rootDir), never a
     // hardcoded ~/.mux — the fixture root proves the isolation.
-    const builtIn = await resolveDreamAgentBody(fixture.muxHome);
+    const builtIn = await resolveDreamAgentBody(fixture.xumHome);
     expect(builtIn).not.toBeNull();
 
-    const agentsDir = path.join(fixture.muxHome, "agents");
+    const agentsDir = path.join(fixture.xumHome, "agents");
     await fsPromises.mkdir(agentsDir, { recursive: true });
     await fsPromises.writeFile(
       path.join(agentsDir, "dream.md"),
       "---\nname: Dream\n---\n\nCustom dream body\n"
     );
-    expect(await resolveDreamAgentBody(fixture.muxHome)).toBe("Custom dream body");
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe("Custom dream body");
 
     // Malformed override (missing frontmatter) falls back to the built-in.
     await fsPromises.writeFile(path.join(agentsDir, "dream.md"), "body without frontmatter\n");
-    expect(await resolveDreamAgentBody(fixture.muxHome)).toBe(builtIn);
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe(builtIn);
   });
 
   it("does nothing when the experiment is disabled", async () => {
@@ -1272,7 +1342,7 @@ describe("MemoryConsolidationService", () => {
     const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
     const recentProjectRunAt = Date.now() - 60_000;
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         projects: {
@@ -1322,7 +1392,7 @@ describe("MemoryConsolidationService", () => {
     // project write older than that legacy run still needs one project pass.
     const projectWriteAt = recentWorkspaceRunAt - 1_000;
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -1339,7 +1409,7 @@ describe("MemoryConsolidationService", () => {
       workspaceId: "ws-dream",
     });
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-meta.json"),
+      path.join(fixture.xumHome, "memory-meta.json"),
       JSON.stringify({
         entries: {
           [logicalKey]: {
@@ -1356,7 +1426,7 @@ describe("MemoryConsolidationService", () => {
 
     expect(fixture.modelCalls).toHaveLength(1);
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown> };
     expect(raw.projects?.["/projects/demo"]).toBeDefined();
   });
@@ -1393,7 +1463,7 @@ describe("MemoryConsolidationService", () => {
     );
     recency.set("ws-eligible", dayAgo);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({ workspaces: sidecarWorkspaces })
     );
 
@@ -1438,6 +1508,215 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(1);
   });
 
+  it("resolves intuition independently through workspace override, global default, selected route, and app default", async () => {
+    using fixture = await createFixture();
+    const resolve = () => resolveHeadlessAgentModelString(fixture.config, "ws-dream", "intuition");
+    expect(resolve()).toBe(resolveDreamModelString(fixture.config, "ws-dream"));
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+      workspace.agentId = "exec";
+      workspace.aiSettingsByAgent = {
+        exec: { model: "coder:private-route", thinkingLevel: "off" },
+      };
+      workspace.aiSettings = { model: "anthropic:stale-route", thinkingLevel: "off" };
+      cfg.agentAiDefaults = { dream: { modelString: "openai:dream-only" } };
+      return cfg;
+    });
+    expect(resolve()).toBe("coder:private-route");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults!.intuition = { modelString: "openai:global-intuition" };
+      return cfg;
+    });
+    expect(resolve()).toBe("openai:global-intuition");
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.intuition = {
+        model: "coder:workspace-intuition",
+        thinkingLevel: "off",
+      };
+      return cfg;
+    });
+    expect(resolve()).toBe("coder:workspace-intuition");
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("openai:dream-only");
+  });
+
+  it("resolves headless effort independently from model with workspace, global, definition, and off precedence", async () => {
+    using fixture = await createFixture();
+    const resolve = (definitionAiDefaults?: { thinkingLevel: "low" }) =>
+      resolveHeadlessAgentSettings(
+        fixture.config,
+        "ws-dream",
+        "intuition",
+        "coder:private-route",
+        definitionAiDefaults
+      );
+    expect(resolve().thinkingLevel).toBe("off");
+    expect(resolve({ thinkingLevel: "low" }).thinkingLevel).toBe("low");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { intuition: { thinkingLevel: "high" } };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:private-route",
+      thinkingLevel: "high",
+    });
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        intuition: { model: "coder:workspace-recall", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:workspace-recall",
+      thinkingLevel: "off",
+    });
+  });
+
+  it.each([false, true])(
+    "pins the resolved selected agent route ahead of stale buckets (Plan bucket: %s)",
+    async (stalePlan) => {
+      using fixture = await createFixture();
+      const selected = "private:exec-global";
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+        workspace.agentId = "exec";
+        workspace.aiSettingsByAgent = stalePlan
+          ? { plan: { model: "openai:stale-plan", thinkingLevel: "off" } }
+          : {};
+        delete workspace.aiSettings;
+        cfg.agentAiDefaults = { exec: { modelString: selected } };
+        return cfg;
+      });
+      const resolve = () =>
+        resolveHeadlessAgentModelString(fixture.config, "ws-dream", "intuition", selected);
+      expect(resolve()).toBe(selected);
+      await fixture.config.editConfig((cfg) => {
+        cfg.agentAiDefaults!.intuition = { modelString: "openai:intuition-global" };
+        return cfg;
+      });
+      expect(resolve()).toBe("openai:intuition-global");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.intuition = {
+          model: "private:intuition-workspace",
+          thinkingLevel: "off",
+        };
+        return cfg;
+      });
+      expect(resolve()).toBe("private:intuition-workspace");
+    }
+  );
+
+  it.each([true, false])(
+    "resolves headless self-inheritance with append=%s without reading project overrides",
+    async (append) => {
+      using fixture = await createFixture();
+      const builtin = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+      if (!builtin) throw new Error("Expected built-in intuition");
+      const globals = path.join(fixture.xumHome, "agents");
+      const projects = path.join(fixture.xumHome, ".xum", "agents");
+      await fsPromises.mkdir(globals, { recursive: true });
+      await fsPromises.mkdir(projects, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(projects, "intuition.md"),
+        "---\nname: Untrusted\nai:\n  model: public:wrong-route\n---\nProject prompt must not load."
+      );
+      await fsPromises.writeFile(
+        path.join(globals, "intuition.md"),
+        `---\nname: Intuition\nbase: intuition\ndisabled: true\nprompt:\n  append: ${append}\nai:\n  model: private:intuition\n---\nLocal memory guidance.`
+      );
+      const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+      expect(resolved?.body).toBe(
+        append ? `${builtin.body}\n\nLocal memory guidance.` : "Local memory guidance."
+      );
+      expect(resolved?.frontmatter).toMatchObject({
+        disabled: true,
+        ai: { model: "private:intuition" },
+      });
+      expect(
+        resolveHeadlessAgentModelString(
+          fixture.config,
+          "ws-dream",
+          "intuition",
+          "openai:parent",
+          resolved?.frontmatter.ai
+        )
+      ).toBe("private:intuition");
+    }
+  );
+
+  it("resolves headless inherited AI and enablement with workspace/config/definition/parent precedence", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "private-base.md"),
+      "---\nname: Private base\ndisabled: true\nai:\n  model: private:inherited\n---\nInherited protocol."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "intuition.md"),
+      "---\nname: Intuition\nbase: private-base\n---\nLocal guidance."
+    );
+    const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+    expect(resolved?.body).toBe("Inherited protocol.\n\nLocal guidance.");
+    expect(resolved?.frontmatter.disabled).toBe(true);
+    const resolveModel = () =>
+      resolveHeadlessAgentModelString(
+        fixture.config,
+        "ws-dream",
+        "intuition",
+        "openai:parent",
+        resolved?.frontmatter.ai
+      );
+    expect(resolveModel()).toBe("private:inherited");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { intuition: { modelString: "private:configured", enabled: true } };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:configured");
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        intuition: { model: "private:workspace", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:workspace");
+  });
+
+  it("fails closed on headless inheritance cycles rather than falling back to another model", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "intuition.md"),
+      "---\nname: Intuition\nbase: loop\n---\nChild."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "loop.md"),
+      "---\nname: Loop\nbase: intuition\nai:\n  model: private:cycle\n---\nBase."
+    );
+    expect(await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition")).toBeNull();
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBeNull();
+  });
+
+  it("resolves intuition global body overrides without changing dream or accepting traversal", async () => {
+    using fixture = await createFixture();
+    const builtin = await resolveHeadlessAgentBody(fixture.xumHome, "intuition");
+    expect(builtin).not.toBeNull();
+    const dream = await resolveDreamAgentBody(fixture.xumHome);
+    const agents = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(agents, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agents, "intuition.md"),
+      "---\nname: Custom\n---\nCustom recall policy"
+    );
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBe(
+      "Custom recall policy"
+    );
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe(dream);
+    await fsPromises.writeFile(path.join(agents, "intuition.md"), "---\nname: Empty\n---\n");
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBe(builtin);
+    expect(resolveHeadlessAgentBody(fixture.xumHome, "../outside")).rejects.toThrow();
+  });
+
   it("resolves the dream model via the inherit cascade", async () => {
     using fixture = await createFixture();
     // No overrides anywhere => app default.
@@ -1450,5 +1729,46 @@ describe("MemoryConsolidationService", () => {
       return cfg;
     });
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:claude-test-dream");
+  });
+
+  it("keeps the dream fallback on the workspace's selected route (r31 security)", async () => {
+    using fixture = await createFixture();
+    // The workspace's CURRENT model lives in the selected agent's per-agent
+    // bucket; legacy aiSettings is stale (updateAgentAISettings never rewrites
+    // it). Without a dream override the fallback must follow the selected
+    // route, not the stale legacy model or the built-in default.
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = {};
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace) {
+          workspace.agentId = "exec";
+          workspace.aiSettingsByAgent = {
+            exec: { model: "coder:private-gw/claude-sonnet", thinkingLevel: "off" },
+          };
+          workspace.aiSettings = { model: "anthropic:stale-legacy", thinkingLevel: "off" };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe(
+      "coder:private-gw/claude-sonnet"
+    );
+
+    // An explicit per-workspace dream override remains higher-precedence
+    // consent for a different route.
+    await fixture.config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace?.aiSettingsByAgent) {
+          workspace.aiSettingsByAgent.dream = {
+            model: "anthropic:explicit-dream",
+            thinkingLevel: "off",
+          };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:explicit-dream");
   });
 });

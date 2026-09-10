@@ -133,11 +133,9 @@ describe("Queued messages during stream start", () => {
         throw new Error("Second stream never started after queued message release");
       }
 
-      const promptResult = aiService.debugGetLastMockPrompt(workspaceId);
-      if (!promptResult.success || !promptResult.data) {
-        throw new Error("Mock prompt snapshot missing after queued stream start");
-      }
-      const promptUserMessages = promptResult.data
+      const prompt = aiService.mockAiStreamPlayer?.debugGetLastPrompt(workspaceId);
+      if (!prompt) throw new Error("Mock prompt snapshot missing after queued stream start");
+      const promptUserMessages = prompt
         .filter((message) => message.role === "user")
         .map((message) =>
           message.parts

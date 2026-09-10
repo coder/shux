@@ -29,7 +29,7 @@ async function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<vo
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() >= deadline) {
-      throw new Error("Timed out waiting for passive PR refresh");
+      throw new Error("Timed out waiting for passive GitHub refresh");
     }
     await sleep(10);
   }
@@ -74,8 +74,7 @@ async function runPassiveRefreshScenario(
   shouldRun: boolean
 ): Promise<number> {
   const executeBash = mock(() => {
-    // Return a top-level failure so detectWorkspacePR exits before JSON parsing.
-    // These tests only care whether passive refresh attempted the gh command.
+    // Return failures because these tests only assert whether runtime gating invokes both commands.
     return Promise.resolve({ success: false as const, error: "gh unavailable" });
   });
 
@@ -95,7 +94,7 @@ async function runPassiveRefreshScenario(
     store.subscribeWorkspace(metadata.id, () => undefined);
 
     if (shouldRun) {
-      await waitUntil(() => executeBash.mock.calls.length > 0);
+      await waitUntil(() => executeBash.mock.calls.length === 2);
     } else {
       await sleep(100);
     }
@@ -134,7 +133,7 @@ describe("passive refresh runtime gating", () => {
       true
     );
 
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
   });
 
   it("retries PR refresh when devcontainer runtime transitions from null to running", async () => {
@@ -162,8 +161,8 @@ describe("passive refresh runtime gating", () => {
       runtimeStatusStore.setStatus("running");
       runtimeStatusStore.emit(metadata.id);
 
-      await waitUntil(() => executeBash.mock.calls.length > 0);
-      expect(executeBash.mock.calls.length).toBe(1);
+      await waitUntil(() => executeBash.mock.calls.length === 2);
+      expect(executeBash.mock.calls.length).toBe(2);
     } finally {
       store.dispose();
     }
@@ -208,7 +207,7 @@ describe("passive refresh runtime gating", () => {
       true
     );
 
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
   });
 });
 

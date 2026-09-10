@@ -35,9 +35,9 @@ const BASH_ONLY: ToolPolicy = [
   { regex_match: "bash", action: "require" },
 ];
 
-const TASK_TERMINATE_ONLY: ToolPolicy = [
+const TASK_STOP_ONLY: ToolPolicy = [
   { regex_match: ".*", action: "disable" },
-  { regex_match: "task_terminate", action: "require" },
+  { regex_match: "task_stop", action: "require" },
 ];
 
 const TASK_AWAIT_ONLY: ToolPolicy = [
@@ -95,30 +95,28 @@ function collectTaskAwaitOutputs(events: WorkspaceChatMessage[]): string {
   return outputs.join("\n");
 }
 
-/**
- * Extract terminated task ids from a task_terminate tool result.
- */
-function extractTerminatedTaskIds(events: WorkspaceChatMessage[]): string[] {
+/** Extract stopped task ids from a task_stop tool result. */
+function extractStoppedTaskIds(events: WorkspaceChatMessage[]): string[] {
   for (const event of events) {
     if (!("type" in event) || event.type !== "tool-call-end") continue;
-    if (!("toolName" in event) || event.toolName !== "task_terminate") continue;
+    if (!("toolName" in event) || event.toolName !== "task_stop") continue;
 
     const results = (
       event as {
         result?: {
-          results?: Array<{ status?: string; terminatedTaskIds?: string[] }>;
+          results?: Array<{ status?: string; stoppedTaskIds?: string[] }>;
         };
       }
     ).result?.results;
     if (!Array.isArray(results)) return [];
 
-    const terminated: string[] = [];
+    const stopped: string[] = [];
     for (const result of results) {
-      if (result.status !== "terminated") continue;
-      if (!Array.isArray(result.terminatedTaskIds)) continue;
-      terminated.push(...result.terminatedTaskIds);
+      if (result.status !== "stopped") continue;
+      if (!Array.isArray(result.stoppedTaskIds)) continue;
+      stopped.push(...result.stoppedTaskIds);
     }
-    return terminated;
+    return stopped;
   }
   return [];
 }
@@ -182,12 +180,12 @@ describeIntegration("Background Bash Execution", () => {
           const terminateEvents = await sendMessageAndWait(
             env,
             workspaceId,
-            `Use task_terminate with task_ids: ["${taskId}"] to terminate the task.`,
+            `Use task_stop with task_ids: ["${taskId}"] to stop the task.`,
             HAIKU_MODEL,
-            TASK_TERMINATE_ONLY,
+            TASK_STOP_ONLY,
             20000
           );
-          const terminatedTaskIds = extractTerminatedTaskIds(terminateEvents);
+          const terminatedTaskIds = extractStoppedTaskIds(terminateEvents);
           expect(terminatedTaskIds).toContain(taskId!);
         } finally {
           await cleanup();
@@ -242,13 +240,13 @@ describeIntegration("Background Bash Execution", () => {
           const terminateEvents = await sendMessageAndWait(
             env,
             workspaceId,
-            `Use task_terminate with task_ids: ["${taskId}"] to terminate the task.`,
+            `Use task_stop with task_ids: ["${taskId}"] to stop the task.`,
             HAIKU_MODEL,
-            TASK_TERMINATE_ONLY,
+            TASK_STOP_ONLY,
             20000
           );
 
-          const terminatedTaskIds = extractTerminatedTaskIds(terminateEvents);
+          const terminatedTaskIds = extractStoppedTaskIds(terminateEvents);
           expect(terminatedTaskIds).toContain(taskId!);
 
           // Note: We skip task_list verification here because LLM-based tests

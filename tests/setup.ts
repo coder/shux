@@ -5,16 +5,17 @@
 
 import assert from "assert";
 import "disposablestack/auto";
+import { resolveXumEnvironmentValue } from "../src/common/compat/xumEnv";
 
 assert.equal(typeof Symbol.dispose, "symbol");
 // Use fast approximate token counting in Jest to avoid 10s WASM cold starts
-// Individual tests can override with MUX_FORCE_REAL_TOKENIZER=1
+// Individual tests can override with XUM_FORCE_REAL_TOKENIZER=1
 
 // Many renderer components gate test-only behavior on `import.meta.env.MODE === "test"`.
 // In Jest, `import.meta.env` is rewritten to `process.env` by our Babel plugin.
 process.env.MODE ??= "test";
-if (process.env.MUX_FORCE_REAL_TOKENIZER !== "1") {
-  process.env.MUX_APPROX_TOKENIZER ??= "1";
+if (resolveXumEnvironmentValue("FORCE_REAL_TOKENIZER", process.env) !== "1") {
+  process.env.XUM_APPROX_TOKENIZER ??= process.env.MUX_APPROX_TOKENIZER ?? "1";
 }
 
 // Some deps (e.g. json-schema-ref-parser) treat `window` existence as "browser"

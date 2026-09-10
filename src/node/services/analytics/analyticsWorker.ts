@@ -2,15 +2,20 @@ import assert from "node:assert/strict";
 import { parentPort } from "node:worker_threads";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
 import {
+  CURRENT_ETL_SEMANTICS_VERSION,
   clearWorkspaceAnalyticsState,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
+  readStoredEtlSemanticsVersion,
   readStoredPricingFingerprint,
   rebuildAll,
   statSessionChatHistory,
+  storeEtlSemanticsVersion,
   storePricingFingerprint,
 } from "./etl";
 import {
@@ -95,6 +100,10 @@ interface RawQueryData {
 
 const EVENTS_COLUMN_MIGRATIONS_SQL = [
   "ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT",
+  // Refusal-fallback downgrade columns: order must match CREATE_EVENTS_TABLE_SQL
+  // so migrated and fresh DBs share the physical column order the appender uses.
+  "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+  "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
 ] as const;
 
 const DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL = [
@@ -147,6 +156,29 @@ async function handleInit(data: InitData): Promise<void> {
   for (const migrationSql of DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL) {
     await activeConn.run(migrationSql);
   }
+
+  await sweepCorruptRows("init");
+}
+
+/**
+ * Delete corruption-class rows and log when anything was actually removed.
+ * Best-effort: a failed sweep must never reject init (which would cache a
+ * worker error and disable analytics until restart), so errors are logged
+ * and swallowed. Runs only at init and after rebuilds: missing-watermark
+ * evidence is unsafe after ordinary ingests (see deleteCorruptAnalyticsRows).
+ */
+async function sweepCorruptRows(
+  context: string,
+  preserveWorkspaceIds?: ReadonlySet<string>
+): Promise<void> {
+  try {
+    const deleted = await deleteCorruptAnalyticsRows(getConn(), preserveWorkspaceIds);
+    if (deleted > 0) {
+      log.info(`[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})`);
+    }
+  } catch (error) {
+    log.warn(`[analytics-worker] Corrupt-row sweep failed (${context}): ${getErrorMessage(error)}`);
+  }
 }
 
 async function handleIngest(data: IngestData): Promise<void> {
@@ -166,10 +198,13 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
   }
 
   const result = await rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
-  // A completed rebuild priced everything with the current tables; refresh the
-  // fingerprint so the next sync check does not schedule a redundant rebuild.
+  await sweepCorruptRows("rebuildAll", result.failedWorkspaceIds);
+  // A completed rebuild priced everything with the current tables and derived
+  // all current ETL columns; refresh the fingerprint and semantics version so
+  // the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
-  return result;
+  await storeEtlSemanticsVersion(getConn());
+  return { workspacesIngested: result.workspacesIngested };
 }
 
 async function handleClearWorkspace(data: ClearWorkspaceData): Promise<void> {
@@ -350,6 +385,11 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   const storedPricingFingerprint = await readStoredPricingFingerprint(getConn());
   const pricingFingerprintChanged = storedPricingFingerprint !== getCurrentPricingFingerprint();
 
+  // ETL semantics version: rows ingested before a new derived column existed
+  // (e.g. refusal-downgrade metadata) must be backfilled via a full rebuild.
+  const storedEtlSemanticsVersion = await readStoredEtlSemanticsVersion(getConn());
+  const semanticsVersionChanged = storedEtlSemanticsVersion !== CURRENT_ETL_SEMANTICS_VERSION;
+
   const plan = decideSyncPlan({
     eventCount,
     watermarkCount,
@@ -357,6 +397,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     watermarkWorkspaceIds,
     hasAnyWatermarkAtOrAboveZero,
     pricingFingerprintChanged,
+    semanticsVersionChanged,
     changedSignalWorkspaceIds,
   });
 
@@ -366,6 +407,10 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   // crashed repricing rebuild re-triggers on the next sync check.
   if (pricingFingerprintChanged && plan.action !== "full_rebuild") {
     await storePricingFingerprint(getConn());
+  }
+  // Same store-after-success policy for the ETL semantics version.
+  if (semanticsVersionChanged && plan.action !== "full_rebuild") {
+    await storeEtlSemanticsVersion(getConn());
   }
 
   if (plan.action === "noop") {
@@ -382,13 +427,17 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   }
 
   if (plan.action === "full_rebuild") {
-    const { workspacesIngested } = await rebuildAll(
+    const { workspacesIngested, failedWorkspaceIds } = await rebuildAll(
       getConn(),
       data.sessionsDir,
       data.workspaceMetaById
     );
+    await sweepCorruptRows("syncCheck full_rebuild", failedWorkspaceIds);
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
+    }
+    if (semanticsVersionChanged) {
+      await storeEtlSemanticsVersion(getConn());
     }
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 

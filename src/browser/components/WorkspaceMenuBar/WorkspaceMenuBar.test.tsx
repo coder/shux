@@ -28,13 +28,20 @@ import * as PopoverErrorModule from "../PopoverError/PopoverError";
 import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
+import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
+import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
+} from "@/constants/layout";
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
 let workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
+let archivingWorkspaceIds = new Set<string>();
 let cleanupDom: (() => void) | null = null;
 const workspaceId = "workspace-1";
 
@@ -53,6 +60,7 @@ function getLastMenuContentProps() {
             onForkChat?: ((anchorEl: HTMLElement) => void) | null;
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
+            onOpenTimeline?: (() => void) | null;
           },
         ]
       >;
@@ -105,7 +113,21 @@ let archiveWorkspaceMock = mock(
 );
 let archiveShowErrorMock = mock(() => undefined);
 
+// Timeline gate control. useExperimentValue must be module-mocked, not driven through
+// localStorage: bun module mocks are process-global, so another test file's leaked
+// useExperiments mock would otherwise override the real hook and poison these gates.
+let mockTimelineExperimentEnabled = false;
+
 function installWorkspaceMenuBarTestDoubles() {
+  const actualExperiments =
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
+  void mock.module("@/browser/hooks/useExperiments", () => ({
+    ...actualExperiments,
+    useExperimentValue: (experimentId: string) =>
+      experimentId === EXPERIMENT_IDS.TIMELINE && mockTimelineExperimentEnabled,
+  }));
+
   preflightArchiveWorkspaceMock = mock(
     (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
   );
@@ -129,6 +151,7 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds,
         preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
         archiveWorkspace: archiveWorkspaceMock,
       }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
@@ -257,6 +280,49 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(SkillIndicatorModule, "SkillIndicator").mockImplementation(
     (() => null) as unknown as typeof SkillIndicatorModule.SkillIndicator
   );
+  spyOn(TimelineDialogModule, "TimelineDialog").mockImplementation(
+    (() => null) as unknown as typeof TimelineDialogModule.TimelineDialog
+  );
+}
+
+// Records render props like the WorkspaceActionsMenuContent double, so tests can
+// assert the dialog opened without rendering the real timeline panel.
+function getLastTimelineDialogProps() {
+  const spy = TimelineDialogModule.TimelineDialog as unknown as {
+    mock: { calls: Array<[{ workspaceId: string; open: boolean }]> };
+  };
+  return spy.mock.calls.at(-1)?.[0];
+}
+
+/**
+ * Replace window.matchMedia so viewport-gated actions can be exercised per test.
+ * `matches` is re-read on every access and registered change listeners are returned
+ * so tests can simulate live viewport transitions.
+ */
+function stubMatchMedia(matches: (query: string) => boolean) {
+  const changeListeners: Array<() => void> = [];
+  window.matchMedia = ((query: string) =>
+    ({
+      get matches() {
+        return matches(query);
+      },
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: (_type: string, listener: () => void) => {
+        changeListeners.push(listener);
+      },
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    }) as unknown as MediaQueryList) as typeof window.matchMedia;
+  return {
+    fireChange: () => {
+      for (const listener of changeListeners) {
+        listener();
+      }
+    },
+  };
 }
 
 const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
@@ -274,6 +340,8 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
     workspaceMetadata = new Map();
+    archivingWorkspaceIds = new Set();
+    mockTimelineExperimentEnabled = false;
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
     /* eslint-disable @typescript-eslint/no-require-imports */
@@ -344,6 +412,17 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(scratchMenuProps?.onOpenTouchFullscreenReview).toBeNull();
   });
 
+  it("shows the archiving status only while this workspace has an archive request in flight", () => {
+    archivingWorkspaceIds = new Set(["some-other-workspace"]);
+    const idle = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(idle.queryByTestId("workspace-archiving-status")).toBeNull();
+    idle.unmount();
+
+    archivingWorkspaceIds = new Set([workspaceId]);
+    const archiving = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(archiving.getByTestId("workspace-archiving-status")).not.toBeNull();
+  });
+
   it("offers fork and immersive review in the More menu for repo-backed workspaces", () => {
     workspaceMetadata.set(workspaceId, {
       id: workspaceId,
@@ -360,6 +439,179 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const menuProps = getLastMenuContentProps();
     expect(typeof menuProps?.onForkChat).toBe("function");
     expect(typeof menuProps?.onEnterImmersiveReview).toBe("function");
+  });
+
+  it("offers the Timeline action on narrow viewports and opens the dialog", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    const menuProps = getLastMenuContentProps();
+    expect(typeof menuProps?.onOpenTimeline).toBe("function");
+
+    act(() => {
+      menuProps?.onOpenTimeline?.();
+    });
+
+    const dialogProps = getLastTimelineDialogProps();
+    expect(dialogProps?.open).toBe(true);
+    expect(dialogProps?.workspaceId).toBe(workspaceId);
+  });
+
+  it("hides the Timeline action on wide viewports", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia(() => false);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+  });
+
+  it("hides the Timeline action when the timeline experiment is disabled", () => {
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+  });
+
+  it("offers the Timeline action when the shell container hides the sidebar at wide viewports", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia(() => false);
+
+    // Mimic WorkspaceShell: the shell wraps the menu bar and a CSS-hidden right sidebar
+    // (the <=684px container query), which the gate reads via computed style.
+    const shell = document.createElement("div");
+    shell.setAttribute("data-workspace-shell", "");
+    document.body.appendChild(shell);
+    const sidebar = document.createElement("div");
+    sidebar.className = "mobile-hide-right-sidebar";
+    sidebar.style.display = "none";
+    shell.appendChild(sidebar);
+    const mount = document.createElement("div");
+    shell.appendChild(mount);
+
+    render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
+
+    expect(typeof getLastMenuContentProps()?.onOpenTimeline).toBe("function");
+    shell.remove();
+  });
+
+  it("re-gates the Timeline action when the viewport crosses the narrow breakpoint", () => {
+    mockTimelineExperimentEnabled = true;
+    let narrow = false;
+    const media = stubMatchMedia(
+      (query) => narrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
+    );
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+
+    narrow = true;
+    act(() => {
+      media.fireChange();
+    });
+
+    expect(typeof getLastMenuContentProps()?.onOpenTimeline).toBe("function");
+  });
+
+  it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    const dialogProps = getLastTimelineDialogProps();
+    expect(dialogProps?.open).toBe(true);
+  });
+
+  it("ignores the timeline shortcut while the sidebar is visible", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia(() => false);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+  });
+
+  it("ignores the timeline shortcut while another modal is open", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    document.body.appendChild(modal);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+    modal.remove();
+  });
+
+  it("closes the timeline dialog when switching workspaces", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+    expect(getLastTimelineDialogProps()?.open).toBe(true);
+
+    // The timeline's "Open child workspace" action swaps the selected workspace while
+    // App reuses this menu bar instance; the dialog must not cover the new workspace.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+
+    // Returning to the original workspace must not resurrect the dialog: the
+    // retained id is cleared on leave, not merely masked by the comparison.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+  });
+
+  it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia(() => false);
+
+    // Immersive review hides the sidebar via the same display:none but marks it
+    // aria-hidden; the gate must not treat that as a responsive (narrow) layout.
+    const shell = document.createElement("div");
+    shell.setAttribute("data-workspace-shell", "");
+    document.body.appendChild(shell);
+    const sidebar = document.createElement("div");
+    sidebar.className = "mobile-hide-right-sidebar";
+    sidebar.style.display = "none";
+    sidebar.setAttribute("aria-hidden", "true");
+    shell.appendChild(sidebar);
+    const mount = document.createElement("div");
+    shell.appendChild(mount);
+
+    render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+    shell.remove();
   });
 
   it("applies the collapsed-left-sidebar inset immediately from props", () => {

@@ -1,22 +1,24 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
-import type { SendMessageError } from "@/common/types/errors";
-import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
+
 const config = {
+  rootDir: "/tmp",
+  sessionsDir: "/tmp",
   srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
+  loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 1000): Promise<boolean> {
@@ -35,13 +37,15 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
   async function createSessionHarness(
     workspaceId: string,
-    streamHandler: StreamMessageHandler = () => Promise.resolve(Ok(undefined))
+    streamHandler: StreamMessageHandler = (opts: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
   ) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const streamMessage = mock(streamHandler);
     const aiService = Object.assign(new EventEmitter(), {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
@@ -282,8 +286,8 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const workspaceId = "ws-edit-preparing";
     const streamResolves: Array<() => void> = [];
     const streamHandler: StreamMessageHandler = (opts) => {
-      return new Promise<Result<void, SendMessageError>>((resolve) => {
-        const resolveOk = () => resolve(Ok(undefined));
+      return new Promise<Awaited<ReturnType<StreamMessageHandler>>>((resolve) => {
+        const resolveOk = () => resolve(Ok(createStartedTurnHandle(opts.abortSignal!)));
         if (opts.abortSignal?.aborted === true) {
           resolveOk();
           return;
@@ -351,10 +355,55 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       }
       await firstSendPromise;
     } finally {
-      session.dispose();
+      session.beginDispose();
       for (const resolve of streamResolves) {
         resolve();
       }
+      await session.dispose();
     }
+  });
+
+  it("holds isBusy through the edit's truncate window (r32 admission reservation)", async () => {
+    // The edit path truncates history and can spend up to the branch-summary
+    // deadline before its turn reaches PREPARING. Without a reservation a
+    // concurrent ordinary send observes an idle session and starts
+    // immediately, interleaving its rows with the edit's against moved
+    // history.
+    const workspaceId = "ws-edit-admission";
+    const { session, historyService } = await createSessionHarness(workspaceId);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-original", "user", "original", { historySequence: 0 })
+    );
+
+    let releaseTruncate: (() => void) | null = null;
+    const truncateGate = new Promise<void>((resolve) => {
+      releaseTruncate = resolve;
+    });
+    const observed: { busyDuringTruncate: boolean | null } = { busyDuringTruncate: null };
+    const realTruncate = historyService.truncateAfterMessage.bind(historyService);
+    spyOn(historyService, "truncateAfterMessage").mockImplementation(async (wsId, messageId) => {
+      observed.busyDuringTruncate = session.isBusy();
+      await truncateGate;
+      return realTruncate(wsId, messageId);
+    });
+
+    const sendPromise = session.sendMessage("edited", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "user-original",
+    });
+    await waitForCondition(() => observed.busyDuringTruncate !== null);
+    // Observed both from inside the truncate window and from a concurrent
+    // caller's perspective right now.
+    expect(observed.busyDuringTruncate).toBe(true);
+    expect(session.isBusy()).toBe(true);
+
+    releaseTruncate!();
+    const result = await sendPromise;
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+    // The reservation released with the turn: the session is not stuck busy.
+    expect(session.isBusy()).toBe(false);
   });
 });

@@ -1,20 +1,13 @@
 import { z } from "zod";
 
 /**
- * A secret value can be a literal string, an alias to another secret key,
- * or a 1Password reference to resolve at runtime.
+ * A secret value can be a literal string or an alias to another secret key.
  */
 export const SecretValueSchema = z.union([
   z.string(),
   z
     .object({
       secret: z.string(),
-    })
-    .strict(),
-  z
-    .object({
-      op: z.string(),
-      opLabel: z.string().optional(),
     })
     .strict(),
 ]);

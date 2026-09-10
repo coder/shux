@@ -288,7 +288,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       if (isDesktop) {
         if (!api) {
           setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError("Mux API not connected.");
+          setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
@@ -503,8 +503,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       : muxGatewayLoginInProgress
         ? "Waiting for login..."
         : muxGatewayIsLoggedIn
-          ? "Re-login to Mux Gateway"
-          : "Login with Mux Gateway";
+          ? "Re-login to Xum Gateway"
+          : "Login with Xum Gateway";
 
   const onboardingProviders = useMemo(() => {
     const gatewayPriority: ProviderName[] = ["mux-gateway", "openrouter"];
@@ -592,12 +592,12 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     if (hasConfiguredProvidersAtStart === false) {
       nextSteps.push({
         key: "mux-gateway",
-        title: "Mux Gateway (evaluation credits)",
+        title: "Xum Gateway (evaluation credits)",
         icon: <Sparkles className="h-4 w-4" />,
         body: (
           <>
             <p>
-              Mux Gateway enables you to use free AI tokens from{" "}
+              Xum Gateway enables you to use free AI tokens from{" "}
               <a
                 href="https://coder.com"
                 target="_blank"
@@ -618,7 +618,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               <div className="mt-3 space-y-2">
                 <div className="border-border-medium bg-background-secondary rounded-md border p-2 text-xs">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-foreground font-medium">Mux Gateway account</div>
+                    <div className="text-foreground font-medium">Xum Gateway account</div>
                     <Button
                       variant="secondary"
                       size="sm"
@@ -655,7 +655,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                 {muxGatewayAccountStatus?.remaining_microdollars === 0 && (
                   <div className="border-destructive/20 bg-destructive/5 mt-2 rounded-md border p-2 text-xs">
                     <p className="text-destructive font-medium">
-                      Your Mux Gateway credits are depleted.
+                      Your Xum Gateway credits are depleted.
                     </p>
                     <p className="text-muted mt-1">
                       Gateway routing has been disabled. Configure another provider below, or visit{" "}
@@ -754,7 +754,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       body: (
         <>
           <p>
-            Mux is provider-agnostic: bring your own keys, mix and match models, or run locally.
+            Xum is provider-agnostic: bring your own keys, mix and match models, or run locally.
           </p>
 
           {configuredProviders.length > 0 && configuredProvidersSummary ? (
@@ -823,8 +823,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       body: (
         <>
           <p>
-            Projects are the folders or repos you want Mux to work in. Add a local folder or clone
-            from GitHub, then click Next.
+            Projects are the folders or repos you want Xum to work in. Add a local folder, clone
+            from GitHub, or create a new project, then click Next.
           </p>
 
           {userProjects.size > 0 ? (
@@ -874,8 +874,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         <>
           <p>
             Agents are file-based definitions (system prompt + tool policy). You can create
-            project-local agents in <code className="text-accent">.mux/agents/*.md</code> or global
-            agents in <code className="text-accent">~/.mux/agents/*.md</code>.
+            project-local agents in <code className="text-accent">.xum/agents/*.md</code> or global
+            agents in <code className="text-accent">~/.xum/agents/*.md</code>.
           </p>
 
           <div className="mt-3 grid gap-2">
@@ -919,7 +919,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               Work directly in your project directory.
             </Card>
             <Card icon={<WorktreeIcon size={14} />} title="Worktree">
-              Isolated git worktree under <code className="text-accent">~/.mux/src</code>.
+              Isolated git worktree under <code className="text-accent">~/.xum/src</code>.
             </Card>
             <Card icon={<SSHIcon size={14} />} title="SSH">
               Remote clone and commands run on an SSH host.
@@ -944,19 +944,19 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       body: (
         <>
           <p>
-            MCP servers extend Mux with tools (memory, ticketing, databases, internal APIs).
+            MCP servers extend Xum with tools (memory, ticketing, databases, internal APIs).
             Configure them globally, with optional repo overrides and per-workspace overrides.
           </p>
 
           <div className="mt-3 grid gap-2">
             <Card icon={<Server className="h-4 w-4" />} title="Global config">
-              <code className="text-accent">~/.mux/mcp.jsonc</code>
+              <code className="text-accent">~/.xum/mcp.jsonc</code>
             </Card>
             <Card icon={<Server className="h-4 w-4" />} title="Repo overrides">
-              <code className="text-accent">./.mux/mcp.jsonc</code>
+              <code className="text-accent">./.xum/mcp.jsonc</code>
             </Card>
             <Card icon={<Server className="h-4 w-4" />} title="Workspace overrides">
-              <code className="text-accent">.mux/mcp.local.jsonc</code>
+              <code className="text-accent">.xum/mcp.local.jsonc</code>
             </Card>
           </div>
 

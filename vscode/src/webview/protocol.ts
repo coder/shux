@@ -5,7 +5,7 @@
  * - Extension → webview: {@link ExtensionToWebviewMessage} (includes oRPC responses + chat updates)
  */
 
-import type { WorkspaceChatMessage } from "mux/common/orpc/types";
+import type { WorkspaceChatMessage } from "xum/common/orpc/types";
 
 export type UiWorkspaceRuntimeType = "local" | "worktree" | "ssh";
 

@@ -1,8 +1,16 @@
+import type { HistoryService } from "@/node/services/historyService";
+import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import { isGrok45Model } from "@/common/types/thinking";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
+import {
+  isGrokFrontierModel,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
@@ -15,6 +23,7 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 // DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
+import { createIntuitionTool } from "@/node/services/tools/intuition";
 import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
@@ -29,14 +38,19 @@ import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
+import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
-import type { MuxToolScope } from "@/common/types/toolScope";
+import type { XumToolScope } from "@/common/types/toolScope";
 import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
 import { createTaskSendMessageTool } from "@/node/services/tools/task_send_message";
-import { createTaskTerminateTool } from "@/node/services/tools/task_terminate";
+import { createTaskMessageParentTool } from "@/node/services/tools/task_message_parent";
+import { createTaskMessageSiblingTool } from "@/node/services/tools/task_message_sibling";
+import { createTaskRetitleTool } from "@/node/services/tools/task_retitle";
+import { createTaskStopTool } from "@/node/services/tools/task_stop";
+import { createTaskRemoveTool } from "@/node/services/tools/task_remove";
 import { createTaskWorkspaceLifecycleTool } from "@/node/services/tools/task_workspace_lifecycle";
 import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
@@ -46,15 +60,16 @@ import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_wri
 import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createSkillsCatalogSearchTool } from "@/node/services/tools/skills_catalog_search";
 import { createSkillsCatalogReadTool } from "@/node/services/tools/skills_catalog_read";
-import { createMuxAgentsReadTool } from "@/node/services/tools/mux_agents_read";
-import { createMuxAgentsWriteTool } from "@/node/services/tools/mux_agents_write";
-import { createMuxConfigReadTool } from "@/node/services/tools/mux_config_read";
-import { createMuxConfigWriteTool } from "@/node/services/tools/mux_config_write";
+import { createWebFetchTool } from "@/node/services/tools/web_fetch";
+import { createXumAgentsReadTool } from "@/node/services/tools/xum_agents_read";
+import { createXumAgentsWriteTool } from "@/node/services/tools/xum_agents_write";
+import { createXumConfigReadTool } from "@/node/services/tools/xum_config_read";
+import { createXumConfigWriteTool } from "@/node/services/tools/xum_config_write";
 import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
-import { withHooks, type HookConfig } from "@/node/services/tools/withHooks";
+import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
@@ -65,6 +80,7 @@ import {
 } from "@/common/utils/tools/toolDefinitions";
 import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 import type { ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -72,6 +88,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
@@ -85,17 +102,12 @@ import type { ModelMessage } from "@/common/types/message";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
-export interface ToolAgentSkillsRoots {
-  projectRoot: string;
-  projectUniversalRoot?: string;
-  globalRoot: string;
-  universalRoot?: string;
-}
-
 export interface ToolModelUsageEvent {
   source: "tool";
   toolName: string;
   model: string;
+  /** Pricing identity pinned by this invocation, independent of other creations of the same model. */
+  metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
   toolCallId?: string;
@@ -136,7 +148,7 @@ export interface WorkflowServiceScriptInput {
   canonicalScriptPath: string;
   source: string;
   sourceHash: string;
-  sourceKind: "skill" | "workspace-file" | "inline";
+  sourceKind: "skill" | "workspace-file" | "inline" | "plugin";
 }
 
 export interface ToolConfiguration {
@@ -149,7 +161,7 @@ export interface ToolConfiguration {
   /** Environment secrets to inject (optional) */
   secrets?: Record<string, string>;
   /** MUX_ environment variables (MUX_PROJECT_PATH, MUX_RUNTIME) - set from init hook env */
-  muxEnv?: Record<string, string>;
+  xumEnv?: Record<string, string>;
   /** Temporary directory for tool outputs in runtime's context (local or remote) */
   runtimeTempDir: string;
   /** Model used for capability checks when the runtime model is a configured alias. */
@@ -179,19 +191,27 @@ export interface ToolConfiguration {
   workspaceProjectPath?: string;
   /** Absolute cwd for workspace-scoped tools that accept execution-relative paths. */
   workspaceExecutionRootPath?: string;
-  /** Workspace session directory (e.g. ~/.mux/sessions/<workspaceId>) for persistent tool state */
+  /** Workspace session directory (e.g. ~/.xum/sessions/<workspaceId>) for persistent tool state */
   workspaceSessionDir?: string;
   /** Workspace ID for tracking background processes and plan storage */
   workspaceId?: string;
-  /** Pre-resolved mux-managed resource scope (global ~/.mux vs project root). */
-  muxScope?: MuxToolScope;
-  /** Optional skill roots override for tests and isolated workflow resolution. */
-  agentSkillsRoots?: ToolAgentSkillsRoots;
+  /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
+  agentId?: string;
+  /** The turn's strict-agent pin, persisted with workflow run provenance so wakes re-pin the launch agent. */
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
+  /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
+  xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
+  historyService?: HistoryService;
   memoryService?: MemoryService;
   timelineService?: TimelineService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
+  /**
+   * When set, every mutating memory command is limited to this exact virtual path
+   * (context-budget flush turns may only write the workspace context notes).
+   */
+  memoryWritePath?: string;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
@@ -200,6 +220,7 @@ export interface ToolConfiguration {
   reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
+  workspaceTurnManager?: WorkspaceTurnManager;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
@@ -272,20 +293,27 @@ export interface ToolConfiguration {
   allowLegacyInvalidWorkflowAgentOutputSchema?: boolean;
   /** Enable agent_report tool (only valid for child task workspaces) */
   enableAgentReport?: boolean;
+  /**
+   * Enable RLM family messaging tools (task_message_parent / task_message_sibling).
+   * Only valid for child task workspaces whose task record was stamped with the rlm
+   * experiment at spawn.
+   */
+  enableFamilyMessaging?: boolean;
   /** Experiments inherited from parent (for subagent spawning) */
   experiments?: {
     programmaticToolCalling?: boolean;
-    programmaticToolCallingExclusive?: boolean;
+    /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
+    rlm?: boolean;
     advisorTool?: boolean;
-    execSubagentHardRestart?: boolean;
     dynamicWorkflows?: boolean;
+    tokenBudget?: boolean;
     memory?: boolean;
     timeline?: boolean;
     workspaceHeartbeats?: boolean;
     toolSearch?: boolean;
     /** claude-skills-compat: discover skills from .claude/skills and ~/.claude/skills (read-only). */
     claudeSkillsCompat?: boolean;
-    /** agent-plugins: discover Agent Plugins skills from .mux/plugins, .agents/plugins and their global counterparts (read-only). */
+    /** agent-plugins: discover Agent Plugins skills from .xum/plugins, .agents/plugins and their global counterparts (read-only). */
     agentPlugins?: boolean;
   };
   /** Available sub-agents for the task tool description (dynamic context) */
@@ -305,12 +333,25 @@ export interface ToolConfiguration {
   analyticsService?: {
     executeRawQuery(sql: string): Promise<unknown>;
   };
+  /** Pinned, host-only recall runtime; present only for eligible parent turns. */
+  intuitionRuntime?: {
+    modelString: string;
+    thinkingLevel?: ThinkingLevel;
+    maxUsesPerTurn: number;
+    /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
+    usesThisTurn: number;
+    createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
+    resolveAgentBody: () => Promise<string | null>;
+    abortSignal: AbortSignal;
+  };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
   advisorRuntime?: {
     /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
     advisorModelString: string;
     /** Optional reasoning/thinking level metadata for the advisor request. */
     reasoningLevel?: string;
+    /** Independent of the parent chat's reasoning mode and advisor effort. */
+    reasoningMode?: OpenAIReasoningMode;
     /** Normalized max uses per turn: null = unlimited, positive integer = exact cap */
     maxUsesPerTurn: number | null;
     /** Normalized max output tokens cap for advisor responses: undefined = unlimited, positive integer = explicit cap */
@@ -319,8 +360,26 @@ export interface ToolConfiguration {
     getTranscriptSnapshot: () => ModelMessage[];
     /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
     takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
-    /** Creates a LanguageModel from a model string (delegates to providerModelFactory) */
-    createModel: (modelString: string) => Promise<LanguageModel>;
+    /**
+     * Creates a model and pins its request identity, route, and config together.
+     * Coder identities retain their actual instance and scoped aliases; option
+     * construction resolves their wire from this snapshot, never live config.
+     */
+    createModel: (modelString: string) => Promise<{
+      model: LanguageModel;
+      metadataModel?: string;
+      optionsModelString: string;
+      /**
+       * Providers snapshot captured at model-creation time for option
+       * construction. Required so buildProviderOptions can remap
+       * custom-provider wire namespaces while still resolving mappedToModel
+       * alias metadata from the raw custom identity.
+       */
+      optionsProvidersConfig: ProvidersConfigMap | null;
+      /** Pinned wire/route options keep Pro restricted to supported Responses routes. */
+      optionsMuxProviderOptions?: MuxProviderOptions;
+      optionsRouteProvider?: ProviderName;
+    }>;
     /** The abort signal from the parent stream */
     abortSignal: AbortSignal;
   };
@@ -330,8 +389,26 @@ export interface ToolConfiguration {
    * `state` is assigned by aiService after policy filtering builds the catalog.
    */
   toolSearchRuntime?: ToolSearchRuntime;
+  /**
+   * Runtime for the mcp_prompt_get tool (present only when connected MCP
+   * servers advertise prompts for this stream). `prompts` is the descriptor
+   * snapshot advertised in the tool description; `getPrompt` dispatches
+   * through MCPServerManager so trust and refresh gates apply.
+   */
+  mcpPromptRuntime?: MCPPromptRuntime;
   /** Desktop session manager for desktop automation tools */
   desktopSessionManager?: DesktopSessionManager;
+}
+
+export interface MCPPromptRuntime {
+  prompts: MCPPromptDescriptor[];
+  /** Returned text is already UTF-8 byte-capped at the manager chokepoint. */
+  getPrompt: (
+    serverName: string,
+    promptName: string,
+    args: Record<string, string>,
+    options?: { signal?: AbortSignal }
+  ) => Promise<{ text: string; description?: string }>;
 }
 
 /**
@@ -349,7 +426,7 @@ export type ToolFactory = (config: ToolConfiguration) => Tool;
  */
 function augmentToolDescription(baseTool: Tool, additionalInstructions: string): Tool {
   // Access the tool as a record to get its properties
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const baseToolRecord = baseTool as any as Record<string, unknown>;
   const originalDescription =
     typeof baseToolRecord.description === "string" ? baseToolRecord.description : "";
@@ -367,7 +444,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
   engine: NotificationEngine
 ): Tool {
   // Access the tool as a record to get its properties.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const baseToolRecord = baseTool as any as Record<string, unknown>;
   const originalExecute = baseToolRecord.execute;
 
@@ -380,7 +457,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
   // Avoid mutating cached tools in place (e.g. MCP tools cached per workspace).
   // Repeated getToolsForModel() calls should not stack wrappers.
   const wrappedTool = cloneToolPreservingDescriptors(baseTool);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const wrappedToolRecord = wrappedTool as any as Record<string, unknown>;
 
   wrappedToolRecord.execute = async (args: unknown, options: unknown) => {
@@ -437,39 +514,24 @@ function wrapToolsWithModelOnlyNotifications(
   return wrappedTools;
 }
 
+export { deriveToolHookConfig } from "@/node/services/tools/withHooks";
+
 /**
  * Wrap tools with hook support.
  *
  * If any of these exist, each tool execution is wrapped:
- * - `.mux/tool_pre` (pre-hook)
- * - `.mux/tool_post` (post-hook)
- * - `.mux/tool_hook` (legacy pre+post)
+ * - `.xum/tool_pre` (pre-hook)
+ * - `.xum/tool_post` (post-hook)
+ * - `.xum/tool_hook` (legacy pre+post)
  */
 function wrapToolsWithHooks(
   tools: Record<string, Tool>,
   config: ToolConfiguration
 ): Record<string, Tool> {
-  // Skip hooks for untrusted projects — repo-controlled scripts must not run
-  if (config.trusted !== true) {
+  const hookConfig = deriveToolHookConfig(config);
+  if (hookConfig === null) {
     return tools;
   }
-
-  // Hooks require workspaceId, cwd, and runtime
-  if (!config.workspaceId || !config.cwd || !config.runtime) {
-    return tools;
-  }
-
-  const hookConfig: HookConfig = {
-    runtime: config.runtime,
-    cwd: config.cwd,
-    runtimeTempDir: config.runtimeTempDir,
-    workspaceId: config.workspaceId,
-    // Match bash tool behavior: muxEnv is present and secrets override it.
-    env: {
-      ...(config.muxEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
-  };
 
   const wrappedTools: Record<string, Tool> = {};
   for (const [toolName, tool] of Object.entries(tools)) {
@@ -700,7 +762,7 @@ export function getForcedXaiSearchToolNames(
   modelString: string,
   searchParameters: ToolConfiguration["xaiSearchParameters"]
 ): string[] | undefined {
-  if (!isGrok45Model(modelString) || searchParameters?.mode !== "on") {
+  if (!isGrokFrontierModel(modelString) || searchParameters?.mode !== "on") {
     return undefined;
   }
 
@@ -722,14 +784,14 @@ export async function getToolsForModel(
 ): Promise<Record<string, Tool>> {
   const capabilityModelString = config.capabilityModelString ?? modelString;
   const [provider, modelId] = modelString.split(":");
+  // Provider-native tool availability keys on the RESOLVED capability
+  // identity so mappedToModel aliases inherit their base model's native
+  // tools (web_search/web_fetch); the raw alias id says nothing about them.
+  const capabilityModelId = capabilityModelString.split(":")[1] ?? modelId;
 
   // Helper to reduce repetition when wrapping runtime tools
   const wrap = <TParameters, TResult>(tool: Tool<TParameters, TResult>) =>
     wrapWithInitWait(tool, workspaceId, initStateManager);
-
-  // Lazy-load web_fetch to avoid loading jsdom (ESM-only) at Jest setup time
-  // This allows integration tests to run without transforming jsdom's dependencies
-  const { createWebFetchTool } = await import("@/node/services/tools/web_fetch");
 
   // Runtime-dependent tools need to wait for workspace initialization
   // Wrap them to handle init waiting centrally instead of in each tool
@@ -750,7 +812,9 @@ export async function getToolsForModel(
     task_await: wrap(createTaskAwaitTool(config)),
     task_apply_git_patch: wrap(createTaskApplyGitPatchTool(config)),
     task_send_message: wrap(createTaskSendMessageTool(config)),
-    task_terminate: wrap(createTaskTerminateTool(config)),
+    task_retitle: wrap(createTaskRetitleTool(config)),
+    task_stop: wrap(createTaskStopTool(config)),
+    task_remove: wrap(createTaskRemoveTool(config)),
     task_workspace_lifecycle: wrap(createTaskWorkspaceLifecycleTool(config)),
     task_list: wrap(createTaskListTool(config)),
 
@@ -763,6 +827,9 @@ export async function getToolsForModel(
     bash_background_terminate: wrap(createBashBackgroundTerminateTool(config)),
 
     web_fetch: wrap(createWebFetchTool(config)),
+    ...(config.experiments?.tokenBudget
+      ? { session_history: wrap(createSessionHistoryTool(config)) }
+      : {}),
 
     // Agent memory (experiment-gated; off => no tool, no context cost)
     ...(config.memoryService && config.experiments?.memory
@@ -780,17 +847,19 @@ export async function getToolsForModel(
   // Non-runtime tools execute immediately (no init wait needed)
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
   const nonRuntimeTools: Record<string, Tool> = {
-    mux_agents_read: createMuxAgentsReadTool(config),
-    mux_agents_write: createMuxAgentsWriteTool(config),
+    mux_agents_read: createXumAgentsReadTool(config),
+    mux_agents_write: createXumAgentsWriteTool(config),
     agent_skill_list: createAgentSkillListTool(config),
     agent_skill_write: createAgentSkillWriteTool(config),
     agent_skill_delete: createAgentSkillDeleteTool(config),
-    mux_config_read: createMuxConfigReadTool(config),
-    mux_config_write: createMuxConfigWriteTool(config),
+    mux_config_read: createXumConfigReadTool(config),
+    mux_config_write: createXumConfigWriteTool(config),
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
     ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
+    ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
+    ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService && config.experiments?.timeline
       ? { timeline_event: createTimelineEventTool(config) }
       : {}),
@@ -809,6 +878,14 @@ export async function getToolsForModel(
         }
       : {}),
     ...(config.enableAgentReport ? { agent_report: createAgentReportTool(config) } : {}),
+    // RLM family messaging: children talk back to their parent and coordinate with
+    // same-parent siblings. Absent unless the child was spawned under the rlm experiment.
+    ...(config.enableFamilyMessaging
+      ? {
+          task_message_parent: createTaskMessageParentTool(config),
+          task_message_sibling: createTaskMessageSiblingTool(config),
+        }
+      : {}),
     ...(shouldExposeHeartbeatTool ? { heartbeat: createHeartbeatTool(config) } : {}),
     ...(config.goalService && config.enableGoalTools?.setGoal
       ? { set_goal: createSetGoalTool(config) }
@@ -854,10 +931,10 @@ export async function getToolsForModel(
         //
         // Known limitations when the native override is active:
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
-        // - Not bridgeable in the PTC sandbox (no execute()); see BridgeableToolName comment.
-        // - Tool hooks (.mux/tool_pre/.mux/tool_post) are skipped because withHooks() returns
+        // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
+        // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
-        if (supportsAnthropicNativeWebFetch(modelId)) {
+        if (supportsAnthropicNativeWebFetch(capabilityModelId)) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),
@@ -885,7 +962,10 @@ export async function getToolsForModel(
         const useResponsesTools = config.openaiWireFormat !== "chatCompletions";
 
         // Only add web search for models that support it
-        if (useResponsesTools && (modelId.includes("gpt-5") || modelId.includes("gpt-4"))) {
+        if (
+          useResponsesTools &&
+          (capabilityModelId.includes("gpt-5") || capabilityModelId.includes("gpt-4"))
+        ) {
           const { openai } = await import("@ai-sdk/openai");
           allTools = {
             ...baseTools,
@@ -906,7 +986,7 @@ export async function getToolsForModel(
       }
 
       case "xai": {
-        if (isGrok45Model(capabilityModelString) && config.xaiNativeToolsEnabled !== false) {
+        if (isGrokFrontierModel(capabilityModelString) && config.xaiNativeToolsEnabled !== false) {
           const nativeSearch = getXaiNativeSearchConfiguration(config.xaiSearchParameters);
           allTools = {
             ...baseTools,
@@ -929,7 +1009,7 @@ export async function getToolsForModel(
             ...baseTools,
             ...(mcpTools ?? {}),
             // Google exposes native Search and URL Context as provider-executed tools for
-            // Gemini 3+. These coexist with Mux function tools in the standard streaming API.
+            // Gemini 3+. These coexist with Xum function tools in the standard streaming API.
             google_search: google.tools.googleSearch({}) as Tool,
             url_context: google.tools.urlContext({}) as Tool,
           };
@@ -947,20 +1027,24 @@ export async function getToolsForModel(
   const allowlistedToolNames = new Set(
     getAvailableTools(capabilityModelString, {
       enableAgentReport: config.enableAgentReport,
+      enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
       enableDynamicWorkflows: Boolean(
         config.workflowService && config.experiments?.dynamicWorkflows
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
+      enableIntuition: Boolean(config.intuitionRuntime),
+      enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),
+      enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
       // The Review pane belongs to the user-facing parent workspace. config
       // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
       // the workspace has a parentWorkspaceId), so withhold the review_pane_*
       // tools from sub-agents to keep the toolset in sync with the system prompt.
       enableReviewPane: !config.enableAgentReport,
-      // Mux global tools are always created; tool policy (agent frontmatter)
+      // Xum global tools are always created; tool policy (agent frontmatter)
       // controls which agents can actually use them.
       enableMuxGlobalAgentsTools: true,
     })

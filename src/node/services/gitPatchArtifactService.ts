@@ -1,8 +1,7 @@
 import * as path from "node:path";
 import assert from "node:assert/strict";
-import * as fsPromises from "fs/promises";
 
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import type {
   SubagentGitPatchArtifact,
   SubagentGitProjectPatchArtifact,
@@ -15,6 +14,7 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { log } from "@/node/services/log";
+import { isActiveWorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
@@ -29,16 +29,18 @@ import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   getSubagentGitPatchMboxPath,
   matchesProjectArtifactProjectPathForUpdate,
+  readSubagentGitPatchArtifact,
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { shellQuote } from "@/common/utils/shell";
-import { streamToString } from "@/node/runtime/streamUtils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
 } from "@/node/services/workspaceProjectRepos";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -50,33 +52,6 @@ function isPathInsideDir(dirPath: string, filePath: string): boolean {
   return (
     relativePath.length > 0 && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)
   );
-}
-
-async function writeReadableStreamToLocalFile(
-  stream: ReadableStream<Uint8Array>,
-  filePath: string
-): Promise<void> {
-  assert(filePath.length > 0, "writeReadableStreamToLocalFile: filePath must be non-empty");
-
-  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-
-  const fileHandle = await fsPromises.open(filePath, "w");
-  try {
-    const reader = stream.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          await fileHandle.write(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  } finally {
-    await fileHandle.close();
-  }
 }
 
 function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
@@ -225,6 +200,33 @@ function buildPendingProjectArtifacts(params: {
   );
 }
 
+export function buildContinuationProjectArtifacts(params: {
+  pendingProjectArtifacts: SubagentGitProjectPatchArtifact[];
+  existingArtifact: SubagentGitPatchArtifact | null;
+}): SubagentGitProjectPatchArtifact[] {
+  return params.pendingProjectArtifacts.map((pendingProjectArtifact) => {
+    const existingProjectArtifact = params.existingArtifact?.projectArtifacts.find((artifact) =>
+      matchesProjectArtifactProjectPathForUpdate(artifact, pendingProjectArtifact.projectPath)
+    );
+    if (!existingProjectArtifact) {
+      return pendingProjectArtifact;
+    }
+
+    // Persistent children keep one stable task ID across continuations. If the prior patch was
+    // applied, hand back only commits made since that artifact's head; otherwise keep the original
+    // base so the refreshed artifact remains cumulative and no unintegrated commits are lost.
+    const baseCommitSha =
+      existingProjectArtifact.appliedAtMs != null
+        ? (existingProjectArtifact.headCommitSha ?? pendingProjectArtifact.baseCommitSha)
+        : (existingProjectArtifact.baseCommitSha ?? pendingProjectArtifact.baseCommitSha);
+
+    return {
+      ...pendingProjectArtifact,
+      baseCommitSha,
+    };
+  });
+}
+
 function buildPendingPatchArtifact(params: {
   childTaskId: string;
   parentWorkspaceId: string;
@@ -305,9 +307,23 @@ function failPendingProjectArtifacts(params: {
  * Extracted from TaskService to keep patch-specific logic self-contained.
  */
 export class GitPatchArtifactService {
+  // Keep completion callbacks observable until they settle without making generation waiters depend
+  // on cleanup callbacks that may need the same workspace event lock as a continuation refresh.
+  private readonly completionCallbacksByTaskId = new Map<string, Promise<void>>();
+  private readonly operationLocks = new MutexMap<string>();
   private readonly pendingJobsByTaskId = new Map<string, Promise<void>>();
 
   constructor(private readonly config: Config) {}
+
+  withOperationLock<T>(childWorkspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(childWorkspaceId.length > 0, "withOperationLock: childWorkspaceId must be non-empty");
+    return this.operationLocks.withLock(childWorkspaceId, operation);
+  }
+
+  async waitForGeneration(childWorkspaceId: string): Promise<void> {
+    assert(childWorkspaceId.length > 0, "waitForGeneration: childWorkspaceId must be non-empty");
+    await this.pendingJobsByTaskId.get(childWorkspaceId);
+  }
 
   /**
    * If the child workspace is an exec-like agent, write a pending patch artifact
@@ -315,11 +331,30 @@ export class GitPatchArtifactService {
    *
    * @param onComplete - called after generation finishes (success *or* failure),
    *   typically used to trigger reported-leaf-task cleanup.
+   * @param options.config - config snapshot to resolve the child/parent entries from; callers that
+   *   iterate many tasks (startup recovery) pass one instead of reloading config.json per task.
    */
   async maybeStartGeneration(
     parentWorkspaceId: string,
     childWorkspaceId: string,
-    onComplete: OnPatchGenerationComplete
+    onComplete: OnPatchGenerationComplete,
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
+  ): Promise<void> {
+    return await this.withOperationLock(childWorkspaceId, async () => {
+      await this.maybeStartGenerationUnlocked(
+        parentWorkspaceId,
+        childWorkspaceId,
+        onComplete,
+        options
+      );
+    });
+  }
+
+  private async maybeStartGenerationUnlocked(
+    parentWorkspaceId: string,
+    childWorkspaceId: string,
+    onComplete: OnPatchGenerationComplete,
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     assert(
       parentWorkspaceId.length > 0,
@@ -327,12 +362,19 @@ export class GitPatchArtifactService {
     );
     assert(childWorkspaceId.length > 0, "maybeStartGeneration: childWorkspaceId must be non-empty");
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    if (options?.refreshForContinuation === true) {
+      // A continuation can finish while the initial report's format-patch job is still draining.
+      // Wait for that generation before replacing its stable-task artifact. The tracked promise
+      // excludes the cleanup callback, so this is safe from the child workspace event lock.
+      await this.waitForGeneration(childWorkspaceId);
+    }
+
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
 
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
     const nowMs = Date.now();
-    const cfg = this.config.loadConfigOrDefault();
+    const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
     if (childEntry?.workspace.kind === "scratch") {
@@ -370,6 +412,21 @@ export class GitPatchArtifactService {
       return;
     }
 
+    if (options?.config != null) {
+      // The caller's snapshot can predate a client removing or reactivating this task. Only a
+      // task with no artifact yet or a crash-left pending one would actually be generated below
+      // (a completed artifact is left untouched), so re-read config for exactly those. A removed
+      // task gets no artifact, and a reactivated one (live execution handle, so its checkout is
+      // changing again) is left to the continuation refresh that runs when that execution settles.
+      const existing = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
+      if (existing == null || existing.status === "pending") {
+        const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (live == null || isActiveWorkspaceTurnTaskStatus(live.workspace.taskExecutionStatus)) {
+          return;
+        }
+      }
+    }
+
     const pendingProjectArtifacts = buildPendingProjectArtifacts({
       projectPath: childEntry.projectPath,
       projects: childEntry.workspace.projects,
@@ -382,20 +439,28 @@ export class GitPatchArtifactService {
       workspaceSessionDir: parentSessionDir,
       childTaskId: childWorkspaceId,
       updater: (existing) => {
-        if (existing && existing.status !== "pending") {
-          return existing;
+        if (options?.refreshForContinuation !== true) {
+          if (existing && existing.status !== "pending") {
+            return existing;
+          }
+          if (existing) {
+            return existing;
+          }
         }
 
-        return (
-          existing ??
-          buildPendingPatchArtifact({
-            childTaskId: childWorkspaceId,
-            parentWorkspaceId,
-            createdAtMs: nowMs,
-            updatedAtMs: nowMs,
-            projectArtifacts: pendingProjectArtifacts,
-          })
-        );
+        return buildPendingPatchArtifact({
+          childTaskId: childWorkspaceId,
+          parentWorkspaceId,
+          createdAtMs: existing?.createdAtMs ?? nowMs,
+          updatedAtMs: nowMs,
+          projectArtifacts:
+            options?.refreshForContinuation === true
+              ? buildContinuationProjectArtifacts({
+                  pendingProjectArtifacts,
+                  existingArtifact: existing,
+                })
+              : pendingProjectArtifacts,
+        });
       },
     });
 
@@ -409,7 +474,7 @@ export class GitPatchArtifactService {
 
     let job: Promise<void>;
     try {
-      job = this.generate(parentWorkspaceId, childWorkspaceId, onComplete)
+      job = this.generate(parentWorkspaceId, childWorkspaceId)
         .catch(async (error: unknown) => {
           log.error("Subagent git patch generation failed", {
             parentWorkspaceId,
@@ -478,17 +543,28 @@ export class GitPatchArtifactService {
     }
 
     this.pendingJobsByTaskId.set(childWorkspaceId, job);
+    const completionJob = job
+      .then(() => onComplete(childWorkspaceId))
+      .catch((error: unknown) => {
+        log.error("Subagent git patch completion callback failed", {
+          parentWorkspaceId,
+          childWorkspaceId,
+          error,
+        });
+      })
+      .finally(() => {
+        if (this.completionCallbacksByTaskId.get(childWorkspaceId) === completionJob) {
+          this.completionCallbacksByTaskId.delete(childWorkspaceId);
+        }
+      });
+    this.completionCallbacksByTaskId.set(childWorkspaceId, completionJob);
   }
 
-  private async generate(
-    parentWorkspaceId: string,
-    childWorkspaceId: string,
-    onComplete: OnPatchGenerationComplete
-  ): Promise<void> {
+  private async generate(parentWorkspaceId: string, childWorkspaceId: string): Promise<void> {
     assert(parentWorkspaceId.length > 0, "generate: parentWorkspaceId must be non-empty");
     assert(childWorkspaceId.length > 0, "generate: childWorkspaceId must be non-empty");
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
 
     const updateArtifact = async (
       updater: Parameters<typeof upsertSubagentGitPatchArtifact>[0]["updater"]
@@ -625,6 +701,11 @@ export class GitPatchArtifactService {
         taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
       });
 
+      const pendingArtifact = await readSubagentGitPatchArtifact(
+        parentSessionDir,
+        childWorkspaceId
+      );
+
       const ensureProjectArtifact = async (
         nextProjectArtifact: SubagentGitProjectPatchArtifact
       ): Promise<void> => {
@@ -653,9 +734,14 @@ export class GitPatchArtifactService {
 
       for (const projectRepo of projectRepos) {
         try {
-          let baseCommitSha = coerceNonEmptyString(
-            taskBaseCommitShaByProjectPath[projectRepo.projectPath]
+          const pendingProjectArtifact = pendingArtifact?.projectArtifacts.find((artifact) =>
+            matchesProjectArtifactProjectPathForUpdate(artifact, projectRepo.projectPath)
           );
+          // Continuation refreshes can advance the handoff base after an earlier patch was applied.
+          // Prefer the pending artifact's captured base over the task's original launch commit.
+          let baseCommitSha =
+            coerceNonEmptyString(pendingProjectArtifact?.baseCommitSha) ??
+            coerceNonEmptyString(taskBaseCommitShaByProjectPath[projectRepo.projectPath]);
           if (!baseCommitSha) {
             const trunkBranch =
               coerceNonEmptyString(ws.taskTrunkBranch) ??
@@ -770,23 +856,14 @@ export class GitPatchArtifactService {
             continue;
           }
 
-          const formatPatchStream = await runtime.exec(
-            `git format-patch --stdout --binary ${baseCommitSha}..${headCommitSha}`,
-            { cwd: projectRepo.repoCwd, timeout: 120 }
-          );
-          await formatPatchStream.stdin.close();
-
-          const stderrPromise = streamToString(formatPatchStream.stderr);
-          const writePromise = writeReadableStreamToLocalFile(formatPatchStream.stdout, patchPath);
-
-          const [exitCode, stderr] = await Promise.all([
-            formatPatchStream.exitCode,
-            stderrPromise,
-            writePromise,
-          ]);
-
-          if (exitCode !== 0) {
-            await fsPromises.rm(patchPath, { force: true });
+          const generation = await taskGitPatchEngine.generatePatch({
+            runtime,
+            repoCwd: projectRepo.repoCwd,
+            baseCommitSha,
+            headCommitSha,
+            patchPath,
+          });
+          if (!generation.success) {
             await ensureProjectArtifact({
               projectPath: projectRepo.projectPath,
               projectName: projectRepo.projectName,
@@ -795,7 +872,7 @@ export class GitPatchArtifactService {
               baseCommitSha,
               headCommitSha,
               commitCount,
-              error: `git format-patch failed (exitCode=${exitCode}): ${stderr.trim() || "unknown error"}`,
+              error: generation.error,
             });
             continue;
           }
@@ -836,9 +913,6 @@ export class GitPatchArtifactService {
           updatedAtMs: Date.now(),
         })
       );
-    } finally {
-      // Unblock auto-cleanup once the patch generation attempt has finished.
-      await onComplete(childWorkspaceId);
     }
   }
 }

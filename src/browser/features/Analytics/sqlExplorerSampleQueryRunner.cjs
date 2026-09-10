@@ -41,7 +41,11 @@ async function runSampleQuery() {
   try {
     await conn.run(payload.createEventsTableSql);
     await conn.run(payload.seedEventsRowSql);
-    await conn.run(payload.sample.sql);
+    const result = await conn.run(payload.sample.sql);
+    const rows = await result.getRowObjectsJS();
+    // Every sample query must return data against the seeded fixture rows —
+    // an empty result means the query no longer matches what the ETL writes.
+    assert(rows.length > 0, `Sample query "${payload.sample.label}" returned no rows against the seed`);
   } finally {
     conn.closeSync();
     instance.closeSync();

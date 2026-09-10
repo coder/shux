@@ -26,53 +26,52 @@ if (shouldRunIntegrationTests()) {
   validateApiKeys(["ANTHROPIC_API_KEY"]);
 }
 
-// Helper: Get queued messages from latest queued-message-changed event
-// If wait=true, waits for a new event first (use when expecting a change)
-// If wait=false, returns current state immediately (use when checking final state)
-async function getQueuedMessages(
-  collector: StreamCollector,
-  options: { wait?: boolean; timeoutMs?: number } = {}
-): Promise<string[]> {
-  const { wait = true, timeoutMs = 5000 } = options;
-
-  if (wait) {
-    await waitForQueuedMessageEvent(collector, timeoutMs);
-  }
-
-  const events = collector.getEvents();
-  const queuedEvents = events.filter(isQueuedMessageChanged);
-
-  if (queuedEvents.length === 0) {
-    return [];
-  }
-
-  // Return messages from the most recent event
-  const latestEvent = queuedEvents[queuedEvents.length - 1];
-  return latestEvent.queuedMessages;
+// Helper: Latest queued-message-changed state observed by the collector.
+function getQueuedMessages(collector: StreamCollector): string[] {
+  const queuedEvents = collector.getEvents().filter(isQueuedMessageChanged);
+  const latest = queuedEvents[queuedEvents.length - 1];
+  return latest ? latest.queuedMessages : [];
 }
 
-// Helper: Wait for a NEW queued-message-changed event (one that wasn't seen before)
+// Helper: Wait until a queued-message-changed event matching `predicate` exists
+// anywhere in the collector history. Scanning history (instead of waiting for
+// "the next new event" past a count snapshot) is required for determinism:
+// oRPC >=1.14 can deliver the queued event before the sendMessage promise
+// resolves, so a count snapshot taken after the send already includes it and a
+// new-event wait then observes the later queue-drain event instead (#4023).
 async function waitForQueuedMessageEvent(
+  collector: StreamCollector,
+  predicate: (event: QueuedMessageChangedEvent) => boolean,
+  timeoutMs = 5000
+): Promise<QueuedMessageChangedEvent | null> {
+  const startTime = Date.now();
+  for (;;) {
+    const match = collector.getEvents().filter(isQueuedMessageChanged).find(predicate);
+    if (match) return match;
+    if (Date.now() - startTime >= timeoutMs) return null;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+// Helper: Wait until the LATEST queued-message-changed event shows an empty,
+// part-free queue (the post-drain state). Latest-state convergence is safe for
+// drain waits because these tests never re-queue after draining; requiring
+// empty fileParts distinguishes the drain event from an image-only queued
+// event (which also has empty queuedMessages).
+async function waitForQueueDrained(
   collector: StreamCollector,
   timeoutMs = 5000
 ): Promise<QueuedMessageChangedEvent | null> {
-  // Get current count of queued-message-changed events
-  const currentEvents = collector.getEvents().filter(isQueuedMessageChanged);
-  const currentCount = currentEvents.length;
-
-  // Wait for a new event
   const startTime = Date.now();
-  while (Date.now() - startTime < timeoutMs) {
-    const events = collector.getEvents().filter(isQueuedMessageChanged);
-    if (events.length > currentCount) {
-      // Return the newest event
-      return events[events.length - 1];
+  for (;;) {
+    const queuedEvents = collector.getEvents().filter(isQueuedMessageChanged);
+    const latest = queuedEvents[queuedEvents.length - 1];
+    if (latest && latest.queuedMessages.length === 0 && (latest.fileParts ?? []).length === 0) {
+      return latest;
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (Date.now() - startTime >= timeoutMs) return null;
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
-
-  // Timeout - return null
-  return null;
 }
 
 // Helper: Wait for restore-to-input event
@@ -118,8 +117,10 @@ describeIntegration("Queued messages", () => {
         expect(queueResult.success).toBe(true);
 
         // Verify message was queued (not sent directly)
-        const queuedEvent = await waitForQueuedMessageEvent(collector1);
-        expect(queuedEvent).toBeDefined();
+        const queuedEvent = await waitForQueuedMessageEvent(collector1, (e) =>
+          e.queuedMessages.includes("Say 'SECOND' and nothing else")
+        );
+        expect(queuedEvent).not.toBeNull();
         expect(queuedEvent?.queuedMessages).toEqual(["Say 'SECOND' and nothing else"]);
         expect(queuedEvent?.displayText).toBe("Say 'SECOND' and nothing else");
 
@@ -128,7 +129,7 @@ describeIntegration("Queued messages", () => {
 
         // Wait for queue to be cleared (happens before auto-send starts new stream)
         // The sendQueuedMessages() clears queue and emits event before sending
-        const clearEvent = await waitForQueuedMessageEvent(collector1, 5000);
+        const clearEvent = await waitForQueueDrained(collector1, 5000);
         expect(clearEvent?.queuedMessages).toEqual([]);
 
         // Wait for auto-send to emit second user message (happens async after stream-end)
@@ -139,8 +140,7 @@ describeIntegration("Queued messages", () => {
         await collector1.waitForEvent("stream-end", 15000);
 
         // Verify queue is still empty (check current state)
-        const queuedAfter = await getQueuedMessages(collector1, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector1)).toEqual([]);
         collector1.stop();
       } finally {
         await cleanup();
@@ -175,12 +175,10 @@ describeIntegration("Queued messages", () => {
         );
 
         // Verify message was queued
-        const queued = await getQueuedMessages(collector);
-        expect(queued).toEqual(["This message should be restored"]);
-
-        // Capture event count BEFORE interrupt to avoid race condition
-        // (clear event may arrive before or with stream-abort)
-        const preInterruptEventCount = collector.getEvents().filter(isQueuedMessageChanged).length;
+        const queuedEvent = await waitForQueuedMessageEvent(collector, (e) =>
+          e.queuedMessages.includes("This message should be restored")
+        );
+        expect(queuedEvent?.queuedMessages).toEqual(["This message should be restored"]);
 
         // Interrupt the stream
         const client = resolveOrpcClient(env);
@@ -190,18 +188,8 @@ describeIntegration("Queued messages", () => {
         // Wait for stream abort
         await collector.waitForEvent("stream-abort", 5000);
 
-        // Wait for queue to be cleared (may have already arrived with stream-abort)
-        // Use preInterruptEventCount as baseline since clear event races with stream-abort
-        const startTime = Date.now();
-        let clearEvent: QueuedMessageChangedEvent | null = null;
-        while (Date.now() - startTime < 5000) {
-          const events = collector.getEvents().filter(isQueuedMessageChanged);
-          if (events.length > preInterruptEventCount) {
-            clearEvent = events[events.length - 1];
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
+        // Wait for queue to be cleared (may arrive before or with stream-abort)
+        const clearEvent = await waitForQueueDrained(collector, 5000);
         expect(clearEvent?.queuedMessages).toEqual([]);
 
         // Wait for restore-to-input event
@@ -211,8 +199,7 @@ describeIntegration("Queued messages", () => {
         expect(restoreEvent?.workspaceId).toBe(workspaceId);
 
         // Verify queue is still empty
-        const queuedAfter = await getQueuedMessages(collector, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector)).toEqual([]);
         collector.stop();
       } finally {
         await cleanup();
@@ -251,8 +238,10 @@ describeIntegration("Queued messages", () => {
         );
 
         // Verify message was queued
-        const queued = await getQueuedMessages(collector);
-        expect(queued).toEqual(["This message should be sent immediately"]);
+        const queuedEvent = await waitForQueuedMessageEvent(collector, (e) =>
+          e.queuedMessages.includes("This message should be sent immediately")
+        );
+        expect(queuedEvent?.queuedMessages).toEqual(["This message should be sent immediately"]);
 
         // Interrupt the stream with sendQueuedImmediately flag
         const client = resolveOrpcClient(env);
@@ -276,8 +265,7 @@ describeIntegration("Queued messages", () => {
         expect(autoSendHappened).toBe(true);
 
         // Verify queue was cleared
-        const queuedAfter = await getQueuedMessages(collector, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector)).toEqual([]);
 
         // Wait for the immediately-sent message's stream to start and complete
         await collector.waitForEvent("stream-start", 5000);
@@ -313,17 +301,19 @@ describeIntegration("Queued messages", () => {
 
         // Queue multiple messages, waiting for each queued-message-changed event
         await sendMessage(env, workspaceId, "Message 1");
-        await waitForQueuedMessageEvent(collector1);
+        await waitForQueuedMessageEvent(collector1, (e) => e.queuedMessages.includes("Message 1"));
 
         await sendMessage(env, workspaceId, "Message 2");
-        await waitForQueuedMessageEvent(collector1);
+        await waitForQueuedMessageEvent(collector1, (e) => e.queuedMessages.includes("Message 2"));
 
         await sendMessage(env, workspaceId, "Message 3");
-        await waitForQueuedMessageEvent(collector1);
 
-        // Verify all messages queued (check current state, don't wait for new event)
-        const queued = await getQueuedMessages(collector1, { wait: false });
-        expect(queued).toEqual(["Message 1", "Message 2", "Message 3"]);
+        // Verify all messages queued
+        const allQueued = await waitForQueuedMessageEvent(
+          collector1,
+          (e) => e.queuedMessages.length === 3
+        );
+        expect(allQueued?.queuedMessages).toEqual(["Message 1", "Message 2", "Message 3"]);
 
         // Wait for first stream to complete (this triggers auto-send)
         await collector1.waitForEvent("stream-end", 15000);
@@ -367,7 +357,9 @@ describeIntegration("Queued messages", () => {
         });
 
         // Verify queued with image
-        const queuedEvent = await waitForQueuedMessageEvent(collector1);
+        const queuedEvent = await waitForQueuedMessageEvent(collector1, (e) =>
+          e.queuedMessages.includes("Describe this image")
+        );
         expect(queuedEvent?.queuedMessages).toEqual(["Describe this image"]);
         expect(queuedEvent?.fileParts).toHaveLength(1);
         expect(queuedEvent?.fileParts?.[0]).toMatchObject(TEST_IMAGES.RED_PIXEL);
@@ -376,7 +368,7 @@ describeIntegration("Queued messages", () => {
         await collector1.waitForEvent("stream-end", 15000);
 
         // Wait for queue to be cleared
-        const clearEvent = await waitForQueuedMessageEvent(collector1, 5000);
+        const clearEvent = await waitForQueueDrained(collector1, 5000);
         expect(clearEvent?.queuedMessages).toEqual([]);
 
         // Wait for auto-send stream to start and complete
@@ -384,8 +376,7 @@ describeIntegration("Queued messages", () => {
         await collector1.waitForEvent("stream-end", 15000);
 
         // Verify queue is still empty
-        const queuedAfter = await getQueuedMessages(collector1, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector1)).toEqual([]);
         collector1.stop();
       } finally {
         await cleanup();
@@ -418,7 +409,10 @@ describeIntegration("Queued messages", () => {
         });
 
         // Verify queued (no text messages, but has image)
-        const queuedEvent = await waitForQueuedMessageEvent(collector1);
+        const queuedEvent = await waitForQueuedMessageEvent(
+          collector1,
+          (e) => (e.fileParts ?? []).length > 0
+        );
         expect(queuedEvent?.queuedMessages).toEqual([]);
         expect(queuedEvent?.displayText).toBe("");
         expect(queuedEvent?.fileParts).toHaveLength(1);
@@ -431,9 +425,7 @@ describeIntegration("Queued messages", () => {
         await collector1.waitForEvent("stream-end", 15000);
 
         // Verify queue was cleared after auto-send
-        // Use wait: false since the queue-clearing event already happened
-        const queuedAfter = await getQueuedMessages(collector1, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector1)).toEqual([]);
         collector1.stop();
       } finally {
         await cleanup();
@@ -517,14 +509,17 @@ describeIntegration("Queued messages", () => {
         });
 
         // Wait for queued-message-changed event
-        const queuedEvent = await waitForQueuedMessageEvent(collector1);
-        expect(queuedEvent?.displayText).toBe("/compact -t 3000");
+        const queuedEvent = await waitForQueuedMessageEvent(
+          collector1,
+          (e) => e.displayText === "/compact -t 3000"
+        );
+        expect(queuedEvent).not.toBeNull();
 
         // Wait for first stream to complete (this triggers auto-send)
         await collector1.waitForEvent("stream-end", 15000);
 
         // Wait for queue to be cleared
-        const clearEvent = await waitForQueuedMessageEvent(collector1, 5000);
+        const clearEvent = await waitForQueueDrained(collector1, 5000);
         expect(clearEvent?.queuedMessages).toEqual([]);
 
         // Wait for auto-send stream to start and complete
@@ -532,8 +527,7 @@ describeIntegration("Queued messages", () => {
         await collector1.waitForEvent("stream-end", 15000);
 
         // Verify queue is still empty
-        const queuedAfter = await getQueuedMessages(collector1, { wait: false });
-        expect(queuedAfter).toEqual([]);
+        expect(getQueuedMessages(collector1)).toEqual([]);
         collector1.stop();
       } finally {
         await cleanup();

@@ -3,7 +3,10 @@ import React from "react";
 import { cn } from "@/common/lib/utils";
 import { getArchivedWorkspacesExpandedKey } from "@/common/constants/storage";
 import { isWorktreeRuntime } from "@/common/types/runtime";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type {
+  FrontendWorkspaceMetadata,
+  WorkspaceRemovalDescendant,
+} from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -54,7 +57,12 @@ interface BulkOperationState {
 }
 
 function canDeleteManagedWorktree(workspace: FrontendWorkspaceMetadata): boolean {
-  return isWorktreeRuntime(workspace.runtimeConfig) && workspace.transcriptOnly !== true;
+  return (
+    isWorktreeRuntime(workspace.runtimeConfig) &&
+    workspace.transcriptOnly !== true &&
+    // isolation:none tasks reuse an ancestor checkout, so they do not own local worktree state.
+    workspace.taskIsolation !== "none"
+  );
 }
 
 /** Group workspaces by time period for timeline display */
@@ -111,6 +119,47 @@ function flattenGrouped(
     result.push(...workspaces);
   }
   return result;
+}
+
+/**
+ * Preserve selection order among peers while ensuring descendants are deleted before parents.
+ * This keeps bulk deletion deterministic and prevents the backend's orphan guard from turning a
+ * single subtree deletion into a partial operation that needs a second attempt.
+ */
+function sortWorkspaceIdsDeepestFirst(
+  workspaceIds: readonly string[],
+  workspaces: readonly FrontendWorkspaceMetadata[]
+): string[] {
+  const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace] as const));
+  const depthById = new Map<string, number>();
+
+  const getDepth = (workspaceId: string, visiting: Set<string>): number => {
+    const cached = depthById.get(workspaceId);
+    if (cached != null) return cached;
+    if (visiting.has(workspaceId)) return 0;
+
+    const workspace = workspaceById.get(workspaceId);
+    const parentWorkspaceId = workspace?.parentWorkspaceId;
+    if (parentWorkspaceId == null || !workspaceById.has(parentWorkspaceId)) {
+      depthById.set(workspaceId, 0);
+      return 0;
+    }
+
+    visiting.add(workspaceId);
+    const depth = Math.min(getDepth(parentWorkspaceId, visiting) + 1, 32);
+    visiting.delete(workspaceId);
+    depthById.set(workspaceId, depth);
+    return depth;
+  };
+
+  return workspaceIds
+    .map((workspaceId, index) => ({
+      workspaceId,
+      index,
+      depth: getDepth(workspaceId, new Set()),
+    }))
+    .sort((left, right) => right.depth - left.depth || left.index - right.index)
+    .map(({ workspaceId }) => workspaceId);
 }
 
 /** Calculate total cost from a SessionUsageFile by summing all model usages */
@@ -270,6 +319,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   const [forceDeleteModal, setForceDeleteModal] = React.useState<{
     workspaceId: string;
     error: string;
+    descendants?: WorkspaceRemovalDescendant[];
   } | null>(null);
   const deleteWorktreeError = usePopoverError();
   const unarchiveError = usePopoverError();
@@ -333,7 +383,6 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       })
     : workspaces;
 
-  // Group filtered workspaces by time period
   const groupedWorkspaces = groupByTimePeriod(filteredWorkspaces);
   const flatWorkspaces = flattenGrouped(groupedWorkspaces);
 
@@ -424,13 +473,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return next;
       });
     } else {
-      // Select all filtered
       setSelectedIds((prev) => new Set([...prev, ...allFilteredIds]));
     }
     setBulkDeleteConfirm(false); // Clear confirmation when selection changes
   };
 
-  // Bulk restore
   const handleBulkRestore = async () => {
     const idsToRestore = Array.from(selectedIds);
     setBulkOperation({
@@ -477,7 +524,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   // Bulk delete (always force: true) - requires confirmation
   const handleBulkDelete = async () => {
     setBulkDeleteConfirm(false);
-    const idsToDelete = Array.from(selectedIds);
+    const idsToDelete = sortWorkspaceIdsDeepestFirst(Array.from(selectedIds), workspaces);
     setBulkOperation({
       type: "delete",
       total: idsToDelete.length,
@@ -677,7 +724,8 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       }
 
       // Shift-click: skip force-delete confirmation, auto-force immediately.
-      if (options?.bypassForceConfirm) {
+      // Descendant deletion always requires an explicit scope confirmation, including Shift-click.
+      if (options?.bypassForceConfirm && !result.descendants?.length) {
         const forced = await removeWorkspace(workspaceId, { force: true });
         if (forced.success) {
           onWorkspacesChanged?.();
@@ -688,6 +736,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         setForceDeleteModal({
           workspaceId,
           error: forced.error ?? result.error ?? "Failed to remove workspace",
+          descendants: forced.descendants,
         });
         return;
       }
@@ -695,6 +744,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setForceDeleteModal({
         workspaceId,
         error: result.error ?? "Failed to remove workspace",
+        descendants: result.descendants,
       });
     } finally {
       setProcessingIds((prev) => {
@@ -716,19 +766,23 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     <>
       {/* Bulk operation progress modal */}
 
-      <ForceDeleteModal
-        isOpen={forceDeleteModal !== null}
-        workspaceId={forceDeleteModal?.workspaceId ?? ""}
-        error={forceDeleteModal?.error ?? ""}
-        onClose={() => setForceDeleteModal(null)}
-        onForceDelete={async (workspaceId) => {
-          const result = await removeWorkspace(workspaceId, { force: true });
-          if (!result.success) {
-            throw new Error(result.error ?? "Force delete failed");
-          }
-          onWorkspacesChanged?.();
-        }}
-      />
+      {forceDeleteModal && (
+        <ForceDeleteModal
+          isOpen
+          workspaceId={forceDeleteModal.workspaceId}
+          error={forceDeleteModal.error}
+          descendants={forceDeleteModal.descendants}
+          onClose={() => setForceDeleteModal(null)}
+          onForceDelete={async (workspaceId, acknowledgedDescendantIds) => {
+            const result = await removeWorkspace(workspaceId, {
+              force: true,
+              acknowledgedDescendantIds,
+            });
+            if (result.success) onWorkspacesChanged?.();
+            return result;
+          }}
+        />
+      )}
       <PopoverError
         error={unarchiveError.error}
         prefix="Failed to restore workspace"

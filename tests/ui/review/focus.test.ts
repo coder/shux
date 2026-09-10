@@ -66,11 +66,14 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
               throw new Error("Review panel not focused");
             }
           },
-          { timeout: 10_000 }
+          { timeout: 30_000 }
         );
       } finally {
         await cleanupView(view, cleanupDom);
       }
     });
-  }, 30_000);
+    // 120s total (like undo.test.ts): CI runners under merge-queue load inflate wall
+    // clock enough that a 30s budget covering workspace setup + render was exceeded
+    // while sibling suites passed at 100s+ (merge-queue run 32715740782).
+  }, 120_000);
 });

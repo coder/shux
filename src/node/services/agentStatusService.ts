@@ -68,8 +68,25 @@ interface State {
    * `runForWorkspace`.
    *
    * null if we have never settled on a transcript for this workspace.
+   * On the first run after process start it is seeded from the hash
+   * persisted next to the sidebar status (see persistedHashChecked).
    */
   lastInputHash: string | null;
+  /**
+   * Whether we already tried seeding lastInputHash from the hash persisted
+   * alongside the sidebar status (ExtensionMetadataService). Done lazily on
+   * the first runForWorkspace per process so a server restart doesn't
+   * regenerate statuses for chats whose transcript hasn't changed.
+   */
+  persistedHashChecked: boolean;
+  /**
+   * Whether lastInputHash settled by persisting a sidebar status (true) or
+   * without one, e.g. placeholder rejection (false). Only persisted settles
+   * are invalidated when another writer clears the shared status slot;
+   * invalidating placeholder settles would retry the same
+   * placeholder-producing transcript on every tick.
+   */
+  lastInputHashPersisted: boolean;
   /**
    * Hash of the transcript the scheduler last examined, even if that input
    * did not settle into a sidebar status (for example, a pre-provider config
@@ -269,6 +286,22 @@ export class AgentStatusService {
       // chat pivoted again.
       const state = this.ensureState(workspaceId);
 
+      // First look at this workspace since process start: seed the dedup
+      // hash persisted alongside the sidebar status so a restart doesn't
+      // regenerate every idle chat. A stale or missing persisted hash simply
+      // misses the dedup branch below and regenerates as before.
+      if (!state.persistedHashChecked) {
+        state.persistedHashChecked = true;
+        if (state.lastInputHash === null) {
+          const persisted = await this.extensionMetadata.getSidebarStatusInputHash(workspaceId);
+          if (persisted !== null) {
+            // The reader only returns hashes backed by a live status, so a
+            // seeded hash is by definition a persisted settle.
+            state.lastInputHash = persisted;
+            state.lastInputHashPersisted = true;
+          }
+        }
+      }
       const markRecencyObserved = () => {
         if (observedRecency !== null) {
           state.lastObservedRecency = observedRecency;
@@ -281,9 +314,10 @@ export class AgentStatusService {
       // Pre-provider failures and the empty/dedup-hit branches use bare
       // `markRecencyObserved()` because they should still retry on the same
       // transcript when conditions change.
-      const settleOnTranscript = () => {
+      const settleOnTranscript = (persistedStatus: boolean) => {
         markRecencyObserved();
         state.lastInputHash = dedupHash;
+        state.lastInputHashPersisted = persistedStatus;
         resetProviderFailureTracking(state);
       };
 
@@ -328,8 +362,24 @@ export class AgentStatusService {
       // the streaming bit must force a re-generation so the new liveness
       // hint actually applies.
       if (state.lastInputHash === dedupHash) {
-        markRecencyObserved();
-        return;
+        // Codex review: another writer (the todo path) can clear the shared
+        // status slot at any time, including between scheduler reads, so a
+        // dispatch-time snapshot would be stale here. Confirm at the skip
+        // decision itself: the authoritative reader returns null once the
+        // slot is cleared. Placeholder settles skip the recheck — they never
+        // persisted a status, so an empty slot is their steady state, and
+        // rechecking would retry the same placeholder transcript every tick.
+        const stillBacked =
+          !state.lastInputHashPersisted ||
+          (await this.extensionMetadata.getSidebarStatusInputHash(workspaceId)) === dedupHash;
+        if (stillBacked) {
+          markRecencyObserved();
+          return;
+        }
+        // Slot cleared (or rewritten) since we settled: drop the stale
+        // settle and regenerate now instead of leaving the sidebar blank.
+        state.lastInputHash = null;
+        state.lastInputHashPersisted = false;
       }
       if (isWaitingForProviderFailureCooldown(state, dedupHash, this.clock())) {
         // Provider-side failures are not permanently settled: after the
@@ -362,7 +412,11 @@ export class AgentStatusService {
             modelString,
             usage,
             usageOptions.providerMetadata,
-            { costsIncluded: usageOptions.costsIncluded, analyticsSource: "workspace_status" }
+            {
+              analyticsSource: "workspace_status",
+              // Creation-time identity from the generator's pinned snapshot.
+              metadataModel: usageOptions.metadataModel,
+            }
           );
           if (recorded) {
             this.requestAnalyticsIngest?.(workspaceId);
@@ -427,7 +481,7 @@ export class AgentStatusService {
           workspaceId,
           message: result.data.status.message,
         });
-        settleOnTranscript();
+        settleOnTranscript(false);
         return;
       }
 
@@ -438,7 +492,9 @@ export class AgentStatusService {
         const snapshot = await this.extensionMetadata.setSidebarStatus(
           workspaceId,
           result.data.status,
-          { skipIfRecencyAdvancedSince: observedRecency }
+          // inputHash persists atomically with the status so a restarted
+          // process can skip regenerating this exact input.
+          { inputHash: dedupHash, skipIfRecencyAdvancedSince: observedRecency }
         );
         if (this.stopped) return;
         if (!snapshot) {
@@ -453,7 +509,7 @@ export class AgentStatusService {
           });
           return;
         }
-        settleOnTranscript();
+        settleOnTranscript(true);
         this.workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
       } catch (error) {
         log.error("AgentStatusService: failed to persist generated status", {
@@ -475,6 +531,8 @@ export class AgentStatusService {
       state = {
         lastRanAt: 0,
         lastInputHash: null,
+        persistedHashChecked: false,
+        lastInputHashPersisted: false,
         lastSeenInputHash: null,
         lastObservedRecency: null,
         lastProviderFailureHash: null,
@@ -613,14 +671,25 @@ function computeTranscriptHash(transcript: string): string {
 }
 
 /**
+ * Codex review: the dedup hash is persisted across restarts, so unlike the
+ * old process-local cache it is no longer naturally invalidated by upgrades.
+ * Bump this when status-generation semantics change without changing
+ * transcript bytes (prompt guidance, placeholder rules, tool-summary
+ * interpretation) so persisted hashes from older builds miss once and
+ * stale statuses regenerate predictably.
+ */
+const STATUS_GENERATION_VERSION = "G1";
+
+/**
  * Dedup key for generation: combines the transcript hash with the
  * streaming bit, because `streaming` changes the prompt's tense guidance
  * (and therefore the generated status). Same transcript + different
- * streaming → must regenerate. Cheap: hashes a 3-byte prefix + the
+ * streaming → must regenerate. Cheap: hashes a short prefix + the
  * already-computed transcript hash.
  */
 function computeDedupHash(transcriptHash: string, streaming: boolean): string {
   return createHash("sha256")
+    .update(STATUS_GENERATION_VERSION + "\n")
     .update(streaming ? "S1\n" : "S0\n")
     .update(transcriptHash)
     .digest("hex");

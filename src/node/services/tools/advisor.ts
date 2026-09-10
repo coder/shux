@@ -154,12 +154,6 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
   assert(typeof runtime.createModel === "function", "advisor createModel must be a function");
 
   let usesThisTurn = 0;
-  // buildProviderOptions returns provider SDK option types; streamText accepts the
-  // same JSON-shaped values through its shared providerOptions slot.
-  const providerOptions = buildProviderOptions(
-    advisorModelString,
-    effectiveReasoningLevel
-  ) as unknown as StreamTextProviderOptions;
 
   return tool({
     description: TOOL_DEFINITIONS.advisor.description,
@@ -258,7 +252,33 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         handoffMessage != null ? [...transcript, handoffMessage] : transcript;
 
       try {
-        const model = await runtime.createModel(advisorModelString);
+        const {
+          model,
+          metadataModel,
+          optionsModelString,
+          optionsProvidersConfig,
+          optionsMuxProviderOptions,
+          optionsRouteProvider,
+        } = await runtime.createModel(advisorModelString);
+        // Keep the creation-time identity, including the actual Coder instance
+        // and scoped aliases. buildProviderOptions resolves its wire namespace
+        // from the same captured config and returns provider SDK option types;
+        // streamText accepts the same JSON-shaped values through its shared
+        // providerOptions slot.
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+        const providerOptions = buildProviderOptions(
+          optionsModelString,
+          effectiveReasoningLevel,
+          undefined,
+          undefined,
+          optionsMuxProviderOptions,
+          undefined,
+          undefined,
+          optionsProvidersConfig,
+          optionsRouteProvider,
+          undefined,
+          runtime.reasoningMode
+        ) as unknown as StreamTextProviderOptions;
 
         emitAdvisorPhase("waiting_for_response");
 
@@ -333,6 +353,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
               source: "tool",
               toolName: "advisor",
               model: advisorModelString,
+              metadataModel,
               usage,
               providerMetadata,
               toolCallId,

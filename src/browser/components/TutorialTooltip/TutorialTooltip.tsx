@@ -159,7 +159,9 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
     <>
       {/* Backdrop - subtle overlay */}
       <div
-        className="fixed inset-0 z-[9998] bg-black/20"
+        // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+        // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
+        className="fixed inset-0 z-[9998] before:absolute before:inset-0 before:bg-black/20"
         data-testid="tutorial-backdrop"
         onClick={onDismiss}
       />

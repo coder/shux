@@ -174,3 +174,93 @@ export const NestedWorkflow: Story = {
     </APIContext.Provider>
   ),
 };
+
+const LONG_PROMPT = [
+  "Implement the workflow visibility feature end to end.",
+  "Requirements: the right sidebar must stay scannable even when runs carry",
+  "multi-kilobyte prompts and reports. ".repeat(30),
+].join(" ");
+
+const LONG_REPORT = `## Implementation report
+
+${"- Verified a long finding line that keeps the report going.\n".repeat(60)}`;
+
+const longContentRun: WorkflowRunRecord = {
+  id: "wfr_long_content_story",
+  workspaceId: "workspace-1",
+  workflow: {
+    name: "long-content",
+    description: "Run with very long prompt args and reports",
+    scope: "project",
+    sourceKind: "inline",
+    executable: true,
+  },
+  source: "export default function workflow() { return null; }",
+  sourceHash: "sha256:long-content",
+  args: { prompt: LONG_PROMPT, repo: "coder/mux" },
+  status: "completed",
+  createdAt: NOW,
+  updatedAt: "2026-05-29T00:00:10.000Z",
+  events: [
+    { sequence: 1, type: "status", at: NOW, status: "running" },
+    { sequence: 2, type: "phase", at: "2026-05-29T00:00:01.000Z", name: "implement" },
+    {
+      sequence: 3,
+      type: "task",
+      at: "2026-05-29T00:00:01.500Z",
+      stepId: "implement",
+      taskId: "task_implement",
+      status: "completed",
+      title: "Implement feature",
+    },
+    {
+      sequence: 4,
+      type: "result",
+      at: "2026-05-29T00:00:09.500Z",
+      result: { reportMarkdown: LONG_REPORT },
+    },
+    { sequence: 5, type: "status", at: "2026-05-29T00:00:10.000Z", status: "completed" },
+  ],
+  steps: [
+    {
+      stepId: "implement",
+      inputHash: "sha256:implement",
+      status: "completed",
+      taskId: "task_implement",
+      startedAt: "2026-05-29T00:00:01.500Z",
+      completedAt: "2026-05-29T00:00:09.000Z",
+      result: { reportMarkdown: LONG_REPORT },
+    },
+  ],
+};
+
+async function* subscribeLongContentRuns(): AsyncGenerator<WorkflowRunStreamEvent> {
+  await Promise.resolve();
+  yield { type: "snapshot", runs: [longContentRun] };
+}
+
+const longContentApi = {
+  workflows: {
+    ...workflowApi.workflows,
+    subscribe: () => subscribeLongContentRuns(),
+    getRun: () => Promise.resolve(longContentRun),
+  },
+};
+
+/** Long prompt args and reports collapse to bounded previews with Show more / Full view. */
+export const LongContent: Story = {
+  args: { workspaceId: "workspace-1" },
+  render: (args) => (
+    <APIContext.Provider
+      value={{
+        status: "connected",
+        api: longContentApi as never,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      <WorkflowsTab {...args} />
+    </APIContext.Provider>
+  ),
+};

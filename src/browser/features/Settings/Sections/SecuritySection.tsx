@@ -6,7 +6,7 @@ import { useAPI } from "@/browser/contexts/API";
 
 /**
  * Security settings section — manages per-project trust state.
- * Trusted projects can run hooks and scripts (.mux/tool_env, tool_pre, tool_post, git hooks).
+ * Trusted projects can run hooks and scripts (.xum/tool_env, tool_pre, tool_post, git hooks).
  * Untrusted projects have all hook/script execution disabled.
  */
 export function SecuritySection() {

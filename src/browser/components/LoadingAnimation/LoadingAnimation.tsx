@@ -9,7 +9,7 @@ interface LoadingAnimationProps {
 
 /**
  * Shared loading animation used for workspace loading and workspace creation screens.
- * (Initial boot uses the static MuxLogo in LoadingScreen instead.)
+ * (Initial boot uses the static XumLogo in LoadingScreen instead.)
  * Renders the dancing-blink Lottie animation with automatic light/dark theme handling.
  *
  * Respects prefers-reduced-motion: shows a static first frame when the user

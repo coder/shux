@@ -39,7 +39,6 @@ export const MemoryFileChangeEventSchema = z.object({
   /** Stable project identity of the emitting scope context. */
   projectPath: z.string(),
 });
-export type MemoryFileChangeEventPayload = z.infer<typeof MemoryFileChangeEventSchema>;
 
 /** Sidecar-only consolidation coverage changed; subscribers should refetch status. */
 export const MemoryConsolidationStatusChangeEventSchema = z.object({
@@ -102,6 +101,8 @@ export const CompactionCompletionMetadataSchema = z.object({
   compactionEpoch: z.number(),
   previousBoundaryHistorySequence: z.number().optional(),
   compactionRequestMessageId: z.string(),
+  // RLM keep-recent floor: preserved-tail copies appended after the boundary.
+  preservedTailMessageCount: z.number().optional(),
 });
 
 export const MemoryHarvestRecordSchema = z.object({

@@ -16,7 +16,10 @@ export interface FileStats {
  * Parse git diff --numstat output into structured file stats
  */
 export function parseNumstat(numstatOutput: string): FileStats[] {
-  const lines = numstatOutput.trim().split("\n").filter(Boolean);
+  // Split before filtering instead of trimming the whole output: a full trim would
+  // silently strip trailing whitespace from the LAST line's file path (e.g. a file
+  // literally named ".env "), making downstream file reads target the wrong file.
+  const lines = numstatOutput.split("\n").filter(Boolean);
   const stats: FileStats[] = [];
 
   for (const line of lines) {

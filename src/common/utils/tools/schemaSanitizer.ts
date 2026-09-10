@@ -331,7 +331,7 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
   // Access tool internals - the AI SDK tool structure varies:
   // - Regular tools have `parameters` (Zod schema)
   // - MCP/dynamic tools have `inputSchema` (JSON Schema wrapper with getter)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const toolRecord = tool as any as Record<string, unknown>;
 
   // Check for inputSchema first (MCP tools use this)
@@ -354,6 +354,7 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
         },
       };
 
+      // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       return {
         ...tool,
         inputSchema: sanitizedInputSchema,
@@ -371,6 +372,7 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
   const clonedParams = sanitizeJsonSchemaForOpenAI(toolRecord.parameters);
 
   // Create a new tool with sanitized parameters
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   return {
     ...tool,
     parameters: clonedParams,

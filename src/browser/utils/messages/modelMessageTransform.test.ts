@@ -7,7 +7,6 @@ import {
   addInterruptedSentinel,
   injectAgentTransition,
   filterEmptyAssistantMessages,
-  injectFileChangeNotifications,
   injectPostCompactionAttachments,
   stripOrphanedToolCalls,
 } from "./modelMessageTransform";
@@ -179,7 +178,10 @@ describe("modelMessageTransform", () => {
         expect(lastAssistant.content[0]).toEqual({ type: "reasoning", text: "..." });
       }
     });
-    it("should keep text-only messages unchanged", () => {
+    it("merges consecutive text-only assistant messages (Anthropic alternation)", () => {
+      // Previously passed through unchanged; since synthetic assistant rows
+      // (branch summaries) can follow a streamed assistant turn, consecutive
+      // text-only assistant messages now merge like consecutive user messages.
       const assistantMsg1: AssistantModelMessage = {
         role: "assistant",
         content: [{ type: "text", text: "Let me help you with that." }],
@@ -191,7 +193,17 @@ describe("modelMessageTransform", () => {
       const messages: ModelMessage[] = [assistantMsg1, assistantMsg2];
 
       const result = transformModelMessages(messages, "anthropic");
-      expect(result).toEqual(messages);
+      // Original text parts are preserved as separate blocks so part-level
+      // providerOptions survive the merge.
+      expect(result).toEqual([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me help you with that." },
+            { type: "text", text: "Here's the result." },
+          ],
+        },
+      ]);
     });
 
     it("coalesces 3 consecutive identical no-progress task_await pairs into 1 (keep last pair)", () => {
@@ -630,6 +642,175 @@ describe("modelMessageTransform", () => {
       expect((result[2].content as Array<{ type: string; text: string }>)[0].text).toBe(
         "How are you?"
       );
+    });
+  });
+
+  describe("consecutive assistant messages", () => {
+    it("merges a text-only synthetic assistant row into the preceding assistant turn", () => {
+      // Branch summaries are assistant-role synthetic rows that can land
+      // directly after a streamed assistant turn; Anthropic rejects
+      // consecutive assistant messages just like consecutive user messages.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        { role: "assistant", content: [{ type: "text", text: "branch point answer" }] },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: explored a race." }],
+        },
+        { role: "user", content: [{ type: "text", text: "first send on the fork" }] },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(3);
+      expect(result[1].role).toBe("assistant");
+      // Original text parts preserved verbatim as separate blocks (never
+      // re-joined into one string, which would drop part providerOptions).
+      expect(result[1].content).toEqual([
+        { type: "text", text: "branch point answer" },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+      // Alternation restored for Anthropic.
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    });
+
+    it("preserves part providerOptions and only merges for Anthropic", () => {
+      // The folded row's text parts keep their providerOptions (e.g.
+      // cacheControl); other providers accept consecutive assistant rows, so
+      // the merge must not change their request bytes.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        { role: "assistant", content: [{ type: "text", text: "answer" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "Summary.",
+              providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+            },
+          ],
+        },
+      ];
+      const anthropic = transformModelMessages(messages, "anthropic");
+      expect(anthropic).toHaveLength(2);
+      expect(anthropic[1].content).toEqual([
+        { type: "text", text: "answer" },
+        {
+          type: "text",
+          text: "Summary.",
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+      ]);
+      // Non-Anthropic providers: consecutive assistant rows pass through.
+      expect(transformModelMessages(messages, "openai")).toEqual(messages);
+      expect(transformModelMessages(messages, "google")).toEqual(messages);
+    });
+
+    it("filters empty text parts from both sides of the merge", () => {
+      // History recorded with extended thinking can carry a signed-reasoning
+      // assistant row whose trailing text part is empty; when a synthetic
+      // summary merges into it (replayed with thinking off — reasoning parts
+      // inside mixed rows are preserved), the previous row's empty block must
+      // be dropped too, not just the incoming row's — Anthropic rejects empty
+      // text blocks. The signed reasoning part itself is preserved verbatim.
+      // (With thinking ON the summary row gains a placeholder reasoning part
+      // and is no longer text-only, so this merge does not fire there.)
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "thinking...",
+              providerOptions: { anthropic: { signature: "sig" } },
+            },
+            { type: "text", text: "" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: explored a race." }],
+        },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(2);
+      expect(result[1].content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking...",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+    });
+
+    it("filters whitespace-only text from both sides of the merge (r46)", () => {
+      // An interrupted stream can persist a whitespace-only text delta on the
+      // signed-reasoning row; Anthropic rejects text blocks without
+      // non-whitespace content, so a nonzero-length whitespace part must be
+      // dropped like an empty one — from the previous row's parts and from
+      // incoming string content alike.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "thinking...",
+              providerOptions: { anthropic: { signature: "sig" } },
+            },
+            { type: "text", text: "  \n" },
+          ],
+        },
+        { role: "assistant", content: "Summary of the abandoned branch: explored a race." },
+        { role: "assistant", content: " \t" },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(2);
+      expect(result[1].content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking...",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+    });
+
+    it("keeps a summary row standalone after a tool-call/tool-result pair", () => {
+      // Tool-call/tool-result adjacency must stay intact: when the branch
+      // point turn ended in tool calls, the summary follows the TOOL message
+      // and must not be folded backwards across it.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "calling" },
+            { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "t1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: stalled." }],
+        },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+      const validation = validateAnthropicCompliance(result);
+      expect(validation.valid).toBe(true);
     });
   });
 
@@ -1649,101 +1830,6 @@ describe("filterEmptyAssistantMessages", () => {
     expect(result2.length).toBe(2);
     expect(result2[1].id).toBe("assistant-1");
     expect(result2[1].metadata?.partial).toBe(true);
-  });
-});
-
-describe("injectFileChangeNotifications", () => {
-  it("should return messages unchanged when no file attachments provided", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Hello" }],
-        metadata: { timestamp: 1000 },
-      },
-    ];
-
-    const result = injectFileChangeNotifications(messages, undefined);
-    expect(result).toEqual(messages);
-
-    const result2 = injectFileChangeNotifications(messages, []);
-    expect(result2).toEqual(messages);
-  });
-
-  it("should append synthetic user message with file change notification", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Fix this code" }],
-        metadata: { timestamp: 1000 },
-      },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "I'll fix it" }],
-        metadata: { timestamp: 2000 },
-      },
-    ];
-
-    const changedFiles = [
-      {
-        type: "edited_text_file" as const,
-        filename: "src/app.ts",
-        snippet: "@@ -10,3 +10,3 @@\n-const x = 1\n+const x = 2",
-      },
-    ];
-
-    const result = injectFileChangeNotifications(messages, changedFiles);
-
-    expect(result.length).toBe(3);
-    expect(result[0]).toEqual(messages[0]);
-    expect(result[1]).toEqual(messages[1]);
-
-    const syntheticMsg = result[2];
-    expect(syntheticMsg.role).toBe("user");
-    expect(syntheticMsg.metadata?.synthetic).toBe(true);
-    expect(syntheticMsg.id).toMatch(/^file-change-/);
-    expect(syntheticMsg.parts[0]).toMatchObject({
-      type: "text",
-    });
-    const text = (syntheticMsg.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-file-update>");
-    expect(text).toContain("src/app.ts was modified");
-    expect(text).toContain("@@ -10,3 +10,3 @@");
-  });
-
-  it("should handle multiple file changes", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Hello" }],
-        metadata: { timestamp: 1000 },
-      },
-    ];
-
-    const changedFiles = [
-      {
-        type: "edited_text_file" as const,
-        filename: "src/foo.ts",
-        snippet: "diff1",
-      },
-      {
-        type: "edited_text_file" as const,
-        filename: "src/bar.ts",
-        snippet: "diff2",
-      },
-    ];
-
-    const result = injectFileChangeNotifications(messages, changedFiles);
-
-    expect(result.length).toBe(2);
-    const text = (result[1].parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("src/foo.ts was modified");
-    expect(text).toContain("src/bar.ts was modified");
-    expect(text).toContain("diff1");
-    expect(text).toContain("diff2");
   });
 });
 

@@ -23,6 +23,13 @@ export interface SyncPlanInput {
    */
   pricingFingerprintChanged: boolean;
   /**
+   * True when the ETL semantics version stored in ingest_meta is missing or
+   * outdated: the ETL now derives new columns (e.g. refusal-downgrade
+   * metadata) from already-committed chat.jsonl data, so existing rows lack
+   * them and need one full rebuild to backfill.
+   */
+  semanticsVersionChanged: boolean;
+  /**
    * Watermarked workspaces whose on-disk change signal (chat files +
    * headless-usage sidecar) no longer matches the stored watermark — writes
    * that landed after the last ingest but before an app exit. Without this,
@@ -57,6 +64,13 @@ export function decideSyncPlan(input: SyncPlanInput): SyncPlan {
   // Skipped when the events table is empty: nothing is stale, and the caller
   // persists the new fingerprint after every sync check.
   if (input.pricingFingerprintChanged && input.eventCount > 0) {
+    return REBUILD;
+  }
+
+  // ETL semantics changed (new derived columns) and rows exist → backfill via
+  // full rebuild. Same empty-table skip as the pricing fingerprint: the
+  // caller persists the current version after every sync check.
+  if (input.semanticsVersionChanged && input.eventCount > 0) {
     return REBUILD;
   }
 

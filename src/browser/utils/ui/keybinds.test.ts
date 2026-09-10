@@ -15,6 +15,17 @@ function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
   } as KeyboardEvent;
 }
 
+describe("COPY_MARKDOWN keybind", () => {
+  test("accepts M without modifiers and rejects modified keys", () => {
+    expect(matchesKeybind(createEvent({ key: "m" }), KEYBINDS.COPY_MARKDOWN)).toBe(true);
+    for (const modifier of ["shiftKey", "ctrlKey", "metaKey", "altKey"]) {
+      expect(
+        matchesKeybind(createEvent({ key: "M", [modifier]: true }), KEYBINDS.COPY_MARKDOWN)
+      ).toBe(false);
+    }
+  });
+});
+
 describe("isMac", () => {
   it("falls back to navigator.platform when Electron API is missing", () => {
     const originalWindow = globalThis.window;

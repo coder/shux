@@ -1,5 +1,5 @@
 /**
- * Voice input via backend transcription (Mux Gateway or OpenAI credentials).
+ * Voice input via backend transcription (Xum Gateway or OpenAI credentials).
  *
  * State machine: idle → requesting → recording → transcribing → idle
  *
@@ -7,8 +7,12 @@
  */
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { matchesKeybind, KEYBINDS, isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import {
+  shouldTranscribeRecording,
+  SILENCE_GATE_SAMPLE_INTERVAL_MS,
+} from "@/browser/utils/voice/silenceGate";
 import type { APIClient } from "@/browser/contexts/API";
 import { trackVoiceTranscription } from "@/common/telemetry";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -20,7 +24,7 @@ export interface UseVoiceInputOptions {
   onError?: (error: string) => void;
   /** Called after successful transcription if stop({ send: true }) was used */
   onSend?: () => void;
-  /** Whether voice transcription is available (OpenAI key set OR Mux Gateway configured). */
+  /** Whether voice transcription is available (OpenAI key set OR Xum Gateway configured). */
   isTranscriptionAvailable: boolean;
   /**
    * When true, hook manages global keybinds during recording:
@@ -70,12 +74,20 @@ function hasTouchDictation(): boolean {
   return hasTouch;
 }
 
-const HAS_TOUCH_DICTATION = hasTouchDictation();
-const HAS_MEDIA_RECORDER = typeof window !== "undefined" && typeof MediaRecorder !== "undefined";
-const HAS_GET_USER_MEDIA =
-  typeof window !== "undefined" &&
-  typeof navigator !== "undefined" &&
-  typeof navigator.mediaDevices?.getUserMedia === "function";
+// Capability checks run at call time, not module load: this module can be evaluated
+// before MediaRecorder/mediaDevices exist in the environment (notably under Bun's test
+// module caching), which would otherwise freeze stale negatives.
+function hasMediaRecorder(): boolean {
+  return typeof window !== "undefined" && typeof MediaRecorder !== "undefined";
+}
+
+function hasGetUserMedia(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof navigator !== "undefined" &&
+    typeof navigator.mediaDevices?.getUserMedia === "function"
+  );
+}
 
 // =============================================================================
 // Global Key State Tracking
@@ -92,6 +104,7 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   window.addEventListener(
     "keydown",
     (e) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") isSpaceCurrentlyHeld = true;
     },
     true
@@ -99,6 +112,7 @@ if (typeof window !== "undefined" && typeof window.addEventListener === "functio
   window.addEventListener(
     "keyup",
     (e) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") isSpaceCurrentlyHeld = false;
     },
     true
@@ -122,6 +136,9 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const meterIntervalRef = useRef<number | null>(null);
+  const rmsFramesRef = useRef<number[]>([]);
 
   // Flags set before stopping to control post-stop behavior
   const shouldSendRef = useRef(false);
@@ -206,6 +223,55 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     streamRef.current = null;
   }, []);
 
+  const stopMetering = useCallback(() => {
+    if (meterIntervalRef.current !== null) {
+      window.clearInterval(meterIntervalRef.current);
+      meterIntervalRef.current = null;
+    }
+
+    const audioContext = audioContextRef.current;
+    audioContextRef.current = null;
+    audioContext?.close().catch(() => undefined);
+  }, []);
+
+  const startMetering = useCallback(
+    (stream: MediaStream) => {
+      stopMetering();
+      rmsFramesRef.current = [];
+
+      try {
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        const source = audioContext.createMediaStreamSource(stream);
+        source.connect(analyser);
+        const data = new Uint8Array(analyser.frequencyBinCount);
+
+        meterIntervalRef.current = window.setInterval(() => {
+          try {
+            analyser.getByteTimeDomainData(data);
+
+            let sum = 0;
+            for (const sample of data) {
+              const normalized = (sample - 128) / 128;
+              sum += normalized * normalized;
+            }
+            rmsFramesRef.current.push(Math.sqrt(sum / data.length));
+          } catch {
+            rmsFramesRef.current = [];
+            stopMetering();
+          }
+        }, SILENCE_GATE_SAMPLE_INTERVAL_MS);
+      } catch {
+        // Metering is best-effort; the gate fails open when no samples are available.
+        stopMetering();
+      }
+    },
+    [stopMetering]
+  );
+
   // ---------------------------------------------------------------------------
   // Start Recording
   // ---------------------------------------------------------------------------
@@ -213,9 +279,9 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
   const start = useCallback(async () => {
     // Guard: only start from idle state with valid configuration
     const canStart =
-      HAS_MEDIA_RECORDER &&
-      HAS_GET_USER_MEDIA &&
-      !HAS_TOUCH_DICTATION &&
+      hasMediaRecorder() &&
+      hasGetUserMedia() &&
+      !hasTouchDictation() &&
       state === "idle" &&
       callbacksRef.current.isTranscriptionAvailable;
 
@@ -243,30 +309,44 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
         // Check if this was a cancel (discard audio) or normal stop (transcribe)
         const cancelled = wasCancelledRef.current;
         wasCancelledRef.current = false;
+        const recordingDurationMs = Date.now() - recordingStartTimeRef.current;
+        const shouldTranscribe = shouldTranscribeRecording({
+          rmsFrames: rmsFramesRef.current,
+          durationMs: recordingDurationMs,
+        });
 
-        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const chunks = chunksRef.current;
         chunksRef.current = [];
         releaseStream();
+        stopMetering();
 
         if (cancelled) {
           setState("idle");
+        } else if (!shouldTranscribe) {
+          shouldSendRef.current = false;
+          setState("idle");
         } else {
-          void transcribe(blob);
+          void transcribe(new Blob(chunks, { type: mimeType }));
         }
       };
 
       recorder.onerror = () => {
         callbacksRef.current.onError?.("Recording failed");
         releaseStream();
+        stopMetering();
         setState("idle");
       };
 
       recorderRef.current = recorder;
       setMediaRecorder(recorder);
+      startMetering(stream);
       recorder.start();
       recordingStartTimeRef.current = Date.now();
       setState("recording");
     } catch (err) {
+      stopMetering();
+      releaseStream();
+
       const msg = getErrorMessage(err);
       const isPermissionDenied = msg.includes("Permission denied") || msg.includes("NotAllowed");
 
@@ -277,7 +357,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
       );
       setState("idle");
     }
-  }, [state, transcribe, releaseStream]);
+  }, [state, transcribe, releaseStream, startMetering, stopMetering]);
 
   // ---------------------------------------------------------------------------
   // Stop Recording (triggers transcription)
@@ -319,8 +399,9 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     return () => {
       recorderRef.current?.stop();
       releaseStream();
+      stopMetering();
     };
-  }, [releaseStream]);
+  }, [releaseStream, stopMetering]);
 
   // ---------------------------------------------------------------------------
   // Recording keybinds (when useRecordingKeybinds is true)
@@ -339,10 +420,13 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
     spaceHeldAtStartRef.current = isSpaceCurrentlyHeld;
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " ") spaceHeldAtStartRef.current = false;
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Global capture runs before noVNC can contain the guest's keyboard input.
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key === " " && !spaceHeldAtStartRef.current) {
         e.preventDefault();
         stop({ send: true });
@@ -371,10 +455,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): UseVoiceInputResul
 
   return {
     state,
-    isSupported: HAS_MEDIA_RECORDER && HAS_GET_USER_MEDIA,
+    isSupported: hasMediaRecorder() && hasGetUserMedia(),
     isAvailable: options.isTranscriptionAvailable,
-    shouldShowUI: HAS_MEDIA_RECORDER && !HAS_TOUCH_DICTATION,
-    requiresSecureContext: HAS_MEDIA_RECORDER && !HAS_GET_USER_MEDIA,
+    shouldShowUI: hasMediaRecorder() && !hasTouchDictation(),
+    requiresSecureContext: hasMediaRecorder() && !hasGetUserMedia(),
     mediaRecorder,
     start: () => void start(),
     stop,

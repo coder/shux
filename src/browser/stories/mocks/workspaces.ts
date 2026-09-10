@@ -91,7 +91,7 @@ export function createIncompatibleWorkspace(
     ...createWorkspace(opts),
     incompatibleRuntime:
       opts.incompatibleReason ??
-      "This workspace was created with a newer version of mux.\nPlease upgrade mux to use this workspace.",
+      "This workspace was created with a newer version of xum.\nPlease upgrade xum to use this workspace.",
   };
 }
 
@@ -109,15 +109,6 @@ export function createArchivedWorkspace(
     archivedAt: opts.archivedAt ?? new Date(NOW - 86400000).toISOString(), // 1 day ago
     // No unarchivedAt means it's archived (archivedAt > unarchivedAt where unarchivedAt is undefined)
   };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROJECT FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface ProjectFixture {
-  path: string;
-  workspaces: FrontendWorkspaceMetadata[];
 }
 
 /** Create project config from workspaces */

@@ -8,14 +8,7 @@
  * to pattern-match on tab ids.
  */
 
-import {
-  BASE_TAB_IDS,
-  isBaseTabId,
-  type BaseTabType,
-} from "@/browser/features/RightSidebar/Tabs/tabConfig";
-
-/** Runtime list of static (non-terminal) tab ids — useful for iteration. */
-export const RIGHT_SIDEBAR_TABS = BASE_TAB_IDS;
+import { isBaseTabId, type BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 export type { BaseTabType };
 
 /**
@@ -49,4 +42,9 @@ export function getTerminalSessionId(tab: TabType): string | undefined {
 /** Create a terminal tab type for a given session ID. */
 export function makeTerminalTabType(sessionId?: string): TabType {
   return sessionId ? `terminal:${sessionId}` : "terminal";
+}
+
+/** Default terminal tab name when no OSC title has been set (0-based index). */
+export function getTerminalTabFallbackName(terminalIndex: number): string {
+  return terminalIndex === 0 ? "Terminal" : `Terminal ${terminalIndex + 1}`;
 }

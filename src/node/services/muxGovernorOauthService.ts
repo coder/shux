@@ -1,12 +1,19 @@
 /**
- * OAuth service for Mux Governor enrollment.
+ * OAuth service for Xum Governor enrollment.
  *
- * Similar pattern to MuxGatewayOauthService but:
+ * Similar pattern to XumGatewayOauthService but:
  * - Takes a user-provided governor origin (not hardcoded)
  * - Persists credentials to config.json (muxGovernorUrl + muxGovernorToken)
+ *
+ * Internals are Effect-native (see muxGatewayOauthService.ts for the shape):
+ * fallible pipelines are `Effect.gen` programs whose error channel carries a
+ * single reason-carrying tagged error, and the public Promise methods are
+ * thin `Effect.runPromise` facades folding back into the wire
+ * `Result<_, string>` shape, so pre-Effect callers keep working unchanged.
  */
 
 import * as crypto from "crypto";
+import { Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -19,7 +26,7 @@ import type { Config } from "@/node/config";
 import type { PolicyService } from "@/node/services/policyService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
-import { createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
+import { createDeferred, renderOAuthCallbackHtml, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -32,6 +39,16 @@ interface ServerFlow {
   governorOrigin: string;
   expiresAtMs: number;
 }
+
+/**
+ * Typed failure for governor OAuth errors. `reason` carries the exact
+ * user-facing string the wire `Result` contract expects, so facades map it
+ * 1:1 onto `Err(reason)` without reformatting.
+ */
+export class MuxGovernorOAuthError extends Schema.TaggedError<MuxGovernorOAuthError>()(
+  "MuxGovernorOAuthError",
+  { reason: Schema.String }
+) {}
 
 export class MuxGovernorOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
@@ -46,76 +63,131 @@ export class MuxGovernorOauthService {
   async startDesktopFlow(input: {
     governorOrigin: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    // Normalize and validate the governor origin
-    let governorOrigin: string;
-    try {
-      governorOrigin = normalizeGovernorUrl(input.governorOrigin);
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Invalid Governor URL: ${message}`);
-    }
+    return Effect.runPromise(this.startDesktopFlowEffect(input));
+  }
 
-    const flowId = crypto.randomUUID();
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
+   * abort between the loopback-server acquisition and `desktopFlows.register`
+   * would leak the server with nothing left to close it. Flow startup is quick
+   * and local, so running it to completion on abort is cheap; an abandoned
+   * flow still self-cleans via the registered timeout.
+   */
+  startDesktopFlowEffect(input: {
+    governorOrigin: string;
+  }): Effect.Effect<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect(input)));
+  }
 
-    let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
-    try {
-      loopback = await startLoopbackServer({
-        expectedState: flowId,
-        deferSuccessResponse: true,
-        renderHtml: (r) =>
-          renderOAuthCallbackHtml({
-            title: r.success ? "Enrollment complete" : "Enrollment failed",
-            message: r.success
-              ? "You can return to Mux. You may now close this tab."
-              : (r.error ?? "Unknown error"),
-            success: r.success,
+  private launchDesktopFlowEffect(input: {
+    governorOrigin: string;
+  }): Effect.Effect<
+    { flowId: string; authorizeUrl: string; redirectUri: string },
+    MuxGovernorOAuthError
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // Normalize and validate the governor origin
+      const governorOrigin = yield* Effect.try({
+        try: () => normalizeGovernorUrl(input.governorOrigin),
+        catch: (error) =>
+          new MuxGovernorOAuthError({ reason: `Invalid Governor URL: ${getErrorMessage(error)}` }),
+      });
+
+      const flowId = crypto.randomUUID();
+
+      const loopback = yield* Effect.tryPromise({
+        try: () =>
+          startLoopbackServer({
+            expectedState: flowId,
+            deferSuccessResponse: true,
+            renderHtml: (r) =>
+              renderOAuthCallbackHtml({
+                title: r.success ? "Enrollment complete" : "Enrollment failed",
+                message: r.success
+                  ? "You can return to Xum. You may now close this tab."
+                  : (r.error ?? "Unknown error"),
+                success: r.success,
+              }),
+          }),
+        catch: (error) =>
+          new MuxGovernorOAuthError({
+            reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
           }),
       });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Failed to start OAuth callback listener: ${message}`);
-    }
 
-    const authorizeUrl = buildGovernorAuthorizeUrl({
-      governorOrigin,
-      redirectUri: loopback.redirectUri,
-      state: flowId,
+      const authorizeUrl = buildGovernorAuthorizeUrl({
+        governorOrigin,
+        redirectUri: loopback.redirectUri,
+        state: flowId,
+      });
+
+      const resultDeferred = createDeferred<Result<void, string>>();
+
+      self.desktopFlows.register(flowId, {
+        server: loopback.server,
+        resultDeferred,
+        // Keep server-side timeout tied to flow lifetime so abandoned flows
+        // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
+        timeoutHandle: setTimeout(() => {
+          Effect.runFork(
+            self.desktopFlows.finishEffect(flowId, Err("Timed out waiting for OAuth callback"))
+          );
+        }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      });
+
+      // Background fiber: await loopback callback, do token exchange, finish
+      // flow. Races against resultDeferred so that if the flow is cancelled/
+      // timed out externally, this fiber exits cleanly instead of dangling on
+      // loopback.result.
+      Effect.runFork(
+        self.desktopCallbackPipeline(flowId, governorOrigin, loopback, resultDeferred)
+      );
+
+      log.debug(
+        `Xum Governor OAuth desktop flow started (flowId=${flowId}, origin=${governorOrigin})`
+      );
+
+      return { flowId, authorizeUrl, redirectUri: loopback.redirectUri };
     });
+  }
 
-    const resultDeferred = createDeferred<Result<void, string>>();
-
-    this.desktopFlows.register(flowId, {
-      server: loopback.server,
-      resultDeferred,
-      // Keep server-side timeout tied to flow lifetime so abandoned flows
-      // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
-      timeoutHandle: setTimeout(() => {
-        void this.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
-      }, DEFAULT_DESKTOP_TIMEOUT_MS),
-    });
-
-    // Background task: await loopback callback, do token exchange, finish flow.
-    // Race against resultDeferred so that if the flow is cancelled/timed out
-    // externally, this task exits cleanly instead of dangling on loopback.result.
-    void (async () => {
-      const callbackOrDone = await Promise.race([
-        loopback.result,
-        resultDeferred.promise.then((): null => null),
-      ]);
+  /**
+   * Desktop-flow completion pipeline, forked from `startDesktopFlowEffect`.
+   * Races the loopback callback against resultDeferred so that if the flow is
+   * cancelled/timed out externally, this fiber exits cleanly instead of
+   * dangling on loopback.result.
+   */
+  private desktopCallbackPipeline(
+    flowId: string,
+    governorOrigin: string,
+    loopback: Awaited<ReturnType<typeof startLoopbackServer>>,
+    resultDeferred: ReturnType<typeof createDeferred<Result<void, string>>>
+  ): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const callbackOrDone = yield* Effect.promise(() =>
+        Promise.race([loopback.result, resultDeferred.promise.then((): null => null)])
+      );
 
       // Flow was already finished externally (timeout or cancel).
       if (callbackOrDone === null) return;
 
       let result: Result<void, string>;
       if (callbackOrDone.success) {
-        result = await this.handleCallbackAndExchange({
-          state: flowId,
-          governorOrigin,
-          code: callbackOrDone.data.code,
-          error: null,
-        });
+        result = yield* toWireResult(
+          self.handleCallbackAndExchange({
+            state: flowId,
+            governorOrigin,
+            code: callbackOrDone.data.code,
+            error: null,
+          })
+        );
       } else {
-        result = Err(`Mux Governor OAuth error: ${callbackOrDone.error}`);
+        result = Err(`Xum Governor OAuth error: ${callbackOrDone.error}`);
       }
 
       // Render the final browser response based on exchange outcome.
@@ -125,27 +197,49 @@ export class MuxGovernorOauthService {
         loopback.sendFailureResponse(result.error);
       }
 
-      await this.desktopFlows.finish(flowId, result);
-    })();
-
-    log.debug(
-      `Mux Governor OAuth desktop flow started (flowId=${flowId}, origin=${governorOrigin})`
-    );
-
-    return Ok({ flowId, authorizeUrl, redirectUri: loopback.redirectUri });
+      yield* self.desktopFlows.finishEffect(flowId, result);
+    });
   }
 
   async waitForDesktopFlow(
     flowId: string,
     opts?: { timeoutMs?: number }
   ): Promise<Result<void, string>> {
-    return this.desktopFlows.waitFor(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
+    return Effect.runPromise(this.waitForDesktopFlowEffect(flowId, opts));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: abandoning the wait does not affect the flow itself (the
+   * shared deferred and registered timeout keep the flow's lifecycle intact).
+   */
+  waitForDesktopFlowEffect(
+    flowId: string,
+    opts?: { timeoutMs?: number }
+  ): Effect.Effect<Result<void, string>> {
+    return this.desktopFlows.waitForEffect(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
   }
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
-    if (!this.desktopFlows.has(flowId)) return;
-    log.debug(`Mux Governor OAuth desktop flow cancelled (flowId=${flowId})`);
-    await this.desktopFlows.cancel(flowId);
+    return Effect.runPromise(this.cancelDesktopFlowEffect(flowId));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel).
+   */
+  cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (!self.desktopFlows.has(flowId)) return;
+        log.debug(`Xum Governor OAuth desktop flow cancelled (flowId=${flowId})`);
+        yield* self.desktopFlows.cancelEffect(flowId);
+      })
+    );
   }
 
   startServerFlow(input: {
@@ -183,7 +277,7 @@ export class MuxGovernorOauthService {
       expiresAtMs: Date.now() + DEFAULT_SERVER_TIMEOUT_MS,
     });
 
-    log.debug(`Mux Governor OAuth server flow started (state=${state}, origin=${governorOrigin})`);
+    log.debug(`Xum Governor OAuth server flow started (state=${state}, origin=${governorOrigin})`);
 
     return Ok({ authorizeUrl, state });
   }
@@ -194,32 +288,40 @@ export class MuxGovernorOauthService {
     error: string | null;
     errorDescription?: string;
   }): Promise<Result<void, string>> {
-    const state = input.state;
-    if (!state) {
-      return Err("Missing OAuth state");
-    }
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.runPromise(
+      toWireResult(
+        Effect.gen(function* () {
+          const state = input.state;
+          if (!state) {
+            return yield* Effect.fail(new MuxGovernorOAuthError({ reason: "Missing OAuth state" }));
+          }
 
-    const flow = this.serverFlows.get(state);
-    if (!flow) {
-      return Err("Unknown OAuth state");
-    }
+          const flow = self.serverFlows.get(state);
+          if (!flow) {
+            return yield* Effect.fail(new MuxGovernorOAuthError({ reason: "Unknown OAuth state" }));
+          }
 
-    if (Date.now() > flow.expiresAtMs) {
-      this.serverFlows.delete(state);
-      return Err("OAuth flow expired");
-    }
+          if (Date.now() > flow.expiresAtMs) {
+            self.serverFlows.delete(state);
+            return yield* Effect.fail(new MuxGovernorOAuthError({ reason: "OAuth flow expired" }));
+          }
 
-    // Regardless of outcome, this flow should not be reused.
-    const governorOrigin = flow.governorOrigin;
-    this.serverFlows.delete(state);
+          // Regardless of outcome, this flow should not be reused.
+          const governorOrigin = flow.governorOrigin;
+          self.serverFlows.delete(state);
 
-    return this.handleCallbackAndExchange({
-      state,
-      governorOrigin,
-      code: input.code,
-      error: input.error,
-      errorDescription: input.errorDescription,
-    });
+          yield* self.handleCallbackAndExchange({
+            state,
+            governorOrigin,
+            code: input.code,
+            error: input.error,
+            errorDescription: input.errorDescription,
+          });
+        })
+      )
+    );
   }
 
   async dispose(): Promise<void> {
@@ -227,85 +329,118 @@ export class MuxGovernorOauthService {
     this.serverFlows.clear();
   }
 
-  private async handleCallbackAndExchange(input: {
+  private handleCallbackAndExchange(input: {
     state: string;
     governorOrigin: string;
     code: string | null;
     error: string | null;
     errorDescription?: string;
-  }): Promise<Result<void, string>> {
-    if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`Mux Governor OAuth error: ${message}`);
-    }
+  }): Effect.Effect<void, MuxGovernorOAuthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (input.error) {
+        const message = input.errorDescription
+          ? `${input.error}: ${input.errorDescription}`
+          : input.error;
+        return yield* Effect.fail(
+          new MuxGovernorOAuthError({ reason: `Xum Governor OAuth error: ${message}` })
+        );
+      }
 
-    if (!input.code) {
-      return Err("Missing OAuth code");
-    }
+      if (!input.code) {
+        return yield* Effect.fail(new MuxGovernorOAuthError({ reason: "Missing OAuth code" }));
+      }
 
-    const tokenResult = await this.exchangeCodeForToken(input.code, input.governorOrigin);
-    if (!tokenResult.success) {
-      return Err(tokenResult.error);
-    }
+      const token = yield* self.exchangeCodeForToken(input.code, input.governorOrigin);
 
-    // Persist to config.json
-    try {
-      await this.config.editConfig((config) => ({
-        ...config,
-        muxGovernorUrl: input.governorOrigin,
-        muxGovernorToken: tokenResult.data,
-      }));
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Failed to save Governor credentials: ${message}`);
-    }
-
-    log.debug(`Mux Governor OAuth exchange completed (state=${input.state})`);
-
-    this.windowService?.focusMainWindow();
-
-    const refreshResult = await this.policyService?.refreshNow();
-    if (refreshResult && !refreshResult.success) {
-      log.warn("Policy refresh after Governor enrollment failed", {
-        error: refreshResult.error,
+      // Persist to config.json
+      yield* Effect.tryPromise({
+        try: async () =>
+          self.config.editConfig((config) => ({
+            ...config,
+            muxGovernorUrl: input.governorOrigin,
+            muxGovernorToken: token,
+          })),
+        catch: (error) =>
+          new MuxGovernorOAuthError({
+            reason: `Failed to save Governor credentials: ${getErrorMessage(error)}`,
+          }),
       });
-    }
-    return Ok(undefined);
+
+      log.debug(`Xum Governor OAuth exchange completed (state=${input.state})`);
+
+      self.windowService?.focusMainWindow();
+
+      // refreshNow resolves with a wire Result; a rejection stays a defect,
+      // matching the previously un-caught await.
+      const refreshResult = yield* Effect.promise(async () => self.policyService?.refreshNow());
+      if (refreshResult && !refreshResult.success) {
+        log.warn("Policy refresh after Governor enrollment failed", {
+          error: refreshResult.error,
+        });
+      }
+    });
   }
 
-  private async exchangeCodeForToken(
+  private exchangeCodeForToken(
     code: string,
     governorOrigin: string
-  ): Promise<Result<string, string>> {
-    const exchangeUrl = buildGovernorExchangeUrl(governorOrigin);
+  ): Effect.Effect<string, MuxGovernorOAuthError> {
+    return Effect.gen(function* () {
+      const exchangeUrl = buildGovernorExchangeUrl(governorOrigin);
 
-    try {
-      const response = await fetch(exchangeUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: buildGovernorExchangeBody({ code }),
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)`, which coerces
+        // non-Promise returns (e.g. a test's synchronous fetch mock).
+        try: async () =>
+          fetch(exchangeUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: buildGovernorExchangeBody({ code }),
+          }),
+        catch: (error) =>
+          new MuxGovernorOAuthError({
+            reason: `Xum Governor exchange failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
-        const prefix = `Mux Governor exchange failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        // Preserve the HTTP status fallback when the response body is unreadable.
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
+        const prefix = `Xum Governor exchange failed (${response.status})`;
+        return yield* Effect.fail(
+          new MuxGovernorOAuthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as { access_token?: unknown };
+      const json = yield* Effect.tryPromise({
+        try: async () => {
+          const parsed = (await response.json()) as unknown;
+          // Validate inside the caught region: a null/non-object JSON body
+          // folds into the wire error instead of a defect.
+          if (parsed === null || typeof parsed !== "object") {
+            throw new TypeError("Response was not a JSON object");
+          }
+          return parsed as { access_token?: unknown };
+        },
+        catch: (error) =>
+          new MuxGovernorOAuthError({
+            reason: `Xum Governor exchange failed: ${getErrorMessage(error)}`,
+          }),
+      });
       const token = typeof json.access_token === "string" ? json.access_token : null;
       if (!token) {
-        return Err("Mux Governor exchange response missing access_token");
+        return yield* Effect.fail(
+          new MuxGovernorOAuthError({
+            reason: "Xum Governor exchange response missing access_token",
+          })
+        );
       }
 
-      return Ok(token);
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Mux Governor exchange failed: ${message}`);
-    }
+      return token;
+    });
   }
 }

@@ -26,7 +26,7 @@ interface AIViewProps {
 
 /**
  * Incompatible workspace error display.
- * Shown when a workspace was created with a newer version of mux.
+ * Shown when a workspace was created with a newer version of xum.
  */
 const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string }> = ({
   message,
@@ -42,7 +42,7 @@ const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string 
       </h2>
       <p className="mb-4 text-[var(--color-text-secondary)]">{message}</p>
       <p className="text-sm text-[var(--color-text-tertiary)]">
-        You can delete this workspace and create a new one, or upgrade mux to use it.
+        You can delete this workspace and create a new one, or upgrade xum to use it.
       </p>
     </div>
   </div>

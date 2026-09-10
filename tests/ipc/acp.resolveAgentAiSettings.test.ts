@@ -43,17 +43,14 @@ describe("resolveAgentAiSettings", () => {
         {
           id: "review",
           base: "exec",
+          // Configured model beats the definition model; no definition
+          // thinkingLevel so the base CONFIG chain supplies it.
           aiDefaults: {
             model: "google:gemini-2.5-pro",
-            thinkingLevel: "off",
           },
         },
         {
           id: "exec",
-          aiDefaults: {
-            model: "anthropic:claude-sonnet-4-5",
-            thinkingLevel: "medium",
-          },
         },
       ],
     });
@@ -81,17 +78,14 @@ describe("resolveAgentAiSettings", () => {
         {
           id: "review",
           base: "exec",
+          // Configured thinking beats the definition thinking; no definition
+          // model so the base CONFIG chain supplies it.
           aiDefaults: {
-            model: "google:gemini-2.5-pro",
             thinkingLevel: "off",
           },
         },
         {
           id: "exec",
-          aiDefaults: {
-            model: "anthropic:claude-sonnet-4-5",
-            thinkingLevel: "medium",
-          },
         },
       ],
     });
@@ -118,25 +112,13 @@ describe("resolveAgentAiSettings", () => {
         {
           id: "audit",
           base: "review",
-          aiDefaults: {
-            model: "google:gemini-2.5-pro",
-            thinkingLevel: "off",
-          },
         },
         {
           id: "review",
           base: "exec",
-          aiDefaults: {
-            model: "anthropic:claude-sonnet-4-5",
-            thinkingLevel: "medium",
-          },
         },
         {
           id: "exec",
-          aiDefaults: {
-            model: "anthropic:claude-opus-4-6",
-            thinkingLevel: "low",
-          },
         },
       ],
     });

@@ -38,6 +38,8 @@ export interface WrapperScriptOptions {
   exitCodePath: string;
   /** Working directory for the script */
   cwd: string;
+  /** Name of the environment variable containing the translated cwd; takes precedence over cwd. */
+  cwdEnvVar?: string;
   /** Environment variables to export */
   env?: Record<string, string>;
   /** The actual script to run */
@@ -63,7 +65,13 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   parts.push(`trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT`);
 
   // Change to working directory
-  parts.push(`cd ${shellQuote(options.cwd)}`);
+  if (options.cwdEnvVar) {
+    parts.push(`__MUX_CWD="$${options.cwdEnvVar}"`);
+    parts.push(`unset ${options.cwdEnvVar}`);
+    parts.push('cd "$__MUX_CWD"');
+  } else {
+    parts.push(`cd ${shellQuote(options.cwd)}`);
+  }
 
   // Add environment variable exports
   if (options.env) {

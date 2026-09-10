@@ -26,9 +26,9 @@ function runGit(cwd: string, args: string[]): string {
     encoding: "utf-8",
     env: {
       ...process.env,
-      GIT_AUTHOR_NAME: "Mux Test",
+      GIT_AUTHOR_NAME: "Xum Test",
       GIT_AUTHOR_EMAIL: "mux@example.com",
-      GIT_COMMITTER_NAME: "Mux Test",
+      GIT_COMMITTER_NAME: "Xum Test",
       GIT_COMMITTER_EMAIL: "mux@example.com",
     },
   }).trim();
@@ -182,9 +182,11 @@ describe("WorktreeArchiveSnapshotService", () => {
       delete workspace.name;
       return cfg;
     });
-    await fs.mkdir(fixture.config.getSessionDir(fixture.workspaceName), { recursive: true });
+    await fs.mkdir(path.join(fixture.config.sessionsDir, fixture.workspaceName), {
+      recursive: true,
+    });
     await fs.writeFile(
-      path.join(fixture.config.getSessionDir(fixture.workspaceName), "metadata.json"),
+      path.join(fixture.config.sessionsDir, fixture.workspaceName, "metadata.json"),
       JSON.stringify({ id: fixture.workspaceId }),
       "utf-8"
     );
@@ -213,7 +215,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(
       await pathExists(
         path.join(
-          fixture.config.getSessionDir(fixture.workspaceId),
+          path.join(fixture.config.sessionsDir, fixture.workspaceId),
           "archive-state",
           "metadata.json"
         )
@@ -254,9 +256,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ?.workspaces[0];
     expect(storedWorkspace?.worktreeArchiveSnapshot).toBeUndefined();
     expect(
-      await pathExists(
-        path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 
@@ -508,7 +508,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       throw new Error("Expected staged patch path");
     }
     await fs.writeFile(
-      path.join(fixture.config.getSessionDir(fixture.workspaceId), stagedPatchPath),
+      path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath),
       "this is not a valid patch\n",
       "utf-8"
     );
@@ -559,9 +559,7 @@ describe("WorktreeArchiveSnapshotService", () => {
         ?.worktreeArchiveSnapshot
     ).toBeUndefined();
     expect(
-      await pathExists(
-        path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 
@@ -712,7 +710,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       return cfg;
     });
 
-    await fs.rm(path.join(fixture.config.getSessionDir(fixture.workspaceId), stagedPatchPath), {
+    await fs.rm(path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath), {
       force: true,
     });
     await fs.writeFile(
@@ -871,7 +869,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       return cfg;
     });
 
-    await fs.rm(path.join(fixture.config.getSessionDir(fixture.workspaceId), stagedPatchPath), {
+    await fs.rm(path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath), {
       force: true,
     });
     runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
@@ -915,7 +913,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       if (
         typeof targetPath === "string" &&
         targetPath.endsWith(
-          path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ) {
         throw new Error("snapshot cleanup failed");
@@ -935,7 +933,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ).toEqual(captureResult.data);
       expect(
         await pathExists(
-          path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ).toBe(true);
     } finally {
@@ -1051,7 +1049,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ).toEqual(captureResult.data);
       expect(
         await pathExists(
-          path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ).toBe(false);
     } finally {
@@ -1093,7 +1091,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       workspaceMetadata: fixture.metadata,
     });
     expect(restoreResult).toEqual({ success: true, data: "restored" });
-    expect(await pathExists(fixture.config.getSessionDir(fixture.workspaceId))).toBe(true);
+    expect(await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId))).toBe(true);
   });
 
   test("rejects archive snapshots when untracked files are present", async () => {
@@ -1108,9 +1106,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       Err({ kind: "confirm-lossy-untracked-files", paths: ["untracked.txt"] })
     );
     expect(
-      await pathExists(
-        path.join(fixture.config.getSessionDir(fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 
@@ -1158,7 +1154,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(failResult.success).toBe(false);
 
     // Clean up the failed attempt's state dir (if any).
-    const sessionDir = fixture.config.getSessionDir(fixture.workspaceId);
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
     await fs.rm(path.join(sessionDir, "archive-state"), { recursive: true, force: true });
 
     // With matching acknowledged paths, capture should succeed.
@@ -1196,7 +1192,9 @@ describe("WorktreeArchiveSnapshotService", () => {
       })
     );
 
-    const sessionDirEntries = await fs.readdir(fixture.config.getSessionDir(fixture.workspaceId));
+    const sessionDirEntries = await fs.readdir(
+      path.join(fixture.config.sessionsDir, fixture.workspaceId)
+    );
     expect(sessionDirEntries.filter((entry) => entry.startsWith("archive-state.tmp-")).length).toBe(
       0
     );

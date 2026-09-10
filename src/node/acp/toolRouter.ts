@@ -239,7 +239,7 @@ export class ToolRouter {
             output: `Background process started with ID: ${processId}`,
             exitCode: 0,
             wall_duration_ms: Date.now() - startedAt,
-            note: "ACP delegated background terminals cannot be managed via task_await/task_terminate yet.",
+            note: "ACP delegated background terminals cannot be managed via task_await/task_stop yet.",
           };
         }
 

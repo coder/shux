@@ -44,7 +44,7 @@ export const WorkspaceStatusIndicator = memo<{
     return (
       <div className="bg-plan-mode-alpha text-plan-mode-light flex min-w-0 items-center gap-1.5 rounded px-1.5 py-0.5 text-xs">
         <CircleHelp aria-hidden="true" className="h-3 w-3 shrink-0" />
-        <span className="min-w-0 truncate font-medium">Mux has a few questions</span>
+        <span className="min-w-0 truncate font-medium">Xum has a few questions</span>
       </div>
     );
   }

@@ -4,11 +4,11 @@ import * as path from "path";
 import * as os from "os";
 import type { ToolExecutionOptions } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { Config } from "@/node/config";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import type { MuxToolScope } from "@/common/types/toolScope";
+import type { XumToolScope } from "@/common/types/toolScope";
 import type { Runtime } from "@/node/runtime/Runtime";
 
 export class TestTempDir implements Disposable {
@@ -50,6 +50,15 @@ interface SkillFixtureOptions {
   files?: Record<string, string>;
 }
 
+export function restoreXumRoot(previousXumRoot: string | undefined): void {
+  if (previousXumRoot === undefined) {
+    delete process.env.XUM_ROOT;
+    return;
+  }
+
+  process.env.XUM_ROOT = previousXumRoot;
+}
+
 export function restoreMuxRoot(previousMuxRoot: string | undefined): void {
   if (previousMuxRoot === undefined) {
     delete process.env.MUX_ROOT;
@@ -71,10 +80,10 @@ export async function withMuxRoot(muxRoot: string, callback: () => Promise<void>
 }
 
 export async function createWorkspaceSessionDir(
-  muxHome: string,
+  xumHome: string,
   workspaceId: string
 ): Promise<string> {
-  const workspaceSessionDir = path.join(muxHome, "sessions", workspaceId);
+  const workspaceSessionDir = path.join(xumHome, "sessions", workspaceId);
   await fsPromises.mkdir(workspaceSessionDir, { recursive: true });
   return workspaceSessionDir;
 }
@@ -127,11 +136,11 @@ export async function writeSkill(
 }
 
 export async function writeGlobalSkill(
-  muxHome: string,
+  xumHome: string,
   name: string,
   options?: SkillFixtureOptions
 ): Promise<void> {
-  await writeSkill(path.join(muxHome, "skills"), name, options);
+  await writeSkill(path.join(xumHome, "skills"), name, options);
 }
 
 export async function writeProjectSkill(
@@ -139,18 +148,18 @@ export async function writeProjectSkill(
   name: string,
   options?: SkillFixtureOptions
 ): Promise<void> {
-  await writeSkill(path.join(projectRoot, ".mux", "skills"), name, options);
+  await writeSkill(path.join(projectRoot, ".xum", "skills"), name, options);
 }
 
-export async function writeSkillWithReference(muxHome: string, name: string): Promise<void> {
-  await writeGlobalSkill(muxHome, name, {
+export async function writeSkillWithReference(xumHome: string, name: string): Promise<void> {
+  await writeGlobalSkill(xumHome, name, {
     description: "fixture",
     files: { "references/foo.txt": "fixture" },
   });
 }
 
 interface RemotePathMappedRuntimeOptions {
-  muxHome?: string;
+  xumHome?: string;
   resolveToRemotePath?: boolean;
 }
 
@@ -158,7 +167,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
   private readonly localBase: string;
   private readonly remoteBase: string;
   private readonly localHomeForTildeRoot: string | null;
-  private readonly muxHomeOverride: string | null;
+  private readonly xumHomeOverride: string | null;
   private readonly resolveToRemotePath: boolean;
   public resolvePathCallCount = 0;
 
@@ -166,7 +175,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
     super(localBase);
     this.localBase = path.resolve(localBase);
     this.remoteBase = remoteBase === "/" ? remoteBase : remoteBase.replace(/\/+$/u, "");
-    this.muxHomeOverride = options?.muxHome ?? null;
+    this.xumHomeOverride = options?.xumHome ?? null;
     this.resolveToRemotePath = options?.resolveToRemotePath ?? true;
 
     if (this.remoteBase === "~") {
@@ -231,8 +240,8 @@ export class RemotePathMappedRuntime extends LocalRuntime {
     return path.posix.join(this.remoteBase, path.basename(projectPath), workspaceName);
   }
 
-  override getMuxHome(): string {
-    return this.muxHomeOverride ?? super.getMuxHome();
+  override getXumHome(): string {
+    return this.xumHomeOverride ?? super.getXumHome();
   }
 
   override normalizePath(targetPath: string, basePath: string): string {
@@ -296,7 +305,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
   }
 }
 
-export class TrueRemotePathMappedRuntime extends RemoteRuntime {
+export class TrueRemotePathMappedRuntime extends TestRemoteRuntime {
   private readonly delegate: RemotePathMappedRuntime;
   private readonly remoteBase: string;
 
@@ -306,22 +315,8 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
     this.delegate = new RemotePathMappedRuntime(localBase, remoteBase);
   }
 
-  protected readonly commandPrefix = "TestRemoteRuntime";
-
-  protected spawnRemoteProcess(): Promise<SpawnResult> {
-    throw new Error("spawnRemoteProcess should not be called");
-  }
-
-  protected getBasePath(): string {
+  protected override getBasePath(): string {
     return this.remoteBase;
-  }
-
-  protected quoteForRemote(targetPath: string): string {
-    return `'${targetPath.replaceAll("'", "'\\''")}'`;
-  }
-
-  protected cdCommand(cwd: string): string {
-    return `cd ${this.quoteForRemote(cwd)}`;
   }
 
   override exec(
@@ -364,30 +359,6 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
   override ensureDir(dirPath: string): ReturnType<LocalRuntime["ensureDir"]> {
     return this.delegate.ensureDir(dirPath);
   }
-
-  override createWorkspace(_params: Parameters<LocalRuntime["createWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override initWorkspace(_params: Parameters<LocalRuntime["initWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override renameWorkspace(
-    _projectPath: string,
-    _oldWorkspaceName: string,
-    _newWorkspaceName: string
-  ) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override deleteWorkspace(_projectPath: string, _workspaceName: string, _deleteBranch: boolean) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override forkWorkspace(_params: Parameters<LocalRuntime["forkWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
 }
 
 let testConfig: Config | null = null;
@@ -415,7 +386,7 @@ export function createTestToolConfig(
     workspaceId?: string;
     sessionsDir?: string;
     runtime?: Runtime;
-    muxScope?: MuxToolScope;
+    xumScope?: XumToolScope;
   }
 ): ToolConfiguration {
   return {
@@ -424,9 +395,9 @@ export function createTestToolConfig(
     runtime: options?.runtime ?? new LocalRuntime(tempDir),
     runtimeTempDir: tempDir,
     workspaceId: options?.workspaceId ?? "test-workspace",
-    muxScope: options?.muxScope ?? {
+    xumScope: options?.xumScope ?? {
       type: "global",
-      muxHome: tempDir,
+      xumHome: tempDir,
     },
   };
 }

@@ -187,7 +187,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
-  const { agentId: currentAgentId } = useAgent();
+  const { agentId: currentAgentId, agents } = useAgent();
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
@@ -502,6 +502,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
+        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
     updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);

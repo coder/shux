@@ -25,7 +25,9 @@ tools:
     - task_apply_git_patch
     - task_list
     - task_send_message
-    - task_terminate
+    - task_retitle
+    - task_stop
+    - task_remove
     - task_workspace_lifecycle
 ---
 

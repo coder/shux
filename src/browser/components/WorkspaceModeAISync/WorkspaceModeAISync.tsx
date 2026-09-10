@@ -24,7 +24,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 
 export function WorkspaceModeAISync(props: { workspaceId: string }): null {
   const workspaceId = props.workspaceId;
-  const { agentId } = useAgent();
+  const { agentId, agents } = useAgent();
 
   const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
     AGENT_AI_DEFAULTS_KEY,
@@ -80,6 +80,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
+        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
     if (existingModel !== resolvedModel) {
@@ -97,7 +98,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     if (existingReasoning !== resolvedReasoningMode) {
       updatePersistedState(reasoningKey, resolvedReasoningMode);
     }
-  }, [agentAiDefaults, agentId, workspaceId]);
+  }, [agentAiDefaults, agentId, agents, workspaceId]);
 
   return null;
 }

@@ -9,30 +9,13 @@
 
 export {
   TAB_REGISTRY,
-  BASE_TAB_IDS,
   isBaseTabId,
-  getTabRegistration,
-  getDefaultLayoutTabIds,
-  getOrderedBaseTabIds,
   type BaseTabType,
-  type TabRegistration,
   type TabPanelContext,
-  type TabLabelContext,
   type ReviewStats,
 } from "./tabRegistry";
 
 export { getTabName, getTabContentClassName } from "./registry";
 
-// Label components are still exported for legacy/test consumers.
-export {
-  StatsTabLabel,
-  OutputTabLabel,
-  ReviewTabLabel,
-  TerminalTabLabel,
-  InstructionsTabLabel,
-  BrowserTabLabel,
-  DebugTabLabel,
-  DesktopTabLabel,
-  GoalTabLabel,
-  WorkflowsTabLabel,
-} from "./TabLabels";
+// Still exported for legacy/test consumers.
+export { TerminalTabLabel } from "./TabLabels";

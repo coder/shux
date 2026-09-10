@@ -80,6 +80,25 @@ export interface GitHubPRStatus {
   fetchedAt: number;
 }
 
+export interface WorkspaceStackBranch {
+  branch: string;
+  isCurrent: boolean;
+  needsRebase: boolean;
+  pr?: {
+    number: number;
+    url?: string;
+    state: "OPEN" | "MERGED" | "QUEUED" | "CLOSED";
+    title?: string;
+    isDraft?: boolean;
+  };
+}
+
+export interface WorkspaceStackInfo {
+  trunk: string;
+  /** Branches are ordered from stack bottom to top. */
+  branches: WorkspaceStackBranch[];
+}
+
 /**
  * Extended PR link with status information.
  */

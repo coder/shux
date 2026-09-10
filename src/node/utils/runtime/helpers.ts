@@ -2,7 +2,6 @@ import type { Runtime, ExecOptions } from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { shellQuote } from "@/common/utils/shell";
 
 /**
  * Convenience helpers for working with streaming Runtime APIs.
@@ -125,8 +124,8 @@ export interface ReadPlanResult {
 
 /**
  * Read plan file content, checking new path first then legacy, migrating if needed.
- * This handles the transparent migration from ~/.mux/plans/{id}.md to
- * ~/.mux/plans/{projectName}/{workspaceName}.md
+ * This handles the transparent migration from {runtimeHome}/plans/{id}.md to
+ * {runtimeHome}/plans/{projectName}/{workspaceName}.md
  */
 export async function readPlanFile(
   runtime: Runtime,
@@ -134,10 +133,9 @@ export async function readPlanFile(
   projectName: string,
   workspaceId: string
 ): Promise<ReadPlanResult> {
-  const muxHome = runtime.getMuxHome();
-  const planPath = getPlanFilePath(workspaceName, projectName, muxHome);
-  // Legacy paths only used for non-Docker runtimes
-  const legacyPath = getLegacyPlanFilePath(workspaceId);
+  const xumHome = runtime.getXumHome();
+  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
+  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
 
   // Resolve tilde to absolute path for client use (editor deep links, etc.)
   // For local runtimes this expands ~ to /home/user; for SSH it resolves remotely
@@ -152,16 +150,18 @@ export async function readPlanFile(
     try {
       const content = await readFileString(runtime, legacyPath);
       // Migrate: move to new location.
-      // Resolve paths first because shellQuote() intentionally prevents ~ expansion.
       try {
         const planDir = planPath.substring(0, planPath.lastIndexOf("/"));
-        const resolvedPlanDir = await runtime.resolvePath(planDir);
-        const resolvedLegacyPath = await runtime.resolvePath(legacyPath);
         await execBuffered(
           runtime,
-          `mkdir -p ${shellQuote(resolvedPlanDir)} && mv ${shellQuote(resolvedLegacyPath)} ${shellQuote(resolvedPath)}`,
+          'mkdir -p "$XUM_PLAN_DIR" && mv "$XUM_LEGACY_PLAN" "$XUM_PLAN"',
           {
             cwd: "/tmp",
+            pathEnv: {
+              XUM_PLAN_DIR: planDir,
+              XUM_LEGACY_PLAN: legacyPath,
+              XUM_PLAN: planPath,
+            },
             timeout: 5,
           }
         );
@@ -177,40 +177,6 @@ export async function readPlanFile(
 }
 
 /**
- * Check if a non-empty plan file exists for this workspace.
- * Checks both the canonical (per-project) path and the legacy (by workspaceId) path.
- */
-export async function hasNonEmptyPlanFile(
-  runtime: Runtime,
-  workspaceName: string,
-  projectName: string,
-  workspaceId: string
-): Promise<boolean> {
-  // Defensive: missing identifiers means we cannot safely resolve plan paths.
-  if (!workspaceName || !projectName || !workspaceId) {
-    return false;
-  }
-
-  const muxHome = runtime.getMuxHome();
-  const planPath = getPlanFilePath(workspaceName, projectName, muxHome);
-  // Legacy paths only used for non-Docker runtimes.
-  const legacyPath = getLegacyPlanFilePath(workspaceId);
-
-  for (const candidatePath of [planPath, legacyPath]) {
-    try {
-      const stat = await runtime.stat(candidatePath);
-      if (!stat.isDirectory && stat.size > 0) {
-        return true;
-      }
-    } catch {
-      // Try next candidate.
-    }
-  }
-
-  return false;
-}
-
-/**
  * Move a plan file from one workspace name to another (e.g., during rename).
  * Silently succeeds if source file doesn't exist.
  */
@@ -220,60 +186,22 @@ export async function movePlanFile(
   newWorkspaceName: string,
   projectName: string
 ): Promise<void> {
-  const muxHome = runtime.getMuxHome();
-  const oldPath = getPlanFilePath(oldWorkspaceName, projectName, muxHome);
-  const newPath = getPlanFilePath(newWorkspaceName, projectName, muxHome);
+  const xumHome = runtime.getXumHome();
+  const oldPath = getPlanFilePath(oldWorkspaceName, projectName, xumHome);
+  const newPath = getPlanFilePath(newWorkspaceName, projectName, xumHome);
 
   try {
     await runtime.stat(oldPath);
-    // Resolve tildes to absolute paths - bash doesn't expand ~ inside quotes
-    const resolvedOldPath = await runtime.resolvePath(oldPath);
-    const resolvedNewPath = await runtime.resolvePath(newPath);
-    await execBuffered(
-      runtime,
-      `mv ${shellQuote(resolvedOldPath)} ${shellQuote(resolvedNewPath)}`,
-      {
-        cwd: "/tmp",
-        timeout: 5,
-      }
-    );
+    await execBuffered(runtime, 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"', {
+      cwd: "/tmp",
+      pathEnv: {
+        XUM_OLD_PLAN: oldPath,
+        XUM_NEW_PLAN: newPath,
+      },
+      timeout: 5,
+    });
   } catch {
     // No plan file to move, that's fine
-  }
-}
-
-/**
- * Copy a plan file from one workspace to another (e.g., during fork).
- * Checks both new path format and legacy path format for the source.
- * Silently succeeds if source file doesn't exist at either location.
- */
-export async function copyPlanFile(
-  runtime: Runtime,
-  sourceWorkspaceName: string,
-  sourceWorkspaceId: string,
-  targetWorkspaceName: string,
-  projectName: string
-): Promise<void> {
-  const muxHome = runtime.getMuxHome();
-  const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, muxHome);
-  // Legacy paths only used for non-Docker runtimes
-  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId);
-  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, muxHome);
-
-  // Prefer the new layout, but fall back to the legacy layout.
-  //
-  // Note: we intentionally use runtime file I/O instead of `cp` because:
-  // 1) bash doesn't expand ~ inside quotes
-  // 2) the target per-project plan directory may not exist yet
-  // 3) runtime.writeFile() already handles directory creation + tilde expansion
-  for (const candidatePath of [sourcePath, legacySourcePath]) {
-    try {
-      const content = await readFileString(runtime, candidatePath);
-      await writeFileString(runtime, targetPath, content);
-      return;
-    } catch {
-      // Try next candidate
-    }
   }
 }
 
@@ -291,11 +219,11 @@ export async function copyPlanFileAcrossRuntimes(
   targetWorkspaceName: string,
   projectName: string
 ): Promise<void> {
-  const sourceMuxHome = sourceRuntime.getMuxHome();
-  const targetMuxHome = targetRuntime.getMuxHome();
+  const sourceMuxHome = sourceRuntime.getXumHome();
+  const targetXumHome = targetRuntime.getXumHome();
   const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
-  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId);
-  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetMuxHome);
+  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId, sourceMuxHome);
+  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
 
   for (const candidatePath of [sourcePath, legacySourcePath]) {
     try {

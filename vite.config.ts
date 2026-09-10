@@ -7,57 +7,23 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
+import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const disableMermaid = process.env.VITE_DISABLE_MERMAID === "1";
 
-// Vite server configuration (for dev-server remote access)
-const devServerHost = process.env.MUX_VITE_HOST ?? "127.0.0.1"; // Secure by default
-const devServerPort = Number(process.env.MUX_VITE_PORT ?? "5173");
+const {
+  host: devServerHost,
+  port: devServerPort,
+  allowedHosts: devServerAllowedHosts,
+  previewPort,
+  backendHost: backendProxyHost,
+  backendPort: backendProxyPort,
+  enableTutorialsInSandbox,
+} = resolveViteDevServerEnv(process.env);
 
-const devServerAllowedHosts = (() => {
-  const raw = process.env.MUX_VITE_ALLOWED_HOSTS?.trim();
-  if (raw) {
-    if (raw === "true" || raw === "all") {
-      return true;
-    }
-
-    const parsed = raw
-      .split(",")
-      .map((host) => host.trim())
-      .filter(Boolean);
-
-    return parsed.length ? parsed : ["localhost", "127.0.0.1"];
-  }
-
-  // Default to localhost-only. For remote access, set MUX_VITE_ALLOWED_HOSTS (or
-  // the Makefile's VITE_ALLOWED_HOSTS).
-  const defaults = ["localhost", "127.0.0.1"];
-
-  // If the dev server is bound to a specific host (not a wildcard), include it so
-  // access works without extra configuration.
-  if (
-    devServerHost !== "127.0.0.1" &&
-    devServerHost !== "localhost" &&
-    devServerHost !== "0.0.0.0" &&
-    devServerHost !== "::"
-  ) {
-    defaults.push(devServerHost);
-  }
-
-  return defaults;
-})();
-
-const previewPort = Number(process.env.MUX_VITE_PREVIEW_PORT ?? "4173");
-
-const enableTutorialsInSandboxDefine = (() => {
-  const raw = process.env.MUX_ENABLE_TUTORIALS_IN_SANDBOX;
-  if (raw == null) {
-    return "null";
-  }
-
-  return JSON.stringify(raw === "1");
-})();
+const enableTutorialsInSandboxDefine =
+  enableTutorialsInSandbox == null ? "null" : JSON.stringify(enableTutorialsInSandbox === "1");
 
 function formatHostForUrl(host: string): string {
   const trimmed = host.trim();
@@ -78,8 +44,6 @@ function formatHostForUrl(host: string): string {
 
 // In dev-server mode we run the backend on a separate local port, but we want the
 // browser UI to talk to it via same-origin paths (single public port).
-const backendProxyHost = process.env.MUX_BACKEND_HOST ?? "127.0.0.1";
-const backendProxyPort = Number(process.env.MUX_BACKEND_PORT ?? "3000");
 const backendProxyTarget = `http://${formatHostForUrl(backendProxyHost)}:${backendProxyPort}`;
 
 const alias: Record<string, string> = {
@@ -141,6 +105,7 @@ export default defineConfig(({ mode }) => {
         input: {
           main: path.resolve(__dirname, "index.html"),
           terminal: path.resolve(__dirname, "terminal.html"),
+          desktop: path.resolve(__dirname, "desktop.html"),
         },
         output: {
           format: "es",
@@ -167,7 +132,7 @@ export default defineConfig(({ mode }) => {
       plugins: () => [topLevelAwait()],
     },
     server: {
-      host: devServerHost, // Configurable via MUX_VITE_HOST (defaults to 127.0.0.1 for security)
+      host: devServerHost, // Configurable via XUM_VITE_HOST (loopback by default)
       port: devServerPort,
       strictPort: true,
       allowedHosts: devServerAllowedHosts,

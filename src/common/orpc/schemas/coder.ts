@@ -30,8 +30,6 @@ export const CoderUnavailableReasonSchema = z.union([
   z.object({ kind: z.literal("error"), message: z.string() }),
 ]);
 
-export type CoderUnavailableReason = z.infer<typeof CoderUnavailableReasonSchema>;
-
 // Coder CLI availability info - discriminated union by state
 export const CoderInfoSchema = z.discriminatedUnion("state", [
   z.object({

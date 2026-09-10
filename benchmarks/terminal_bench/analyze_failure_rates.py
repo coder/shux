@@ -369,11 +369,11 @@ def find_optimization_opportunities(
     stats = compute_agent_stats(results)
 
     # Find Mux agents
-    mux_agents = [k for k in stats.keys() if k.startswith("Mux__")]
+    xum_agents = [k for k in stats.keys() if k.startswith("Mux__")]
     if mux_filter:
-        mux_agents = [k for k in mux_agents if mux_filter.lower() in k.lower()]
+        xum_agents = [k for k in xum_agents if mux_filter.lower() in k.lower()]
 
-    if not mux_agents:
+    if not xum_agents:
         print("Warning: No Mux agents found in results", file=sys.stderr)
         return []
 
@@ -383,7 +383,7 @@ def find_optimization_opportunities(
         print("Warning: No non-Mux agents found", file=sys.stderr)
         return []
 
-    print(f"\nAnalyzing Mux agents: {', '.join(mux_agents)}", file=sys.stderr)
+    print(f"\nAnalyzing Mux agents: {', '.join(xum_agents)}", file=sys.stderr)
     print(f"Comparing against top {len(top_agents)} agents:", file=sys.stderr)
     for agent in top_agents[:5]:
         s = stats[agent]
@@ -395,13 +395,13 @@ def find_optimization_opportunities(
         print(f"  ... and {len(top_agents) - 5} more", file=sys.stderr)
 
     # Compute task-level failure rates
-    all_relevant_agents = set(mux_agents) | set(top_agents)
+    all_relevant_agents = set(xum_agents) | set(top_agents)
     task_rates = compute_task_failure_rates(results, all_relevant_agents)
 
     # Find opportunities for each Mux agent
     opportunities: list[OptimizationOpportunity] = []
 
-    for mux_agent in mux_agents:
+    for mux_agent in xum_agents:
         for task_id, agent_rates in task_rates.items():
             if mux_agent not in agent_rates:
                 continue

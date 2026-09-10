@@ -6,6 +6,10 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
 import { getModelName, getModelProvider } from "@/common/utils/ai/models";
 
+// The full model catalog is ~2k entries; rendering every row makes the popover
+// janky, so cap the list and prompt the user to narrow the search instead.
+const MAX_RENDERED_MODELS = 200;
+
 /** Searchable model dropdown with keyboard navigation */
 export function SearchableModelSelect(props: {
   value: string;
@@ -34,6 +38,9 @@ export function SearchableModelSelect(props: {
       model.toLowerCase().includes(searchLower) ||
       (getModelName(model)?.toLowerCase().includes(searchLower) ?? false)
   );
+  const hiddenModelCount = Math.max(0, filteredModels.length - MAX_RENDERED_MODELS);
+  const visibleModels =
+    hiddenModelCount > 0 ? filteredModels.slice(0, MAX_RENDERED_MODELS) : filteredModels;
 
   // Build list of all selectable items (empty option + filtered models)
   const items: Array<{ value: string; label: string; provider?: string; isMuted?: boolean }> = [];
@@ -44,7 +51,7 @@ export function SearchableModelSelect(props: {
       isMuted: true,
     });
   }
-  for (const model of filteredModels) {
+  for (const model of visibleModels) {
     items.push({
       value: model,
       label: getModelName(model) ?? model,
@@ -179,6 +186,11 @@ export function SearchableModelSelect(props: {
                 <span className={cn("truncate", item.isMuted && "text-muted")}>{item.label}</span>
               </button>
             ))
+          )}
+          {hiddenModelCount > 0 && (
+            <div className="text-muted px-2 py-1 text-center text-[10px]">
+              +{hiddenModelCount} more, keep typing to filter
+            </div>
           )}
         </div>
       </PopoverContent>

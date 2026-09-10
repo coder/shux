@@ -1,71 +1,28 @@
+/**
+ * ACP adapter for the unified agent AI-settings resolver: gathers configured
+ * defaults and agent descriptors over ORPC, assembles the declared base chain
+ * (plus the implicit plan/exec fallback ancestor), and delegates precedence to
+ * the shared pure resolver.
+ */
+
 import assert from "node:assert/strict";
-import { DEFAULT_MODEL } from "@/common/constants/knownModels";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import type {
+  AgentAiSettingsLayerValues,
+  ResolveAgentAiSettingsInput,
+  ResolvedAgentAiSettings,
+} from "@/common/types/agentAiSettings";
+import {
+  collectDeclaredAncestorLayers,
+  type AgentAncestorDescriptor,
+} from "@/common/utils/ai/agentAncestorLayers";
+import { resolveAgentAiSettings as resolveAgentAiSettingsShared } from "@/common/utils/ai/resolveAgentAiSettings";
 import type { ORPCClient } from "./serverConnection";
 
-export interface ResolvedAiSettings {
-  model: string;
-  thinkingLevel: ThinkingLevel;
-  /**
-   * OpenAI pro reasoning mode. A per-workspace choice: populated only when
-   * session state is read from workspace metadata buckets (agent AI defaults
-   * never carry it), and threaded into prompt sends so ACP sessions do not
-   * silently downgrade pro workspaces to standard.
-   */
-  reasoningMode?: OpenAIReasoningMode;
-}
-
-const DEFAULT_PLAN_AGENT_ID = "plan";
-const DEFAULT_EXEC_AGENT_ID = "exec";
-const DEFAULT_THINKING_LEVEL: ThinkingLevel = "off";
-
-function getFallbackBaseAgentId(agentId: string): string {
-  return agentId === DEFAULT_PLAN_AGENT_ID ? DEFAULT_PLAN_AGENT_ID : DEFAULT_EXEC_AGENT_ID;
-}
-
-function resolveInheritedConfigDefaults(
-  agentId: string,
-  agentDefsById: ReadonlyMap<string, { base?: string }>,
-  agentAiDefaults: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>
-): { modelString?: string; thinkingLevel?: ThinkingLevel } | undefined {
-  const visited = new Set<string>([agentId]);
-  let cursor = agentId;
-
-  let inheritedModel: string | undefined;
-  let inheritedThinkingLevel: ThinkingLevel | undefined;
-
-  while (true) {
-    const baseAgentId = agentDefsById.get(cursor)?.base ?? getFallbackBaseAgentId(cursor);
-    if (baseAgentId === cursor || visited.has(baseAgentId)) {
-      break;
-    }
-
-    const inheritedDefaults = agentAiDefaults[baseAgentId];
-    if (inheritedDefaults != null) {
-      // Inheritance is field-wise across the full base chain. If an intermediate
-      // base defines only one field, continue traversing so deeper bases can
-      // still provide missing fields.
-      inheritedModel ??= inheritedDefaults.modelString;
-      inheritedThinkingLevel ??= inheritedDefaults.thinkingLevel;
-
-      if (inheritedModel != null && inheritedThinkingLevel != null) {
-        break;
-      }
-    }
-
-    visited.add(baseAgentId);
-    cursor = baseAgentId;
-  }
-
-  if (inheritedModel == null && inheritedThinkingLevel == null) {
-    return undefined;
-  }
-
-  return {
-    modelString: inheritedModel,
-    thinkingLevel: inheritedThinkingLevel,
-  };
-}
+/**
+ * Selected (persistence-shaped) settings, threaded into prompt sends so ACP
+ * sessions do not silently downgrade pro workspaces to standard.
+ */
+export type ResolvedAiSettings = ResolvedAgentAiSettings["selected"];
 
 function buildAgentsListInput(
   workspaceId?: string
@@ -81,11 +38,23 @@ function buildAgentsListInput(
   return { projectPath: process.cwd(), includeDisabled: true };
 }
 
-export async function resolveAgentAiSettings(
+export interface AcpResolveExtras {
+  explicit?: ResolveAgentAiSettingsInput["explicit"];
+  targetWorkspaceSettings?: AgentAiSettingsLayerValues;
+  parentRuntime?: AgentAiSettingsLayerValues;
+}
+
+/**
+ * Detailed variant returning the full resolver result; callers such as ACP
+ * /compact supply additional tiers (explicit command flags, the workspace's
+ * compact bucket, the live session settings as parent runtime).
+ */
+export async function resolveAcpAgentAiSettings(
   client: ORPCClient,
   agentId: string,
-  workspaceId?: string
-): Promise<ResolvedAiSettings> {
+  workspaceId?: string,
+  extras?: AcpResolveExtras
+): Promise<ResolvedAgentAiSettings> {
   const trimmedAgentId = agentId.trim();
   assert(trimmedAgentId.length > 0, "resolveAgentAiSettings: agentId must be non-empty");
 
@@ -95,33 +64,33 @@ export async function resolveAgentAiSettings(
   ]);
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
-  const agentDefsById = new Map<string, { base?: string }>(
-    agents.map((agent) => [agent.id, { base: agent.base }])
+  const agentDefsById = new Map<string, AgentAncestorDescriptor>(
+    agents.map((agent) => [agent.id, { base: agent.base, definitionAiDefaults: agent.aiDefaults }])
   );
 
-  const agentAiDefaults = config.agentAiDefaults ?? {};
-  const directDefaults = agentAiDefaults[trimmedAgentId];
-  const inheritedDefaults = resolveInheritedConfigDefaults(
-    trimmedAgentId,
-    agentDefsById,
-    agentAiDefaults
-  );
-  const descriptorDefaults = agentDef?.aiDefaults;
+  return resolveAgentAiSettingsShared({
+    targetAgentId: trimmedAgentId,
+    profile: "interactive",
+    explicit: extras?.explicit,
+    targetWorkspaceSettings: extras?.targetWorkspaceSettings,
+    agentAiDefaults: config.agentAiDefaults,
+    targetDefinitionAiDefaults: agentDef?.aiDefaults,
+    ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
+    parentRuntime: extras?.parentRuntime,
+  });
+}
 
-  const model =
-    directDefaults?.modelString ??
-    inheritedDefaults?.modelString ??
-    descriptorDefaults?.model ??
-    DEFAULT_MODEL;
-
-  const thinkingLevel =
-    directDefaults?.thinkingLevel ??
-    inheritedDefaults?.thinkingLevel ??
-    descriptorDefaults?.thinkingLevel ??
-    DEFAULT_THINKING_LEVEL;
-
+export async function resolveAgentAiSettings(
+  client: ORPCClient,
+  agentId: string,
+  workspaceId?: string
+): Promise<ResolvedAiSettings> {
+  const resolved = await resolveAcpAgentAiSettings(client, agentId, workspaceId);
   return {
-    model,
-    thinkingLevel,
+    model: resolved.selected.model,
+    thinkingLevel: resolved.selected.thinkingLevel,
+    ...(resolved.selected.reasoningMode != null
+      ? { reasoningMode: resolved.selected.reasoningMode }
+      : {}),
   };
 }

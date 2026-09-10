@@ -28,13 +28,19 @@
 # Telemetry in Development:
 #   Telemetry is enabled by default in dev mode (same as production).
 #   It is automatically disabled in CI, test environments, and automation contexts.
-#   To manually disable telemetry, set MUX_DISABLE_TELEMETRY=1.
+#   To manually disable telemetry, set XUM_DISABLE_TELEMETRY=1.
 
+# Developer env: XUM_* is canonical. MUX_* and unprefixed VITE_*/BACKEND_* remain accepted.
 # React profiling in development:
-# Default desktop dev launches opt into Mux's lightweight component render sampler so
+# Default desktop dev launches opt into Xum's lightweight component render sampler so
 # already-running dev instances can be inspected without a restart. Override with
-# `make start MUX_PROFILE_REACT=0` when measuring an uninstrumented baseline.
-MUX_PROFILE_REACT ?= 1
+# `make start XUM_PROFILE_REACT=0` when measuring an uninstrumented baseline.
+XUM_PROFILE_REACT ?= $(or $(MUX_PROFILE_REACT),1)
+XUM_VITE_HOST ?= $(or $(MUX_VITE_HOST),$(VITE_HOST),127.0.0.1)
+XUM_VITE_PORT ?= $(or $(MUX_VITE_PORT),$(VITE_PORT),5173)
+XUM_VITE_ALLOWED_HOSTS ?= $(or $(MUX_VITE_ALLOWED_HOSTS),$(VITE_ALLOWED_HOSTS))
+XUM_BACKEND_HOST ?= $(or $(MUX_BACKEND_HOST),$(BACKEND_HOST),127.0.0.1)
+XUM_BACKEND_PORT ?= $(or $(MUX_BACKEND_PORT),$(BACKEND_PORT),3000)
 
 # Use PATH-resolved bash for portability across different systems.
 # - Windows: /usr/bin/bash doesn't exist in Chocolatey's make environment or GitHub Actions
@@ -52,13 +58,20 @@ ifeq (,$(filter -j%,$(MAKEFLAGS)))
 MAKEFLAGS += -j
 endif
 
+# Issue #3831: macOS may SIGKILL the copied esbuild inode while the platform binary still execs.
+# ESBUILD_BINARY_PATH is not used because only esbuild's JS API honors it, not the Go CLI.
+# Prefer the host platform package: ensure-mac-sharp-runtime-deps adds darwin packages on any
+# host, and a bare wildcard would sort @esbuild/darwin-arm64 first (issue #3338).
+ESBUILD_HOST_PLATFORM := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))-$(subst x86_64,x64,$(subst aarch64,arm64,$(shell uname -m)))
+ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/$(ESBUILD_HOST_PLATFORM)/bin/esbuild) $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
+
 # Common esbuild flags for CLI API bundle (ESM format for trpc-cli)
-ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --external:@1password/sdk --external:@1password/sdk-core --banner:js="import{createRequire}from'module';globalThis.require=createRequire(import.meta.url);"
+ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --external:typescript --banner:js="import{createRequire}from\"module\";globalThis.require=createRequire(import.meta.url);"
 
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.
 # External native modules (node-pty, ssh2) and electron remain runtime dependencies.
-ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --external:@1password/sdk --external:@1password/sdk-core --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
+ESBUILD_SERVER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/server-bundle.js --external:@lydell/node-pty --external:node-pty --external:electron --external:ssh2 --alias:jsonc-parser=jsonc-parser/lib/esm/main.js --minify
 
 # Common esbuild flags for tokenizer worker bundle used by server-bundle runtime.
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify
@@ -70,7 +83,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
-.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons check-mac-attach-file-runtime
+.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build test-storybook
@@ -163,51 +176,68 @@ dev: node_modules/.installed build-main build-preload ## Start development serve
 	@bun x concurrently -k \
 		"bun x nodemon --watch src/node/workflowRuntime --ext js --exec 'bun scripts/gen_workflow_runtime_sources.ts'" \
 		"bun x concurrently \"$(TSGO) -w -p tsconfig.main.json\" \"bun x tsc-alias -w -p tsconfig.main.json\"" \
-		'bun x esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
+		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
 		"vite"
 endif
 
 ifeq ($(OS),Windows_NT)
-dev-server: node_modules/.installed build-main ## Start server mode with hot reload (backend :3000 + frontend :5173). Use VITE_HOST=0.0.0.0 VITE_ALLOWED_HOSTS=<public-host> for remote access
+dev-server: node_modules/.installed build-main ## Start server mode with hot reload. Use XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host> for remote access
 	@echo "Starting dev-server..."
-	@echo "  Backend (IPC/WebSocket): http://$(or $(BACKEND_HOST),127.0.0.1):$(or $(BACKEND_PORT),3000)"
-	@echo "  Frontend (with HMR):     http://$(or $(VITE_HOST),localhost):$(or $(VITE_PORT),5173)"
+	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
+	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
 	@echo ""
-	@echo "For remote access: make dev-server VITE_HOST=0.0.0.0 VITE_ALLOWED_HOSTS=<public-host>"
+	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# On Windows, use npm run because bunx doesn't correctly pass arguments
 	@npm x concurrently -k \
 		"nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules scripts/build-main-watch.js" \
 		'npx esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server --no-auth --host $(or $(BACKEND_HOST),127.0.0.1) --port $(or $(BACKEND_PORT),3000)" \
-		"set MUX_VITE_HOST=$(or $(VITE_HOST),127.0.0.1)&& set MUX_VITE_PORT=$(or $(VITE_PORT),5173)&& set MUX_VITE_ALLOWED_HOSTS=$(VITE_ALLOWED_HOSTS)&& set MUX_BACKEND_PORT=$(or $(BACKEND_PORT),3000)&& vite"
+		"set NODE_ENV=development&& nodemon --watch dist/cli/index.js --watch dist/cli/server.js --delay 500ms dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)" \
+		"set XUM_VITE_HOST=$(XUM_VITE_HOST)&& set XUM_VITE_PORT=$(XUM_VITE_PORT)&& set XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS)&& set XUM_BACKEND_HOST=$(XUM_BACKEND_HOST)&& set XUM_BACKEND_PORT=$(XUM_BACKEND_PORT)&& vite"
 else
-dev-server: node_modules/.installed build-main ## Start server mode with hot reload (backend :3000 + frontend :5173). Use VITE_HOST=0.0.0.0 VITE_ALLOWED_HOSTS=<public-host> for remote access
+dev-server: node_modules/.installed build-main ## Start server mode with hot reload. Use XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host> for remote access
 	@echo "Starting dev-server..."
-	@echo "  Backend (IPC/WebSocket): http://$(or $(BACKEND_HOST),127.0.0.1):$(or $(BACKEND_PORT),3000)"
-	@echo "  Frontend (with HMR):     http://$(or $(VITE_HOST),localhost):$(or $(VITE_PORT),5173)"
+	@echo "  Backend (IPC/WebSocket): http://$(XUM_BACKEND_HOST):$(XUM_BACKEND_PORT)"
+	@echo "  Frontend (with HMR):     http://$(XUM_VITE_HOST):$(XUM_VITE_PORT)"
 	@echo ""
-	@echo "For remote access: make dev-server VITE_HOST=0.0.0.0 VITE_ALLOWED_HOSTS=<public-host>"
+	@echo "For remote access: make dev-server XUM_VITE_HOST=0.0.0.0 XUM_VITE_ALLOWED_HOSTS=<public-host>"
 	@# Keep tsgo -> tsc-alias sequential to avoid transient unresolved @/ imports in dist during restarts.
 	@bun x concurrently -k \
 		"bun x nodemon --watch src --watch tsconfig.main.json --watch tsconfig.json --ext ts,tsx,json,js --ignore dist --ignore node_modules --exec 'node scripts/build-main-watch.js'" \
-		'bun x esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
-		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server --no-auth --host $(or $(BACKEND_HOST),127.0.0.1) --port $(or $(BACKEND_PORT),3000)'" \
-		"MUX_VITE_HOST=$(or $(VITE_HOST),127.0.0.1) MUX_VITE_PORT=$(or $(VITE_PORT),5173) MUX_VITE_ALLOWED_HOSTS=$(VITE_ALLOWED_HOSTS) MUX_BACKEND_PORT=$(or $(BACKEND_PORT),3000) vite"
+		'$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS) --watch' \
+		"bun x nodemon --watch dist/.main-build-complete --delay 300ms --exec 'NODE_ENV=development node dist/cli/index.js server --no-auth --host $(XUM_BACKEND_HOST) --port $(XUM_BACKEND_PORT)'" \
+		"XUM_VITE_HOST=$(XUM_VITE_HOST) XUM_VITE_PORT=$(XUM_VITE_PORT) XUM_VITE_ALLOWED_HOSTS=$(XUM_VITE_ALLOWED_HOSTS) XUM_BACKEND_HOST=$(XUM_BACKEND_HOST) XUM_BACKEND_PORT=$(XUM_BACKEND_PORT) vite"
 endif
 
 
 
 
-dev-desktop-sandbox: ## Start an isolated Electron dev instance (fresh MUX_ROOT + free ports)
+dev-desktop-sandbox: ## Start an isolated Electron dev instance (fresh XUM_ROOT + free ports)
 	@bun scripts/dev-desktop-sandbox.ts $(DEV_DESKTOP_SANDBOX_ARGS)
-dev-server-sandbox: ## Start an isolated dev-server instance (fresh MUX_ROOT + free ports)
+dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + free ports)
 	@bun scripts/dev-server-sandbox.ts $(DEV_SERVER_SANDBOX_ARGS)
 
+rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
+	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
+
 start: node_modules/.installed build-main build-preload build-static ## Build and start Electron app
-	@NODE_ENV=development MUX_PROFILE_REACT=$(MUX_PROFILE_REACT) bunx electron --remote-debugging-port=9222 .
+	@NODE_ENV=development XUM_PROFILE_REACT=$(XUM_PROFILE_REACT) bunx electron --remote-debugging-port=9222 .
 
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
+
+.PHONY: update-models
+update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
+	@bun scripts/update_models.ts
+
+# #3727: `make build UPDATE_MODELS=1` refreshes the vendored models.json before
+# building; plain `make build` stays network-free and reproducible. The refresh
+# must be a prerequisite of every catalog-consuming bundle (not just `build`) so
+# parallel make cannot bundle the old catalog, and the phony prerequisite forces
+# those bundles stale because models.json is not part of $(TS_SOURCES).
+ifeq ($(UPDATE_MODELS),1)
+build: update-models
+build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
+endif
 
 build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
 
@@ -225,7 +255,9 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
+# catalog-only refresh would leave a stale main bundle (#3727).
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json
@@ -234,9 +266,11 @@ dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/ve
 	@touch dist/.main-build-complete
 
 # Build API CLI as ESM bundle (trpc-cli requires ESM with top-level await)
-dist/cli/api.mjs: src/cli/api.ts src/cli/proxifyOrpc.ts $(TS_SOURCES)
+# node_modules/.installed is required here: unlike `bun x`, $(ESBUILD_BIN) cannot
+# self-bootstrap, and parallel make would otherwise race this recipe against bun install.
+dist/cli/api.mjs: src/cli/api.ts src/cli/proxifyOrpc.ts $(TS_SOURCES) node_modules/.installed
 	@echo "Building API CLI (ESM)..."
-	@bun x esbuild src/cli/api.ts $(ESBUILD_CLI_FLAGS)
+	@$(ESBUILD_BIN) src/cli/api.ts $(ESBUILD_CLI_FLAGS)
 
 build-preload: node_modules/.installed dist/preload.js ## Build preload script
 
@@ -290,7 +324,7 @@ dist/runtime/server-bundle.js: build-main $(TS_SOURCES)
 	@echo "Bundling server runtime for Docker..."
 	@test -f dist/cli/server.js
 	@mkdir -p dist/runtime
-	@bun x esbuild dist/cli/server.js $(ESBUILD_SERVER_FLAGS)
+	@$(ESBUILD_BIN) dist/cli/server.js $(ESBUILD_SERVER_FLAGS)
 
 # Bundle tokenizer worker next to server-bundle.js so workerPool resolves it at runtime.
 # Depend on build-main explicitly because tokenizer worker JS is emitted under dist/node/ as a side effect.
@@ -298,7 +332,7 @@ dist/runtime/tokenizer.worker.js: build-main
 	@echo "Bundling tokenizer worker for Docker..."
 	@test -f dist/node/utils/main/tokenizer.worker.js
 	@mkdir -p dist/runtime
-	@bun x esbuild dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
+	@$(ESBUILD_BIN) dist/node/utils/main/tokenizer.worker.js $(ESBUILD_TOKENIZER_WORKER_FLAGS)
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
@@ -400,6 +434,13 @@ check-deadcode: node_modules/.installed ## Check for potential dead code (manual
 		|| echo "✓ No obvious dead code found"
 
 ## Testing
+.PHONY: test-codex-comments test-pr-checks
+test-codex-comments: ## Test Codex comment gates with offline GitHub fixtures
+	@python3 scripts/check_codex_comments_test.py
+
+test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fixtures
+	@python3 scripts/pr_checks_test.py
+
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src
 	@TEST_INTEGRATION=1 bun x jest tests
@@ -419,27 +460,47 @@ test-coverage: ## Run tests with coverage
 
 smoke-test: build ## Run smoke test on npm package
 	@echo "Building npm package tarball..."
-	@npm pack
-	@TARBALL=$$(ls mux-*.tgz | head -1); \
+	@TARBALL=$$(./scripts/pack-npm-package.sh) || exit $$?; \
 	echo "Running smoke test on $$TARBALL..."; \
-	PACKAGE_TARBALL="$$TARBALL" ./scripts/smoke-test.sh; \
+	PACKAGE_TARBALL="$$TARBALL" ./scripts/smoke-test.sh && \
+	CANONICAL_TARBALL="$$TARBALL" ./scripts/smoke-test-mux-compat.sh; \
 	EXIT_CODE=$$?; \
 	rm -f "$$TARBALL"; \
 	exit $$EXIT_CODE
 
 test-e2e: ## Run end-to-end tests
 	@$(MAKE) build
-	@MUX_E2E_LOAD_DIST=1 MUX_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron $(PLAYWRIGHT_ARGS)
+	@XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron $(PLAYWRIGHT_ARGS)
 
 test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build
-	@MUX_E2E_RUN_PERF=1 MUX_PROFILE_REACT=1 MUX_E2E_LOAD_DIST=1 MUX_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts $(PLAYWRIGHT_ARGS)
+	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts $(PLAYWRIGHT_ARGS)
 
 ## Distribution
 dist: build ## Build distributable packages
 	@bun x electron-builder --publish never
 
+# Issue #3338: bun installs host-only optional deps, but electron-builder packages both mac
+# architectures from one node_modules tree, which otherwise omits the x64 sharp runtime.
+ensure-mac-sharp-runtime-deps: node_modules/.installed
+	@bun install --frozen-lockfile --os=darwin --cpu=x64
+	@bun install --frozen-lockfile --os=darwin --cpu=arm64
+	@# Cross-arch installs repoint node_modules/.bin at the last-installed platform; a
+	@# host-native install restores them and keeps the darwin packages added above.
+	@bun install --frozen-lockfile
+	@for dir in \
+		node_modules/@img/sharp-darwin-x64 \
+		node_modules/@img/sharp-libvips-darwin-x64 \
+		node_modules/@img/sharp-darwin-arm64 \
+		node_modules/@img/sharp-libvips-darwin-arm64; do \
+		if [ ! -d "$$dir" ]; then \
+			echo "Missing $$dir after platform installs. bun >= 1.3 is required because older versions silently ignore --os/--cpu." >&2; \
+			exit 1; \
+		fi; \
+	done
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
 		bun x electron-builder --mac --x64 --arm64 --publish never; \
@@ -452,23 +513,27 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@echo "✅ Both architectures built successfully"
 
 dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "🔐 Building macOS x64 + arm64 (unified for correct yml)..."
 	@bun x electron-builder --mac --x64 --arm64 --publish always
 	@echo "✅ Both architectures built and published successfully"
 
 dist-mac-x64: build ## Build macOS x64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
 	@bun x electron-builder --mac --x64 --publish never
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
 	@bun x electron-builder --mac --arm64 --publish never
 
 install-mac-arm64: dist-mac-arm64 ## Build and install macOS arm64 app to /Applications
-	@echo "Installing mux.app to /Applications..."
-	@rm -rf /Applications/mux.app
-	@cp -R release/mac-arm64/mux.app /Applications/
-	@echo "Installed mux.app to /Applications"
+	@app_bundle="$$(bun -e 'import { resolveMacPackagedAppNames } from "./src/common/compat/macPackagedApp.ts"; import pkg from "./package.json"; process.stdout.write(resolveMacPackagedAppNames(pkg.build).appBundleName)')"; \
+	echo "Installing $$app_bundle to /Applications..."; \
+	rm -rf "/Applications/$$app_bundle"; \
+	cp -R "release/mac-arm64/$$app_bundle" /Applications/; \
+	echo "Installed $$app_bundle to /Applications"
 
 dist-win: build ## Build Windows distributable
 	@bun x electron-builder --win --publish never

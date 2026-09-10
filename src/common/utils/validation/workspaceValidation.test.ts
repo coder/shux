@@ -1,4 +1,9 @@
-import { validateWorkspaceName } from "./workspaceValidation";
+import {
+  getBranchWorkspaceNameConflict,
+  sanitizeBranchNameForWorkspace,
+  validateWorkspaceBranchName,
+  validateWorkspaceName,
+} from "./workspaceValidation";
 
 describe("validateWorkspaceName", () => {
   describe("valid names", () => {
@@ -80,5 +85,54 @@ describe("validateWorkspaceName", () => {
       expect(validateWorkspaceName("feature/branch").valid).toBe(false);
       expect(validateWorkspaceName("path\\to\\branch").valid).toBe(false);
     });
+  });
+});
+
+describe("validateWorkspaceBranchName", () => {
+  test.each(["feature/foo", "a/b/c", "plain-name", "branch_123"])("accepts %s", (name) => {
+    expect(validateWorkspaceBranchName(name).valid).toBe(true);
+  });
+
+  test.each(["", "/foo", "foo/", "a//b", "Feature/foo", "feature name"])("rejects %s", (name) => {
+    expect(validateWorkspaceBranchName(name).valid).toBe(false);
+  });
+
+  test("rejects names over 64 characters", () => {
+    expect(validateWorkspaceBranchName(`feature/${"a".repeat(57)}`).valid).toBe(false);
+  });
+});
+
+describe("sanitizeBranchNameForWorkspace", () => {
+  test.each([
+    ["feature/foo", "feature-foo"],
+    ["a/b/c", "a-b-c"],
+    ["plain-name", "plain-name"],
+  ])("maps %s to %s", (branchName, workspaceName) => {
+    expect(sanitizeBranchNameForWorkspace(branchName)).toBe(workspaceName);
+  });
+
+  test.each(["feature/foo", "a/b/c", "plain-name", "branch_123"])(
+    "produces a valid workspace name for %s",
+    (branchName) => {
+      expect(validateWorkspaceBranchName(branchName).valid).toBe(true);
+      expect(validateWorkspaceName(sanitizeBranchNameForWorkspace(branchName)).valid).toBe(true);
+    }
+  );
+});
+
+describe("getBranchWorkspaceNameConflict", () => {
+  test("reports the sanitized collision for slash branches", () => {
+    const conflict = getBranchWorkspaceNameConflict("feature/foo", ["other", "feature-foo"]);
+
+    expect(conflict).toContain('Branch "feature/foo"');
+    expect(conflict).toContain('workspace name "feature-foo"');
+  });
+
+  test("allows slash branches whose sanitized workspace name is unused", () => {
+    expect(getBranchWorkspaceNameConflict("feature/foo", ["feature-bar"])).toBeUndefined();
+  });
+
+  test("leaves slash-free collisions to the existing suffix policy", () => {
+    expect(getBranchWorkspaceNameConflict("feature-foo", ["feature-foo"])).toBeUndefined();
   });
 });

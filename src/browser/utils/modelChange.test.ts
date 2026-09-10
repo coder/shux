@@ -79,4 +79,30 @@ describe("modelChange", () => {
     expect(consumeWorkspaceModelChange(workspaceId, firstModel)).toBeNull();
     expect(consumeWorkspaceModelChange(workspaceId, secondModel)).toBe("user");
   });
+
+  test("tracks switches between a Coder gateway entry and the direct model as explicit", () => {
+    const workspaceId = nextWorkspaceId();
+    const directModel = "openai:claude-opus-4-1";
+    const coderModel = "coder:openai/claude-opus-4-1";
+
+    setWorkspaceModelWithOrigin(workspaceId, directModel, "sync");
+
+    // Name-only canonicalization collapsed these into the same identity, so
+    // the explicit entry was dropped and the warning path saw a background sync.
+    setWorkspaceModelWithOrigin(workspaceId, coderModel, "user");
+
+    expect(consumeWorkspaceModelChange(workspaceId, coderModel)).toBe("user");
+  });
+
+  test("still collapses passthrough gateway aliases when tracking explicit changes", () => {
+    const workspaceId = nextWorkspaceId();
+    const canonicalModel = "openai:gpt-5.2-codex";
+    const gatewayAlias = "mux-gateway:openai/gpt-5.2-codex";
+
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "sync");
+    setWorkspaceModelWithOrigin(workspaceId, canonicalModel, "user");
+
+    // A persisted rewrite to the passthrough alias must still consume the entry.
+    expect(consumeWorkspaceModelChange(workspaceId, gatewayAlias)).toBe("user");
+  });
 });

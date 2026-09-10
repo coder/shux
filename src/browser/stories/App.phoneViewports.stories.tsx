@@ -9,13 +9,20 @@ import { userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import {
+  LEFT_SIDEBAR_COLLAPSED_KEY,
+  getPinnedTodoExpandedKey,
+  getSubAgentTasksExpandedKey,
+} from "@/common/constants/storage";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
+import { createTodoWriteTool } from "./mocks/tools";
 import { STABLE_TIMESTAMP, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { clearWorkspaceSelection, collapseRightSidebar, expandProjects } from "./helpers/uiState";
@@ -32,7 +39,7 @@ const IPHONE_16E = {
   height: 844,
 } as const;
 
-// NOTE: Mux's mobile UI tweaks are gated on `@media (max-width: 768px) and (pointer: coarse)`.
+// NOTE: Some phone-specific UI tweaks are gated on `@media (max-width: 768px) and (pointer: coarse)`.
 // Pixel does not emulate touch, so `pointer: coarse` never matches during snapshot
 // capture and touch-only affordances (hidden right sidebar, mobile header) are a
 // known coverage gap; these stories still validate the narrow-width layout.
@@ -289,6 +296,123 @@ export const IPhone17ProMax: AppStory = {
   },
 };
 
+const COMPOSER_DECORATIONS_WORKSPACE_ID = "ws-iphone-16e-composer-decorations";
+
+/**
+ * Neither Pixel nor the test-runner matches `pointer: coarse`, so read the shipped rule instead
+ * of the rendered height: the min-height `selector` receives inside a coarse-pointer media rule.
+ */
+function coarsePointerMinHeight(selector: string): number | null {
+  const visit = (rules: CSSRuleList, inCoarse: boolean): number | null => {
+    for (const rule of rules) {
+      if (rule instanceof CSSStyleRule) {
+        if (inCoarse && rule.selectorText === selector && rule.style.minHeight) {
+          return Number.parseFloat(rule.style.minHeight);
+        }
+      } else if (rule instanceof CSSGroupingRule) {
+        const coarse =
+          inCoarse ||
+          (rule instanceof CSSMediaRule && rule.conditionText.includes("pointer: coarse"));
+        const found = visit(rule.cssRules, coarse);
+        if (found !== null) return found;
+      }
+    }
+    return null;
+  };
+  for (const sheet of document.styleSheets) {
+    const found = visit(sheet.cssRules, false);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/**
+ * Every collapsible decoration stacked above the composer at once (TODO, sub-agents, background
+ * bash). Pixel captures the collapsed stack at phone width; the play assertion covers the touch
+ * floor these rows opt into, which the snapshot cannot.
+ */
+export const IPhone16eComposerDecorations: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(getPinnedTodoExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
+        updatePersistedState(getSubAgentTasksExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
+        return setupSimpleChatStory({
+          workspaceId: COMPOSER_DECORATIONS_WORKSPACE_ID,
+          workspaceName: "mobile-decorations",
+          projectName: "mux",
+          projectPath: "/home/user/projects/mux",
+          messages: [
+            MESSAGES[0],
+            createAssistantMessage("msg-2", "Tracking the remaining work in the TODO list.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 110_000,
+              toolCalls: [
+                createTodoWriteTool("call-todo-1", [
+                  { content: "Audit phone layout", status: "completed" },
+                  { content: "Tighten decoration rows", status: "in_progress" },
+                  { content: "Verify on device", status: "pending" },
+                ]),
+              ],
+            }),
+          ],
+          additionalWorkspaces: [
+            createWorkspace({
+              id: "ws-iphone-16e-composer-decorations-subagent",
+              name: "agent_explore_layout",
+              title: "Check narrow layout",
+              projectName: "mux",
+              projectPath: "/home/user/projects/mux",
+              parentWorkspaceId: COMPOSER_DECORATIONS_WORKSPACE_ID,
+              taskStatus: "reported",
+            }),
+          ],
+          backgroundProcesses: [
+            {
+              id: "bg-dev-server",
+              pid: 4242,
+              script: "bun run dev",
+              displayName: "dev server",
+              startTime: STABLE_TIMESTAMP - 90_000,
+              status: "running",
+            },
+          ],
+        });
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitFor(() => {
+      const rows = storyRoot.querySelectorAll(
+        '[data-component="ChatInputDecorationStack"] .mobile-touch-row'
+      );
+      if (rows.length < 3) {
+        throw new Error(`Expected TODO, sub-agent, and background bash rows, found ${rows.length}`);
+      }
+    });
+
+    const rowFloor = coarsePointerMinHeight(".mobile-touch-row");
+    if (rowFloor === null || rowFloor >= MOBILE_TOUCH_TARGET_PX) {
+      throw new Error(
+        `Decoration rows should sit below the ${MOBILE_TOUCH_TARGET_PX}px touch floor on coarse pointers, got ${String(rowFloor)}`
+      );
+    }
+  },
+};
+
 /**
  * Stands in for the `pointer: coarse` coverage gap noted above. Neither Pixel nor the Storybook
  * test-runner emulates touch, so this applies the touch-target floor that globals.css would apply
@@ -414,6 +538,109 @@ export const IPhone17ProMaxTouchReviewImmersive: AppStory = {
         if (document.querySelectorAll("[data-bottom-inset-owner]").length > 0) {
           throw new Error("Immersive review left the bottom safe-area inset unowned.");
         }
+      },
+      { timeout: 10_000 }
+    );
+
+    blurActiveElement();
+  },
+};
+
+const TIMELINE_DIALOG_WORKSPACE_ID = "ws-iphone-16e-timeline";
+const TIMELINE_DIALOG_BASE_TS = Date.UTC(2020, 0, 15, 15, 0, 0);
+const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
+  {
+    v: 1,
+    id: "turn-completed",
+    kind: "turn.completed",
+    seq: 3,
+    ts: TIMELINE_DIALOG_BASE_TS,
+    source: { system: "chat" },
+    status: "completed",
+    data: { model: "anthropic/claude-sonnet-4", mode: "exec", durationMs: 84_000 },
+    anchor: { messageId: "msg-2" },
+  },
+  {
+    v: 1,
+    id: "agent-milestone",
+    kind: "agent.event",
+    seq: 2,
+    ts: TIMELINE_DIALOG_BASE_TS - 45_000,
+    source: { system: "agent", key: "timeline-event:milestone" },
+    data: {
+      description: "Wired the mobile timeline dialog behind the workspace actions menu",
+      category: "milestone",
+    },
+  },
+  {
+    v: 1,
+    id: "goal-set",
+    kind: "goal.set",
+    seq: 1,
+    ts: TIMELINE_DIALOG_BASE_TS - 90_000,
+    source: { system: "goal" },
+    status: "started",
+    data: { digest: "Make the timeline reachable at phone widths" },
+  },
+];
+
+/**
+ * Timeline on small viewports: the right sidebar (the timeline's usual home) is
+ * hidden at phone widths, so the workspace actions menu offers a Timeline entry
+ * that opens the panel in a dialog instead.
+ */
+export const IPhone16eTimelineDialog: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: TIMELINE_DIALOG_WORKSPACE_ID,
+          workspaceName: "mobile-timeline",
+          projectName: "mux",
+          messages: [...MESSAGES],
+          timelineEvents: TIMELINE_DIALOG_EVENTS,
+        });
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+        return client;
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    // The Timeline menu action is gated on `window.matchMedia`, which the fixed-width
+    // decorator cannot move; only assert where the viewport is genuinely narrow (Pixel's
+    // phone viewport). The test-runner executes at desktop window size and skips here.
+    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
+      return;
+    }
+
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
+    await userEvent.click(
+      await waitFor(() => within(document.body).getByTestId("workspace-timeline-button"))
+    );
+
+    // The dialog portals to document.body, outside the story canvas.
+    await waitFor(
+      () => {
+        const dialog = document.querySelector('[data-testid="timeline-dialog"]');
+        if (!dialog) {
+          throw new Error("Timeline dialog did not open");
+        }
+        within(dialog as HTMLElement).getByText(
+          "Wired the mobile timeline dialog behind the workspace actions menu"
+        );
       },
       { timeout: 10_000 }
     );

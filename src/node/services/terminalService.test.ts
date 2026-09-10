@@ -1,14 +1,21 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn, vi, type Mock } from "bun:test";
 import { TerminalService } from "./terminalService";
 import type { PTYService } from "./ptyService";
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { TerminalCreateParams } from "@/common/types/terminal";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as childProcess from "child_process";
 import * as fs from "fs/promises";
 
+// Unique per test run: native-terminal markers persist on disk, so a shared path would leak
+// sticky state across runs and flake the "not yet opened" assertions.
+const NATIVE_TERMINAL_SESSIONS_DIR = `/tmp/xum-test-native-terminal-sessions-${process.pid}-${Date.now()}`;
+
 const getEffectiveSecretsMock = mock(() => [{ key: "TEST_SECRET", value: "secret-value" }]);
+const mockSecretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = {
+  getEffectiveSecrets: getEffectiveSecretsMock,
+};
 
 // Mock dependencies
 const mockConfig = {
@@ -23,11 +30,11 @@ const mockConfig = {
       },
     ])
   ),
-  getEffectiveSecrets: getEffectiveSecretsMock,
   loadConfigOrDefault: mock(() => ({
     projects: new Map(),
     terminalDefaultShell: undefined,
   })),
+  sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
   srcDir: "/tmp",
 } as unknown as Config;
 
@@ -40,11 +47,11 @@ function createConfigWithMetadata(metadata: {
 }): Config {
   return {
     getAllWorkspaceMetadata: mock(() => Promise.resolve([metadata])),
-    getEffectiveSecrets: getEffectiveSecretsMock,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 }
@@ -115,7 +122,7 @@ describe("TerminalService", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockPTYService.createSession as any) = createSessionMock;
 
-    service = new TerminalService(mockConfig, mockPTYService, undefined);
+    service = new TerminalService(mockConfig, mockPTYService, mockSecretsStore);
     service.setTerminalWindowManager(mockWindowManager);
     createSessionMock.mockClear();
     closeSessionMock.mockClear();
@@ -227,7 +234,7 @@ describe("TerminalService", () => {
         runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/runtime-src" },
       }),
       mockPTYService,
-      undefined
+      mockSecretsStore
     );
 
     await service.create({ workspaceId: "ws-persisted", cols: 80, rows: 24 });
@@ -245,7 +252,7 @@ describe("TerminalService", () => {
         runtimeConfig: { type: "docker", image: "node:20" },
       }),
       mockPTYService,
-      undefined
+      mockSecretsStore
     );
 
     await service.create({ workspaceId: "ws-docker", cols: 80, rows: 24 });
@@ -486,7 +493,9 @@ describe("TerminalService", () => {
     await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
     closeSessionMock.mockClear();
 
+    expect(service.getOpenSessionCount()).toBe(1);
     service.closeAllSessions();
+    expect(service.getOpenSessionCount()).toBe(0);
 
     expect(closeSessionMock).toHaveBeenCalled();
     // PTY bulk close should NOT be used
@@ -496,8 +505,8 @@ describe("TerminalService", () => {
 
   it("should open terminal window via manager", async () => {
     await service.openWindow("ws-1");
-    // openWindow(workspaceId, sessionId?) passes sessionId as undefined when not provided
-    expect(openTerminalWindowMock).toHaveBeenCalledWith("ws-1", undefined);
+    // openWindow(workspaceId, sessionId?, initialTitle?) passes undefined when not provided
+    expect(openTerminalWindowMock).toHaveBeenCalledWith("ws-1", undefined, undefined);
   });
 
   it("should handle session exit", async () => {
@@ -984,6 +993,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1009,6 +1019,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1031,6 +1042,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1053,6 +1065,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1106,7 +1119,7 @@ describe("TerminalService.openNative", () => {
         return { status: 0 }; // other commands available
       });
 
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-local");
 
@@ -1119,6 +1132,111 @@ describe("TerminalService.openNative", () => {
       expect(call[2]?.stdio).toBe("ignore");
     });
 
+    it("rolls back the recording when the open fails before the marker persists", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
+
+      // Unique IDs: other tests open ws-local and its durable marker would leak in here.
+      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(false);
+      // Unknown workspace: refused before any shell launches, so the reservation rolls back —
+      // a sticky record here would permanently refuse model-driven snapshot/Coder-stop
+      // archives for a workspace that never had a terminal.
+      try {
+        await service.openNative("ws-sticky");
+        expect.unreachable("openNative must fail for unknown workspaces");
+      } catch (error) {
+        expect(String(error)).toContain("not found");
+      }
+      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(false);
+      expect(await service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
+    });
+
+    it("remembers native terminal opens across service instances via the durable marker", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative("ws-local");
+
+      // Detached emulators outlive Xum restarts; a fresh service (fresh in-memory Set) must
+      // still observe the open through the persisted marker.
+      const restartedService = new TerminalService(
+        configWithLocalWorkspace,
+        mockPTYService,
+        mockSecretsStore
+      );
+      expect(await restartedService.hasOpenedNativeTerminal("ws-local")).toBe(true);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-never-opened")).toBe(false);
+    });
+
+    it("refuses native terminal opens while the workspace is being archived", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
+      service.setWorkspaceArchiveGuard(() => true);
+
+      // Fresh id: ws-local's durable marker may exist from earlier tests in this run, and
+      // this test asserts the refused open leaves no recording behind.
+      try {
+        await service.openNative("ws-guard-refused");
+        expect.unreachable("openNative must refuse while the workspace is being archived");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+      // A refused open launches no shell, so its reservation rolls back: leaving it sticky
+      // would permanently refuse model-driven snapshot/Coder-stop archives after unarchive.
+      expect(await service.hasOpenedNativeTerminal("ws-guard-refused")).toBe(false);
+    });
+
+    it("refuses native terminal opens for archived workspaces", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const configWithArchivedWorkspace = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(() =>
+          Promise.resolve([
+            {
+              id: "ws-local",
+              projectPath: "/tmp/project",
+              name: "main",
+              namedWorkspacePath: "/tmp/project/main",
+              runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+              archivedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ])
+        ),
+      } as unknown as Config;
+      service = new TerminalService(configWithArchivedWorkspace, mockPTYService, mockSecretsStore);
+
+      // Persisted archived state (e.g. a stale renderer) must refuse like the other
+      // admissions: the checkout may already be snapshot and removed.
+      try {
+        await service.openNative("ws-local");
+        expect.unreachable("openNative must refuse archived workspaces");
+      } catch (error) {
+        expect(String(error)).toContain("is archived");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
+    it("refuses the native launch when the durable marker cannot be persisted", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      // Session dir rooted under /dev/null: marker persistence (mkdir/writeFile) must fail.
+      const configWithUnwritableSessions = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        sessionsDir: "/dev/null/sessions",
+      } as unknown as Config;
+      service = new TerminalService(configWithUnwritableSessions, mockPTYService, mockSecretsStore);
+
+      // A terminal launched without the marker would be invisible to archive gating after
+      // a restart (the in-memory record dies with the app), so persistence failure must
+      // abort the launch itself rather than proceed unguarded.
+      try {
+        await service.openNative("ws-local");
+        expect.unreachable("openNative must refuse when the marker cannot be persisted");
+      } catch (error) {
+        expect(String(error)).toContain("terminal-open marker");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
     it("should open Ghostty for local workspace when available", async () => {
       // Make ghostty available via fs.stat (common install path)
       fsStatSpy.mockImplementation((path: string) => {
@@ -1128,7 +1246,7 @@ describe("TerminalService.openNative", () => {
         return Promise.reject(new Error("ENOENT"));
       });
 
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-local");
 
@@ -1149,7 +1267,7 @@ describe("TerminalService.openNative", () => {
         return { status: 0 };
       });
 
-      service = new TerminalService(configWithSSHWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithSSHWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-ssh");
 
@@ -1167,13 +1285,144 @@ describe("TerminalService.openNative", () => {
     });
   });
 
+  describe("marker rollback on failed launches", () => {
+    beforeEach(() => {
+      setPlatform("linux");
+    });
+
+    const configWithWorkspace = (id: string) =>
+      ({
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(() =>
+          Promise.resolve([
+            {
+              id,
+              projectPath: "/tmp/project",
+              name: "main",
+              namedWorkspacePath: "/tmp/project/main",
+              runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+            },
+          ])
+        ),
+      }) as unknown as Config;
+
+    it("rolls back a freshly created marker when the launch fails after it persists", async () => {
+      // No terminal emulator is available: the launch fails deterministically after the
+      // durable marker was written, and no shell was spawned.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const config = configWithWorkspace("ws-marker-rollback");
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+
+      try {
+        await service.openNative("ws-marker-rollback");
+        expect.unreachable("openNative must fail when no terminal emulator exists");
+      } catch (error) {
+        expect(String(error)).toContain("No terminal emulator found");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+      // The failed launch opened no shell, so a sticky marker would be a false positive that
+      // permanently refuses model-driven snapshot/Coder-stop archives — it must roll back
+      // durably (visible to a fresh service instance too).
+      expect(await service.hasOpenedNativeTerminal("ws-marker-rollback")).toBe(false);
+      const restartedService = new TerminalService(config, mockPTYService, mockSecretsStore);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-rollback")).toBe(false);
+    });
+
+    it("rolls back the marker when every launch in a concurrent batch fails", async () => {
+      // Two first-time opens overlap in flight and both fail: the second admission sees the
+      // marker written by the first, but that in-flight marker must not masquerade as
+      // evidence of a real prior launch — with no launch in the whole batch, the marker
+      // must not survive.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const config = configWithWorkspace("ws-marker-concurrent");
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+
+      const results = await Promise.allSettled([
+        service.openNative("ws-marker-concurrent"),
+        service.openNative("ws-marker-concurrent"),
+      ]);
+      expect(results.every((r) => r.status === "rejected")).toBe(true);
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(await service.hasOpenedNativeTerminal("ws-marker-concurrent")).toBe(false);
+      const restartedService = new TerminalService(config, mockPTYService, mockSecretsStore);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-concurrent")).toBe(false);
+    });
+
+    it("keeps gating archives while a sibling open is still in flight", async () => {
+      // A fails after marker admission while B still awaits workspace metadata: A's rollback
+      // collapses the shared marker and cache entry, but B already passed the archive guard
+      // and will launch after its awaits without rechecking — the pending-open count must
+      // keep the probe true for B's whole pre-marker window.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 })); // every launch fails
+      const metadata = [
+        {
+          id: "ws-pending-sibling",
+          projectPath: "/tmp/project",
+          name: "main",
+          namedWorkspacePath: "/tmp/project/main",
+          runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+        },
+      ];
+      let releaseSecondLookup!: () => void;
+      const secondLookupGate = new Promise<void>((resolve) => {
+        releaseSecondLookup = resolve;
+      });
+      let lookups = 0;
+      const config = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(async () => {
+          lookups += 1;
+          if (lookups >= 2) {
+            await secondLookupGate;
+          }
+          return metadata;
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+
+      const first = service.openNative("ws-pending-sibling");
+      const second = service.openNative("ws-pending-sibling");
+      await first.catch(() => undefined);
+
+      // B is still pre-marker (frozen in its metadata lookup) after A's rollback: the
+      // workspace must still gate snapshot/Coder-stop archives.
+      expect(await service.hasOpenedNativeTerminal("ws-pending-sibling")).toBe(true);
+
+      releaseSecondLookup();
+      await second.catch(() => undefined);
+      // The whole group failed and settled: nothing gates anymore.
+      expect(await service.hasOpenedNativeTerminal("ws-pending-sibling")).toBe(false);
+    });
+
+    it("preserves a marker that predates the failed launch", async () => {
+      const config = configWithWorkspace("ws-marker-preexisting");
+      // First open succeeds and persists the durable marker.
+      spawnSyncSpy.mockImplementation(() => ({ status: 0 }));
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+      await service.openNative("ws-marker-preexisting");
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+      // A relaunch after a restart fails (say the emulator was uninstalled): the earlier
+      // session's shell may still be running, so the pre-existing marker must survive.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const restartedService = new TerminalService(config, mockPTYService, mockSecretsStore);
+      try {
+        await restartedService.openNative("ws-marker-preexisting");
+        expect.unreachable("openNative must fail when no terminal emulator exists");
+      } catch (error) {
+        expect(String(error)).toContain("No terminal emulator found");
+      }
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-preexisting")).toBe(true);
+    });
+  });
+
   describe("Windows (win32)", () => {
     beforeEach(() => {
       setPlatform("win32");
     });
 
     it("should open cmd for local workspace", async () => {
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-local");
 
@@ -1185,7 +1434,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("should open cmd with SSH for SSH workspace", async () => {
-      service = new TerminalService(configWithSSHWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithSSHWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-ssh");
 
@@ -1204,7 +1453,7 @@ describe("TerminalService.openNative", () => {
       service = new TerminalService(
         configWithWindowsDevcontainerWorkspace,
         mockPTYService,
-        undefined
+        mockSecretsStore
       );
 
       await service.openNative("ws-devcontainer-win");
@@ -1244,7 +1493,7 @@ describe("TerminalService.openNative", () => {
         return { status: 0 };
       });
 
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-local");
 
@@ -1259,7 +1508,7 @@ describe("TerminalService.openNative", () => {
       // All terminals not found
       spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
 
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(service.openNative("ws-local")).rejects.toThrow("No terminal emulator found");
@@ -1274,7 +1523,7 @@ describe("TerminalService.openNative", () => {
         return { status: 1 };
       });
 
-      service = new TerminalService(configWithSSHWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithSSHWorkspace, mockPTYService, mockSecretsStore);
 
       await service.openNative("ws-ssh");
 
@@ -1296,7 +1545,11 @@ describe("TerminalService.openNative", () => {
         return { status: 1 };
       });
 
-      service = new TerminalService(configWithDevcontainerWorkspace, mockPTYService, undefined);
+      service = new TerminalService(
+        configWithDevcontainerWorkspace,
+        mockPTYService,
+        mockSecretsStore
+      );
 
       await service.openNative("ws-devcontainer");
 
@@ -1318,7 +1571,7 @@ describe("TerminalService.openNative", () => {
     });
 
     it("should throw error for non-existent workspace", async () => {
-      service = new TerminalService(configWithLocalWorkspace, mockPTYService, undefined);
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService, mockSecretsStore);
 
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(service.openNative("non-existent")).rejects.toThrow(

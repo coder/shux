@@ -2,7 +2,7 @@ import type z from "zod";
 import type { MuxProviderOptionsSchema } from "../orpc/schemas";
 
 /**
- * Mux provider-specific options that get passed through the stack.
+ * Xum provider-specific options that get passed through the stack.
  * Used by both frontend and backend to configure provider-specific features
  * without polluting function signatures with individual flags.
  *
@@ -13,3 +13,6 @@ import type { MuxProviderOptionsSchema } from "../orpc/schemas";
  */
 
 export type MuxProviderOptions = z.infer<typeof MuxProviderOptionsSchema>;
+
+/** OpenAI wire format selected in provider settings or per request. */
+export type OpenAIWireFormat = NonNullable<NonNullable<MuxProviderOptions["openai"]>["wireFormat"]>;

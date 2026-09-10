@@ -3,6 +3,7 @@ import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import {
   AgentSkillDescriptorSchema,
   SkillNameSchema,
@@ -15,10 +16,12 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
+  getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -30,20 +33,15 @@ interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
 }
 
-interface SkillDirectoryEntry {
-  name: string;
-  isSymbolicLink: boolean;
-}
-
-async function listSkillDirectories(skillsRoot: string): Promise<SkillDirectoryEntry[]> {
+async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   try {
     const entries = await fsPromises.readdir(skillsRoot, { withFileTypes: true });
+    // Include symlinked entries: skill package managers install skills by
+    // symlinking directories into skills roots. readSkillDescriptor enforces
+    // realpath containment per skill, so escaping symlinks stay rejected.
     return entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .map((entry) => ({
-        name: entry.name,
-        isSymbolicLink: entry.isSymbolicLink(),
-      }));
+      .map((entry) => entry.name);
   } catch (error) {
     log.warn(
       `Skipping skills root '${skillsRoot}' because directory entries could not be read: ${getErrorMessage(error)}`
@@ -67,12 +65,17 @@ async function readSkillDescriptor(
   }
 
   const directoryName = parsedDirectoryName.data;
-  const skillFilePath = path.join(skillsRoot, directoryName, "SKILL.md");
+  const skillDir = path.join(skillsRoot, directoryName);
+  const skillFilePath = path.join(skillDir, "SKILL.md");
 
-  // Validate SKILL.md canonical path stays within the containment root before any read.
-  // This prevents repo-controlled symlinks from escaping the project boundary.
+  // SECURITY: validate that BOTH the skill directory and SKILL.md canonical
+  // paths stay within the containment root before any read. Checking only the
+  // file would let a skill-dir symlink resolve outside containment while its
+  // SKILL.md symlinks back inside, advertising a skill whose sibling files
+  // agent_skill_read_file would then read from the external location.
   let containedPath: string;
   try {
+    await ensurePathContained(containmentRoot, skillDir);
     containedPath = await ensurePathContained(containmentRoot, skillFilePath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
@@ -175,26 +178,37 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
           workspacePath: config.cwd,
-          muxScope: config.muxScope ?? null,
+          xumScope: config.xumScope ?? null,
           includeClaudeSkills,
           includeAgentPlugins,
         });
 
         if (skillCtx.kind === "project-runtime") {
           // Runtime discovery mirrors the shared default roots contract so project-runtime
-          // listings include .mux/skills and .agents/skills plus ~/.mux/skills and ~/.agents/skills.
-          const roots = getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
-            includeClaudeSkills,
-            includeAgentPlugins,
-          });
+          // listings include .xum/skills and .agents/skills plus ~/.xum/skills and ~/.agents/skills.
+          const roots =
+            skillCtx.roots ??
+            getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
+              includeClaudeSkills,
+              includeAgentPlugins,
+            });
 
           const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
             roots,
             containment: skillCtx.containment,
             dedupeByName: false,
           });
+          const seenByScope = new Set<string>();
           const skills = discovered
             .filter((skill) => skill.scope !== "built-in")
+            .filter((skill) => {
+              const scopeKey = `${skill.scope}:${skill.name}`;
+              if (seenByScope.has(scopeKey)) {
+                return false;
+              }
+              seenByScope.add(scopeKey);
+              return true;
+            })
             .filter((skill) => includeUnadvertised === true || skill.advertise !== false)
             .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -204,9 +218,9 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           };
         }
 
-        const { muxScope } = config;
-        if (!muxScope) {
-          throw new Error("agent_skill_list requires muxScope");
+        const { xumScope } = config;
+        if (!xumScope) {
+          throw new Error("agent_skill_list requires xumScope");
         }
 
         const userHome = os.homedir();
@@ -216,16 +230,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillsRoot: string;
           containmentRoot: string;
           scope: "global" | "project";
-          /**
-           * Agent Plugins root: per-skill containment anchors at the plugin
-           * root (§4.1), so contained symlinked skill dirs stay listed —
-           * matching stream discovery and agent_skill_read.
-           */
-          isPlugin?: boolean;
+          importedSkills?: readonly string[];
         }> = [
           {
-            skillsRoot: path.join(muxScope.muxHome, "skills"),
-            containmentRoot: muxScope.muxHome,
+            skillsRoot: path.join(xumScope.xumHome, "skills"),
+            containmentRoot: xumScope.xumHome,
             scope: "global",
           },
           {
@@ -243,30 +252,18 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             scope: "global",
           });
         }
-        if (muxScope.type === "project") {
+        if (xumScope.type === "project") {
+          if (skillCtx.roots == null) {
+            throw new Error("Project-local skill context requires explicit roots");
+          }
+          const containmentRoot = xumScope.checkoutRoot ?? xumScope.projectRoot;
           roots.unshift(
-            {
-              // Project skills listed first so they appear before global ones.
-              skillsRoot: path.join(muxScope.projectRoot, ".mux", "skills"),
-              containmentRoot: muxScope.projectRoot,
-              scope: "project",
-            },
-            {
-              skillsRoot: path.join(muxScope.projectRoot, ".agents", "skills"),
-              containmentRoot: muxScope.projectRoot,
-              scope: "project",
-            },
-            // claude-skills-compat: lowest-precedence project root, contained at projectRoot
-            // exactly like the other project roots.
-            ...(includeClaudeSkills
-              ? [
-                  {
-                    skillsRoot: path.join(muxScope.projectRoot, ".claude", "skills"),
-                    containmentRoot: muxScope.projectRoot,
-                    scope: "project" as const,
-                  },
-                ]
-              : [])
+            ...getProjectSkillRoots(skillCtx.roots).map((skillsRoot) => ({
+              // Project skills are nearest-directory first, before global ones.
+              skillsRoot,
+              containmentRoot,
+              scope: "project" as const,
+            }))
           );
         }
 
@@ -276,21 +273,25 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           // for subProjectPath workspaces `projectRoot` is the execution
           // subdirectory, but plugins live at the checkout level.
           const pluginAnchor =
-            muxScope.type === "project" ? (muxScope.checkoutRoot ?? muxScope.projectRoot) : null;
+            xumScope.type === "project" ? (xumScope.checkoutRoot ?? xumScope.projectRoot) : null;
           const pluginContainers = [
             ...(pluginAnchor != null
               ? [
-                  {
-                    path: path.join(pluginAnchor, ".mux", "plugins"),
+                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+                    path: path.join(pluginAnchor, relativePath),
                     scope: "project" as const,
-                  },
+                  })),
                   {
                     path: path.join(pluginAnchor, ".agents", "plugins"),
                     scope: "project" as const,
                   },
                 ]
               : []),
-            { path: path.join(muxScope.muxHome, "plugins"), scope: "global" as const },
+            {
+              path: path.join(xumScope.xumHome, "plugins"),
+              scope: "global" as const,
+              registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+            },
             { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
           ];
           const { plugins } = await discoverAgentPlugins(pluginContainers);
@@ -315,13 +316,14 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRoot: plugin.skillsDir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
-              isPlugin: true,
+              importedSkills: plugin.importedComponents?.skills,
             });
           }
         }
 
         const skills: AgentSkillDescriptor[] = [];
-        for (const { skillsRoot, containmentRoot, scope, isPlugin } of roots) {
+        const seenByScope = new Set<string>();
+        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -341,28 +343,29 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             continue;
           }
 
-          const directoryEntries = await listSkillDirectories(skillsRootReal);
-          for (const entry of directoryEntries) {
-            // Project scope: reject symlinked skill directories to avoid resolving
-            // repo-controlled entries to out-of-project locations. Plugin roots
-            // are exempt: readSkillDescriptor enforces realpath containment at
-            // the plugin root, the same rule stream discovery applies.
-            if (scope === "project" && !isPlugin && entry.isSymbolicLink) {
-              log.warn(
-                `Skipping project skill '${entry.name}': skill directory is a symbolic link`
-              );
-              continue;
-            }
-
+          const directoryNames = await listSkillDirectories(skillsRootReal);
+          for (const directoryName of directoryNames) {
+            // Skipped plugin skills must not claim a same-named fallback in this manual scan.
+            if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
+            // SECURITY: symlinked skill directories are allowed only through
+            // readSkillDescriptor's realpath containment check, which rejects
+            // entries resolving outside the containment root. This matches the
+            // posture of stream discovery and plugin roots.
             const descriptor = await readSkillDescriptor(
               skillsRootReal,
-              entry.name,
+              directoryName,
               scope,
               containmentRoot
             );
             if (!descriptor) {
               continue;
             }
+
+            const scopeKey = `${scope}:${descriptor.name}`;
+            if (seenByScope.has(scopeKey)) {
+              continue;
+            }
+            seenByScope.add(scopeKey);
 
             if (includeUnadvertised !== true && descriptor.advertise === false) {
               continue;

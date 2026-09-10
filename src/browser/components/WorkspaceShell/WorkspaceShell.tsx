@@ -218,6 +218,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   return (
     <div
       ref={shellRef}
+      // Lets descendants (WorkspaceMenuBar's timeline gate) locate the shell that
+      // owns the right-sidebar container query without prop-drilling layout state.
+      data-workspace-shell=""
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
         props.className

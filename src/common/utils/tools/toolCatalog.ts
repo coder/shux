@@ -34,6 +34,8 @@ export interface ToolCatalogEntry {
   description: string;
   /** Flattened input-parameter names + descriptions used for scoring only. */
   paramText: string;
+  /** MCP server that provides this tool, when known (used for the catalog overview + scoring). */
+  serverName?: string;
 }
 
 /**
@@ -106,6 +108,11 @@ interface ToolCatalogInputs {
   mcpToolNames: readonly string[];
   toolPolicy?: ToolPolicy;
   /**
+   * Provider-safe MCP tool name → originating server name. Used to group the
+   * deferred-catalog overview by server and to score server-name matches.
+   */
+  mcpToolServers?: Readonly<Record<string, string>>;
+  /**
    * Whether PTC (programmatic tool calling) is enabled, i.e. the record's
    * `code_execution` entry is the PTC tool rather than a same-named MCP tool.
    * Presence-sniffing the record is not enough: an MCP server/tool pair can
@@ -148,10 +155,177 @@ export function buildToolCatalog(inputs: ToolCatalogInputs): ToolCatalogClassifi
       name,
       description: typeof tool.description === "string" ? tool.description : "",
       paramText: extractParamText(tool),
+      serverName: inputs.mcpToolServers?.[name],
     });
   }
 
   return { catalog, deferredToolNames, allToolNames };
+}
+
+/** Max tool names listed per server in the catalog overview before eliding. */
+const OVERVIEW_MAX_TOOLS_PER_SERVER = 8;
+
+/**
+ * Server labels are unbounded user-config map keys; clamp them so a single
+ * pathological name cannot bloat the overview. Display-only — grouping still
+ * uses the full server name.
+ */
+const OVERVIEW_MAX_SERVER_LABEL_CHARS = 64;
+
+/**
+ * Overall character budget for the generated overview. Tool names are capped
+ * at 64 chars by provider rules and per-server lines are capped above, but the
+ * number of servers is unbounded — without a total budget a large MCP config
+ * could blow up the tool schema / provider request size. Servers beyond the
+ * budget collapse into an omitted-count line pointing at search.
+ */
+const OVERVIEW_MAX_CHARS = 2000;
+
+/**
+ * Header marking the generated overview inside tool_catalog_search's
+ * description. Also used to strip a previously appended overview so repeated
+ * prepareToolSearch calls (post-hook / model-fallback rebuilds receive the
+ * already-augmented tool as input) stay idempotent instead of stacking copies.
+ */
+const OVERVIEW_HEADER = "Deferred tool catalog overview (search to activate):";
+
+/**
+ * Explicit terminator for the generated overview block. Stripping removes
+ * exactly the marker-delimited region, so arbitrary hook text — including
+ * bullet lines a request.assemble middleware appends after the overview —
+ * survives re-preparation. Content-shape heuristics (e.g. "consume contiguous
+ * bullets") cannot distinguish generated bullets from hook-appended ones.
+ */
+const OVERVIEW_END_MARKER = "(end of deferred tool catalog overview)";
+
+/** Separator emitted between the base description and the generated block. */
+const OVERVIEW_SEPARATOR = "\n\n";
+
+/**
+ * Server names are arbitrary user-config map keys. Scrub reserved marker text
+ * so a label can neither terminate nor forge the generated block (which would
+ * break marker-based stripping and re-stack overviews on rebuilds), and
+ * flatten newlines so one label cannot fabricate extra overview lines. Tool
+ * names need no scrubbing: buildMcpToolName enforces provider-safe
+ * `[a-zA-Z0-9_-]` names that cannot contain marker text.
+ *
+ * Scrubbing loops to a fixpoint: a single deletion pass can itself synthesize
+ * a marker by joining fragments (e.g. "(end of deferred " + HEADER + "tool
+ * catalog overview)" becomes the end marker once the embedded header is
+ * removed). Each pass strictly shortens the string, so the loop terminates.
+ */
+function sanitizeServerLabel(label: string): string {
+  let sanitized = label.replace(/[\r\n]+/g, " ");
+  while (sanitized.includes(OVERVIEW_END_MARKER) || sanitized.includes(OVERVIEW_HEADER)) {
+    sanitized = sanitized.split(OVERVIEW_END_MARKER).join("").split(OVERVIEW_HEADER).join("");
+  }
+  return sanitized;
+}
+
+/**
+ * Pre-scrub input clamp. The fixpoint scrub is quadratic in the worst case
+ * (recursively nested markers force one full rescan per nesting level), so it
+ * must only ever run on a bounded prefix — a multi-hundred-KB adversarial key
+ * would otherwise stall tool preparation synchronously. 512 chars leaves ample
+ * room for the scrub to delete embedded markers and still fill the 64-char
+ * display label; clamping can leave a partial marker at the cut, which is
+ * harmless because stripping matches only complete markers.
+ */
+const OVERVIEW_LABEL_SCRUB_INPUT_CHARS = 512;
+
+/**
+ * Bounded, sanitized display form of a server name for model-facing output
+ * (overview lines and search-result serverName fields). The full name is kept
+ * internally for grouping and scoring only — anything sent to the model must
+ * be bounded, since a long name repeated across up to 25 search matches could
+ * inflate the tool result past provider limits.
+ */
+function displayServerLabel(server: string): string {
+  const wasClamped = server.length > OVERVIEW_LABEL_SCRUB_INPUT_CHARS;
+  const sanitized = sanitizeServerLabel(
+    wasClamped ? server.slice(0, OVERVIEW_LABEL_SCRUB_INPUT_CHARS) : server
+  );
+  if (wasClamped || sanitized.length > OVERVIEW_MAX_SERVER_LABEL_CHARS) {
+    return `${sanitized.slice(0, OVERVIEW_MAX_SERVER_LABEL_CHARS - 1)}…`;
+  }
+  return sanitized;
+}
+
+/**
+ * Remove a previously appended catalog overview from a description, if any.
+ * Removes exactly the marker-delimited generated region plus the separator we
+ * emitted before it — nothing else. Hook-authored content outside the region
+ * (including whitespace-sensitive Markdown such as indented blocks) is
+ * preserved verbatim: no trimming.
+ */
+function stripToolCatalogOverview(description: string): string {
+  const start = description.indexOf(OVERVIEW_HEADER);
+  if (start === -1) {
+    return description;
+  }
+  const endMarker = description.indexOf(OVERVIEW_END_MARKER, start);
+  // The end marker is always emitted with the header; if a hook removed it,
+  // leave the description untouched rather than guessing at block boundaries.
+  if (endMarker === -1) {
+    return description;
+  }
+  const separatorStart = start - OVERVIEW_SEPARATOR.length;
+  const regionStart =
+    separatorStart >= 0 && description.slice(separatorStart, start) === OVERVIEW_SEPARATOR
+      ? separatorStart
+      : start;
+  const regionEnd = endMarker + OVERVIEW_END_MARKER.length;
+  return description.slice(0, regionStart) + description.slice(regionEnd);
+}
+
+/**
+ * Build a compact, deterministic index of the deferred catalog grouped by MCP
+ * server, e.g. `- github (12 tools): github_create_issue, … (+4 more)`.
+ * Only names are listed — descriptions and parameter schemas stay deferred
+ * until activation, so the overview solves the "unknown unknowns" discovery
+ * problem without reintroducing schema token bloat. Returns "" for an empty
+ * catalog.
+ */
+export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): string {
+  if (catalog.length === 0) {
+    return "";
+  }
+  const byServer = new Map<string, string[]>();
+  for (const entry of catalog) {
+    const server = entry.serverName ?? "other tools";
+    const names = byServer.get(server) ?? [];
+    names.push(entry.name);
+    byServer.set(server, names);
+  }
+  const servers = [...byServer.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const lines: string[] = [];
+  let usedChars = OVERVIEW_HEADER.length + OVERVIEW_END_MARKER.length;
+  let omittedServers = 0;
+  for (const [server, names] of servers) {
+    // Once over budget, stop emitting lines and just count omitted servers.
+    if (omittedServers > 0) {
+      omittedServers += 1;
+      continue;
+    }
+    const label = displayServerLabel(server);
+    names.sort((a, b) => a.localeCompare(b));
+    const shown = names.slice(0, OVERVIEW_MAX_TOOLS_PER_SERVER);
+    const extra = names.length - shown.length;
+    const suffix = extra > 0 ? ` (+${extra} more)` : "";
+    const line = `- ${label} (${names.length} tool${names.length === 1 ? "" : "s"}): ${shown.join(", ")}${suffix}`;
+    if (usedChars + line.length + 1 > OVERVIEW_MAX_CHARS) {
+      omittedServers = 1;
+      continue;
+    }
+    usedChars += line.length + 1;
+    lines.push(line);
+  }
+  if (omittedServers > 0) {
+    lines.push(
+      `- …and ${omittedServers} more server${omittedServers === 1 ? "" : "s"} (use this tool to discover their tools)`
+    );
+  }
+  return `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`;
 }
 
 /**
@@ -206,8 +380,25 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
     const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
     return { tools: rest };
   }
+  // Advertise the deferred surface area up front: append a compact per-server
+  // index of deferred tool names to tool_catalog_search's description so the
+  // model knows what capabilities exist to search for ("unknown unknowns"),
+  // while full descriptions/schemas stay deferred until activation.
+  const overview = buildToolCatalogOverview(classification.catalog);
+  const searchTool = inputs.tools[TOOL_SEARCH_TOOL_NAME];
+  // Strip any overview appended by an earlier prepareToolSearch call: rebuild
+  // paths (assembly hooks, model fallback) pass the augmented tool back in, and
+  // blindly appending again would send the whole catalog overview twice.
+  const baseDescription = stripToolCatalogOverview(
+    typeof searchTool.description === "string" ? searchTool.description : ""
+  );
+  // Object.assign (not spread) keeps the `Tool` union type intact while
+  // overriding only the description on a shallow copy.
+  const augmentedSearchTool: Tool = Object.assign({}, searchTool, {
+    description: baseDescription.length > 0 ? `${baseDescription}\n\n${overview}` : overview,
+  });
   return {
-    tools: inputs.tools,
+    tools: { ...inputs.tools, [TOOL_SEARCH_TOOL_NAME]: augmentedSearchTool },
     state: { ...classification, activatedToolNames: new Set<string>() },
   };
 }
@@ -252,6 +443,8 @@ function tokenize(text: string): string[] {
 export interface ToolSearchMatch {
   name: string;
   description: string;
+  /** Bounded display label of the originating MCP server, when known. */
+  serverName?: string;
 }
 
 /**
@@ -274,12 +467,32 @@ export function searchToolCatalog(
     TOOL_SEARCH_MAX_LIMIT
   );
 
+  // Server tokens come from the bounded display label — the exact string the
+  // overview advertises — so copying the visible label into a query scores as
+  // expected even when the raw name exceeds the label clamp. Tokenizing the
+  // label (never the raw, unbounded config key) also bounds per-search work,
+  // and the cache computes it once per distinct server instead of per tool.
+  const serverTokensCache = new Map<string, Set<string>>();
+  const serverTokensFor = (server: string): Set<string> => {
+    let tokens = serverTokensCache.get(server);
+    if (tokens === undefined) {
+      tokens = new Set(tokenize(displayServerLabel(server)));
+      serverTokensCache.set(server, tokens);
+    }
+    return tokens;
+  };
+
   const scored: Array<{ entry: ToolCatalogEntry; score: number }> = [];
   for (const entry of catalog) {
     const nameLower = entry.name.toLowerCase();
     const nameTokens = new Set(tokenize(entry.name));
     const descriptionTokens = new Set(tokenize(entry.description));
     const paramTokens = new Set(tokenize(entry.paramText));
+    // Server-name matches rank between name and description hits so a query
+    // like "github" surfaces that server's tools even when normalization
+    // changed the tool-name prefix.
+    const serverTokens =
+      entry.serverName !== undefined ? serverTokensFor(entry.serverName) : new Set<string>();
 
     let score = 0;
     for (const token of queryTokens) {
@@ -287,6 +500,9 @@ export function searchToolCatalog(
         score += 8;
       } else if (nameLower.includes(token)) {
         score += 5;
+      }
+      if (serverTokens.has(token)) {
+        score += 3;
       }
       if (descriptionTokens.has(token)) {
         score += 2;
@@ -304,6 +520,9 @@ export function searchToolCatalog(
   return scored.slice(0, effectiveLimit).map(({ entry }) => ({
     name: entry.name,
     description: entry.description,
+    // Display label, not the raw name: an unbounded server-map key repeated
+    // across up to 25 matches could inflate the result past provider limits.
+    ...(entry.serverName !== undefined ? { serverName: displayServerLabel(entry.serverName) } : {}),
   }));
 }
 
@@ -371,9 +590,9 @@ function renameLegacyToolSearchResultPart(part: ToolResultPart): ToolResultPart 
  * the tool names they matched, so tools discovered in earlier turns (or
  * before a mid-turn stream retry) re-activate without a new search. Accepts
  * both provider-shaped ModelMessages (tool-result parts, `{type:"json"}` /
- * `{type:"text"}` output encodings plus raw result objects) and MuxMessages
- * (dynamic-tool parts with raw outputs) — aiService seeds from MuxMessages
- * because the agent-transition sentinel is computed before the Mux→Model
+ * `{type:"text"}` output encodings plus raw result objects) and XumMessages
+ * (dynamic-tool parts with raw outputs) — aiService seeds from XumMessages
+ * because the agent-transition sentinel is computed before the Xum→Model
  * conversion runs. Callers intersect the result with the current deferred set.
  */
 export function extractPreActivatedToolNames(
@@ -408,7 +627,7 @@ export function extractPreActivatedToolNames(
 
 /**
  * AI SDK 7 reserves the legacy `tool_search` name for OpenAI's native tool.
- * Rewrite only completed historical Mux search calls, request-only, so old
+ * Rewrite only completed historical Xum search calls, request-only, so old
  * workspaces remain usable without relabeling unrelated MCP tools.
  */
 export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): ModelMessage[] {

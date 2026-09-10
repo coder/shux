@@ -26,7 +26,10 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      "fixed inset-0 z-[1500] bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+      // sampler ignores this fixed overlay (it samples background-color/backdrop-filter
+      // on fixed elements; pseudo-elements/absolute children are skipped).
+      "fixed inset-0 z-[1500] before:absolute before:inset-0 before:bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       className
     )}
     {...props}

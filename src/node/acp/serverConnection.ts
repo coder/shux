@@ -4,12 +4,14 @@ import { createORPCClient, type ClientContext } from "@orpc/client";
 import { RPCLink as WebSocketRPCLink } from "@orpc/client/websocket";
 import type { RouterClient } from "@orpc/server";
 import WebSocket from "ws";
-import { getMuxHome } from "@/common/constants/paths";
-import { Config } from "@/node/config";
+import { getXumHome } from "@/common/constants/paths";
+import { SERVICE_TEARDOWN_BUDGET_MS } from "@/constants/terminationTimeouts";
+import { createConfigStores } from "@/node/config";
 import type { AppRouter } from "@/node/orpc/router";
 import { createOrpcServer } from "@/node/orpc/server";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { ServerLockfile } from "@/node/services/serverLockfile";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 interface ConnectViaWebSocketResult {
   client: ORPCClient;
@@ -49,7 +51,7 @@ export async function connectToServer(options: {
     });
   }
 
-  const lockfile = new ServerLockfile(getMuxHome());
+  const lockfile = new ServerLockfile(getXumHome());
   const lockData = await lockfile.read();
 
   if (lockData?.baseUrl) {
@@ -151,15 +153,13 @@ async function connectToExistingServer(options: {
 
 async function connectToInProcessServer(requestedAuthToken?: string): Promise<ServerConnection> {
   const authToken = requestedAuthToken ?? crypto.randomUUID();
-  const config = new Config();
-  const serviceContainer = new ServiceContainer(config);
+  const stores = createConfigStores();
+  const serviceContainer = new ServiceContainer(stores);
 
-  let initialized = false;
   let inProcessServer: InProcessOrpcServer | undefined;
 
   try {
     await serviceContainer.initialize();
-    initialized = true;
 
     const context = serviceContainer.toORPCContext();
     inProcessServer = await createOrpcServer({
@@ -207,9 +207,16 @@ async function connectToInProcessServer(requestedAuthToken?: string): Promise<Se
       await inProcessServer.close().catch(() => undefined);
     }
 
-    if (initialized) {
-      await serviceContainer.dispose().catch(() => undefined);
-    }
+    // Also after a rejected initialize(): a startup step that failed — or timed out and is still
+    // running as a plain promise (StartupStepTimeoutError) — must not leave half-started services
+    // behind, and the stdio adapter must still exit if a teardown step hangs. dispose() is safe
+    // on a container that never finished initializing.
+    await raceWithAbortAndTimeout(
+      serviceContainer.dispose().catch(() => undefined),
+      {
+        timeoutMs: SERVICE_TEARDOWN_BUDGET_MS,
+      }
+    );
 
     throw error;
   }
@@ -229,8 +236,10 @@ async function connectViaWebSocket(
   await waitForWebSocketOpen(websocket, wsUrl);
 
   // oRPC expects a browser-like WebSocket surface; ws is compatible at runtime.
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
   const link = new WebSocketRPCLink({
-    websocket: websocket as unknown as globalThis.WebSocket,
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+    connect: () => websocket as unknown as globalThis.WebSocket,
   });
   const client = createTypedClient(link);
 

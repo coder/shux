@@ -1,3 +1,4 @@
+import type { PrefixSwapInvalidatedEventSchema } from "@/common/orpc/schemas/stream";
 /**
  * Event types emitted by AIService
  */
@@ -5,8 +6,6 @@
 import type { z } from "zod";
 import type { MuxReasoningPart, MuxTextPart, MuxToolPart } from "./message";
 import type {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
@@ -16,7 +15,6 @@ import type {
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
@@ -45,7 +43,6 @@ export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
-export type StreamLifecyclePhase = z.infer<typeof StreamLifecyclePhaseSchema>;
 export type StreamLifecycleSnapshot = z.infer<typeof StreamLifecycleSnapshotSchema>;
 export type StreamLifecycleEvent = z.infer<typeof StreamLifecycleEventSchema>;
 
@@ -87,9 +84,6 @@ export type ReasoningEndEvent = z.infer<typeof ReasoningEndEventSchema>;
  */
 export type UsageDeltaEvent = z.infer<typeof UsageDeltaEventSchema>;
 
-export type AutoCompactionTriggeredEvent = z.infer<typeof AutoCompactionTriggeredEventSchema>;
-export type AutoCompactionCompletedEvent = z.infer<typeof AutoCompactionCompletedEventSchema>;
-
 export type AutoRetryScheduledEvent = z.infer<typeof AutoRetryScheduledEventSchema>;
 export type AutoRetryStartingEvent = z.infer<typeof AutoRetryStartingEventSchema>;
 export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSchema>;
@@ -99,3 +93,5 @@ export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSche
  * Used for both runtime readiness and generic startup breadcrumbs in the barrier UI.
  */
 export type RuntimeStatusEvent = z.infer<typeof RuntimeStatusEventSchema>;
+
+export type PrefixSwapInvalidatedEvent = z.infer<typeof PrefixSwapInvalidatedEventSchema>;

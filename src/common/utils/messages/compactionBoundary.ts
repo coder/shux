@@ -8,7 +8,7 @@ import { hasProviderReplayableContent } from "@/common/utils/messages/providerEl
 
 import type { MuxMessage } from "@/common/types/message";
 
-export { CONTEXT_BOUNDARY_KINDS, type ContextBoundaryKind };
+export { CONTEXT_BOUNDARY_KINDS };
 
 export function isDurableCompactedMarker(
   value: unknown
@@ -128,17 +128,23 @@ export function sliceMessagesFromLatestCompactionBoundary(messages: MuxMessage[]
   return sliced;
 }
 
-export function isProviderEligibleMessage(message: MuxMessage): boolean {
+export function isProviderEligibleMessage(
+  message: MuxMessage,
+  options?: Parameters<typeof hasProviderReplayableContent>[1]
+): boolean {
   if (isDurableContextResetBoundaryMarker(message)) {
     return false;
   }
 
-  return hasProviderReplayableContent(message);
+  return hasProviderReplayableContent(message, options);
 }
 
-export function hasProviderEligibleMessages(messages: MuxMessage[]): boolean {
+export function hasProviderEligibleMessages(
+  messages: MuxMessage[],
+  options?: Parameters<typeof hasProviderReplayableContent>[1]
+): boolean {
   assert(Array.isArray(messages), "hasProviderEligibleMessages requires a message array");
-  return messages.some(isProviderEligibleMessage);
+  return messages.some((message) => isProviderEligibleMessage(message, options));
 }
 
 /**

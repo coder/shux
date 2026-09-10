@@ -55,6 +55,43 @@ describe("WorktreeRuntime workspacePath override", () => {
     expect(ready.ready).toBe(true);
   });
 
+  it("executes the init hook from the persisted workspace checkout", async () => {
+    const srcBaseDir = path.join(rootDir, "src");
+    const projectPath = path.join(rootDir, "repo");
+    const workspacePath = path.join(rootDir, "branch-checkout");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(path.join(projectPath, ".xum", "init"), "#!/bin/sh\necho primary\n", {
+      mode: 0o755,
+    });
+    await fs.mkdir(path.join(workspacePath, ".mux"), { recursive: true });
+    await fs.writeFile(path.join(workspacePath, ".mux", "init"), "#!/bin/sh\necho target\n", {
+      mode: 0o755,
+    });
+
+    const stdout: string[] = [];
+    const runtime = new WorktreeRuntime(srcBaseDir, {
+      projectPath,
+      workspaceName: "feature",
+      workspacePath,
+    });
+    const result = await runtime.initWorkspace({
+      projectPath,
+      workspacePath,
+      branchName: "feature",
+      trunkBranch: "main",
+      trusted: true,
+      initLogger: {
+        logStep: () => undefined,
+        logStdout: (line) => stdout.push(line),
+        logStderr: () => undefined,
+        logComplete: () => undefined,
+      },
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(stdout).toEqual(["target"]);
+  });
+
   it("reports not-ready without an override when the derived path does not exist", async () => {
     const srcBaseDir = path.join(rootDir, "src");
     const projectPath = path.join(rootDir, "repo");

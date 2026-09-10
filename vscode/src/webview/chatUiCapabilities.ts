@@ -1,4 +1,4 @@
-import type { ChatUiFeatureId, ChatUiSupport } from "mux/common/constants/chatUiFeatures";
+import type { ChatUiFeatureId, ChatUiSupport } from "xum/common/constants/chatUiFeatures";
 
 export const VSCODE_CHAT_UI_SUPPORT = {
   messageEditing: "planned",

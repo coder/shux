@@ -7,6 +7,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { MCPStdioServerInfo } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { Config } from "@/node/config";
+import { MCPConfigService } from "@/node/services/mcpConfigService";
+import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { createTestPluginInstallEntry } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -68,7 +72,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(diagnostics).toEqual([]);
     const instanceId = computePluginInstanceId(plugin.rootPath);
@@ -114,7 +118,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(diagnostics).toEqual([]);
     const values = Object.values(servers);
@@ -136,7 +140,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(Object.values(servers)).toHaveLength(1);
     expect(diagnostics).toHaveLength(1);
@@ -167,7 +171,7 @@ describe("loadPluginMcpServers", () => {
 
     for (const [index, testCase] of cases.entries()) {
       const plugin = await makePlugin(tmp.path, `bad-${index}`, testCase.doc);
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
       expect(servers).toEqual({});
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0].severity).toBe("error");
@@ -175,10 +179,53 @@ describe("loadPluginMcpServers", () => {
     }
   });
 
+  test("disables MCP for the plugin on an oversized mcp.json", async () => {
+    // Server summaries built from mcp.json reach the install consent
+    // preview's IPC/render path: an unbounded document must disable MCP for
+    // this plugin instead of shipping megabytes of text to the renderer.
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const oversized = JSON.stringify({
+      $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+      mcpServers: {
+        big: { type: "stdio", command: "bunx", args: ["x".repeat(512 * 1024)] },
+      },
+    });
+    const plugin = await makePlugin(tmp.path, "oversized", oversized);
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(servers).toEqual({});
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].severity).toBe("error");
+    expect(diagnostics[0].message).toContain("too large");
+  });
+
+  test("disables MCP when mcp.json is a symlink escaping the plugin root", async () => {
+    // A managed update can replace a consented regular mcp.json with an
+    // absolute symlink to attacker-chosen content outside the plugin root
+    // (staged validation only rejects links into the managed container). The
+    // consuming read must refuse to follow it: this document defines
+    // spawnable commands, so following the link would let outside config be
+    // parsed and its command spawned during the promotion race.
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const outside = path.join(tmp.path, "outside-mcp.json");
+    await fs.writeFile(
+      outside,
+      JSON.stringify(mcpDoc({ evil: { type: "stdio", command: "sh" } })),
+      "utf8"
+    );
+    const plugin = await makePlugin(tmp.path, "symlinked", mcpDoc({}));
+    await fs.rm(plugin.mcpConfigPath!);
+    await fs.symlink(outside, plugin.mcpConfigPath!);
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(servers).toEqual({});
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].severity).toBe("error");
+    expect(diagnostics[0].message).toContain("outside containment root");
+  });
+
   test("an empty mcpServers object is valid", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(tmp.path, "empty", mcpDoc({}));
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
     expect(servers).toEqual({});
     expect(diagnostics).toEqual([]);
   });
@@ -197,7 +244,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     const instanceId = computePluginInstanceId(plugin.rootPath);
     expect(Object.keys(servers)).toEqual([buildPluginServerKey(instanceId, "good")]);
@@ -212,7 +259,7 @@ describe("loadPluginMcpServers", () => {
         `cmd-${Buffer.from(command).toString("hex")}`,
         mcpDoc({ srv: { type: "stdio", command } })
       );
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain("executable token");
     }
@@ -232,7 +279,7 @@ describe("loadPluginMcpServers", () => {
       mode: 0o755,
     });
 
-    const { servers } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     const info = Object.values(servers)[0] as MCPStdioServerInfo;
     expect(info.command).toBe(path.join(plugin.rootPath, "bin", "tool"));
@@ -246,7 +293,7 @@ describe("loadPluginMcpServers", () => {
       "missing-cmd",
       mcpDoc({ srv: { type: "stdio", command: "./bin/nope" } })
     );
-    const missingResult = await loadPluginMcpServers(missing, { muxHome: tmp.path });
+    const missingResult = await loadPluginMcpServers(missing, { xumHome: tmp.path });
     expect(missingResult.servers).toEqual({});
     expect(missingResult.diagnostics[0].message).toContain("does not exist");
 
@@ -258,7 +305,7 @@ describe("loadPluginMcpServers", () => {
       mcpDoc({ srv: { type: "stdio", command: "./tool" } })
     );
     await fs.symlink(outside, path.join(escaping.rootPath, "tool"));
-    const escapeResult = await loadPluginMcpServers(escaping, { muxHome: tmp.path });
+    const escapeResult = await loadPluginMcpServers(escaping, { xumHome: tmp.path });
     expect(escapeResult.servers).toEqual({});
     expect(escapeResult.diagnostics[0].message).toContain("outside the plugin root");
   });
@@ -272,7 +319,7 @@ describe("loadPluginMcpServers", () => {
     );
     await fs.mkdir(path.join(plugin.rootPath, "bin"), { recursive: true });
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(servers).toEqual({});
     expect(diagnostics[0].message).toContain("must be a file");
@@ -287,7 +334,7 @@ describe("loadPluginMcpServers", () => {
         mcpDoc({ srv: { type: "stdio", command } })
       );
 
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain("single executable token");
@@ -308,7 +355,7 @@ describe("loadPluginMcpServers", () => {
         mode: 0o644,
       });
 
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain("not executable");
@@ -327,7 +374,7 @@ describe("loadPluginMcpServers", () => {
     for (const [index, testCase] of cases.entries()) {
       const plugin = await makePlugin(tmp.path, `nul-${index}`, mcpDoc({ srv: testCase.entry }));
 
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain(testCase.expect);
@@ -342,7 +389,7 @@ describe("loadPluginMcpServers", () => {
         `reserved-${key.toLowerCase()}`,
         mcpDoc({ srv: { type: "stdio", command: "x", env: { [key]: "/y" } } })
       );
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain(key);
     }
@@ -363,7 +410,7 @@ describe("loadPluginMcpServers", () => {
     );
     await fs.mkdir(path.join(plugin.rootPath, "sub"), { recursive: true });
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(diagnostics).toEqual([]);
     const instanceId = computePluginInstanceId(plugin.rootPath);
@@ -398,7 +445,7 @@ describe("loadPluginMcpServers", () => {
         `bad-cwd-${index}`,
         mcpDoc({ srv: { type: "stdio", command: "x", cwd: testCase.cwd } })
       );
-      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
       expect(servers).toEqual({});
       expect(diagnostics[0].message).toContain(testCase.messagePart);
     }
@@ -416,7 +463,7 @@ describe("loadPluginMcpServers", () => {
     );
     await fs.writeFile(path.join(plugin.rootPath, "afile"), "not a dir", "utf8");
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(servers).toEqual({});
     expect(diagnostics).toHaveLength(2);
@@ -434,7 +481,7 @@ describe("loadPluginMcpServers", () => {
     await fs.mkdir(dataPath, { recursive: true });
     await fs.writeFile(path.join(dataPath, "blob"), "not a dir", "utf8");
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(servers).toEqual({});
     expect(diagnostics[0].message).toContain("must be a directory");
@@ -451,7 +498,7 @@ describe("loadPluginMcpServers", () => {
     );
     await fs.symlink(outsideDir, path.join(plugin.rootPath, "link"));
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(servers).toEqual({});
     expect(diagnostics[0].message).toContain("escapes");
@@ -474,7 +521,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     const instanceId = computePluginInstanceId(plugin.rootPath);
     const loaded = Object.keys(servers).sort();
@@ -509,7 +556,7 @@ describe("loadPluginMcpServers", () => {
       })
     );
 
-    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     expect(servers).toEqual({});
     expect(diagnostics).toHaveLength(3);
@@ -520,7 +567,7 @@ describe("loadPluginMcpServers", () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(tmp.path, "stable", mcpDoc({ srv: STDIO_ENTRY }));
 
-    const first = await loadPluginMcpServers(plugin, { muxHome: tmp.path });
+    const first = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
     // Simulate a manifest rename + version bump: same root path.
     const renamed: AgentPluginInfo = {
@@ -528,7 +575,7 @@ describe("loadPluginMcpServers", () => {
       name: "renamed-plugin",
       manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "renamed-plugin", version: "2.0" },
     };
-    const second = await loadPluginMcpServers(renamed, { muxHome: tmp.path });
+    const second = await loadPluginMcpServers(renamed, { xumHome: tmp.path });
 
     expect(Object.keys(second.servers)).toEqual(Object.keys(first.servers));
     expect(Object.keys(first.servers)).toHaveLength(1);
@@ -542,8 +589,8 @@ describe("loadPluginMcpServers", () => {
     const a = await makePlugin(path.join(tmp.path, "a"), "same-name", mcpDoc({ srv: STDIO_ENTRY }));
     const b = await makePlugin(path.join(tmp.path, "b"), "same-name", mcpDoc({ srv: STDIO_ENTRY }));
 
-    const resultA = await loadPluginMcpServers(a, { muxHome: tmp.path });
-    const resultB = await loadPluginMcpServers(b, { muxHome: tmp.path });
+    const resultA = await loadPluginMcpServers(a, { xumHome: tmp.path });
+    const resultB = await loadPluginMcpServers(b, { xumHome: tmp.path });
 
     const keyA = Object.keys(resultA.servers)[0];
     const keyB = Object.keys(resultB.servers)[0];
@@ -604,18 +651,150 @@ async function writeDiscoverablePlugin(
 }
 
 describe("createAgentPluginsMcpProvider", () => {
+  test.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "overlapping %s project containers cannot bypass managed MCP imports via overrides (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
+      using home = new DisposableTempDir("plugin-mcp-container-overlap");
+      await withHomeDir(home.path, async () => {
+        const physicalHome = path.join(home.path, metadataDir);
+        const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+        await fs.mkdir(physicalHome, { recursive: true });
+        if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
+        await writeDiscoverablePlugin(
+          path.join(xumHome, "plugins"),
+          "managed",
+          mcpDoc({
+            allowed: STDIO_ENTRY,
+            blocked: STDIO_ENTRY,
+          })
+        );
+        await writeDiscoverablePlugin(
+          path.join(home.path, ".agents", "plugins"),
+          "project-only",
+          mcpDoc({ unmanaged: STDIO_ENTRY })
+        );
+        const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+        const context = { projectRoot: home.path, projectKey: home.path };
+        const unfiltered = await provider({ ...context, trusted: true });
+        const keyFor = (name: string) => {
+          const key = Object.entries(unfiltered).find(
+            ([, info]) => info.plugin?.serverName === name
+          )?.[0];
+          if (key === undefined) throw new Error(`Fixture server ${name} missing`);
+          return key;
+        };
+        const overrides = { enabledServers: Object.keys(unfiltered) };
+        const registryPath = path.join(xumHome, "plugins.json");
+        await fs.writeFile(
+          registryPath,
+          JSON.stringify({
+            plugins: [
+              createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+            ],
+          })
+        );
+        const manager = new MCPServerManager(
+          new MCPConfigService(new Config(xumHome), { agentPluginsMcpProvider: provider })
+        );
+        try {
+          const servers = await manager.listServers(home.path, overrides, true, context);
+          const globalKey = buildPluginServerKey(
+            computePluginInstanceId(path.join(xumHome, "plugins", "managed")),
+            "allowed"
+          );
+          expect(Object.keys(servers).sort()).toEqual(
+            [keyFor("allowed"), keyFor("unmanaged"), ...(aliasHome ? [globalKey] : [])].sort()
+          );
+          const loaded = await provider({ ...context, trusted: true });
+          const physicalProvider = createAgentPluginsMcpProvider({
+            xumHome: physicalHome,
+            isEnabled: () => true,
+          });
+          const physicalKeys = Object.keys(await physicalProvider({ ...context, trusted: true }));
+          expect(Object.keys(loaded).sort()).toEqual(
+            [...physicalKeys, ...(aliasHome ? [globalKey] : [])].sort()
+          );
+          expect(loaded[globalKey]?.plugin?.sourceScope).toBe(aliasHome ? "global" : undefined);
+          expect(
+            Object.values(loaded).some((server) => server.plugin?.serverName === "blocked")
+          ).toBe(false);
+          const global = await provider({ trusted: false });
+          expect(global[globalKey]?.plugin?.serverName).toBe("allowed");
+          expect(loaded[keyFor("allowed")]?.plugin?.sourceScope).toBe("project");
+          expect(loaded[keyFor("blocked")]).toBeUndefined();
+          await fs.writeFile(registryPath, "{");
+          expect(
+            Object.keys(await manager.listServers(home.path, overrides, true, context))
+          ).toEqual([keyFor("unmanaged")]);
+        } finally {
+          manager.dispose();
+        }
+      });
+    }
+  );
+
+  test("an escaped project alias does not discard its distinct valid global MCP registration", async () => {
+    using home = new DisposableTempDir("plugin-provider-outward-home");
+    using project = new DisposableTempDir("plugin-provider-outward-project");
+    await withHomeDir(home.path, async () => {
+      const xumHome = path.join(home.path, "configured");
+      const owner = path.join(xumHome, "plugins");
+      await writeDiscoverablePlugin(
+        owner,
+        "managed",
+        mcpDoc({ allowed: STDIO_ENTRY, blocked: STDIO_ENTRY })
+      );
+      await fs.writeFile(
+        path.join(xumHome, "plugins.json"),
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+          ],
+        })
+      );
+      const projectAlias = path.join(project.path, ".xum", "plugins");
+      await fs.mkdir(path.dirname(projectAlias));
+      await fs.symlink(owner, projectAlias, "dir");
+      const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+      const globalKey = buildPluginServerKey(
+        computePluginInstanceId(path.join(owner, "managed")),
+        "allowed"
+      );
+      const manager = new MCPServerManager(
+        new MCPConfigService(new Config(xumHome), { agentPluginsMcpProvider: provider })
+      );
+      try {
+        const result = await manager.listServers(
+          project.path,
+          { enabledServers: [globalKey] },
+          true,
+          { projectRoot: project.path, projectKey: project.path }
+        );
+        expect(Object.keys(result)).toEqual([globalKey]);
+        expect(result[globalKey].plugin?.sourceScope).toBe("global");
+      } finally {
+        manager.dispose();
+      }
+    });
+  });
+
   test("returns no servers when the experiment is disabled", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
-    using muxHome = new DisposableTempDir("plugin-provider-mux");
+    using xumHome = new DisposableTempDir("plugin-provider-mux");
     await withHomeDir(home.path, async () => {
       await writeDiscoverablePlugin(
-        path.join(muxHome.path, "plugins"),
+        path.join(xumHome.path, "plugins"),
         "demo",
         mcpDoc({ srv: STDIO_ENTRY })
       );
 
       const provider = createAgentPluginsMcpProvider({
-        muxHome: muxHome.path,
+        xumHome: xumHome.path,
         isEnabled: () => false,
       });
       expect(await provider({ trusted: false })).toEqual({});
@@ -624,11 +803,11 @@ describe("createAgentPluginsMcpProvider", () => {
 
   test("discovers global plugin servers and gates project containers on trust", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
-    using muxHome = new DisposableTempDir("plugin-provider-mux");
+    using xumHome = new DisposableTempDir("plugin-provider-mux");
     using project = new DisposableTempDir("plugin-provider-project");
     await withHomeDir(home.path, async () => {
       await writeDiscoverablePlugin(
-        path.join(muxHome.path, "plugins"),
+        path.join(xumHome.path, "plugins"),
         "global-plugin",
         mcpDoc({ srv: STDIO_ENTRY })
       );
@@ -644,7 +823,7 @@ describe("createAgentPluginsMcpProvider", () => {
       );
 
       const provider = createAgentPluginsMcpProvider({
-        muxHome: muxHome.path,
+        xumHome: xumHome.path,
         isEnabled: () => true,
       });
 
@@ -673,20 +852,20 @@ describe("createAgentPluginsMcpProvider", () => {
 
   test("global plugin identity survives symlink retargeting (versioned installs)", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
-    using muxHome = new DisposableTempDir("plugin-provider-mux");
+    using xumHome = new DisposableTempDir("plugin-provider-mux");
     await withHomeDir(home.path, async () => {
       // Versioned install layout: plugins/demo is a symlink an updater
       // retargets from v1 to v2. The realpath changes; identity must not.
-      const versions = path.join(muxHome.path, "versions");
+      const versions = path.join(xumHome.path, "versions");
       await writeDiscoverablePlugin(versions, "v1", mcpDoc({ srv: STDIO_ENTRY }));
       await writeDiscoverablePlugin(versions, "v2", mcpDoc({ srv: STDIO_ENTRY }));
-      const container = path.join(muxHome.path, "plugins");
+      const container = path.join(xumHome.path, "plugins");
       await fs.mkdir(container, { recursive: true });
       const link = path.join(container, "demo");
       await fs.symlink(path.join(versions, "v1"), link);
 
       const provider = createAgentPluginsMcpProvider({
-        muxHome: muxHome.path,
+        xumHome: xumHome.path,
         isEnabled: () => true,
       });
 
@@ -703,14 +882,14 @@ describe("createAgentPluginsMcpProvider", () => {
 
   test("a plugin with broken mcp.json never affects sibling plugins", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
-    using muxHome = new DisposableTempDir("plugin-provider-mux");
+    using xumHome = new DisposableTempDir("plugin-provider-mux");
     await withHomeDir(home.path, async () => {
-      const container = path.join(muxHome.path, "plugins");
+      const container = path.join(xumHome.path, "plugins");
       await writeDiscoverablePlugin(container, "broken", "{ not json");
       await writeDiscoverablePlugin(container, "healthy", mcpDoc({ srv: STDIO_ENTRY }));
 
       const provider = createAgentPluginsMcpProvider({
-        muxHome: muxHome.path,
+        xumHome: xumHome.path,
         isEnabled: () => true,
       });
       const servers = await provider({ trusted: false });
@@ -721,22 +900,25 @@ describe("createAgentPluginsMcpProvider", () => {
 
   test("project plugin keys are stable across checkouts of the same project", async () => {
     using home = new DisposableTempDir("plugin-provider-home");
-    using muxHome = new DisposableTempDir("plugin-provider-mux");
+    using xumHome = new DisposableTempDir("plugin-provider-mux");
     using projectDir = new DisposableTempDir("plugin-provider-checkout-a");
     using worktreeDir = new DisposableTempDir("plugin-provider-checkout-b");
     await withHomeDir(home.path, async () => {
-      // Same plugin at the same repo-relative location in two checkouts
-      // (project checkout + workspace worktree).
-      for (const checkout of [projectDir.path, worktreeDir.path]) {
-        await writeDiscoverablePlugin(
-          path.join(checkout, ".mux", "plugins"),
-          "shared-plugin",
-          mcpDoc({ srv: STDIO_ENTRY })
-        );
-      }
+      // The worktree has already migrated to .xum while the project checkout
+      // still uses .mux; both locations must retain one persisted identity.
+      await writeDiscoverablePlugin(
+        path.join(projectDir.path, ".mux", "plugins"),
+        "shared-plugin",
+        mcpDoc({ srv: STDIO_ENTRY })
+      );
+      await writeDiscoverablePlugin(
+        path.join(worktreeDir.path, ".xum", "plugins"),
+        "shared-plugin",
+        mcpDoc({ srv: STDIO_ENTRY })
+      );
 
       const provider = createAgentPluginsMcpProvider({
-        muxHome: muxHome.path,
+        xumHome: xumHome.path,
         isEnabled: () => true,
       });
 
@@ -761,7 +943,7 @@ describe("createAgentPluginsMcpProvider", () => {
       const projectInfo = Object.values(fromProject)[0] as MCPStdioServerInfo;
       expect(worktreeInfo.env?.PLUGIN_DATA).toBe(projectInfo.env?.PLUGIN_DATA ?? "");
       expect(worktreeInfo.env?.PLUGIN_ROOT).toBe(
-        path.join(await fs.realpath(worktreeDir.path), ".mux", "plugins", "shared-plugin")
+        path.join(await fs.realpath(worktreeDir.path), ".xum", "plugins", "shared-plugin")
       );
       expect(projectInfo.env?.PLUGIN_ROOT).toBe(
         path.join(await fs.realpath(projectDir.path), ".mux", "plugins", "shared-plugin")

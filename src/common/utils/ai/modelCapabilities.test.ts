@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { getModelCapabilities, getSupportedInputMediaTypes } from "./modelCapabilities";
+import {
+  extractModelCapabilities,
+  getModelCapabilities,
+  getSupportedInputMediaTypes,
+} from "./modelCapabilities";
 
 describe("getModelCapabilities", () => {
   it("returns capabilities for known models", () => {
@@ -42,6 +46,15 @@ describe("getModelCapabilities", () => {
     }
   });
 
+  it("reports image-only multimodal input for GLM 5.3 Flash", () => {
+    const caps = getModelCapabilities("zai:glm-5.3-flash");
+
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsVision).toBe(true);
+    expect(caps?.supportsPdfInput).toBe(false);
+    expect(caps?.supportsVideoInput).toBe(false);
+  });
+
   it("infers PDF support for OpenAI vision models when models-extra omits the flag", () => {
     const caps = getModelCapabilities("openai:gpt-5.5");
     expect(caps).not.toBeNull();
@@ -49,11 +62,12 @@ describe("getModelCapabilities", () => {
     expect(caps?.supportsVision).toBe(true);
   });
 
-  it("returns maxPdfSizeMb when present in model metadata", () => {
-    const caps = getModelCapabilities("google:gemini-1.5-flash");
-    expect(caps).not.toBeNull();
-    expect(caps?.supportsPdfInput).toBe(true);
-    expect(caps?.maxPdfSizeMb).toBeGreaterThan(0);
+  it("returns maxPdfSizeMb and infers PDF support when metadata carries the field", () => {
+    // Injected metadata: upstream LiteLLM dropped max_pdf_size_mb, but
+    // models-extra overrides can still supply it.
+    const caps = extractModelCapabilities({ max_pdf_size_mb: 30 });
+    expect(caps.supportsPdfInput).toBe(true);
+    expect(caps.maxPdfSizeMb).toBe(30);
   });
 
   it("returns multimodal capabilities for Gemini 3.5 Flash", () => {

@@ -1,4 +1,5 @@
 import http from "node:http";
+import type net from "node:net";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
@@ -144,7 +145,7 @@ export async function startLoopbackServer(options: LoopbackServerOptions): Promi
       renderOAuthCallbackHtml({
         title: r.success ? "Login complete" : "Login failed",
         message: r.success
-          ? "You can return to Mux. You may now close this tab."
+          ? "You can return to Xum. You may now close this tab."
           : (r.error ?? "Unknown error"),
         success: r.success,
       }));
@@ -252,12 +253,33 @@ export async function startLoopbackServer(options: LoopbackServerOptions): Promi
     deferred.resolve(Ok({ code, state }));
   });
 
+  // Track live connections: `server.close()` only stops accepting and then
+  // waits for existing sockets to DRAIN — any localhost client that opened
+  // the port and left an HTTP request incomplete (port scanners, half-open
+  // probes) would park the close callback forever, pinning the awaited
+  // cancellation RPC (Settings' Cancel) even though the flow itself ended.
+  const openSockets = new Set<net.Socket>();
+  server.on("connection", (socket) => {
+    openSockets.add(socket);
+    socket.once("close", () => openSockets.delete(socket));
+  });
+
   // Ensure pending deferred browser responses are completed before server close,
-  // even when callers close via the raw `server` handle (e.g. OAuthFlowManager).
+  // even when callers close via the raw `server` handle (e.g. OAuthFlowManager),
+  // and bound the shutdown by force-finishing every remaining connection.
   const originalClose = server.close.bind(server);
   server.close = ((callback?: (err?: Error) => void) => {
     sendCancelledResponseIfPending();
-    return originalClose(callback);
+    const result = originalClose(callback);
+    for (const socket of openSockets) {
+      // end() flushes queued response bytes (the cancel/success page written
+      // above) and sends FIN; the finish listener then destroys the socket
+      // regardless of whether the client ever completes its side — undrained
+      // or half-open connections cannot stall the close callback.
+      socket.end();
+      socket.once("finish", () => socket.destroy());
+    }
+    return result;
   }) as typeof server.close;
 
   // Listen on the specified host/port — mirrors the existing

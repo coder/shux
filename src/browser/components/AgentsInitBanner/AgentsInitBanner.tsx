@@ -23,7 +23,7 @@ export function AgentsInitBanner(props: AgentsInitBannerProps) {
         <span className="text-muted-foreground text-xs">
           Add or improve an{" "}
           <code className="bg-bg-dark-hover rounded px-1 font-mono">AGENTS.md</code>
-          so Mux learns your repo’s commands, conventions, and constraints.
+          so Xum learns your repo’s commands, conventions, and constraints.
         </span>
       </div>
 

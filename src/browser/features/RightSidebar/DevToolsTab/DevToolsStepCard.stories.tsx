@@ -66,7 +66,7 @@ const debugStep: DevToolsStep = {
       parameters: { type: "object", properties: { query: { type: "string" } } },
     })),
     prompt: [
-      { role: "system", content: "You are Mux." },
+      { role: "system", content: "You are Xum." },
       { role: "user", content: "Find the latest information about evaluations." },
       { role: "assistant", content: "I will search the web and summarize the results." },
       {

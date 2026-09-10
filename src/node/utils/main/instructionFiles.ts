@@ -6,8 +6,12 @@ import {
   type InstructionScope,
   type InstructionSet,
 } from "@/common/types/instructions";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
+
+export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
+const CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME = "CLAUDE.md";
 
 const MARKDOWN_COMMENT_REGEX = /<!--[\s\S]*?-->/g;
 
@@ -30,15 +34,10 @@ const INSTRUCTION_FILE_NAMES = ["AGENTS.md", "AGENT.md", "CLAUDE.md"] as const;
 const LOCAL_INSTRUCTION_FILENAME = "AGENTS.local.md";
 
 /**
- * Mux-dedicated instruction subdirectory. `<dir>/.mux/AGENTS.md` (plus an
- * optional `<dir>/.mux/AGENTS.local.md`) is read in addition to the shared
- * base files. Because only Mux reads files under `.mux/`, this is where scoped
- * `Model:`/`Mode:` directives live — keeping them out of the shared AGENTS.md
- * that non-Mux agents also consume. Only the `AGENTS.md` name is supported
- * here (no AGENT.md/CLAUDE.md fallback; those exist for other tools' sake).
+ * Xum-only AGENTS.md companions carry scoped directives without exposing them
+ * to other agents that consume the shared instruction files.
  */
-const MUX_INSTRUCTION_SUBDIR = ".mux";
-const MUX_INSTRUCTION_FILENAME = "AGENTS.md";
+const XUM_INSTRUCTION_FILENAME = "AGENTS.md";
 
 /**
  * File reader abstraction for reading files from either local fs or Runtime.
@@ -75,7 +74,7 @@ async function readSingleFile(
   scope: InstructionScope,
   isLocal: boolean,
   projectName: string | undefined,
-  muxOnly: boolean
+  xumOnly: boolean
 ): Promise<ReadInstructionFileResult> {
   let raw: string;
   try {
@@ -91,7 +90,7 @@ async function readSingleFile(
       path: path.join(directory, filename),
       filename,
       isLocal,
-      muxOnly,
+      xumOnly,
       scope,
       projectName: projectName ?? null,
       content: sanitized,
@@ -107,7 +106,7 @@ async function readBaseInstructionFile(
   directory: string,
   scope: InstructionScope,
   projectName: string | undefined,
-  muxOnly: boolean
+  xumOnly: boolean
 ): Promise<ReadInstructionFileResult> {
   for (const filename of INSTRUCTION_FILE_NAMES) {
     const result = await readSingleFile(
@@ -117,7 +116,7 @@ async function readBaseInstructionFile(
       scope,
       false,
       projectName,
-      muxOnly
+      xumOnly
     );
     // Existence, not post-comment content, decides base-file priority. This
     // preserves the historical behavior where an AGENTS.md containing only
@@ -142,9 +141,9 @@ async function readInstructionSetWith(
   scope: InstructionScope,
   projectName?: string
 ): Promise<InstructionSet | null> {
-  // The global set lives inside the Mux home itself (~/.mux/AGENTS.md), so its
-  // files are Mux-dedicated by construction — scoped Model:/Mode: directives
-  // are honored there and we must not look for a nested ~/.mux/.mux/AGENTS.md.
+  // The global set lives inside the Xum home itself (~/.xum/AGENTS.md), so its
+  // files are Xum-dedicated by construction — scoped Model:/Mode: directives
+  // are honored there and we must not look for a nested ~/.xum/.xum/AGENTS.md.
   const isGlobalScope = scope === INSTRUCTION_SCOPE.GLOBAL;
 
   const base = await readBaseInstructionFile(reader, directory, scope, projectName, isGlobalScope);
@@ -161,42 +160,43 @@ async function readInstructionSetWith(
       )
     : ({ exists: false } satisfies ReadInstructionFileResult);
 
-  // Mux-dedicated companion: <dir>/.mux/AGENTS.md (+ .local.md). Read
-  // independently of the shared base file so a repo can provide only
-  // Mux-specific instructions. Skipped for the global set (see above).
-  let muxBase: ReadInstructionFileResult = { exists: false };
-  let muxLocal: ReadInstructionFileResult = { exists: false };
+  // Read one Xum-dedicated companion tree, preferring .xum and falling back
+  // to the legacy .mux name. Never combine both trees.
+  let dedicatedBase: ReadInstructionFileResult = { exists: false };
+  let dedicatedLocal: ReadInstructionFileResult = { exists: false };
   if (!isGlobalScope) {
-    const muxDirectory = path.join(directory, MUX_INSTRUCTION_SUBDIR);
-    muxBase = await readSingleFile(
-      reader,
-      muxDirectory,
-      MUX_INSTRUCTION_FILENAME,
-      scope,
-      false,
-      projectName,
-      true
-    );
-    if (muxBase.exists) {
-      muxLocal = await readSingleFile(
+    for (const relativeDirectory of listProjectMetadataRelativePaths("")) {
+      const dedicatedDirectory = path.join(directory, relativeDirectory);
+      dedicatedBase = await readSingleFile(
         reader,
-        muxDirectory,
+        dedicatedDirectory,
+        XUM_INSTRUCTION_FILENAME,
+        scope,
+        false,
+        projectName,
+        true
+      );
+      if (!dedicatedBase.exists) continue;
+      dedicatedLocal = await readSingleFile(
+        reader,
+        dedicatedDirectory,
         LOCAL_INSTRUCTION_FILENAME,
         scope,
         true,
         projectName,
         true
       );
+      break;
     }
   }
 
-  if (!base.exists && !muxBase.exists) return null;
+  if (!base.exists && !dedicatedBase.exists) return null;
 
   const files: InstructionFile[] = [
     base.exists ? base.file : null,
     local.exists ? local.file : null,
-    muxBase.exists ? muxBase.file : null,
-    muxLocal.exists ? muxLocal.file : null,
+    dedicatedBase.exists ? dedicatedBase.file : null,
+    dedicatedLocal.exists ? dedicatedLocal.file : null,
   ].filter((file): file is InstructionFile => file != null);
   if (files.length === 0) return null;
 
@@ -241,6 +241,35 @@ export async function readInstructionSet(
 }
 
 /**
+ * Read Claude Code's host-global instruction file as a lowest-precedence,
+ * read-only compatibility source. Only CLAUDE.md is supported here so native
+ * Xum candidate and local-file semantics never leak into ~/.claude.
+ */
+export async function readClaudeCompatGlobalInstructionSet(
+  directory: string
+): Promise<InstructionSet | null> {
+  const resolvedDirectory = path.resolve(directory);
+  const result = await readSingleFile(
+    createLocalFileReader(),
+    resolvedDirectory,
+    CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME,
+    INSTRUCTION_SCOPE.GLOBAL,
+    false,
+    undefined,
+    false
+  );
+  if (!result.exists || !result.file) return null;
+
+  return {
+    scope: INSTRUCTION_SCOPE.GLOBAL,
+    projectName: null,
+    directory: resolvedDirectory,
+    files: [result.file],
+    combinedContent: result.file.content,
+  };
+}
+
+/**
  * Read an instruction set from a workspace using the Runtime abstraction.
  * Supports both local and remote (SSH/Docker/devcontainer) workspaces.
  *
@@ -265,7 +294,7 @@ export async function readInstructionSetFromRuntime(
  * All found instruction sets are returned as separate entries.
  *
  * This allows for layered instructions where:
- * - Global instructions (~/.mux/AGENTS.md) apply to all projects
+ * - Global instructions (~/.xum/AGENTS.md) apply to all projects
  * - Project instructions (workspace/AGENTS.md) add project-specific context
  *
  * @param directories - List of (directory, scope, projectName?) tuples in priority order

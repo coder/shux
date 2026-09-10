@@ -443,6 +443,52 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
+  it("strips deprecated sampling parameters for Gemini 3.7 Flash", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.7-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 32768,
+      },
+    });
+  });
+
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    const result = resolveModelParameterOverrides(
+      providersConfig,
+      "google",
+      "google:gemini-3.8-flash"
+    );
+
+    expect(result).toEqual({
+      standard: {
+        maxOutputTokens: 32768,
+      },
+    });
+  });
+
   it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {
     const providersConfig = withGoogleModelParameters({
       "gemini-3.5-flash-lite": {
@@ -474,8 +520,8 @@ describe("resolveModelParameterOverrides", () => {
     const result = resolveModelParameterOverrides(
       providersConfig,
       "google",
-      "google:gemini-3.6-flash",
-      "mux-gateway:google/gemini-3.6-flash"
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash"
     );
 
     expect(result).toEqual({ standard: {} });
@@ -484,7 +530,7 @@ describe("resolveModelParameterOverrides", () => {
   it("strips sampling parameters for custom entries mapped to a sampling-rejecting model", () => {
     const providersConfig = asProvidersConfig({
       google: {
-        models: [{ id: "team-flash", mappedToModel: "google:gemini-3.6-flash" }],
+        models: [{ id: "team-flash", mappedToModel: "google:gemini-3.8-flash" }],
         modelParameters: {
           "*": {
             temperature: 0.7,

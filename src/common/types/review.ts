@@ -288,20 +288,19 @@ export function parseReviewLineRange(lineRange: string): ParsedReviewLineRange |
 /**
  * Normalize a plan file path for cross-platform matching.
  *
- * Converts Windows separators and strips absolute mux-home prefixes so callers can
- * compare only the stable ".mux/plans/..." suffix.
+ * Converts Windows separators and strips canonical or legacy home prefixes. The
+ * normalized `.mux/plans/...` suffix is intentionally retained as a serialized
+ * compatibility shape for older review transcripts.
  *
- * Accepts any absolute path containing `/.mux/plans/`, `/.mux-<suffix>/plans/`,
- * or `/var/mux/plans/`. Also accepts tilde-prefixed paths like
- * `~/.mux/plans/...` and
- * `~/.mux-<suffix>/plans/...` from legacy transcripts.
+ * Accepts `/.xum/plans/`, legacy `/.mux/plans/`, suffixed development homes,
+ * Docker `/var/mux/plans/`, and their tilde-prefixed equivalents.
  */
 export function normalizePlanFilePath(filePath: string): string | null {
   if (!filePath) return null;
 
   const normalized = filePath.replace(/\\/g, "/");
 
-  const tildeMatch = /^~\/\.mux(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
+  const tildeMatch = /^~\/\.(?:xum|mux)(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
   if (tildeMatch?.[1]) {
     return `.mux/plans/${tildeMatch[1]}`;
   }
@@ -317,9 +316,9 @@ export function normalizePlanFilePath(filePath: string): string | null {
   const isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized);
   if (!isAbsolute) return null;
 
-  const muxHomeMatch = /\/\.mux(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
-  if (muxHomeMatch?.[1]) {
-    return `.mux/plans/${muxHomeMatch[1]}`;
+  const xumHomeMatch = /\/\.(?:xum|mux)(?:-[^/]+)?\/plans\/(.+)/.exec(normalized);
+  if (xumHomeMatch?.[1]) {
+    return `.mux/plans/${xumHomeMatch[1]}`;
   }
 
   const dockerMatch = /\/var\/mux\/plans\/(.+)/.exec(normalized);

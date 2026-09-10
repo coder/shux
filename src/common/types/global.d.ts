@@ -1,6 +1,7 @@
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
-import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
+import type { DeepLinkPayload } from "@/common/types/deepLink";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 declare global {
   interface WindowApi {
@@ -32,9 +33,11 @@ declare global {
     // Returns an unsubscribe function.
     onNotificationClicked?: (callback: (data: { workspaceId: string }) => void) => () => void;
     // Consume any mux:// deep links received before the renderer subscribed.
-    consumePendingDeepLinks?: () => MuxDeepLinkPayload[];
+    consumePendingDeepLinks?: () => DeepLinkPayload[];
     // Subscribe to mux:// deep links as they arrive. Returns an unsubscribe function.
-    onDeepLink?: (callback: (payload: MuxDeepLinkPayload) => void) => () => void;
+    onDeepLink?: (callback: (payload: DeepLinkPayload) => void) => () => void;
+    // Only the local desktop renderer can control remote windows.
+    remoteConnection?: RemoteConnectionApi;
     // Optional ORPC-backed API surfaces populated in tests/storybook mocks
     tokenizer?: unknown;
     providers?: unknown;

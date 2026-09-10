@@ -140,7 +140,7 @@ function validateSlotKeybindOverride(params: {
 
   for (const core of Object.values(KEYBINDS)) {
     if (keybindConflicts(params.keybind, core)) {
-      return `Conflicts with an existing mux shortcut (${formatKeybind(core)}).`;
+      return `Conflicts with an existing xum shortcut (${formatKeybind(core)}).`;
     }
   }
 

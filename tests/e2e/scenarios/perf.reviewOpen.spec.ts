@@ -1,5 +1,6 @@
 import { type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
@@ -10,7 +11,7 @@ import {
 } from "../utils/perfProfile";
 import { disableReviewTutorial, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
 async function waitForRegularReviewReady(page: Page, hunkCount: number): Promise<void> {
   const reviewPanel = page.getByTestId("review-panel");
@@ -28,7 +29,7 @@ test.skip(
 );
 
 test.describe("regular review performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: reopen regular review for a large diff", async ({
     page,

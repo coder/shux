@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Updates the flake offline cache outputHash marker in flake.nix using the
-# replacement hash reported by `nix build .#mux`. In `--check` mode, it writes
+# replacement hash reported by `nix build .#xum`. In `--check` mode, it writes
 # the expected result to a temp file, shows a diff, and exits non-zero on drift.
 
 set -euo pipefail
@@ -32,11 +32,11 @@ fi
 
 # Some environments (including CI/sandboxes) have a read-only ~/.cache.
 # Point Nix cache writes to a writable location so hash refresh still works.
-tmp_root="${TMPDIR:-/tmp}/mux-nix-cache"
+tmp_root="${TMPDIR:-/tmp}/xum-nix-cache"
 mkdir -p "$tmp_root"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$tmp_root}"
 
-hash_marker="mux-offline-cache-hash"
+hash_marker="xum-offline-cache-hash"
 
 current_hash="$(sed -nE "s/^[[:space:]]*outputHash = \"(sha256-[^\"]+)\";[[:space:]]*# ${hash_marker}$/\\1/p" "$flake_path" | head -n1)"
 if [ -z "$current_hash" ]; then
@@ -46,12 +46,12 @@ fi
 
 echo "Checking flake output hash..."
 set +e
-build_output="$(nix build .#mux --no-link 2>&1)"
+build_output="$(nix build .#xum --no-link 2>&1)"
 build_status=$?
 set -e
 
 if [ "$build_status" -ne 0 ] && printf '%s\n' "$build_output" | grep -Fq "fetcher-cache-v4.sqlite"; then
-  retry_root="$(mktemp -d "${TMPDIR:-/tmp}/mux-nix-home.XXXXXX")"
+  retry_root="$(mktemp -d "${TMPDIR:-/tmp}/xum-nix-home.XXXXXX")"
   mkdir -p "$retry_root/.cache"
 
   set +e
@@ -59,7 +59,7 @@ if [ "$build_status" -ne 0 ] && printf '%s\n' "$build_output" | grep -Fq "fetche
     HOME="$retry_root" \
       XDG_CACHE_HOME="$retry_root/.cache" \
       NIX_CONFIG="use-xdg-base-directories = true" \
-      nix build .#mux --no-link 2>&1
+      nix build .#xum --no-link 2>&1
   )"
   build_status=$?
   set -e
@@ -131,4 +131,4 @@ trap - EXIT
 echo "Updated outputHash:"
 echo "  old: $current_hash"
 echo "  new: $new_hash"
-echo "Run: nix build .#mux --no-link"
+echo "Run: nix build .#xum --no-link"

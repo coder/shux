@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { buildSystemMessage, extractToolInstructions, readToolInstructions } from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectConfig } from "@/common/types/project";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 
 const extractTagContent = (message: string, tagName: string): string | null => {
@@ -168,7 +169,7 @@ describe("buildSystemMessage", () => {
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(globalDir, { recursive: true });
 
-    // Mock homedir to return our test directory (getSystemDirectory will append .mux)
+    // Mock homedir to return our test directory (getXumHome will append .mux)
     mockHomedir = spyOn(os, "homedir");
     mockHomedir.mockReturnValue(tempDir);
 
@@ -252,6 +253,151 @@ Use clear examples.
     expect(customInstructions).toContain("Use clear examples.");
   });
 
+  describe("Claude global instruction compatibility", () => {
+    const metadata = (): WorkspaceMetadata => ({
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    });
+
+    const buildWithCompat = (modelString?: string, modes?: readonly string[]): Promise<string> =>
+      buildSystemMessage(metadata(), runtime, workspaceDir, undefined, modelString, undefined, {
+        claudeSkillsCompatEnabled: true,
+        modes,
+      });
+
+    test("includes Claude instructions when compatibility is enabled", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+
+      const customInstructions = extractTagContent(await buildWithCompat(), "custom-instructions");
+
+      expect(customInstructions).toContain("Claude global guidance.");
+    });
+
+    test("layers Claude instructions before native global instructions", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+      await fs.writeFile(path.join(globalDir, "AGENTS.md"), "Native global guidance.");
+
+      const customInstructions = extractTagContent(await buildWithCompat(), "custom-instructions");
+
+      expect(customInstructions).not.toBeNull();
+      expect(customInstructions?.indexOf("Claude global guidance.")).toBeLessThan(
+        customInstructions?.indexOf("Native global guidance.") ?? -1
+      );
+    });
+
+    test("does not read Claude instructions when compatibility is disabled", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+
+      const systemMessage = await buildSystemMessage(metadata(), runtime, workspaceDir);
+
+      expect(systemMessage).not.toContain("Claude global guidance.");
+    });
+
+    test("keeps Claude Model and Mode headings unscoped while native globals remain scoped", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        `Claude general guidance.
+## Model: sonnet
+Claude model guidance stays shared.
+## Mode: plan
+Claude mode guidance stays shared.
+`
+      );
+      await fs.writeFile(
+        path.join(globalDir, "AGENTS.md"),
+        `Native general guidance.
+## Model: sonnet
+Native model guidance is scoped.
+## Mode: plan
+Native mode guidance is scoped.
+`
+      );
+
+      const systemMessage = await buildWithCompat("anthropic:claude-3.5-sonnet", ["plan"]);
+      const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
+      const modelInstructions =
+        extractTagContent(systemMessage, "model-anthropic-claude-3-5-sonnet") ?? "";
+      const modeInstructions = extractTagContent(systemMessage, "mode-plan") ?? "";
+
+      expect(customInstructions).toContain("Claude model guidance stays shared.");
+      expect(customInstructions).toContain("Claude mode guidance stays shared.");
+      expect(customInstructions).not.toContain("Native model guidance is scoped.");
+      expect(customInstructions).not.toContain("Native mode guidance is scoped.");
+      expect(modelInstructions).toContain("Native model guidance is scoped.");
+      expect(modelInstructions).not.toContain("Claude model guidance stays shared.");
+      expect(modeInstructions).toContain("Native mode guidance is scoped.");
+      expect(modeInstructions).not.toContain("Claude mode guidance stays shared.");
+    });
+
+    test("leaves the prompt unchanged when the Claude directory is missing", async () => {
+      const withoutCompat = await buildSystemMessage(metadata(), runtime, workspaceDir);
+      const withCompat = await buildWithCompat();
+
+      expect(withCompat).toBe(withoutCompat);
+    });
+
+    test("includes Tool sections from Claude global instructions", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        "## Tool: bash\nUse the Claude-compatible shell guidance.\n"
+      );
+
+      const toolInstructions = await readToolInstructions(
+        metadata(),
+        runtime,
+        workspaceDir,
+        "anthropic:claude-sonnet-4-20250514",
+        undefined,
+        undefined,
+        true
+      );
+
+      expect(toolInstructions.bash).toBe("Use the Claude-compatible shell guidance.");
+    });
+
+    test("joins native global Tool sections before Claude compat Tool sections", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        "## Tool: bash\nClaude compat shell guidance.\n"
+      );
+      await fs.writeFile(
+        path.join(globalDir, "AGENTS.md"),
+        "## Tool: bash\nNative shell guidance.\n"
+      );
+
+      const toolInstructions = await readToolInstructions(
+        metadata(),
+        runtime,
+        workspaceDir,
+        "anthropic:claude-sonnet-4-20250514",
+        undefined,
+        undefined,
+        true
+      );
+
+      // Tool extraction is highest-precedence first, so native global guidance
+      // must precede the compat source even though the prompt orders compat first.
+      expect(toolInstructions.bash).toBe(
+        ["Native shell guidance.", "Claude compat shell guidance."].join("\n\n")
+      );
+    });
+  });
+
   test("includes parent project AGENTS.md alongside sub-project AGENTS.md when subProjectPath is set", async () => {
     // Regression: the prompt builder previously read `workspacePath` (the
     // execution path = workspace_root + subProjectRelativePath) as if it were
@@ -319,6 +465,135 @@ Include the secondary project context too.
     const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
     expect(customInstructions).toContain("Use the primary project context.");
     expect(customInstructions).toContain("Include the secondary project context too.");
+  });
+
+  describe("project customInstructions from config", () => {
+    const singleProjectMetadata = (projectPath: string): WorkspaceMetadata => ({
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    });
+
+    test("appends only the workspace's own project instructions", async () => {
+      const projectConfigs = new Map<string, ProjectConfig>([
+        [projectDir, { workspaces: [], customInstructions: "Never touch the legacy folder." }],
+        [
+          path.join(tempDir, "other-project"),
+          { workspaces: [], customInstructions: "Unrelated project guidance." },
+        ],
+      ]);
+
+      const systemMessage = await buildSystemMessage(
+        singleProjectMetadata(projectDir),
+        runtime,
+        workspaceDir,
+        undefined,
+        undefined,
+        undefined,
+        { projectConfigs }
+      );
+
+      const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
+      expect(customInstructions).toContain("Never touch the legacy folder.");
+      expect(customInstructions).not.toContain("Unrelated project guidance.");
+    });
+
+    test("skips blank customInstructions", async () => {
+      const projectConfigs = new Map<string, ProjectConfig>([
+        [projectDir, { workspaces: [], customInstructions: "   \n\t" }],
+      ]);
+
+      const systemMessage = await buildSystemMessage(
+        singleProjectMetadata(projectDir),
+        runtime,
+        workspaceDir,
+        undefined,
+        undefined,
+        undefined,
+        { projectConfigs }
+      );
+
+      expect(systemMessage).not.toContain("<custom-instructions>");
+    });
+
+    test("survives malformed non-string customInstructions in config.json", async () => {
+      // config.json is hand-editable and loaded without schema validation; a
+      // malformed value must be skipped, not brick every send from the project.
+      const projectConfigs = new Map<string, ProjectConfig>([
+        [projectDir, { workspaces: [], customInstructions: 42 } as unknown as ProjectConfig],
+      ]);
+
+      const systemMessage = await buildSystemMessage(
+        singleProjectMetadata(projectDir),
+        runtime,
+        workspaceDir,
+        undefined,
+        undefined,
+        undefined,
+        { projectConfigs }
+      );
+
+      expect(systemMessage).not.toContain("<custom-instructions>");
+    });
+
+    test("includes customInstructions from every project in a multi-project workspace", async () => {
+      const { metadata } = await createMultiProjectFixture();
+      const projectConfigs = new Map<string, ProjectConfig>(
+        (metadata.projects ?? []).map((project, index) => [
+          project.projectPath,
+          { workspaces: [], customInstructions: `Guidance for project number ${index + 1}.` },
+        ])
+      );
+
+      const systemMessage = await buildSystemMessage(
+        metadata,
+        runtime,
+        workspaceDir,
+        undefined,
+        undefined,
+        undefined,
+        { projectConfigs }
+      );
+
+      const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
+      expect(customInstructions).toContain("Guidance for project number 1.");
+      expect(customInstructions).toContain("Guidance for project number 2.");
+    });
+
+    test("honors scoped Model: sections like other Mux-dedicated sources", async () => {
+      const projectConfigs = new Map<string, ProjectConfig>([
+        [
+          projectDir,
+          {
+            workspaces: [],
+            customInstructions: `Unscoped project guidance.
+## Model: sonnet
+Scoped project model guidance.
+`,
+          },
+        ],
+      ]);
+
+      const systemMessage = await buildSystemMessage(
+        singleProjectMetadata(projectDir),
+        runtime,
+        workspaceDir,
+        undefined,
+        "anthropic:claude-3.5-sonnet",
+        undefined,
+        { projectConfigs }
+      );
+
+      const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
+      expect(customInstructions).toContain("Unscoped project guidance.");
+      expect(customInstructions).not.toContain("Scoped project model guidance.");
+
+      const modelSection =
+        extractTagContent(systemMessage, "model-anthropic-claude-3-5-sonnet") ?? "";
+      expect(modelSection).toContain("Scoped project model guidance.");
+    });
   });
 
   test("preserves bash tool instructions from every multi-project context source", async () => {
@@ -398,8 +673,8 @@ Respond to Sonnet tickets in two sentences max.
   });
 
   test("ignores Model sections in shared workspace AGENTS.md (breaking change)", async () => {
-    // Shared AGENTS.md is read by non-Mux agents too, so "Model:" headings
-    // there are no longer parsed as Mux directives — they stay plain markdown
+    // Shared AGENTS.md is read by non-Xum agents too, so "Model:" headings
+    // there are no longer parsed as Xum directives — they stay plain markdown
     // inside <custom-instructions>.
     await fs.writeFile(
       path.join(workspaceDir, "AGENTS.md"),
@@ -800,7 +1075,7 @@ OpenAI-only instructions.
 
     for (const scenario of scopingScenarios) {
       test(scenario.name, async () => {
-        // Scoped Model: sections only activate in Mux-dedicated files.
+        // Scoped Model: sections only activate in Xum-dedicated files.
         await fs.mkdir(path.join(workspaceDir, ".mux"), { recursive: true });
         await fs.writeFile(path.join(workspaceDir, ".mux", "AGENTS.md"), scenario.mdContent);
 

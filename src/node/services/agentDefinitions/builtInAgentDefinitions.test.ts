@@ -30,6 +30,14 @@ describe("built-in agent definitions", () => {
     expect(ids).toContain("plan");
   });
 
+  test("intuition cannot run as an interactive agent or child workspace", () => {
+    const intuition = getBuiltInAgentDefinitions().find((agent) => agent.id === "intuition");
+    expect(intuition?.frontmatter.ui?.hidden).toBe(true);
+    expect(intuition?.frontmatter.subagent?.runnable).toBe(false);
+    expect(intuition?.frontmatter.subagent?.workflow_runnable).not.toBe(true);
+    expect(intuition?.frontmatter.tools?.require).toEqual(["memory_read", "intuition_report"]);
+  });
+
   test("includes desktop built-in with desktop automation safeguards", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
@@ -88,17 +96,17 @@ describe("built-in agent definitions", () => {
     expect(plan?.frontmatter.tools?.remove ?? []).toContain("analytics_query");
   });
 
-  test("workspace lifecycle cleanup is unavailable in plan mode", () => {
+  test("irreversible task removal is unavailable in plan mode", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
 
     const exec = byId.get("exec");
     expect(exec).toBeTruthy();
-    expect(exec?.frontmatter.tools?.remove ?? []).not.toContain("task_workspace_lifecycle");
+    expect(exec?.frontmatter.tools?.remove ?? []).not.toContain("task_remove");
 
     const plan = byId.get("plan");
     expect(plan).toBeTruthy();
-    expect(plan?.frontmatter.tools?.remove ?? []).toContain("task_workspace_lifecycle");
+    expect(plan?.frontmatter.tools?.remove ?? []).toContain("task_remove");
   });
 
   test("task_apply_git_patch is restricted to exec", () => {

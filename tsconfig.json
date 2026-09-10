@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "lib": ["ES2023", "DOM", "ES2022.Intl"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "ES2022.Intl"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",

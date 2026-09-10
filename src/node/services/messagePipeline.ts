@@ -1,5 +1,5 @@
 /**
- * Message pipeline: transforms MuxMessages into provider-ready ModelMessages.
+ * Message pipeline: transforms XumMessages into provider-ready ModelMessages.
  *
  * This module extracts the message preparation pipeline from `streamMessage()`,
  * making the sequential transform steps explicit and testable.
@@ -12,20 +12,19 @@ import { convertToModelMessages, type AssistantModelMessage, type ModelMessage }
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
+import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
+import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
-import type { EditedFileAttachment } from "@/node/services/agentSession";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { Runtime } from "@/node/runtime/Runtime";
-import { injectFileAtMentions } from "./fileAtMentions";
 import {
   transformModelMessages,
   validateAnthropicCompliance,
   injectAgentTransition,
-  injectFileChangeNotifications,
   injectPostCompactionAttachments,
 } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeLegacyToolSearchMessages } from "@/common/utils/tools/toolCatalog";
@@ -44,22 +43,21 @@ export interface PrepareMessagesOptions {
   planContentForTransition?: string;
   /** Plan file path for transition context. */
   planFilePath?: string;
-  /** File-change attachments for notification injection. */
-  changedFileAttachments?: EditedFileAttachment[];
   /** Post-compaction attachments (plan file, loaded skills, edited files). */
   postCompactionAttachments?: PostCompactionAttachment[] | null;
-  /** Runtime for file I/O (used by @file mention injection). */
-  runtime: Runtime;
-  /** Workspace path for file resolution. */
-  workspacePath: string;
-  /** Abort signal for async operations. */
-  abortSignal: AbortSignal;
   /** Canonical provider name for provider-specific transforms. */
   providerForMessages: string;
   /** Thinking level for provider-specific behavior. */
   effectiveThinkingLevel: ThinkingLevel;
   /** Full model string (used for cache control). */
   modelString: string;
+  /**
+   * Providers config for cache-control eligibility: gateway-scoped Coder
+   * strings (coder:<instance>/<model>) resolve their wire protocol from
+   * instance metadata, so Anthropic cache markers apply to custom-named
+   * Anthropic instances too.
+   */
+  providersConfig?: ProvidersConfigMap | null;
   /** Optional Anthropic cache TTL override for prompt caching. */
   anthropicCacheTtl?: AnthropicCacheTtl | null;
   /** Workspace ID (used only for debug logging). */
@@ -69,22 +67,28 @@ export interface PrepareMessagesOptions {
 /**
  * Run the full message preparation pipeline.
  *
- * Transforms pre-filtered `MuxMessage[]` into provider-ready `ModelMessage[]` by:
+ * Transforms pre-filtered `XumMessage[]` into provider-ready `ModelMessage[]` by:
  * 1. Injecting agent-transition context (plan→exec handoff)
- * 2. Injecting file-change notifications
- * 3. Injecting post-compaction attachments
- * 4. Expanding @file mentions into synthetic user messages
- * 5. Redacting heavy tool outputs
- * 6. Sanitizing tool inputs
- * 7. Inlining SVG attachments as text
- * 8. Sanitizing PDF filenames for Anthropic
- * 9. Extracting tool-result media as user message attachments
- * 10. Rewriting data-URI file parts to SDK-safe inline base64
- * 11. Converting to Vercel AI SDK ModelMessage format
- * 12. Self-healing: filtering empty/whitespace assistant messages
- * 13. Applying provider-specific message transforms
- * 14. Applying cache control headers
- * 15. Validating Anthropic compliance (logs warnings only)
+ * 2. Injecting post-compaction attachments
+ * 3. Redacting heavy tool outputs
+ * 4. Sanitizing tool inputs
+ * 5. Inlining SVG attachments as text
+ * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 7. Sanitizing PDF filenames for Anthropic
+ * 8. Extracting tool-result media as user message attachments
+ * 9. Rewriting data-URI file parts to SDK-safe inline base64
+ * 10. Converting to Vercel AI SDK ModelMessage format
+ * 11. Self-healing: filtering empty/whitespace assistant messages
+ * 12. Applying provider-specific message transforms
+ * 13. Applying cache control headers
+ * 14. Validating Anthropic compliance (logs warnings only)
+ *
+ * Log purity: this pipeline never reads live workspace state (disk, file
+ * trackers). File-change notifications and @file mention snapshots are
+ * materialized into chat.jsonl by AgentSession before the request is built,
+ * so replaying the same history always produces the same provider messages.
+ * Old histories that predate send-time @mention materialization simply keep
+ * their @mentions as plain text — they still build, just without file content.
  */
 export async function prepareMessagesForProvider(
   opts: PrepareMessagesOptions
@@ -95,19 +99,16 @@ export async function prepareMessagesForProvider(
     toolNamesForSentinel,
     planContentForTransition,
     planFilePath,
-    changedFileAttachments,
     postCompactionAttachments,
-    runtime,
-    workspacePath,
-    abortSignal,
     providerForMessages,
     effectiveThinkingLevel,
     modelString,
+    providersConfig,
     anthropicCacheTtl,
     workspaceId,
   } = opts;
 
-  // --- MuxMessage-level transforms ---
+  // --- XumMessage-level transforms ---
 
   // Inject agent transition context with plan content (for plan→exec handoff)
   const messagesWithAgentContext = injectAgentTransition(
@@ -118,29 +119,15 @@ export async function prepareMessagesForProvider(
     planContentForTransition ? planFilePath : undefined
   );
 
-  // Inject file change notifications as user messages (preserves system message cache)
-  const messagesWithFileChanges = injectFileChangeNotifications(
-    messagesWithAgentContext,
-    changedFileAttachments
-  );
-
   // Inject post-compaction attachments (plan file, loaded skills, edited files) after compaction summary
   const messagesWithPostCompaction = injectPostCompactionAttachments(
-    messagesWithFileChanges,
+    messagesWithAgentContext,
     postCompactionAttachments
   );
 
-  // Expand @file mentions (e.g. @src/foo.ts#L1-20) into in-memory synthetic user messages.
-  // Keeps chat history clean while giving the model immediate file context.
-  const messagesWithFileAtMentions = await injectFileAtMentions(messagesWithPostCompaction, {
-    runtime,
-    workspacePath,
-    abortSignal,
-  });
-
   // Apply centralized tool-output redaction BEFORE converting to provider ModelMessages.
   // Keeps the persisted/UI history intact while trimming heavy fields for the request.
-  const redactedForProvider = applyToolOutputRedaction(messagesWithFileAtMentions);
+  const redactedForProvider = applyToolOutputRedaction(messagesWithPostCompaction);
   log.debug_obj(`${workspaceId}/2a_redacted_messages.json`, redactedForProvider);
 
   // Sanitize tool inputs to ensure they are valid objects (not strings or arrays).
@@ -153,12 +140,17 @@ export async function prepareMessagesForProvider(
   // Request-only — does not mutate persisted history.
   const messagesWithInlinedSvg = inlineSvgAsTextForProvider(sanitizedMessages);
 
+  // Rewrite user-typed <mux_agent_message> lookalikes so only server-authored peer envelopes
+  // reach the provider with the exact wrapper (pasted envelopes keep user authority).
+  const messagesWithNeutralizedEnvelopes =
+    neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
+
   // Sanitize PDF filenames for Anthropic (request-only, preserves original in UI/history).
   // Anthropic rejects document names containing periods, underscores, etc.
   const messagesWithSanitizedPdf =
     providerForMessages === "anthropic"
-      ? sanitizeAnthropicPdfFilenames(messagesWithInlinedSvg)
-      : messagesWithInlinedSvg;
+      ? sanitizeAnthropicPdfFilenames(messagesWithNeutralizedEnvelopes)
+      : messagesWithNeutralizedEnvelopes;
 
   // Rewrite supported tool-result attachments to small text placeholders + file parts.
   // Prevents providers from treating large base64 payloads as text/JSON context.
@@ -172,11 +164,15 @@ export async function prepareMessagesForProvider(
     messagesWithToolMediaExtracted
   );
 
+  // Mirror persisted reasoning replay data (signatures, encrypted reasoning) into
+  // providerMetadata, the only field convertToModelMessages forwards to the request.
+  const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
+
   // --- Convert to ModelMessage format ---
 
-  // Type assertion needed because MuxMessage has custom tool parts for interrupted tools
+  // Type assertion needed because XumMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-  const rawModelMessages = await convertToModelMessages(messagesWithSdkSafeFileParts as any, {
+  const rawModelMessages = await convertToModelMessages(messagesWithReasoningReplay as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,
@@ -197,7 +193,12 @@ export async function prepareMessagesForProvider(
   });
 
   // Apply cache control for Anthropic models AFTER transformation
-  const finalMessages = applyCacheControl(transformedMessages, modelString, anthropicCacheTtl);
+  const finalMessages = applyCacheControl(
+    transformedMessages,
+    modelString,
+    anthropicCacheTtl,
+    providersConfig
+  );
 
   log.debug_obj(`${workspaceId}/3_final_messages.json`, finalMessages);
 

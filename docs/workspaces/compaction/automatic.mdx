@@ -1,19 +1,21 @@
 ---
 title: Automatic Compaction
-description: Let Mux automatically compact your conversations based on usage or idle time
+description: Let Xum automatically compact your conversations based on usage or idle time
 ---
 
-Mux can run `/compact` for you to keep context size manageable. There are two types of automatic compaction:
+Xum can run `/compact` for you to keep context size manageable. There are two types of automatic compaction:
 
 - **Usage-based**: Compacts when your conversation reaches a configurable percentage of the model's context window
 - **Idle-based**: Optionally compacts inactive workspaces after a period of time
 
+The opt-in [token-budget context windows experiment](/workspaces/compaction/token-budget) replaces usage-triggered summaries with fresh windows and on-demand history retrieval. Manual and idle compaction are unchanged.
+
 ## Usage-based auto-compaction
 
-When enabled, Mux monitors your context usage and:
+When enabled, Xum monitors your context usage and:
 
 1. Shows a subtle warning as you approach the threshold (e.g., "Auto-Compact in 12% usage")
-2. When you send your next message **at or above the threshold**, Mux runs compaction first, then automatically sends your message as a follow-up
+2. When you send your next message **at or above the threshold**, Xum runs compaction first, then automatically sends your message as a follow-up
 
 ### Configure the threshold
 
@@ -23,11 +25,11 @@ When enabled, Mux monitors your context usage and:
 - Default is **70%**
 - Set it to **100%** to disable usage-based auto-compaction
 
-Mux caps the enabled threshold at **90%** to leave a safety buffer before hard context limits.
+Xum caps the enabled threshold at **90%** to leave a safety buffer before hard context limits.
 
 ### Force-compaction during streaming
 
-If a single response pushes context usage above your threshold while streaming, Mux may interrupt and compact automatically once you exceed the threshold by an additional buffer (currently **+5%**). After compaction, Mux resumes the conversation automatically.
+If a single response pushes context usage above your threshold while streaming, Xum may interrupt and compact automatically once you exceed the threshold by an additional buffer (currently **+5%**). After compaction, Xum resumes the conversation automatically.
 
 This safety mechanism prevents hitting hard context limits mid-stream.
 
@@ -37,7 +39,7 @@ This safety mechanism prevents hitting hard context limits mid-stream.
 
 Idle-based auto-compaction is **off by default**.
 
-When enabled for a project, Mux periodically checks for workspaces that:
+When enabled for a project, Xum periodically checks for workspaces that:
 
 - Have been inactive for the configured number of hours
 - Are not currently streaming
@@ -78,12 +80,12 @@ Disable idle compaction for this project.
 ### Notes
 
 - The setting is **per project** (applies to all workspaces in the project)
-- Mux checks roughly **once per hour**, so compaction may not trigger immediately when the timer expires
+- Xum checks roughly **once per hour**, so compaction may not trigger immediately when the timer expires
 
 ---
 
 ## General notes
 
 - Auto-compaction uses API tokens (same cost model as `/compact`)
-- Auto-compaction requires known model context limits; if Mux can't determine a model's context window, usage-based auto-compaction won't run
+- Auto-compaction requires known model context limits; if Xum can't determine a model's context window, usage-based auto-compaction won't run
 - Both types of auto-compaction use the same summarization logic as manual `/compact`

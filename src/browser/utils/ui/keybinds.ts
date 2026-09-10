@@ -23,6 +23,7 @@ export function isMac(): boolean {
     interface MinimalAPI {
       platform?: string;
     }
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const api = (window as unknown as { api?: MinimalAPI }).api;
     if (api?.platform != null) {
       return api.platform === "darwin";
@@ -37,6 +38,7 @@ export function isMac(): boolean {
         platform?: string;
       };
     }
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const nav = navigator as unknown as MinimalNavigator;
     const platform = nav.userAgentData?.platform ?? nav.platform ?? nav.userAgent ?? "";
     return /mac|iphone|ipad|ipod/i.test(platform);
@@ -170,6 +172,11 @@ export const TERMINAL_CONTAINER_ATTR = "data-terminal-container";
  * keystrokes instead of having capture/bubble-phase app shortcuts steal them first.
  */
 export const BROWSER_VIEWPORT_ATTR = "data-browser-viewport";
+export const DESKTOP_VIEWPORT_ATTR = "data-desktop-viewport";
+
+export function isDesktopViewportFocused(target: EventTarget | null): boolean {
+  return hasClosestWithAttr(target, DESKTOP_VIEWPORT_ATTR);
+}
 
 /**
  * Data attribute used to opt an element (or one of its ancestors) into allowing Escape
@@ -291,6 +298,9 @@ export function isKeybindDeprecated(keybind: Keybind): boolean {
  * We also like vim keybinds.
  */
 export const KEYBINDS = {
+  /** Copy selected transcript Markdown while its context menu is open. */
+  COPY_MARKDOWN: { key: "m" },
+
   /** Open agent picker (focuses search) */
   TOGGLE_AGENT: { key: "A", ctrl: true, shift: true },
 
@@ -441,6 +451,12 @@ export const KEYBINDS = {
   /** Reveal the selected timeline event in the transcript */
   REVEAL_TIMELINE_EVENT: { key: "Enter", ctrl: true, shift: true },
 
+  /** Open the timeline dialog on small viewports where the right sidebar is hidden */
+  OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
+
+  /** Reveal the last prompt in the transcript while its popup is open */
+  REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
+
   /** Switch to tab by position in right sidebar (1-9) */
   // macOS: Cmd+N, Win/Linux: Ctrl+N
   // NOTE: Both Ctrl and Cmd work for switching tabs on Mac (macOS has no standard Cmd+number behavior)
@@ -516,6 +532,16 @@ export const KEYBINDS = {
 
   SHOW_LAST_PROMPT: { key: "L", ctrl: true, shift: true },
 
+  SETTINGS_BACKUP_SAVE: { key: "s", code: "KeyS", ctrl: true, alt: true },
+  SETTINGS_BACKUP_VALIDATE: { key: "v", code: "KeyV", ctrl: true, alt: true },
+  SETTINGS_BACKUP_PREVIEW: { key: "e", code: "KeyE", ctrl: true, alt: true },
+  SETTINGS_BACKUP_PUSH: { key: "b", code: "KeyB", ctrl: true, alt: true },
+  SETTINGS_BACKUP_RESTORE: { key: "r", code: "KeyR", ctrl: true, alt: true },
+  SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  SETTINGS_BACKUP_APPROVE_COMMANDS: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },
 
@@ -572,8 +598,17 @@ export const KEYBINDS = {
   /** Toggle focus between diff and notes sidebar in immersive review */
   REVIEW_FOCUS_NOTES: { key: "Tab" },
 
+  /** Copy the active file's full contents to the clipboard in immersive review */
+  REVIEW_COPY_FILE: { key: "y" },
+
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
+
+  /** Copy image to clipboard (scoped to image lightbox / image context menu) */
+  IMAGE_COPY: { key: "c", ctrl: true },
+
+  /** Download image (scoped to image lightbox / image context menu) */
+  IMAGE_DOWNLOAD: { key: "s", ctrl: true },
 
   TOGGLE_POWER_MODE: { key: "F12", shift: true },
 } as const;

@@ -3,6 +3,7 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import {
   GitBranch,
   HeartPulse,
+  History,
   Maximize2,
   Pencil,
   Pin,
@@ -52,6 +53,8 @@ interface WorkspaceActionsMenuContentProps {
   /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
   onOpenTouchFullscreenReview?: (() => void) | null;
   onEnterImmersiveReview?: (() => void) | null;
+  /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
+  onOpenTimeline?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
   onForkChat?: ((anchorEl: HTMLElement) => void) | null;
   /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
@@ -132,6 +135,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onCloseMenu();
             props.onEnterImmersiveReview?.();
           }}
+        />
+      )}
+      {props.onOpenTimeline && (
+        <WorkspaceActionButton
+          label="Timeline"
+          shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<History className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenTimeline?.();
+          }}
+          testId="workspace-timeline-button"
         />
       )}
       {props.onStopRuntime && (

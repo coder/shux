@@ -4,9 +4,10 @@ import assert from "@/common/utils/assert";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import * as path from "path";
 
-import type { HistoryService } from "./historyService";
+import type { CompactionFollowUpCleanupOutcome, HistoryService } from "./historyService";
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { LoadedSkillSnapshot } from "@/common/types/attachment";
@@ -40,6 +41,12 @@ import {
   isDurableContextBoundaryMarker,
   sliceMessagesFromLatestCompactionBoundary,
 } from "@/common/utils/messages/compactionBoundary";
+import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import {
+  estimateMuxMessageTokens,
+  getKeepRecentTailStartHistorySequence,
+} from "@/common/utils/messages/keepRecentTail";
+import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createLoadedSkillSnapshot,
@@ -55,7 +62,7 @@ import {
  * A valid compaction summary should be prose text describing the conversation,
  * not a JSON blob. This general check catches any tool that might leak through.
  */
-function looksLikeRawJsonObject(text: string): boolean {
+export function looksLikeRawJsonObject(text: string): boolean {
   const trimmed = text.trim();
 
   // Must be a JSON object (not array, not primitive)
@@ -79,18 +86,30 @@ interface PersistedPostCompactionStateV1 {
   createdAt: number;
   diffs: FileEditDiff[];
   loadedSkills: LoadedSkillSnapshot[];
+  /**
+   * Cumulative file paths read during summarized epochs (newest-first, capped).
+   * Written unconditionally (internal bookkeeping) but only surfaced to the
+   * model when RLM mode is on. Absent in files written by older builds.
+   */
+  readFiles: string[];
+  /** Only continuous preparation is provisional until this boundary is durable. */
+  boundaryMessageId?: string;
+  previousState?: PersistedPostCompactionStateV1;
 }
 
 interface HeartbeatResetRollbackState {
+  owner: symbol;
   postCompactionAttachmentsPending: boolean;
   cachedFileDiffs: FileEditDiff[];
   cachedLoadedSkills: LoadedSkillSnapshot[];
+  cachedReadFilePaths: string[];
   persistedPendingStateLoaded: boolean;
 }
 
 interface PendingPostCompactionState {
   diffs: FileEditDiff[];
   loadedSkills: LoadedSkillSnapshot[];
+  readFiles: string[];
 }
 
 function coerceFileEditDiffs(value: unknown): FileEditDiff[] {
@@ -218,7 +237,23 @@ function mergeFileEditDiffs(existing: FileEditDiff[], incoming: FileEditDiff[]):
   return merged;
 }
 
-function coercePersistedPostCompactionState(value: unknown): PersistedPostCompactionStateV1 | null {
+function coerceReadFilePaths(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  // mergeReadFilePaths already dedupes and caps (without trimming, since
+  // whitespace is part of a path's identity); merging against an empty list
+  // reuses that sanitization for persisted rows.
+  return mergeReadFilePaths(
+    [],
+    value.filter((item): item is string => typeof item === "string")
+  );
+}
+
+function coercePersistedPostCompactionState(
+  value: unknown,
+  allowPrevious = true
+): PersistedPostCompactionStateV1 | null {
   if (!value || typeof value !== "object") {
     return null;
   }
@@ -233,16 +268,33 @@ function coercePersistedPostCompactionState(value: unknown): PersistedPostCompac
     return null;
   }
 
+  const boundaryMessageId = (value as { boundaryMessageId?: unknown }).boundaryMessageId;
+  if (
+    boundaryMessageId !== undefined &&
+    (typeof boundaryMessageId !== "string" || !boundaryMessageId)
+  )
+    return null;
+  const previousState = allowPrevious
+    ? (coercePersistedPostCompactionState(
+        (value as { previousState?: unknown }).previousState,
+        false
+      ) ?? undefined)
+    : undefined;
   const diffsRaw = (value as { diffs?: unknown }).diffs;
   const diffs = coerceFileEditDiffs(diffsRaw);
   const loadedSkillsRaw = (value as { loadedSkills?: unknown }).loadedSkills;
   const loadedSkills = coerceLoadedSkillSnapshots(loadedSkillsRaw);
+  const readFilesRaw = (value as { readFiles?: unknown }).readFiles;
+  const readFiles = coerceReadFilePaths(readFilesRaw);
 
   return {
     version: 1,
     createdAt,
     diffs,
     loadedSkills,
+    readFiles,
+    boundaryMessageId,
+    previousState,
   };
 }
 
@@ -355,6 +407,7 @@ export class CompactionHandler {
   private readonly sessionDir: string;
   private readonly postCompactionStatePath: string;
   private persistedPendingStateLoaded = false;
+  private pendingStateBoundaryMessageId?: string;
   private readonly telemetryService?: TelemetryService;
   private readonly emitter: EventEmitter;
   private readonly processedCompactionRequestIds: Set<string> = new Set<string>();
@@ -368,8 +421,15 @@ export class CompactionHandler {
   private cachedFileDiffs: FileEditDiff[] = [];
   /** Rollback snapshot for synthetic heartbeat reset boundaries that get skipped before dispatch. */
   private heartbeatResetRollbackState: HeartbeatResetRollbackState | null = null;
+  // Request consumers retain this identity rather than claiming whichever snapshot is current later.
+  private pendingStateOwner = Symbol();
+  private pendingStateFileOwner?: symbol;
+  private pendingStateWrites: Promise<unknown> = Promise.resolve();
+  private readonly pendingStateOwners = new WeakMap<PendingPostCompactionState, symbol>();
   /** Cached loaded skill snapshots extracted from history before appending compaction summary */
   private cachedLoadedSkills: LoadedSkillSnapshot[] = [];
+  /** Cumulative file paths read in summarized epochs (paths only, newest-first, capped). */
+  private cachedReadFilePaths: string[] = [];
 
   constructor(options: CompactionHandlerOptions) {
     assert(options, "CompactionHandler requires options");
@@ -387,16 +447,28 @@ export class CompactionHandler {
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
   }
 
+  private enqueuePendingStateWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.pendingStateWrites.then(operation);
+    this.pendingStateWrites = result.catch(() => undefined);
+    return result;
+  }
+
   private async loadPersistedPendingStateIfNeeded(): Promise<void> {
     if (this.persistedPendingStateLoaded || this.postCompactionAttachmentsPending) {
       return;
     }
 
     this.persistedPendingStateLoaded = true;
+    const owner = Symbol();
+    this.pendingStateOwner = owner;
 
     let raw: string;
     try {
-      raw = await fsPromises.readFile(this.postCompactionStatePath, "utf-8");
+      raw = await this.enqueuePendingStateWrite(async () => {
+        const contents = await fsPromises.readFile(this.postCompactionStatePath, "utf-8");
+        this.pendingStateFileOwner = owner;
+        return contents;
+      });
     } catch {
       return;
     }
@@ -406,23 +478,40 @@ export class CompactionHandler {
       parsed = JSON.parse(raw);
     } catch {
       log.warn("Invalid post-compaction state JSON; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(owner);
       return;
     }
 
-    const state = coercePersistedPostCompactionState(parsed);
+    let state = coercePersistedPostCompactionState(parsed);
     if (!state) {
       log.warn("Invalid post-compaction state schema; ignoring", { workspaceId: this.workspaceId });
-      await this.deletePersistedPendingStateBestEffort();
+      await this.deletePersistedPendingStateBestEffort(owner);
       return;
     }
 
-    // Note: We intentionally do not validate against chat history here.
-    // The presence of this file is the source of truth that a compaction occurred (or at least started),
-    // and pre-compaction diffs may have been deleted from history.
-
+    if (state.boundaryMessageId) {
+      const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+      if (!history.success) {
+        if (this.pendingStateOwner === owner) this.persistedPendingStateLoaded = false;
+        return;
+      }
+      const boundaryId = history.data.findLast(isDurableContextBoundaryMarker)?.id;
+      if (state.boundaryMessageId !== boundaryId) {
+        // A crash before the boundary must neither resurrect canceled head state
+        // nor lose an older, still-pending attachment snapshot.
+        state = state.previousState ?? null;
+        if (!state || (state.boundaryMessageId && state.boundaryMessageId !== boundaryId)) {
+          await this.deletePersistedPendingStateBestEffort(owner);
+          return;
+        }
+      }
+    }
+    // A load must not relabel a snapshot written while its history check was awaiting I/O.
+    if (this.pendingStateOwner !== owner) return;
+    this.pendingStateBoundaryMessageId = state.boundaryMessageId;
     this.cachedFileDiffs = state.diffs;
     this.cachedLoadedSkills = state.loadedSkills;
+    this.cachedReadFilePaths = state.readFiles;
     this.postCompactionAttachmentsPending = true;
   }
 
@@ -439,10 +528,13 @@ export class CompactionHandler {
       return null;
     }
 
-    return {
+    const state = {
       diffs: this.cachedFileDiffs,
       loadedSkills: this.cachedLoadedSkills,
+      readFiles: this.cachedReadFilePaths,
     };
+    this.pendingStateOwners.set(state, this.pendingStateOwner);
+    return state;
   }
 
   /**
@@ -461,45 +553,82 @@ export class CompactionHandler {
    * We intentionally retain loaded skill snapshots in memory after acknowledgement so
    * later compactions in the same session can keep carrying those guardrails forward
    * even when no new agent_skill_read call occurs between compactions.
+   *
+   * Read-file paths are retained the same way: they are cumulative "already
+   * seen" memory, so the next compaction must merge them even when the pending
+   * state was consumed in between.
    */
-  async ackPendingStateConsumed(): Promise<void> {
-    // If we never loaded persisted state but it exists, clear it anyway.
-    if (!this.postCompactionAttachmentsPending && !this.persistedPendingStateLoaded) {
-      await this.loadPersistedPendingStateIfNeeded();
-    }
-
-    this.postCompactionAttachmentsPending = false;
-    this.cachedFileDiffs = [];
-    await this.deletePersistedPendingStateBestEffort();
+  async ackPendingStateConsumed(expected?: PendingPostCompactionState | null): Promise<void> {
+    await this.consumePendingState(expected, false);
   }
 
   /**
    * Drop pending post-compaction state (e.g., because it caused context_exceeded).
    */
-  async discardPendingState(reason: string): Promise<void> {
-    await this.loadPersistedPendingStateIfNeeded();
-
-    const hadPendingState = this.postCompactionAttachmentsPending;
-    if (!hadPendingState && this.cachedLoadedSkills.length === 0) {
-      return;
-    }
-
-    log.warn("Discarding pending post-compaction state", {
+  async discardPendingState(
+    reason: string,
+    expected?: PendingPostCompactionState | null
+  ): Promise<void> {
+    log.debug("Discarding pending post-compaction state", {
       workspaceId: this.workspaceId,
       reason,
-      trackedFiles: this.cachedFileDiffs.length,
-      loadedSkills: this.cachedLoadedSkills.length,
     });
-
-    if (hadPendingState) {
-      await this.ackPendingStateConsumed();
-    }
-    this.cachedLoadedSkills = [];
+    await this.consumePendingState(expected, true);
   }
 
-  private async deletePersistedPendingStateBestEffort(): Promise<void> {
+  private async consumePendingState(
+    expected: PendingPostCompactionState | null | undefined,
+    discard: boolean
+  ): Promise<void> {
+    if (expected === undefined) await this.loadPersistedPendingStateIfNeeded();
+    const owner =
+      expected === undefined
+        ? this.pendingStateOwner
+        : expected && this.pendingStateOwners.get(expected);
+    if (!owner || this.pendingStateOwner !== owner) return;
+
+    // Clear this request's cache before yielding. A queued unlink must not later clear B's cache.
+    this.pendingStateBoundaryMessageId = undefined;
+    this.postCompactionAttachmentsPending = false;
+    this.cachedFileDiffs = [];
+    if (discard) {
+      this.cachedLoadedSkills = [];
+      this.cachedReadFilePaths = [];
+    }
+    await this.deletePersistedPendingStateBestEffort(owner);
+  }
+
+  /**
+   * Context-boundary variant of discardPendingState: the persisted pending
+   * state must be provably gone before the boundary caller reports success —
+   * a stale post-compaction.json re-injects PRE-boundary read paths / skills
+   * / diffs into a fresh session after a restart. Performs the same in-memory
+   * discard, then deletes the persisted file durable-or-throw (ENOENT counts
+   * as deleted; it also heals an earlier swallowed best-effort unlink
+   * failure, since the in-memory early return above cannot see the file).
+   */
+  async discardPendingStateDurably(reason: string): Promise<void> {
+    await this.discardPendingState(reason);
     try {
-      await fsPromises.unlink(this.postCompactionStatePath);
+      await this.enqueuePendingStateWrite(async () => {
+        await fsPromises.unlink(this.postCompactionStatePath);
+        this.pendingStateFileOwner = undefined;
+      });
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async deletePersistedPendingStateBestEffort(owner?: symbol): Promise<void> {
+    try {
+      await this.enqueuePendingStateWrite(async () => {
+        if (owner && this.pendingStateFileOwner !== owner) return;
+        await fsPromises.unlink(this.postCompactionStatePath);
+        this.pendingStateFileOwner = undefined;
+      });
     } catch {
       // ignore
     }
@@ -507,9 +636,11 @@ export class CompactionHandler {
 
   private captureHeartbeatResetRollbackState(): void {
     this.heartbeatResetRollbackState = {
+      owner: this.pendingStateOwner,
       postCompactionAttachmentsPending: this.postCompactionAttachmentsPending,
       cachedFileDiffs: [...this.cachedFileDiffs],
       cachedLoadedSkills: [...this.cachedLoadedSkills],
+      cachedReadFilePaths: [...this.cachedReadFilePaths],
       persistedPendingStateLoaded: this.persistedPendingStateLoaded,
     };
   }
@@ -520,13 +651,23 @@ export class CompactionHandler {
       return;
     }
 
+    // Keep the original request's authority even if the best-effort restoration write fails.
+    this.pendingStateOwner = rollbackState.owner;
     this.postCompactionAttachmentsPending = rollbackState.postCompactionAttachmentsPending;
     this.cachedFileDiffs = [...rollbackState.cachedFileDiffs];
     this.cachedLoadedSkills = [...rollbackState.cachedLoadedSkills];
+    this.cachedReadFilePaths = [...rollbackState.cachedReadFilePaths];
     this.persistedPendingStateLoaded = rollbackState.persistedPendingStateLoaded;
 
     if (rollbackState.postCompactionAttachmentsPending) {
-      await this.persistPendingStateBestEffort(this.cachedFileDiffs, this.cachedLoadedSkills);
+      await this.persistPendingStateBestEffort(
+        this.cachedFileDiffs,
+        this.cachedLoadedSkills,
+        this.cachedReadFilePaths,
+        undefined,
+        undefined,
+        rollbackState.owner
+      );
     } else {
       await this.deletePersistedPendingStateBestEffort();
     }
@@ -536,11 +677,14 @@ export class CompactionHandler {
 
   private async persistPendingStateBestEffort(
     diffs: FileEditDiff[],
-    loadedSkills: LoadedSkillSnapshot[]
+    loadedSkills: LoadedSkillSnapshot[],
+    readFiles: string[],
+    boundaryMessageId?: string,
+    previousState?: PersistedPostCompactionStateV1,
+    owner = Symbol()
   ): Promise<void> {
+    this.pendingStateOwner = owner;
     try {
-      await fsPromises.mkdir(this.sessionDir, { recursive: true });
-
       for (const snapshot of loadedSkills) {
         assert(snapshot.name.trim().length > 0, "loaded skill snapshot name must not be empty");
       }
@@ -550,9 +694,17 @@ export class CompactionHandler {
         createdAt: Date.now(),
         diffs,
         loadedSkills,
+        readFiles,
+        ...(boundaryMessageId && { boundaryMessageId, previousState }),
       };
 
-      await fsPromises.writeFile(this.postCompactionStatePath, JSON.stringify(persisted));
+      await this.enqueuePendingStateWrite(async () => {
+        // This write owns retirement even if it fails and leaves earlier bytes on disk.
+        // Queueing writes with consumption prevents a held unlink from deleting a later write.
+        this.pendingStateFileOwner = owner;
+        await fsPromises.mkdir(this.sessionDir, { recursive: true });
+        await fsPromises.writeFile(this.postCompactionStatePath, JSON.stringify(persisted));
+      });
     } catch (error) {
       log.warn("Failed to persist post-compaction state", {
         workspaceId: this.workspaceId,
@@ -561,8 +713,13 @@ export class CompactionHandler {
     }
   }
 
-  private async preparePendingStateFromMessages(messages: MuxMessage[]): Promise<void> {
+  async preparePendingStateFromMessages(
+    messages: MuxMessage[],
+    boundaryMessageId?: string,
+    previousState?: PersistedPostCompactionStateV1
+  ): Promise<void> {
     await this.loadPersistedPendingStateIfNeeded();
+    this.pendingStateBoundaryMessageId = boundaryMessageId;
 
     const latestCompactionEpochMessages = sliceMessagesFromLatestCompactionBoundary(messages);
     this.cachedFileDiffs = mergeFileEditDiffs(
@@ -573,10 +730,83 @@ export class CompactionHandler {
       ...this.cachedLoadedSkills,
       ...extractLoadedSkillSnapshotsFromMessages(latestCompactionEpochMessages),
     ]);
+    // Cumulative read tracking mirrors cachedFileDiffs: newest epoch reads
+    // first, then previously tracked paths, capped. Tracked in both modes
+    // (internal bookkeeping); surfaced to the model only when RLM is on.
+    this.cachedReadFilePaths = mergeReadFilePaths(
+      this.cachedReadFilePaths,
+      extractReadFilePaths(latestCompactionEpochMessages)
+    );
 
     // Persist pending state before append so pre-boundary diffs survive crashes/restarts.
     // Best-effort: boundary creation must not fail just because persistence fails.
-    await this.persistPendingStateBestEffort(this.cachedFileDiffs, this.cachedLoadedSkills);
+    await this.persistPendingStateBestEffort(
+      this.cachedFileDiffs,
+      this.cachedLoadedSkills,
+      this.cachedReadFilePaths,
+      boundaryMessageId,
+      previousState
+    );
+  }
+
+  async withContinuousPendingState(
+    messages: MuxMessage[],
+    apply: (boundaryMessageId: string, onCommitted: () => void) => Promise<boolean>,
+    boundaryMessageId = createCompactionSummaryMessageId()
+  ): Promise<boolean> {
+    await this.loadPersistedPendingStateIfNeeded();
+    const previous = {
+      owner: this.pendingStateOwner,
+      pending: this.postCompactionAttachmentsPending,
+      diffs: this.cachedFileDiffs,
+      loadedSkills: this.cachedLoadedSkills,
+      readFiles: this.cachedReadFilePaths,
+      boundaryMessageId: this.pendingStateBoundaryMessageId,
+    };
+    const previousState: PersistedPostCompactionStateV1 | undefined = previous.pending
+      ? {
+          version: 1,
+          createdAt: Date.now(),
+          diffs: previous.diffs,
+          loadedSkills: previous.loadedSkills,
+          readFiles: previous.readFiles,
+          boundaryMessageId: previous.boundaryMessageId,
+        }
+      : undefined;
+    let applied = false;
+    try {
+      await this.preparePendingStateFromMessages(messages, boundaryMessageId, previousState);
+      // A committed boundary must retain its pending attachments even if a later
+      // observer or cleanup throws before the apply promise returns.
+      const result = await apply(boundaryMessageId, () => {
+        applied = true;
+      });
+      applied ||= result;
+      return applied;
+    } finally {
+      // Never roll an older apply back over a newer preparation/consumption.
+      if (!applied && this.pendingStateBoundaryMessageId === boundaryMessageId) {
+        // Restoring A must preserve the authority already captured by A's request.
+        this.pendingStateOwner = previous.owner;
+        this.postCompactionAttachmentsPending = previous.pending;
+        this.cachedFileDiffs = previous.diffs;
+        this.cachedLoadedSkills = previous.loadedSkills;
+        this.cachedReadFilePaths = previous.readFiles;
+        this.pendingStateBoundaryMessageId = previous.boundaryMessageId;
+        if (previous.pending) {
+          await this.persistPendingStateBestEffort(
+            previous.diffs,
+            previous.loadedSkills,
+            previous.readFiles,
+            previous.boundaryMessageId,
+            undefined,
+            previous.owner
+          );
+        } else {
+          await this.deletePersistedPendingStateBestEffort();
+        }
+      }
+    }
   }
 
   private getMaxExistingHistorySequence(messages: MuxMessage[]): number {
@@ -694,8 +924,9 @@ export class CompactionHandler {
   }
 
   async rollbackHeartbeatContextResetBoundary(
-    summaryMessage: MuxMessage
-  ): Promise<Result<void, string>> {
+    summaryMessage: MuxMessage,
+    isCurrent: () => boolean = () => true
+  ): Promise<Result<CompactionFollowUpCleanupOutcome, string>> {
     assert(
       summaryMessage.role === "assistant",
       "rollbackHeartbeatContextResetBoundary requires an assistant boundary message"
@@ -705,15 +936,22 @@ export class CompactionHandler {
       "rollbackHeartbeatContextResetBoundary requires a heartbeat reset boundary"
     );
 
-    const deleteResult = await this.historyService.deleteMessage(
+    const owner = this.pendingStateOwner;
+    const deleteResult = await this.historyService.cleanupCompactionFollowUp(
       this.workspaceId,
-      summaryMessage.id
+      summaryMessage,
+      "rollback-heartbeat",
+      () => this.pendingStateOwner === owner && isCurrent()
     );
     if (!deleteResult.success) {
       return Err(`Failed to delete heartbeat reset boundary: ${deleteResult.error}`);
     }
+    // A replacement retained its boundary, so its cached state and renderer row must survive too.
+    if (deleteResult.data === "skipped") return deleteResult;
 
-    await this.restoreHeartbeatResetRollbackState();
+    // Once deletion commits, a new turn cannot cancel reconciliation of this owner's snapshot.
+    // A replacement pending-state owner still takes precedence over the rollback.
+    if (this.pendingStateOwner === owner) await this.restoreHeartbeatResetRollbackState();
 
     const historySequence = summaryMessage.metadata?.historySequence;
     if (isNonNegativeInteger(historySequence)) {
@@ -723,7 +961,7 @@ export class CompactionHandler {
       });
     }
 
-    return Ok(undefined);
+    return Ok("applied");
   }
 
   /**
@@ -744,20 +982,28 @@ export class CompactionHandler {
    * Detects when a compaction stream finishes, extracts the summary,
    * and appends a durable compaction boundary message.
    */
-  async handleCompletion(event: StreamEndEvent): Promise<boolean> {
-    // Check if the last user message is a compaction-request.
-    // Only need recent messages — the compaction-request is always near the tail.
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 10);
+  async handleCompletion(
+    event: StreamEndEvent,
+    compactionRequestMessageId?: string
+  ): Promise<boolean> {
+    // The current stream identifies its request when available. Synthetic prompt snapshots can
+    // follow that request in history, so the last user row is not always the compaction request.
+    const historyResult = compactionRequestMessageId
+      ? await this.historyService.getHistoryFromLatestBoundary(this.workspaceId)
+      : await this.historyService.getLastMessages(this.workspaceId, 10);
     if (!historyResult.success) {
       return false;
     }
 
     const messages = historyResult.data;
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-    const muxMeta = lastUserMsg?.metadata?.muxMetadata;
-    const isCompaction = muxMeta?.type === "compaction-request";
+    const compactionRequestMessage = compactionRequestMessageId
+      ? messages.find((message) => message.id === compactionRequestMessageId)
+      : [...messages].reverse().find((message) => message.role === "user");
+    const muxMeta = compactionRequestMessage?.metadata?.muxMetadata;
+    const isCompaction =
+      compactionRequestMessage?.role === "user" && muxMeta?.type === "compaction-request";
 
-    if (!isCompaction || !lastUserMsg) {
+    if (!isCompaction || !compactionRequestMessage) {
       return false;
     }
 
@@ -767,7 +1013,7 @@ export class CompactionHandler {
       muxMeta?.type === "compaction-request" && muxMeta.source === "idle-compaction";
 
     // Dedupe: If we've already processed this compaction-request, skip
-    if (this.processedCompactionRequestIds.has(lastUserMsg.id)) {
+    if (this.processedCompactionRequestIds.has(compactionRequestMessage.id)) {
       return true;
     }
 
@@ -815,23 +1061,26 @@ export class CompactionHandler {
     const pendingFollowUp = getCompactionFollowUpContent(muxMeta);
 
     // Mark as processed before performing compaction
-    this.processedCompactionRequestIds.add(lastUserMsg.id);
+    this.processedCompactionRequestIds.add(compactionRequestMessage.id);
 
-    // Use boundary-aware read so getNextCompactionEpoch (called inside performCompaction)
-    // sees the prior boundary's epoch even if it's beyond the last-10 messages window.
-    const boundaryHistoryResult = await this.historyService.getHistoryFromLatestBoundary(
-      this.workspaceId
-    );
-    const messagesForCompaction = boundaryHistoryResult.success
-      ? boundaryHistoryResult.data
-      : messages; // fallback to last-10 if boundary read fails
+    // Use boundary-aware history so getNextCompactionEpoch sees the prior boundary's epoch.
+    // The correlated path already loaded that history to find the exact request.
+    let messagesForCompaction = messages;
+    if (!compactionRequestMessageId) {
+      const boundaryHistoryResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      if (boundaryHistoryResult.success) {
+        messagesForCompaction = boundaryHistoryResult.data;
+      }
+    }
 
     const result = await this.performCompaction(
       summary,
       event.metadata,
       messagesForCompaction,
       event.messageId,
-      lastUserMsg.id,
+      compactionRequestMessage.id,
       isIdleCompaction,
       pendingFollowUp
     );
@@ -997,6 +1246,110 @@ export class CompactionHandler {
     return null;
   }
 
+  /** The rolling summarizer already paid for this text; applying it must not start another turn. */
+  buildContinuousCompactionRows(params: {
+    boundaryMessageId?: string;
+    messages: MuxMessage[];
+    text: string;
+    model: string;
+    tail: MuxMessage[];
+    systemMessageTokens: number;
+    attachmentTokens: number;
+    pendingFollowUp?: CompactionFollowUpRequest;
+  }): { boundary: MuxMessage; copies: MuxMessage[] } {
+    assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
+    const boundary = createMuxMessage(
+      params.boundaryMessageId ?? createCompactionSummaryMessageId(),
+      "assistant",
+      params.text,
+      {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: getNextCompactionEpoch(params.messages),
+        model: params.model,
+        systemMessageTokens: params.systemMessageTokens,
+        muxMetadata: {
+          type: "compaction-summary",
+          strategy: "continuous",
+          pendingFollowUp: params.pendingFollowUp,
+        },
+      }
+    );
+    const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
+    const copies = params.tail.map((row) => {
+      const copy = this.buildPreservedTailCopy(row, idMap);
+      // Continuous compaction prunes the just-finished answer too. Keep recent pages
+      // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
+      copy.metadata = { ...copy.metadata, uiVisible: true };
+      // User Esc keeps its interrupted marker and next-send continuation sentinel.
+      // Only our internal stop has an explicit durable Continue replacing it.
+      if (params.pendingFollowUp) delete copy.metadata.partial;
+      return copy;
+    });
+    return { boundary, copies };
+  }
+
+  async persistContinuousCompaction(
+    params: Parameters<CompactionHandler["buildContinuousCompactionRows"]>[0] & {
+      prepared?: { boundary: MuxMessage; copies: MuxMessage[] };
+      shouldPersist: (messages: MuxMessage[]) => boolean;
+      publication?: ContinuousCompactionPublication;
+      onCommitted?: () => void;
+    }
+  ): Promise<boolean> {
+    const { boundary, copies } = params.prepared ?? this.buildContinuousCompactionRows(params);
+    const inputTokens =
+      params.systemMessageTokens +
+      params.attachmentTokens +
+      estimateMuxMessageTokens(boundary) +
+      copies.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
+    assert(boundary.metadata !== undefined, "Continuous boundary requires metadata");
+    boundary.metadata.contextUsage = {
+      inputTokens,
+      outputTokens: 0,
+      totalTokens: inputTokens,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+    };
+    const result = await this.historyService.persistBoundaryWithTailCopies(
+      this.workspaceId,
+      boundary,
+      copies,
+      false,
+      params.shouldPersist,
+      params.publication
+        ? {
+            publication: params.publication,
+            onCommitted: () => {
+              params.onCommitted?.();
+            },
+          }
+        : undefined
+    );
+    if (!result.success) {
+      log.warn("[continuous-compaction] persist failed", result.error);
+      return false;
+    }
+    this.postCompactionAttachmentsPending = true;
+    this.emitChatEvent({ ...boundary, type: "message" });
+    for (const copy of copies) this.emitChatEvent({ ...copy, type: "message" });
+    const sequence = boundary.metadata.historySequence;
+    const epoch = boundary.metadata.compactionEpoch;
+    assert(isNonNegativeInteger(sequence), "Continuous boundary requires a persisted sequence");
+    assert(isPositiveInteger(epoch), "Continuous boundary requires an epoch");
+    this.onCompactionComplete?.({
+      workspaceId: this.workspaceId,
+      summaryMessageId: boundary.id,
+      summaryHistorySequence: sequence,
+      compactionEpoch: epoch,
+      previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
+      compactionRequestMessageId: boundary.id,
+      preservedTailMessageCount: copies.length,
+    });
+    return true;
+  }
+
   /**
    * Perform history compaction by persisting a durable summary boundary.
    *
@@ -1010,6 +1363,8 @@ export class CompactionHandler {
     summary: string,
     metadata: {
       model: string;
+      /** Request-pinned pricing identity from the compaction stream. */
+      metadataModel?: string;
       usage?: LanguageModelV2Usage;
       contextUsage?: LanguageModelV2Usage;
       duration?: number;
@@ -1111,6 +1466,11 @@ export class CompactionHandler {
         compactionEpoch: nextCompactionEpoch,
         compactionBoundary: true,
         model: metadata.model,
+        // Preserve the stream's request-pinned pricing identity: session
+        // usage rebuilds (missing/corrupt session-usage.json) key coder:
+        // rows on the persisted metadataModel, and dropping it here would
+        // reprice the compaction request from mutable current metadata.
+        ...(metadata.metadataModel != null && { metadataModel: metadata.metadataModel }),
         usage: metadata.usage,
         duration: metadata.duration,
         systemMessageTokens: metadata.systemMessageTokens,
@@ -1142,14 +1502,47 @@ export class CompactionHandler {
       "Compaction summary must not persist stale contextProviderMetadata"
     );
 
-    const persistenceResult = persistedStreamSummary
-      ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
-      : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
+    // RLM keep-recent floor: sanitized tail copies re-appear verbatim AFTER
+    // the boundary so post-compaction requests see [summary, ...tail]. The
+    // boundary and every copy must land in ONE atomic history commit: the
+    // boundary write seals the previous epoch and the summarizer already
+    // excluded the stamped tail rows, so a boundary that became durable
+    // without the full tail (crash or failure mid-append) would leave the
+    // suffix permanently absent from provider context with no recovery
+    // marker. Empty when unstamped (RLM off) — that path stays untouched.
+    const preservedTailCopies = this.buildPreservedTailCopies(
+      messages,
+      compactionRequestMessageId,
+      summaryMessage.id
+    );
+
+    const persistenceResult =
+      preservedTailCopies.length > 0
+        ? await this.historyService.persistBoundaryWithTailCopies(
+            this.workspaceId,
+            summaryMessage,
+            preservedTailCopies,
+            persistedStreamSummary !== null
+          )
+        : persistedStreamSummary
+          ? await this.historyService.updateHistory(this.workspaceId, summaryMessage)
+          : await this.historyService.appendToHistory(this.workspaceId, summaryMessage);
     if (!persistenceResult.success) {
+      // No boundary committed: retire this provisional snapshot independently of an older
+      // request's acknowledgement, which correctly cannot consume its replacement owner.
+      this.pendingStateOwner = Symbol();
+      this.pendingStateBoundaryMessageId = undefined;
+      this.postCompactionAttachmentsPending = false;
       this.cachedFileDiffs = [];
       this.cachedLoadedSkills = [];
+      this.cachedReadFilePaths = [];
       await this.deletePersistedPendingStateBestEffort();
-      const operation = persistedStreamSummary ? "update streamed summary" : "append summary";
+      const operation =
+        preservedTailCopies.length > 0
+          ? "commit boundary with preserved tail"
+          : persistedStreamSummary
+            ? "update streamed summary"
+            : "append summary";
       return Err(`Failed to ${operation}: ${persistenceResult.error}`);
     }
 
@@ -1177,6 +1570,12 @@ export class CompactionHandler {
     // Emit summary message to frontend (add type: "message" for discriminated union)
     this.emitChatEvent({ ...summaryMessage, type: "message" });
 
+    // The tail copies were committed atomically with the boundary above;
+    // sequences were assigned in place, so the emitted events carry them.
+    for (const copy of preservedTailCopies) {
+      this.emitChatEvent({ ...copy, type: "message" });
+    }
+
     return Ok({
       workspaceId: this.workspaceId,
       summaryMessageId: summaryMessage.id,
@@ -1184,7 +1583,122 @@ export class CompactionHandler {
       compactionEpoch: nextCompactionEpoch,
       previousBoundaryHistorySequence,
       compactionRequestMessageId,
+      preservedTailMessageCount: preservedTailCopies.length,
     });
+  }
+
+  /**
+   * Build sanitized copies of the keep-recent tail for re-appearance after
+   * the compaction boundary (RLM mode). The tail is derived purely from the
+   * durable stamp on the compaction-request row, so completion agrees
+   * byte-for-byte with what the summarization request excluded. Returns []
+   * when unstamped — i.e. RLM off — keeping default behavior untouched.
+   * Pure build, no I/O: the caller commits the copies atomically WITH the
+   * boundary via persistBoundaryWithTailCopies.
+   */
+  private buildPreservedTailCopies(
+    messages: MuxMessage[],
+    compactionRequestMessageId: string,
+    summaryMessageId: string
+  ): MuxMessage[] {
+    const requestIndex = messages.findIndex((message) => message.id === compactionRequestMessageId);
+    if (requestIndex === -1) {
+      return [];
+    }
+
+    const startHistorySequence = getKeepRecentTailStartHistorySequence(
+      messages[requestIndex].metadata?.muxMetadata
+    );
+    if (startHistorySequence === undefined) {
+      return [];
+    }
+
+    // Tail = rows between the stamped start and the compaction request.
+    // Older compaction-request rows (failed prior attempts) are summarization
+    // prompts, not conversation — never preserve them.
+    const tailRows = messages.slice(0, requestIndex).filter((message) => {
+      const sequence = message.metadata?.historySequence;
+      if (!isNonNegativeInteger(sequence) || sequence < startHistorySequence) {
+        return false;
+      }
+      if (message.id === summaryMessageId) {
+        return false;
+      }
+      return message.metadata?.muxMetadata?.type !== "compaction-request";
+    });
+    if (tailRows.length === 0) {
+      return [];
+    }
+
+    // Preassign copy IDs for ALL tail rows before building any copy: MCP
+    // snapshot rows precede the user row they expand, so a build-time map
+    // would not yet contain the invoking row's copy ID when the snapshot row
+    // is copied — the preserved original ID would then be dropped as an
+    // orphan by request-time filtering (filterOrphanedMcpPromptSnapshots).
+    const idMap = new Map<string, string>();
+    for (const row of tailRows) {
+      idMap.set(row.id, createPreservedTailCopyMessageId());
+    }
+    return tailRows.map((row) => this.buildPreservedTailCopy(row, idMap));
+  }
+
+  /**
+   * Build a sanitized copy of a preserved tail row.
+   *
+   * Whitelisted metadata only: usage/cost/context fields MUST NOT be copied so
+   * session-usage rebuilds never double-count the original row, and boundary
+   * markers MUST NOT be copied so a copy can never masquerade as a compaction
+   * boundary. Copies are synthetic without uiVisible (UI-hidden) because the
+   * original rows remain visible above the boundary; fresh IDs keep UI
+   * aggregation from collapsing a hidden copy over its visible original.
+   */
+  private buildPreservedTailCopy(row: MuxMessage, idMap: Map<string, string>): MuxMessage {
+    // IDs are preassigned for the whole tail (see caller) so forward-pointing
+    // references (snapshot row → later invoking user row) rewrite correctly.
+    const copyId = idMap.get(row.id);
+    assert(copyId !== undefined, "buildPreservedTailCopy: row is missing a preassigned copy ID");
+
+    const source = row.metadata;
+    // MCP prompt snapshots pair with their invoking user row by message ID;
+    // rewrite to the invoking row's copy ID so the pairing survives copying.
+    const mcpPromptSnapshot =
+      source?.mcpPromptSnapshot?.invokingMessageId !== undefined
+        ? {
+            ...source.mcpPromptSnapshot,
+            invokingMessageId:
+              idMap.get(source.mcpPromptSnapshot.invokingMessageId) ??
+              source.mcpPromptSnapshot.invokingMessageId,
+          }
+        : source?.mcpPromptSnapshot;
+
+    return {
+      ...row,
+      id: copyId,
+      metadata: {
+        synthetic: true,
+        rlmPreservedTailCopy: true,
+        ...(source?.timestamp !== undefined ? { timestamp: source.timestamp } : {}),
+        ...(source?.model !== undefined ? { model: source.model } : {}),
+        ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),
+        ...(source?.agentId !== undefined ? { agentId: source.agentId } : {}),
+        ...(source?.stepStartPartIndices !== undefined
+          ? { stepStartPartIndices: source.stepStartPartIndices }
+          : {}),
+        // Preserve partial so interrupted-tool sentinels keep applying.
+        ...(source?.partial !== undefined ? { partial: source.partial } : {}),
+        // muxMetadata drives provider-side filtering (workflow display rows),
+        // so it must ride along verbatim.
+        ...(source?.muxMetadata !== undefined ? { muxMetadata: source.muxMetadata } : {}),
+        ...(source?.kind !== undefined ? { kind: source.kind } : {}),
+        ...(source?.fileAtMentionSnapshot !== undefined
+          ? { fileAtMentionSnapshot: source.fileAtMentionSnapshot }
+          : {}),
+        ...(source?.agentSkillSnapshot !== undefined
+          ? { agentSkillSnapshot: source.agentSkillSnapshot }
+          : {}),
+        ...(mcpPromptSnapshot !== undefined ? { mcpPromptSnapshot } : {}),
+      },
+    };
   }
 
   /**

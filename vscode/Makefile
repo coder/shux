@@ -2,7 +2,7 @@
 # ==============================
 # Isolated build system for the mux VS Code/Cursor extension
 
-.PHONY: all build install clean test test-integration test-orpc help
+.PHONY: all build install clean test test-integration test-orpc help version
 
 # Default target
 all: build
@@ -21,8 +21,14 @@ node_modules/.installed: package.json
 	@bun install
 	@touch node_modules/.installed
 
+# The webview imports the root's generated version module. Phony like the root's `version`
+# target, so every build path (including a direct `make -C vscode`) regenerates it instead of
+# trusting a stale file left by an earlier checkout.
+version:
+	@$(MAKE) -C .. src/version.ts
+
 ## Build extension package
-build: node_modules/.installed ## Build VS Code extension (.vsix)
+build: node_modules/.installed version ## Build VS Code extension (.vsix)
 	@echo "Building VS Code extension with esbuild..."
 	@rm -rf out mux-0.1.0.vsix
 	@bun run compile

@@ -133,6 +133,7 @@ docs/theme/pagetoc.css
 !src/node/services/workflows/builtInWorkflowActionContent.generated.ts
 !src/node/services/workflows/workflowRuntimeSources.generated.ts
 docs/theme/pagetoc.js
+.xum/mcp.jsonc
 .mux/mcp.jsonc
 # Removed mobile/ Expo prototype: upgraded checkouts keep untracked leftovers
 # (node_modules, .expo, ios, android) that its deleted nested .gitignore used

@@ -34,10 +34,102 @@ export function isWorkspacePinnable(workspace: {
   return !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt);
 }
 
-/** Unparseable/missing pinnedAt sorts first (same fallback the sidebar sort always used). */
+/**
+ * Unparseable/missing pinnedAt sorts first (same fallback the sidebar sort
+ * always used). Corrupted boundary timestamps get the same treatment so the
+ * comparator, the reorder re-deal, and the successor scan agree: the corrupted
+ * row sits stably at the top of the pinned block while new pins keep appending
+ * at the bottom, and any reorder re-deals it to a sane value.
+ */
 function parsePinnedAtMs(pinnedAt: string | undefined): number {
-  const ms = Date.parse(pinnedAt ?? "");
-  return Number.isFinite(ms) ? ms : 0;
+  return pinnedAtMsForSuccessorScan(pinnedAt) ?? 0;
+}
+
+/**
+ * Highest sane pinnedAt epoch ms: one below the maximum representable Date so
+ * every accepted value still has a serializable +1ms successor. pinnedAt is
+ * persisted as an unrestricted string, so a corrupted-but-parseable boundary
+ * timestamp (e.g. "+275760-09-13T00:00:00.000Z") would otherwise poison every
+ * monotonic successor computation: max + 1ms leaves the representable range
+ * and toISOString() throws, permanently blocking pinning. Ordering and
+ * successor scans treat values above this as absent (self-healing), and
+ * generated timestamps clamp to it so they stay valid for later scans; ties at
+ * the clamp fall back to the comparator's id tie-break.
+ */
+const MAX_PINNED_AT_MS = 8_640_000_000_000_000 - 1;
+
+/** Epoch ms of a sane pinnedAt (parseable, within MAX_PINNED_AT_MS), else null. */
+function pinnedAtMsForSuccessorScan(pinnedAt: string | undefined): number | null {
+  if (!pinnedAt) return null;
+  const ms = new Date(pinnedAt).getTime();
+  return Number.isFinite(ms) && ms <= MAX_PINNED_AT_MS ? ms : null;
+}
+
+/**
+ * Monotonic pin timestamp: strictly greater than every existing
+ * (representable) pin so rapid pins always append deterministically, even if
+ * the wall clock is skewed or several pins land within the same millisecond.
+ * The scan is global (all projects), keeping the flat sidebar's unified pinned
+ * block appending at the bottom. Shared by the backend and the client's
+ * optimistic update so the optimistic row lands where the authoritative
+ * metadata will place it.
+ */
+export function nextMonotonicPinnedAtIso(
+  existingPinnedAts: Iterable<string | undefined>,
+  nowMs: number = Date.now()
+): string {
+  let pinnedAtMs = Math.min(nowMs, MAX_PINNED_AT_MS);
+  for (const value of existingPinnedAts) {
+    const ms = pinnedAtMsForSuccessorScan(value);
+    if (ms !== null && ms >= pinnedAtMs) pinnedAtMs = Math.min(ms + 1, MAX_PINNED_AT_MS);
+  }
+  return new Date(pinnedAtMs).toISOString();
+}
+
+/**
+ * Ordering key for a newly pinned chat plus any write-path healing. Normally
+ * mints max+1ms (see nextMonotonicPinnedAtIso) and changes nothing else. When
+ * the successor saturates at the sane cap (reachable only through corrupted
+ * persisted state), no strictly-greater sane key exists, so every currently
+ * pinned entry is renumbered compactly below nowMs in its current visual
+ * order: ordering keys stay unique, append order survives, and future pins
+ * regain their full headroom (write-path self-healing).
+ */
+export function appendPinnedTimestamp(
+  pinned: ReadonlyArray<{ id?: string; pinnedAt?: string }>,
+  nowMs: number = Date.now()
+): { changed: Map<string, string>; pinnedAt: string } {
+  const pinnedAt = nextMonotonicPinnedAtIso(
+    pinned.map((entry) => entry.pinnedAt),
+    nowMs
+  );
+  // Collision detection compares parsed values: JavaScript accepts multiple
+  // string representations of the same capped millisecond, so raw string
+  // equality would miss noncanonical duplicates.
+  const pinnedAtMs = new Date(pinnedAt).getTime();
+  if (!pinned.some((entry) => pinnedAtMsForSuccessorScan(entry.pinnedAt) === pinnedAtMs)) {
+    return { changed: new Map(), pinnedAt };
+  }
+  const order = pinned.filter((entry) => entry.pinnedAt).sort(comparePinnedOrderLoose);
+  const changed = new Map<string, string>();
+  order.forEach((entry, index) => {
+    const iso = new Date(nowMs - order.length + index).toISOString();
+    if (entry.id !== undefined && entry.pinnedAt !== iso) {
+      changed.set(entry.id, iso);
+    }
+  });
+  return { changed, pinnedAt: new Date(nowMs).toISOString() };
+}
+
+/** comparePinnedOrder for entries whose id may be missing (config rows). */
+function comparePinnedOrderLoose(
+  a: { id?: string; pinnedAt?: string },
+  b: { id?: string; pinnedAt?: string }
+): number {
+  return comparePinnedOrder(
+    { id: a.id ?? "", pinnedAt: a.pinnedAt },
+    { id: b.id ?? "", pinnedAt: b.pinnedAt }
+  );
 }
 
 /**
@@ -75,16 +167,30 @@ export function reassignPinnedTimestamps(
   orderedIds: readonly string[],
   currentPinnedAtById: ReadonlyMap<string, string>
 ): Map<string, string> {
+  // Corrupted boundary timestamps re-deal from 0 like unparseable ones so the
+  // +1ms nudges below can never leave the representable Date range.
   const poolMs = orderedIds
     .map((id) => parsePinnedAtMs(currentPinnedAtById.get(id)))
     .sort((a, b) => a - b);
 
-  const changed = new Map<string, string>();
+  const assignedMs: number[] = [];
   let previousMs = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < orderedIds.length; index++) {
+    previousMs = Math.max(poolMs[index], previousMs + 1);
+    assignedMs.push(previousMs);
+  }
+  // Backward clamp: capped values compact strictly below the sane maximum so
+  // the assigned sequence stays strictly monotonic (unique keys) and the
+  // requested order always persists, even when corrupted pool values tie at
+  // the cap.
+  for (let index = assignedMs.length - 1; index >= 0; index--) {
+    const bound = index === assignedMs.length - 1 ? MAX_PINNED_AT_MS : assignedMs[index + 1] - 1;
+    if (assignedMs[index] > bound) assignedMs[index] = bound;
+  }
+
+  const changed = new Map<string, string>();
   orderedIds.forEach((id, index) => {
-    const ms = Math.max(poolMs[index], previousMs + 1);
-    previousMs = ms;
-    const iso = new Date(ms).toISOString();
+    const iso = new Date(assignedMs[index]).toISOString();
     if (currentPinnedAtById.get(id) !== iso) {
       changed.set(id, iso);
     }

@@ -2,10 +2,7 @@ import { MAX_IMAGE_DIMENSION } from "@/common/constants/imageAttachments";
 import {
   computeResizedDimensions,
   getResizedRasterOutputMediaType,
-  type ResizeDimensions,
 } from "@/common/utils/attachments/rasterImageResize";
-
-export type { ResizeDimensions };
 
 export interface ResizeResult {
   dataUrl: string;

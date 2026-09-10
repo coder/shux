@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
   copyWorkspaceStorage,
   deleteWorkspaceStorage,
   getDraftScopeId,
   getInputAttachmentsKey,
+  normalizeTerminalBadgeConfig,
   normalizeTranscriptDensity,
+  type TerminalBadgeConfig,
 } from "@/common/constants/storage";
 
 class MemoryStorage implements Storage {
@@ -122,5 +125,41 @@ describe("storage workspace-scoped keys", () => {
     deleteWorkspaceStorage(workspaceId);
 
     expect(localStorage.getItem(key)).toBeNull();
+  });
+});
+
+describe("normalizeTerminalBadgeConfig", () => {
+  test("returns defaults for non-object input", () => {
+    expect(normalizeTerminalBadgeConfig(undefined)).toEqual(DEFAULT_TERMINAL_BADGE_CONFIG);
+    expect(normalizeTerminalBadgeConfig("nope")).toEqual(DEFAULT_TERMINAL_BADGE_CONFIG);
+    expect(normalizeTerminalBadgeConfig([])).toEqual(DEFAULT_TERMINAL_BADGE_CONFIG);
+  });
+
+  test("passes through a valid config", () => {
+    const config: TerminalBadgeConfig = {
+      enabled: true,
+      template: "{tab}",
+      position: "bottom-left",
+      opacity: 0.75,
+      fontSize: 24,
+    };
+    expect(normalizeTerminalBadgeConfig(config)).toEqual(config);
+  });
+
+  test("falls back per field on invalid values", () => {
+    const normalized = normalizeTerminalBadgeConfig({
+      enabled: "yes",
+      template: 7,
+      position: "middle",
+      opacity: 3,
+      fontSize: -2,
+    });
+    expect(normalized).toEqual({ ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: false });
+  });
+
+  test("rejects zero opacity and keeps the default", () => {
+    expect(normalizeTerminalBadgeConfig({ opacity: 0 }).opacity).toBe(
+      DEFAULT_TERMINAL_BADGE_CONFIG.opacity
+    );
   });
 });

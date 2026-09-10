@@ -2,6 +2,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import modelsData from "../tokens/models.json";
 import { modelsExtra } from "../tokens/models-extra";
+import { generateModelLookupKeys } from "../tokens/modelStats";
 import { normalizeToCanonical } from "./models";
 
 interface RawModelCapabilitiesData {
@@ -24,45 +25,9 @@ export interface ModelCapabilities {
 
 export type SupportedInputMediaType = "image" | "pdf" | "audio" | "video";
 
-const PROVIDER_KEY_ALIASES: Record<string, string> = {
-  // GitHub Copilot keys in models.json use underscores for LiteLLM provider names.
-  "github-copilot": "github_copilot",
-};
-
-/**
- * Generates lookup keys for a model string with multiple naming patterns.
- *
- * Keep this aligned with getModelStats(): many providers/layers use slightly different
- * conventions (e.g. "ollama/model-cloud", "provider/model").
- */
-function generateLookupKeys(modelString: string): string[] {
-  const colonIndex = modelString.indexOf(":");
-  const provider = colonIndex !== -1 ? modelString.slice(0, colonIndex) : "";
-  const modelName = colonIndex !== -1 ? modelString.slice(colonIndex + 1) : modelString;
-  const litellmProvider = PROVIDER_KEY_ALIASES[provider] ?? provider;
-
-  const keys: string[] = [
-    modelName, // Direct model name (e.g., "claude-opus-4-5")
-  ];
-
-  if (provider) {
-    keys.push(
-      `${litellmProvider}/${modelName}`, // "ollama/gpt-oss:20b"
-      `${litellmProvider}/${modelName}-cloud` // "ollama/gpt-oss:20b-cloud" (LiteLLM convention)
-    );
-
-    // Fallback: strip size suffix for base model lookup
-    // "ollama:gpt-oss:20b" → "ollama/gpt-oss"
-    if (modelName.includes(":")) {
-      const baseModel = modelName.split(":")[0];
-      keys.push(`${litellmProvider}/${baseModel}`);
-    }
-  }
-
-  return keys;
-}
-
-function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabilities {
+// Exported for tests: upstream LiteLLM no longer ships max_pdf_size_mb, so the
+// inference branches can only be exercised with injected metadata.
+export function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabilities {
   const maxPdfSizeMb = typeof data.max_pdf_size_mb === "number" ? data.max_pdf_size_mb : undefined;
   const provider = typeof data.litellm_provider === "string" ? data.litellm_provider : undefined;
 
@@ -85,9 +50,13 @@ function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabili
 
 export function getModelCapabilities(modelString: string): ModelCapabilities | null {
   const normalized = normalizeToCanonical(modelString);
-  const lookupKeys = generateLookupKeys(normalized);
+  // Shared with getModelStats so capabilities and stats resolve from the same
+  // catalog entry (provider-scoped keys win over bare-name entries).
+  const lookupKeys = generateModelLookupKeys(normalized);
 
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const modelsExtraRecord = modelsExtra as unknown as Record<string, RawModelCapabilitiesData>;
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const modelsDataRecord = modelsData as unknown as Record<string, RawModelCapabilitiesData>;
 
   // Merge models.json (upstream) + models-extra.ts (local overrides). Extras win.

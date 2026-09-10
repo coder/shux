@@ -8,6 +8,13 @@ describe("formatCompactModelDisplayName", () => {
     expect(formatCompactModelDisplayName("gpt-5.6-luna-2026-07-09")).toBe("Luna");
   });
 
+  test("keeps the GPT-6 Astra tier in constrained labels, but not named variants", () => {
+    expect(formatCompactModelDisplayName("gpt-6-astra")).toBe("Astra");
+    expect(formatCompactModelDisplayName("gpt-6-astra-2026-09-30")).toBe("Astra");
+    // A hypothetical variant keeps its full name so the qualifier is not lost.
+    expect(formatCompactModelDisplayName("gpt-6-astra-mini")).toBe("GPT-6 Astra Mini");
+  });
+
   test("falls back to the full display name when no shorter label is clearer", () => {
     expect(formatCompactModelDisplayName("claude-opus-5")).toBe("Opus 5");
     expect(formatCompactModelDisplayName("gpt-5.3-codex-spark")).toBe("Spark 5.3");
@@ -27,7 +34,15 @@ describe("formatModelDisplayName", () => {
 
     test("formats Mythos-class Fable / Mythos models", () => {
       expect(formatModelDisplayName("claude-fable-5")).toBe("Fable 5");
+      expect(formatModelDisplayName("claude-fable-5-1")).toBe("Fable 5.1");
       expect(formatModelDisplayName("claude-mythos-5")).toBe("Mythos 5");
+      expect(formatModelDisplayName("claude-mythos-5-1")).toBe("Mythos 5.1");
+    });
+  });
+
+  describe("GLM models", () => {
+    test("preserves uppercase GLM branding", () => {
+      expect(formatModelDisplayName("glm-5.3-flash")).toBe("GLM 5.3 Flash");
     });
   });
 
@@ -36,6 +51,7 @@ describe("formatModelDisplayName", () => {
       expect(formatModelDisplayName("gpt-5-pro")).toBe("GPT-5 Pro");
       expect(formatModelDisplayName("gpt-4o")).toBe("GPT-4o");
       expect(formatModelDisplayName("gpt-4o-mini")).toBe("GPT-4o Mini");
+      expect(formatModelDisplayName("gpt-6-astra")).toBe("GPT-6 Astra");
     });
 
     test("formats Codex models with Codex branding", () => {

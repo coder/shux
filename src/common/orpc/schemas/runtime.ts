@@ -74,7 +74,7 @@ export const RuntimeConfigSchema = z.union([
     type: z.literal("worktree"),
     srcBaseDir: z
       .string()
-      .meta({ description: "Base directory where all workspaces are stored (e.g., ~/.mux/src)" }),
+      .meta({ description: "Base directory where all workspaces are stored (e.g., ~/.xum/src)" }),
     bgOutputDir: bgOutputDirField,
   }),
   // SSH runtime

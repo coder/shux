@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
@@ -30,6 +31,22 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
 // Use with: using testEnv = createTestBashTool();
+function createExecStream(stdout: string, exitCode = 0): ExecStream {
+  const encoder = new TextEncoder();
+  return {
+    stdout: new ReadableStream({
+      start(controller) {
+        if (stdout.length > 0) controller.enqueue(encoder.encode(stdout));
+        controller.close();
+      },
+    }),
+    stderr: new ReadableStream({ start: (controller) => controller.close() }),
+    stdin: new WritableStream(),
+    exitCode: Promise.resolve(exitCode),
+    duration: Promise.resolve(0),
+  };
+}
+
 function createTestBashTool() {
   const tempDir = new TestTempDir("test-bash");
   const config = createTestToolConfig(process.cwd());
@@ -1611,12 +1628,132 @@ describe("zombie process cleanup", () => {
   });
 });
 
-describe("muxEnv environment variables", () => {
-  it("should inject MUX_ environment variables when muxEnv is provided", async () => {
+describe("remote bash git hardening", () => {
+  it("discovers remote drivers and keeps provider secrets blanked", async () => {
+    const calls: Array<{ command: string; options: ExecOptions }> = [];
+    const runtime = {
+      exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        calls.push({ command, options });
+        if (command.includes("rev-parse --git-dir"))
+          return Promise.resolve(createExecStream(".git\n"));
+        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream(""));
+        if (options.cwd === "/remote/workspace/project-a") {
+          return Promise.resolve(createExecStream("", 1));
+        }
+        if (options.cwd === "/remote/workspace/project-b") {
+          return Promise.resolve(
+            createExecStream(
+              "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0"
+            )
+          );
+        }
+        return Promise.resolve(createExecStream("done\n"));
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    config.secrets = { ANTHROPIC_API_KEY: "secret" };
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script: "git checkout -- data.txt",
+        timeout_secs: 5,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(7);
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
+    expect(calls[3]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[6]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("alias.evil");
+  });
+
+  it("fails closed when remote driver discovery fails", async () => {
+    let callCount = 0;
+    const runtime = {
+      exec(): Promise<ExecStream> {
+        const exitCodes = [0, 0, 1, 0, 2];
+        const exitCode = exitCodes[callCount] ?? 2;
+        callCount += 1;
+        return Promise.resolve(createExecStream("", exitCode));
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    const tool = createBashTool(config);
+
+    let rejection: unknown;
+    try {
+      await tool.execute!(
+        {
+          script: "echo should-not-run",
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      );
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("Failed to inspect repository");
+    expect(callCount).toBe(5);
+  });
+
+  it("blanks run-session roots inherited by local Bash", async () => {
+    const previousXumRoot = process.env.XUM_RUN_SESSION_ROOT;
+    const previousMuxRoot = process.env.MUX_RUN_SESSION_ROOT;
+    process.env.XUM_RUN_SESSION_ROOT = "/tmp/xum-session";
+    process.env.MUX_RUN_SESSION_ROOT = "/tmp/mux-session";
+
+    try {
+      const config = createTestToolConfig(process.cwd());
+      config.trusted = false;
+      const tool = createBashTool(config);
+      const result = (await tool.execute!(
+        {
+          script: 'printf "%s|%s" "$XUM_RUN_SESSION_ROOT" "$MUX_RUN_SESSION_ROOT"',
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.output).toBe("|");
+    } finally {
+      if (previousXumRoot == null) delete process.env.XUM_RUN_SESSION_ROOT;
+      else process.env.XUM_RUN_SESSION_ROOT = previousXumRoot;
+      if (previousMuxRoot == null) delete process.env.MUX_RUN_SESSION_ROOT;
+      else process.env.MUX_RUN_SESSION_ROOT = previousMuxRoot;
+    }
+  });
+});
+
+describe("xumEnv environment variables", () => {
+  it("should inject MUX_ environment variables when xumEnv is provided", async () => {
     using tempDir = new TestTempDir("test-mux-env");
     const config = createTestToolConfig(process.cwd());
     config.runtimeTempDir = tempDir.path;
-    config.muxEnv = {
+    config.xumEnv = {
       MUX_PROJECT_PATH: "/test/project/path",
       MUX_RUNTIME: "worktree",
       MUX_WORKSPACE_NAME: "feature-branch",
@@ -1640,11 +1777,11 @@ describe("muxEnv environment variables", () => {
     }
   });
 
-  it("should allow secrets to override muxEnv", async () => {
+  it("should allow secrets to override xumEnv", async () => {
     using tempDir = new TestTempDir("test-mux-env-override");
     const config = createTestToolConfig(process.cwd());
     config.runtimeTempDir = tempDir.path;
-    config.muxEnv = {
+    config.xumEnv = {
       MUX_PROJECT_PATH: "/mux/path",
       CUSTOM_VAR: "from-mux",
     };
@@ -1664,9 +1801,9 @@ describe("muxEnv environment variables", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      // MUX_PROJECT_PATH from muxEnv should be present
+      // MUX_PROJECT_PATH from xumEnv should be present
       expect(result.output).toContain("MUX:/mux/path");
-      // Secrets should override muxEnv when there's a conflict
+      // Secrets should override xumEnv when there's a conflict
       expect(result.output).toContain("CUSTOM:from-secrets");
     }
   });
@@ -1940,6 +2077,66 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
+  it("terminates the process and fails when foreground-to-background migration fails", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-fail");
+    // Point the manager's output root at a regular FILE so migrateToBackground's mkdir
+    // fails deterministically (stand-in for ENOSPC/EACCES-style failures).
+    const blockedRoot = path.join(tempDir.path, "bg-root-blocked");
+    fs.writeFileSync(blockedRoot, "not a directory");
+    const manager = new BackgroundProcessManager(blockedRoot);
+
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-fail.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-fail",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    // Wait for the script to be running before clicking "send to background".
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+
+    const sendResult = manager.sendToBackground(mockToolCallOptions.toolCallId);
+    expect(sendResult.success).toBe(true);
+
+    // An untracked live process would be invisible to archive gates and crash-orphan scans,
+    // so a failed migration must terminate the process and report failure instead of
+    // claiming the process will continue running.
+    const result = await resultPromise;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("terminated because it could not be tracked");
+    }
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    const killDeadline = Date.now() + 5000;
+    let alive = true;
+    while (alive && Date.now() < killDeadline) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
   it("should arm monitor for background mode and echo monitor config", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
@@ -2033,13 +2230,13 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
-  it("should inject muxEnv environment variables in background mode", async () => {
+  it("should inject xumEnv environment variables in background mode", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg-mux-env");
     const config = createTestToolConfig(tempDir.path);
     config.backgroundProcessManager = manager;
-    config.muxEnv = {
+    config.xumEnv = {
       MUX_MODEL_STRING: "openai:gpt-5.2",
       MUX_THINKING_LEVEL: "medium",
     };

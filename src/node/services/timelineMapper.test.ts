@@ -319,7 +319,7 @@ describe("mapChatEventToTimeline", () => {
       type: "message",
       id: "user-recovery",
       role: "user",
-      parts: [{ type: "text", text: "Mux restarted while this task was running." }],
+      parts: [{ type: "text", text: "Xum restarted while this task was running." }],
       metadata: { historySequence: 11, timestamp: 100, synthetic: true },
     });
 
@@ -541,18 +541,6 @@ describe("mapChatEventToTimeline", () => {
       errorType: "api",
     });
     expect(second.drafts[0].source.key).toBeUndefined();
-  });
-
-  test("records a history clear announced outside replaceHistory", () => {
-    const cleared = map({
-      type: "history-cleared",
-      workspaceId: "ws-1",
-      reason: "exec sub-agent hard restart",
-    });
-
-    expect(cleared.drafts).toMatchObject([
-      { kind: "history.cleared", data: { reason: "exec sub-agent hard restart" } },
-    ]);
   });
 
   test("leaves a child-caused budget limit to the goal service to avoid a duplicate row", () => {

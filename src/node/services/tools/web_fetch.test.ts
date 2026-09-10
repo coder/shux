@@ -332,6 +332,53 @@ describe("web_fetch tool", () => {
     expect(isCurlCommand(execSpy.mock.calls[0]?.[1] ?? "")).toBe(true);
   });
 
+  it("extracts readable article content while removing heavy and non-article chrome", async () => {
+    using testEnv = createTestWebFetchTool();
+    const articleHtml = `<!DOCTYPE html>
+      <html>
+        <head>
+          <title>Happy DOM Article</title>
+          <style>.secret-style { color: red; }</style>
+          <script>window.secretScript = "hidden";</script>
+        </head>
+        <body>
+          <nav>Navigation chrome that should be removed</nav>
+          <main>
+            <article>
+              <h1>Reliable streaming</h1>
+              <p>Docker users can read <strong>complete responses</strong> again.</p>
+              <p><a href="/details">Read the implementation details</a>.</p>
+            </article>
+          </main>
+          <footer>Footer chrome that should be removed</footer>
+        </body>
+      </html>`;
+    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
+      createExecResult({
+        stdout:
+          "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
+      })
+    );
+
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/article" },
+      toolCallOptions
+    )) as WebFetchToolResult;
+
+    expect(execSpy).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.title).toBe("Happy DOM Article");
+      expect(result.content).toContain("# Reliable streaming");
+      expect(result.content).toContain("**complete responses**");
+      expect(result.content).toContain("https://93.184.216.34/details");
+      expect(result.content).not.toContain("Navigation chrome");
+      expect(result.content).not.toContain("Footer chrome");
+      expect(result.content).not.toContain("secret-style");
+      expect(result.content).not.toContain("secretScript");
+    }
+  });
+
   it("follows validated public redirects and returns the final content", async () => {
     using testEnv = createTestWebFetchTool();
 

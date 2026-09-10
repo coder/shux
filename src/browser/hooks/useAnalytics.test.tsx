@@ -23,6 +23,7 @@ let APIProvider!: typeof APIModule.APIProvider;
 let useAnalyticsProviderCacheHitRatio!: typeof UseAnalyticsModule.useAnalyticsProviderCacheHitRatio;
 let useAnalyticsRawQuery!: typeof UseAnalyticsModule.useAnalyticsRawQuery;
 let useAnalyticsSpendByModel!: typeof UseAnalyticsModule.useAnalyticsSpendByModel;
+let useAnalyticsSpendOverTime!: typeof UseAnalyticsModule.useAnalyticsSpendOverTime;
 let useAnalyticsSummary!: typeof UseAnalyticsModule.useAnalyticsSummary;
 let useSavedQueries!: typeof UseAnalyticsModule.useSavedQueries;
 let isolatedModulePaths: string[] = [];
@@ -56,12 +57,14 @@ async function importIsolatedAnalyticsModules() {
     useAnalyticsProviderCacheHitRatio,
     useAnalyticsRawQuery,
     useAnalyticsSpendByModel,
+    useAnalyticsSpendOverTime,
     useAnalyticsSummary,
     useSavedQueries,
   } = requireTestModule<{
     useAnalyticsProviderCacheHitRatio: typeof UseAnalyticsModule.useAnalyticsProviderCacheHitRatio;
     useAnalyticsRawQuery: typeof UseAnalyticsModule.useAnalyticsRawQuery;
     useAnalyticsSpendByModel: typeof UseAnalyticsModule.useAnalyticsSpendByModel;
+    useAnalyticsSpendOverTime: typeof UseAnalyticsModule.useAnalyticsSpendOverTime;
     useAnalyticsSummary: typeof UseAnalyticsModule.useAnalyticsSummary;
     useSavedQueries: typeof UseAnalyticsModule.useSavedQueries;
   }>(isolatedHookPath));
@@ -126,20 +129,24 @@ interface AnalyticsServiceCalls {
     from: Date | null | undefined;
     to: Date | null | undefined;
   }>;
+  spendOverTime: Array<{
+    projectPath: string | null;
+    granularity: "hour" | "day" | "week";
+    from: Date | null | undefined;
+    to: Date | null | undefined;
+    timeZone: string | null | undefined;
+  }>;
 }
 
 let currentApiClient: RouterClient<AppRouter> | null = null;
 let analyticsServiceCalls: AnalyticsServiceCalls | null = null;
 
 function importCreateOrpcServer(): typeof OrpcServerModule.createOrpcServer {
-  void mock.module("@/version", () => ({
-    VERSION: "test-version",
-  }));
-
+  // Bun module mocks survive mock.restore(); use the real VERSION so later reconnect
+  // tests receive valid build metadata instead of a leaked analytics-only fixture.
   const { createOrpcServer } = requireTestModule<{
     createOrpcServer: typeof OrpcServerModule.createOrpcServer;
   }>("@/node/orpc/server");
-  mock.restore();
   return createOrpcServer;
 }
 
@@ -158,7 +165,8 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper
@@ -229,25 +237,47 @@ function createAnalyticsServiceStub(summary: Summary): {
     summary: [],
     spendByModel: [],
     cacheHitRatioByProvider: [],
+    spendOverTime: [],
   };
 
   return {
     calls,
     service: {
-      getSummary: (projectPath, from, to) => {
-        calls.summary.push({ projectPath, from, to });
+      getSummary: (input) => {
+        calls.summary.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve(summary);
       },
-      getSpendOverTime: () => Promise.resolve([]),
+      getSpendOverTime: (input) => {
+        calls.spendOverTime.push({
+          projectPath: input.projectPath ?? null,
+          granularity: input.granularity,
+          from: input.from,
+          to: input.to,
+          timeZone: input.timeZone,
+        });
+        return Promise.resolve([]);
+      },
       getSpendByProject: () => Promise.resolve([]),
-      getSpendByModel: (projectPath, from, to) => {
-        calls.spendByModel.push({ projectPath, from, to });
+      getSpendByModel: (input) => {
+        calls.spendByModel.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       getTimingDistribution: () => Promise.resolve({ p50: 0, p90: 0, p99: 0, histogram: [] }),
       getAgentCostBreakdown: () => Promise.resolve([]),
-      getCacheHitRatioByProvider: (projectPath, from, to) => {
-        calls.cacheHitRatioByProvider.push({ projectPath, from, to });
+      getCacheHitRatioByProvider: (input) => {
+        calls.cacheHitRatioByProvider.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       rebuildAll: () => Promise.resolve({ success: true, workspacesIngested: 0 }),
@@ -355,6 +385,35 @@ describe("useAnalytics hooks", () => {
     expect(latest.projectPath).toBe("/tmp/project");
     expect(latest.from.toISOString()).toBe(from.toISOString());
     expect(latest.to.toISOString()).toBe(to.toISOString());
+  });
+
+  test("forwards the selected timezone to spend-over-time endpoint", async () => {
+    const from = new Date("2026-01-07T00:00:00.000Z");
+    const to = new Date("2026-01-27T00:00:00.000Z");
+
+    const { result } = renderAnalyticsHook(() =>
+      useAnalyticsSpendOverTime({
+        projectPath: "/tmp/project",
+        granularity: "day",
+        from,
+        to,
+        timeZone: "America/New_York",
+      })
+    );
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    const calls = requireAnalyticsServiceCalls().spendOverTime;
+    expect(calls.length).toBeGreaterThan(0);
+
+    const latest = calls.at(-1);
+    expect(latest).toEqual({
+      projectPath: "/tmp/project",
+      granularity: "day",
+      from,
+      to,
+      timeZone: "America/New_York",
+    });
   });
 
   test("forwards from/to filters to spend-by-model endpoint", async () => {
@@ -594,7 +653,11 @@ describe("useAnalytics hooks", () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.error).toBe("Internal server error");
+    // The behavioral contract is "generic error, no infrastructure detail leak".
+    // Match case-insensitively: oRPC changed its default INTERNAL_SERVER_ERROR
+    // message casing in 1.14 ("Internal server error" -> "Internal Server Error").
+    expect(result.current.error ?? "").toMatch(/^internal server error$/i);
+    expect(result.current.error).not.toContain("Analytics worker");
     expect(result.current.data).toBeNull();
   });
 });

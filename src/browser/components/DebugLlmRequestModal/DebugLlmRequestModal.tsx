@@ -11,6 +11,7 @@ import {
 import { Button } from "@/browser/components/Button/Button";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
+import { downloadBlob } from "@/browser/utils/downloadFile";
 import { getErrorMessage } from "@/common/utils/errors";
 
 const JsonOutput: React.FC<{ children: React.ReactNode }> = ({ children }) => (
@@ -71,16 +72,8 @@ export const DebugLlmRequestModal: React.FC<DebugLlmRequestModalProps> = ({
   const handleDownload = () => {
     if (!snapshot) return;
     const timestamp = new Date(snapshot.capturedAt).toISOString().replace(/[:.]/g, "-");
-    const fileName = `mux-llm-request-${workspaceId}-${timestamp}.json`;
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    const fileName = `xum-llm-request-${workspaceId}-${timestamp}.json`;
+    void downloadBlob(new Blob([json], { type: "application/json" }), fileName);
   };
 
   return (

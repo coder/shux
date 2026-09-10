@@ -35,6 +35,24 @@ describe("commandParser", () => {
       });
     });
 
+    it("parses /refine and exact '/refine apply', rejecting all other arguments", () => {
+      expectParse("/refine", { type: "refine" });
+      expectParse("/refine apply", { type: "refine", apply: true });
+      // Mistyped approvals must NOT fall through to a fresh run — that would
+      // overwrite the staged proposal the user meant to approve and incur
+      // another model call.
+      expectParse("/refine Apply", {
+        type: "unknown-command",
+        command: "refine",
+        subcommand: "Apply",
+      });
+      expectParse("/refine apply now", {
+        type: "unknown-command",
+        command: "refine",
+        subcommand: "apply now",
+      });
+    });
+
     it("treats removed /providers command as unknown", () => {
       expectParse("/providers", {
         type: "unknown-command",

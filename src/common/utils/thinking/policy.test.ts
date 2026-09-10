@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
   enforceThinkingPolicy,
   resolveThinkingInput,
   isGeminiFlashThinkingLevelModelName,
+  isGeminiFlashMinimalRejectingModelName,
   getDefaultMinimumThinkingLevel,
+  lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
   resolveEffectiveThinkingLevel,
   getAvailableThinkingLevels,
@@ -187,16 +190,6 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  test("returns 5 levels including xhigh for gpt-5.5", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
   test("returns 6 levels including max for gpt-5.6-sol", () => {
     expect(getThinkingPolicyForModel("openai:gpt-5.6-sol")).toEqual([
       "off",
@@ -251,6 +244,68 @@ describe("getThinkingPolicyForModel", () => {
       "medium",
       "high",
     ]);
+  });
+
+  // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
+  // is not offered. Named variants and other GPT-6 ids stay outside the rule.
+  test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
+      fiveLevels
+    );
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "max")).toBe("max");
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
+  });
+
+  test("gpt-6-astra named variants and other GPT-6 ids fall through to the default policy", () => {
+    const defaultPolicy: ThinkingLevel[] = ["off", "low", "medium", "high"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra-mini")).toEqual(defaultPolicy);
+    expect(getThinkingPolicyForModel("openai:gpt-6")).toEqual(defaultPolicy);
+    expect(enforceThinkingPolicy("openai:gpt-6-astra-mini", "max")).toBe("high");
+  });
+
+  test("gpt-6-astra clamps unset/off to low (forced thinking, like Mythos/GLM/3.8 Flash)", () => {
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("mux-gateway:openai/gpt-6-astra", null)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
+    // Sol keeps a real "off" (wire effort "none"); the clamp is Astra-specific.
+    expect(resolveEffectiveThinkingLevel("openai:gpt-5.6-sol", undefined)).toBe("off");
+    // Recognized reasoning model: default medium floor applies like the GPT-5.6 family.
+    expect(getDefaultMinimumThinkingLevel("openai:gpt-6-astra")).toBe("medium");
+    expect(getAvailableThinkingLevels("openai:gpt-6-astra", "medium")).toEqual([
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("mappedToModel aliases inherit gpt-6-astra's 5-level ladder", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    expect(getThinkingPolicyForModel("openai:team-astra", providersConfig)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(enforceThinkingPolicy("openai:team-astra", "max", null, providersConfig)).toBe("max");
+    expect(resolveEffectiveThinkingLevel("openai:team-astra", undefined, providersConfig)).toBe(
+      "low"
+    );
+    expect(getDefaultMinimumThinkingLevel("openai:team-astra", providersConfig)).toBe("medium");
+    // Without providers config the alias is unknown: default 4-level policy clamps max down.
+    expect(enforceThinkingPolicy("openai:team-astra", "max")).toBe("high");
   });
 
   test("returns 5 levels including xhigh for gpt-5.4-mini", () => {
@@ -442,7 +497,21 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-fable-5-1")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-mythos-5-1")).toEqual([
       "low",
       "medium",
       "high",
@@ -454,10 +523,12 @@ describe("getThinkingPolicyForModel", () => {
   test("clamps 'off' up to 'low' for Mythos-class models", () => {
     // A stored/legacy "off" selection must not reach the wire as disabled thinking.
     expect(enforceThinkingPolicy("anthropic:claude-fable-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Mythos-class only", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for forced-thinking models", () => {
     // Mythos-class cannot disable thinking: unset and "off" both resolve to "low"
     // so provider options, replay transforms, and metadata stay consistent with
     // the provider's always-thinking behavior.
@@ -469,6 +540,19 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-4-8", undefined)).toBe("off");
     expect(resolveEffectiveThinkingLevel("openai:gpt-5-pro", undefined)).toBe("off");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
+  });
+
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash but not older Flash", () => {
+    // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
+    // request envelope and debug snapshots agree with what the Google adapter sends.
+    for (const model of ["google:gemini-3.8-flash", "mux-gateway:google/gemini-3.8-flash"]) {
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
+    }
+    // Older Flash tiers still express "off" as minimal, so nothing is forced.
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.7-flash", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.8-flash-lite", undefined)).toBe("off");
   });
 
   test("resolveEffectiveThinkingLevel resolves mappedToModel aliases before the Mythos check", () => {
@@ -617,6 +701,31 @@ describe("getThinkingPolicyForModel", () => {
     }
   });
 
+  test("returns off/low/medium/high for stable Gemini 3.7 Flash", () => {
+    for (const model of [
+      "google:gemini-3.7-flash",
+      "mux-gateway:google/gemini-3.7-flash",
+      "google:gemini-3.7-flash-001",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+    }
+  });
+
+  test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-3.8-flash-001",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+    // Still a recognized reasoning model: defaults to the medium floor like other Flash tiers.
+    expect(getDefaultMinimumThinkingLevel("google:gemini-3.8-flash")).toBe("medium");
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash behind OpenRouter", () => {
     expect(getThinkingPolicyForModel("openrouter:google/gemini-3.5-flash")).toEqual([
       "off",
@@ -683,6 +792,25 @@ describe("isGeminiFlashThinkingLevelModelName", () => {
     expect(isGeminiFlashThinkingLevelModelName("gemini-3-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.5-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.6-flash-lite")).toBe(false);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.7-flash-lite")).toBe(false);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-lite")).toBe(false);
+  });
+
+  test("classifies stable Gemini 3.8 Flash IDs as Flash thinking-level chat models", () => {
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-001")).toBe(true);
+  });
+});
+
+describe("isGeminiFlashMinimalRejectingModelName", () => {
+  test("matches only Gemini 3.8 Flash chat IDs, not older Flash tiers or Lite variants", () => {
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-001")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-lite")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.7-flash")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3-flash")).toBe(false);
   });
 });
 
@@ -897,12 +1025,87 @@ describe("resolveMinimumThinkingLevel", () => {
   });
 });
 
+describe("lookupMinThinkingLevelOverride", () => {
+  test("prefers the gateway-preserving key over the legacy canonical key", () => {
+    const map = {
+      "coder:openai/gpt-5.5": "low",
+      "openai:gpt-5.5": "high",
+    } as const;
+    expect(lookupMinThinkingLevelOverride({ ...map }, "coder:openai/gpt-5.5")).toBe("low");
+  });
+
+  test("falls back to the legacy name-canonical key persisted by older versions", () => {
+    // Older versions keyed floors via normalizeToCanonical, collapsing
+    // coder:openai/<model> into openai:<model>.
+    const map = { "openai:gpt-5.5": "high" } as const;
+    expect(lookupMinThinkingLevelOverride({ ...map }, "coder:openai/gpt-5.5")).toBe("high");
+    // The direct selection still reads its own key.
+    expect(lookupMinThinkingLevelOverride({ ...map }, "openai:gpt-5.5")).toBe("high");
+  });
+
+  test("returns undefined when neither key is present", () => {
+    expect(
+      lookupMinThinkingLevelOverride(
+        { "anthropic:claude-opus-4-6": "high" },
+        "coder:openai/gpt-5.5"
+      )
+    ).toBeUndefined();
+    expect(lookupMinThinkingLevelOverride(undefined, "openai:gpt-5.5")).toBeUndefined();
+  });
+});
+
+describe("Grok 4.1 Fast thinking policy", () => {
+  test("offers a binary ladder without turning legacy non-Off effort off", () => {
+    const model = "xai:grok-4-1-fast";
+    expect(getThinkingPolicyForModel(model)).toEqual(["off", "high"]);
+    expect(getDefaultMinimumThinkingLevel(model)).toBe("off");
+    expect(enforceThinkingPolicy(model, "off")).toBe("off");
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(enforceThinkingPolicy(model, level)).toBe("high");
+    }
+    expect(resolveThinkingInput(1, model)).toBe("high");
+    expect(getAvailableThinkingLevels(model, "medium")).toEqual(["high"]);
+  });
+});
+
 describe("Grok 4.5 thinking policy", () => {
   test("offers only the reasoning efforts accepted by xAI", () => {
     expect(getThinkingPolicyForModel("xai:grok-4.5")).toEqual(["low", "medium", "high"]);
     expect(getDefaultMinimumThinkingLevel("xai:grok-4.5")).toBe("medium");
     expect(enforceThinkingPolicy("xai:grok-4.5", "off")).toBe("low");
     expect(enforceThinkingPolicy("xai:grok-4.5", "max")).toBe("high");
+  });
+});
+
+describe("Grok 4.6 thinking policy", () => {
+  test("adds native xhigh on top of the frontier Grok ladder", () => {
+    expect(getThinkingPolicyForModel("xai:grok-4.6")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(getDefaultMinimumThinkingLevel("xai:grok-4.6")).toBe("medium");
+    expect(enforceThinkingPolicy("xai:grok-4.6", "off")).toBe("low");
+    expect(enforceThinkingPolicy("xai:grok-4.6", "max")).toBe("xhigh");
+  });
+});
+
+describe("GLM 5.3 thinking policy", () => {
+  test("offers only Z.ai's forced-thinking effort levels", () => {
+    for (const model of ["glm-5.3-flash", "zai:glm-5.3", "zai:glm-5.3-flash-2026-08-26"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "off")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "medium")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "xhigh")).toBe("high");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
+  });
+
+  test("does not apply the GLM 5.3 policy to named variants", () => {
+    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 });
 

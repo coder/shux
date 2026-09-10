@@ -113,10 +113,10 @@ endif
 
 fmt-sync-docs:
 	@bun scripts/gen_docs.ts
-	@bun scripts/gen_builtin_skills.ts --sync-mux-docs-skill
+	@bun scripts/gen_builtin_skills.ts --sync-xum-docs-skill
 	@bun scripts/gen_workflow_runtime_sources.ts
 
 fmt-sync-docs-check:
 	@bun scripts/gen_docs.ts check
-	@bun scripts/gen_builtin_skills.ts check --sync-mux-docs-skill
+	@bun scripts/gen_builtin_skills.ts check --sync-xum-docs-skill
 	@bun scripts/gen_workflow_runtime_sources.ts check

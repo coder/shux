@@ -1,6 +1,10 @@
 import type { z } from "zod";
 import type * as schemas from "./schemas";
-import type { OnChatCursorSchema, OnChatModeSchema } from "./schemas/stream";
+import type {
+  OnChatCursorSchema,
+  OnChatHistoryCursorSchema,
+  OnChatModeSchema,
+} from "./schemas/stream";
 
 import type {
   StreamStartEvent,
@@ -33,19 +37,20 @@ export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema
 export type ProviderConfigInfo = z.infer<typeof schemas.ProviderConfigInfoSchema>;
 export type ProvidersConfigMap = z.infer<typeof schemas.ProvidersConfigMapSchema>;
 export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderMutationErrorSchema>;
-export type AddCustomOpenAICompatibleProviderInput = z.infer<
-  typeof schemas.providers.addCustomOpenAICompatibleProvider.input
->;
+export type AddCustomProviderInput = z.infer<typeof schemas.providers.addCustomProvider.input>;
 export type FilePart = z.infer<typeof schemas.FilePartSchema>;
 export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSchema>;
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
+export type OnChatHistoryCursor = z.infer<typeof OnChatHistoryCursorSchema>;
 export type OnChatMode = z.infer<typeof OnChatModeSchema>;
+export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReasonSchema>;
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;
 export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema>;
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
+export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
 export type DesktopPrereqStatus = z.infer<typeof schemas.desktop.getPrereqStatus.output>;
 export type ChatMuxMessage = z.infer<typeof schemas.ChatMuxMessageSchema>;
 export type WorkspaceStatsSnapshot = z.infer<typeof schemas.WorkspaceStatsSnapshotSchema>;

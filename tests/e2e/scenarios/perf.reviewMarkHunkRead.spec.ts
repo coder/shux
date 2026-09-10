@@ -1,4 +1,5 @@
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import { REVIEW_SORT_ORDER_KEY, getReviewStateKey } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
@@ -9,7 +10,7 @@ import {
 } from "../utils/perfProfile";
 import { LARGE_CHANGE_ROOT, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
 test.skip(
   ({ browserName }) => browserName !== "chromium",
@@ -17,7 +18,7 @@ test.skip(
 );
 
 test.describe("immersive review performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: mark hunk as read in immersive review for a large diff", async ({
     page,

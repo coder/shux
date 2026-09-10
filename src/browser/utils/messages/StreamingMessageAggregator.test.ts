@@ -141,6 +141,7 @@ function endToolCall(
     result: unknown;
     timestamp?: number;
     parentToolCallId?: string;
+    replay?: boolean;
   }
 ): void {
   aggregator.handleToolCallEnd({
@@ -152,6 +153,7 @@ function endToolCall(
     result: options.result,
     timestamp: options.timestamp ?? Date.now(),
     parentToolCallId: options.parentToolCallId,
+    replay: options.replay,
   });
 }
 
@@ -2062,7 +2064,7 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("live compaction boundary pruning", () => {
-    // handleMessage expects ChatMuxMessage (type: "message"), matching how the
+    // handleMessage expects ChatXumMessage (type: "message"), matching how the
     // backend emits events via emitChatEvent({ ...message, type: "message" }).
     const asChatMessage = (msg: ReturnType<typeof createMuxMessage>) => ({
       ...msg,
@@ -2161,7 +2163,7 @@ describe("StreamingMessageAggregator", () => {
       expect(remaining.map((m) => m.id)).toEqual(["boundary-2"]);
     });
 
-    test("updates reconnect cursor floor when a live compaction boundary arrives", () => {
+    test("keeps returning the stored server cursor when a live compaction boundary arrives", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
       // Simulate initial replay window starting at historySequence 40.
@@ -2180,8 +2182,16 @@ describe("StreamingMessageAggregator", () => {
         { mode: "replace" }
       );
 
+      const serverCursor = {
+        messageId: "history-41",
+        historySequence: 41,
+        oldestHistorySequence: 40,
+        priorHistoryFingerprint: "cafe1234",
+      };
+      aggregator.setServerHistoryCursor(serverCursor);
+
       const beforeCompactionCursor = aggregator.getOnChatCursor();
-      expect(beforeCompactionCursor?.history?.oldestHistorySequence).toBe(40);
+      expect(beforeCompactionCursor?.history).toEqual(serverCursor);
 
       const boundary = asChatMessage(
         createMuxMessage("boundary-60", "assistant", "Summary epoch 60", {
@@ -2194,8 +2204,11 @@ describe("StreamingMessageAggregator", () => {
       );
       aggregator.handleMessage(boundary);
 
+      // The cursor is reused verbatim: a live compaction makes it stale, and the
+      // server-side anchor validation downgrades the next reconnect to a (small)
+      // full replay of the fresh epoch instead of the client guessing a new cursor.
       const afterCompactionCursor = aggregator.getOnChatCursor();
-      expect(afterCompactionCursor?.history?.oldestHistorySequence).toBe(60);
+      expect(afterCompactionCursor?.history).toEqual(serverCursor);
     });
 
     test("keeps visible history when a live reset boundary arrives", () => {
@@ -3782,6 +3795,46 @@ describe("StreamingMessageAggregator", () => {
       }
     });
 
+    test("drops nested starts whose parent part has not streamed in (no ghost top-level row)", () => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+      // No parent tool part exists yet; streamManager re-emits the nested
+      // events after the parent lands, so the early event must be dropped.
+      startToolCall(aggregator, {
+        toolCallId: "nested-early-1",
+        toolName: "workflow_run",
+        args: {},
+        timestamp: 1100,
+        parentToolCallId: "parent-tool-1",
+      });
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .some((m) => m.type === "tool" && m.toolCallId === "nested-early-1")
+      ).toBe(false);
+    });
+
+    test("skips duplicate nested starts (reconnect replays re-emit them with the parent part)", () => {
+      const aggregator = createTestAggregator();
+      startParentTool(aggregator);
+      for (let i = 0; i < 2; i++) {
+        startToolCall(aggregator, {
+          toolCallId: "nested-tool-1",
+          toolName: "workflow_run",
+          args: { script_path: "wf.js" },
+          timestamp: 1100,
+          parentToolCallId: "parent-tool-1",
+        });
+      }
+
+      const toolMsg = parentToolMessage(aggregator);
+      if (toolMsg?.type !== "tool") {
+        throw new Error("Expected parent tool message");
+      }
+      expect(toolMsg.nestedCalls).toHaveLength(1);
+    });
+
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();
       startParentTool(aggregator);
@@ -3857,23 +3910,6 @@ describe("StreamingMessageAggregator", () => {
         expect(toolMsg.nestedCalls![1].toolName).toBe("bash");
         expect(toolMsg.nestedCalls![1].state).toBe("output-available");
       }
-    });
-
-    test("falls through to create regular tool if parent not found", () => {
-      // Defensive behavior: out-of-order nested calls should become regular tool parts.
-      const aggregator = createTestAggregator();
-      startTestStream(aggregator, { messageId: "msg-1" });
-      startToolCall(aggregator, {
-        toolCallId: "nested-orphan",
-        toolName: "file_read",
-        args: { filePath: "test.txt" },
-        timestamp: 1000,
-        parentToolCallId: "non-existent-parent",
-      });
-
-      const toolParts = aggregator.getDisplayedMessages().filter((m) => m.type === "tool");
-      expect(toolParts).toHaveLength(1);
-      expect(toolParts[0].toolCallId).toBe("nested-orphan");
     });
 
     test("nested call end is ignored if nested call not found in parent", () => {
@@ -4299,5 +4335,377 @@ describe("review_pane_update -> assistedReviewHunks", () => {
     const pins = aggregator.getAssistedReviewHunks();
     expect(pins).toHaveLength(1);
     expect(pins[0].path).toBe("src/bar.ts");
+  });
+});
+
+/**
+ * Tests for notify tool results -> Web Notifications routing.
+ *
+ * The notify tool persists its routing metadata (`notifiedVia: "browser"`) in
+ * history, so the aggregator must fire Web Notifications only for live tool
+ * results. History hydration and reconnect replay re-process the same outputs
+ * on every workspace switch/reload and must stay silent (#2547).
+ */
+class FakeNotification {
+  static permission = "granted";
+  static created: Array<{ title: string; body?: string }> = [];
+  onclick: (() => void) | null = null;
+
+  constructor(title: string, options?: { body?: string }) {
+    FakeNotification.created.push({ title, body: options?.body });
+  }
+
+  static requestPermission(): Promise<string> {
+    return Promise.resolve("granted");
+  }
+}
+
+function withFakeNotificationWindow<T>(fn: () => T): T {
+  const globalWithWindow = globalThis as unknown as { window?: unknown };
+  const previousWindow = globalWithWindow.window;
+  FakeNotification.created = [];
+  globalWithWindow.window = { Notification: FakeNotification, focus: () => undefined };
+  try {
+    return fn();
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalWithWindow.window;
+    } else {
+      globalWithWindow.window = previousWindow;
+    }
+  }
+}
+
+function browserNotifyOutput(title: string, message?: string) {
+  return {
+    success: true,
+    title,
+    message,
+    ui_only: { notify: { notifiedVia: "browser", workspaceId: TEST_WORKSPACE_ID } },
+  };
+}
+
+function runNotifyTool(
+  aggregator: StreamingMessageAggregator,
+  options: { messageId?: string; toolCallId?: string; replay?: boolean } = {}
+): void {
+  const messageId = options.messageId ?? "msg-1";
+  const toolCallId = options.toolCallId ?? "tc-notify";
+  startToolCall(aggregator, {
+    messageId,
+    toolCallId,
+    toolName: "notify",
+    args: { title: "Task done" },
+  });
+  endToolCall(aggregator, {
+    messageId,
+    toolCallId,
+    toolName: "notify",
+    result: browserNotifyOutput("Task done", "All checks passed"),
+    replay: options.replay,
+  });
+}
+
+describe("notify tool -> browser notifications", () => {
+  test("live notify results fire a browser notification", () => {
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+
+      runNotifyTool(aggregator);
+
+      expect(FakeNotification.created).toEqual([{ title: "Task done", body: "All checks passed" }]);
+    });
+  });
+
+  test("replayed tool-call-end does not re-fire the notification", () => {
+    // Reconnect replay re-emits tool-call-end (replay: true) for already-completed
+    // calls of an active stream; the user was already notified when it ran live.
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+
+      runNotifyTool(aggregator, { replay: true });
+
+      expect(FakeNotification.created).toEqual([]);
+    });
+  });
+
+  test("history hydration does not re-fire notifications; later live ones still do", () => {
+    // Workspace switches and reloads hydrate the full transcript through
+    // loadHistoricalMessages; historical notify results must stay silent.
+    withFakeNotificationWindow(() => {
+      const aggregator = createTestAggregator();
+      const message = createMuxMessage("msg-1", "assistant", "", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        muxMetadata: { type: "normal", requestedModel: TEST_MODEL },
+      });
+      message.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "tc-notify",
+        toolName: "notify",
+        state: "output-available",
+        input: { title: "Task done" },
+        output: browserNotifyOutput("Task done", "All checks passed"),
+      });
+
+      aggregator.loadHistoricalMessages([message]);
+      expect(FakeNotification.created).toEqual([]);
+
+      // A genuinely new notify after hydration still notifies.
+      startTestStream(aggregator, { messageId: "msg-2", historySequence: 2 });
+      runNotifyTool(aggregator, { messageId: "msg-2", toolCallId: "tc-notify-2" });
+      expect(FakeNotification.created).toEqual([{ title: "Task done", body: "All checks passed" }]);
+    });
+  });
+
+  describe("server-issued reconnect cursor", () => {
+    test("returns undefined before any server cursor is stored", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("history-1", "user", "hello", { historySequence: 1, timestamp: 1 })],
+        false,
+        { mode: "replace" }
+      );
+
+      // Local rows alone are not enough: only the server can issue a valid cursor.
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("returns the stored server cursor verbatim and clears on null", () => {
+      const aggregator = createTestAggregator();
+      const serverCursor = {
+        messageId: "history-2",
+        historySequence: 2,
+        oldestHistorySequence: 1,
+        priorHistoryFingerprint: "deadbeef",
+      };
+
+      aggregator.setServerHistoryCursor(serverCursor);
+      expect(aggregator.getOnChatCursor()?.history).toEqual(serverCursor);
+
+      aggregator.setServerHistoryCursor(null);
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("clear() drops the stored server cursor", () => {
+      const aggregator = createTestAggregator();
+      aggregator.setServerHistoryCursor({ messageId: "history-1", historySequence: 1 });
+      aggregator.clear();
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+  });
+
+  describe("since-replay suffix reconciliation", () => {
+    const persistedRow = (
+      id: string,
+      historySequence: number,
+      texts: string[],
+      role: "user" | "assistant" = "assistant"
+    ) => {
+      // createMuxMessage rejects empty user messages, so build with placeholder
+      // content and overwrite parts with the exact persisted-form layout.
+      const message = createMuxMessage(id, role, "placeholder", {
+        historySequence,
+        timestamp: historySequence * 100,
+      });
+      message.parts = texts.map((text) => ({ type: "text" as const, text }));
+      return message;
+    };
+
+    test("removes local suffix rows the server did not re-send", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["kept"]),
+          persistedRow("assistant-3", 3, ["deleted server-side while away"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["kept"])],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual([
+        "user-1",
+        "assistant-2",
+      ]);
+    });
+
+    test("replaces rewritten rows even when the persisted form has fewer parts", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["a", "b", "c"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["rewritten"])],
+        hasActiveStream: false,
+      });
+
+      const rewritten = aggregator.getAllMessages().find((message) => message.id === "assistant-2");
+      expect(rewritten?.parts).toEqual([{ type: "text", text: "rewritten" }]);
+    });
+
+    test("keeps optimistic rows without a historySequence and does not duplicate the boundary row", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("assistant-1", 1, ["turn one"])], false, {
+        mode: "replace",
+      });
+      // Optimistic send awaiting ack: no historySequence yet.
+      aggregator.addMessage(createMuxMessage("optimistic-1", "user", "queued send"));
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("assistant-1", 1, ["turn one"])],
+        hasActiveStream: false,
+      });
+
+      const ids = aggregator.getAllMessages().map((message) => message.id);
+      expect(ids.filter((id) => id === "assistant-1")).toHaveLength(1);
+      expect(ids).toContain("optimistic-1");
+    });
+
+    test("drops derived state sourced from a removed suffix row", () => {
+      const aggregator = createTestAggregator();
+      const todos = [{ content: "task", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          historicalTodoMessage("todo-row", todos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(todos);
+
+      // The todo-bearing row was deleted server-side while the client was away.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual(["user-1"]);
+      expect(aggregator.getCurrentTodos()).toEqual([]);
+    });
+
+    test("rebuilds derived state from surviving rows when a suffix source is removed", () => {
+      const aggregator = createTestAggregator();
+      const keptTodos = [{ content: "kept", status: "in_progress" as const }];
+      const staleTodos = [{ content: "stale", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          historicalTodoMessage("todo-kept", keptTodos, { historySequence: 1 }),
+          historicalTodoMessage("todo-stale", staleTodos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(staleTodos);
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      // Derived state falls back to the surviving todo_write below the anchor.
+      expect(aggregator.getCurrentTodos()).toEqual(keptTodos);
+    });
+
+    test("preserves the locally assembled active-stream row when the carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      startTestStream(aggregator, { messageId: "msg-live", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "Hello ",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "world",
+        tokens: 1,
+        timestamp: 1_002,
+      });
+
+      // The persisted placeholder for an in-flight stream has empty parts.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("user-1", 1, ["hello"], "user"), persistedRow("msg-live", 2, [])],
+        preservedActiveStreamMessageId: "msg-live",
+        hasActiveStream: true,
+      });
+
+      const liveRow = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(liveRow?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBe("msg-live");
+
+      // Stream ending right after caught-up still finalizes the preserved message.
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        metadata: { model: TEST_MODEL, historySequence: 2, timestamp: 1_003 },
+        parts: [],
+      });
+      const finalized = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(finalized?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
+    });
+
+    test("rebuilds the stream row from persisted form when no carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      // Local stream context went stale (e.g. stream A ended while away); the store
+      // clears mismatched stream contexts before reconciling, so no carve-out applies
+      // and the persisted (finalized) form wins over the richer local assembly.
+      startTestStream(aggregator, { messageId: "msg-old", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-old",
+        delta: "locally assembled much longer content",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.clearActiveStreams();
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("msg-old", 2, ["final"]),
+        ],
+        hasActiveStream: false,
+      });
+
+      const rebuilt = aggregator.getAllMessages().find((message) => message.id === "msg-old");
+      expect(rebuilt?.parts).toEqual([{ type: "text", text: "final" }]);
+    });
   });
 });

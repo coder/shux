@@ -1,5 +1,5 @@
 import React, { useEffect } from "react";
-import { ChevronDown, Github, MessageCircle } from "lucide-react";
+import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
@@ -12,9 +12,11 @@ import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import {
-  useWorkspaceLastUserPrompt,
+  pinTimelineRevealTarget,
+  useWorkspaceLastUserPromptInfo,
   useWorkspaceRoundedStreamingTps,
   useWorkspaceSidebarState,
+  useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
@@ -30,7 +32,13 @@ import { MultiProjectGitStatusIndicator } from "../GitStatusIndicator/MultiProje
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { revealTimelineTarget, type TimelineRevealResult } from "@/browser/utils/timelineReveal";
+import {
+  formatKeybind,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 
 interface WorkspaceFooterBarProps {
   workspaceId: string;
@@ -107,7 +115,7 @@ function DriftModeToggle() {
           onKeyDown={stopKeyboardPropagation}
         >
           {isLineDelta ? "Lines" : "Commits"}
-          <ChevronDown className="h-3 w-3 shrink-0" aria-hidden="true" />
+          <ArrowLeftRight className="h-3 w-3 shrink-0" aria-hidden="true" />
         </button>
       </TooltipTrigger>
       <TooltipContent side="top">
@@ -204,15 +212,31 @@ function FooterUsageStats(props: { workspaceId: string }) {
 }
 
 function FooterLastPrompt(props: { workspaceId: string }) {
-  const lastPrompt = useWorkspaceLastUserPrompt(props.workspaceId);
+  const lastPrompt = useWorkspaceLastUserPromptInfo(props.workspaceId);
+  const workspaceStore = useWorkspaceStoreRaw();
   const [open, setOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
+  const revealButtonRef = React.useRef<HTMLButtonElement>(null);
+  const revealOperationRef = React.useRef(0);
+  const lastPromptMessageId = lastPrompt?.messageId;
+  const [revealState, setRevealState] = React.useState<
+    "idle" | "revealing" | "not-found" | "error"
+  >("idle");
+
+  useEffect(() => {
+    revealOperationRef.current += 1;
+    setRevealState("idle");
+    return () => {
+      revealOperationRef.current += 1;
+    };
+  }, [lastPromptMessageId]);
 
   // Reset open state when the prompt disappears so a later prompt cannot inherit it.
   useEffect(() => {
-    if (lastPrompt === null) {
+    if (lastPromptMessageId == null) {
       setOpen(false);
       setTooltipOpen(false);
+      setRevealState("idle");
       return;
     }
     const handler = (e: KeyboardEvent) => {
@@ -223,11 +247,69 @@ function FooterLastPrompt(props: { workspaceId: string }) {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [lastPrompt]);
+  }, [lastPromptMessageId]);
+
+  useEffect(() => {
+    if (open) {
+      return;
+    }
+    revealOperationRef.current += 1;
+    setRevealState("idle");
+  }, [open]);
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (
+        !open ||
+        !matchesKeybind(event, KEYBINDS.REVEAL_LAST_PROMPT) ||
+        isEditableElement(event.target)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (revealButtonRef.current && !revealButtonRef.current.disabled) {
+        revealButtonRef.current.click();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [open]);
 
   if (lastPrompt === null) {
     return null;
   }
+
+  const handleReveal = () => {
+    if (revealState === "revealing") {
+      return;
+    }
+
+    setRevealState("revealing");
+    const operation = ++revealOperationRef.current;
+    revealTimelineTarget({
+      workspaceId: props.workspaceId,
+      getTarget: () => ({ messageId: lastPrompt.messageId }),
+      workspaceStore,
+      pinTarget: pinTimelineRevealTarget,
+      isCancelled: () => operation !== revealOperationRef.current,
+    })
+      .then((result: TimelineRevealResult) => {
+        if (result === "cancelled" || operation !== revealOperationRef.current) {
+          return;
+        }
+        if (result === "revealed") {
+          setOpen(false);
+          setRevealState("idle");
+        } else {
+          setRevealState(result);
+        }
+      })
+      .catch(() => {
+        if (operation === revealOperationRef.current) {
+          setRevealState("error");
+        }
+      });
+  };
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -256,9 +338,24 @@ function FooterLastPrompt(props: { workspaceId: string }) {
         align="end"
         sideOffset={8}
         collisionPadding={12}
-        className="max-h-60 w-auto max-w-[min(25rem,var(--radix-popover-content-available-width,25rem))] overflow-y-auto p-3 text-xs leading-relaxed break-words whitespace-pre-wrap"
+        className="max-h-60 w-auto max-w-[min(25rem,var(--radix-popover-content-available-width,25rem))] overflow-y-auto p-3 text-xs leading-relaxed break-words"
       >
-        {lastPrompt}
+        <div className="whitespace-pre-wrap">{lastPrompt.text}</div>
+        <button
+          type="button"
+          ref={revealButtonRef}
+          data-testid="workspace-footer-last-prompt-reveal"
+          disabled={revealState === "revealing"}
+          onClick={handleReveal}
+          className="border-border bg-surface-primary text-content-primary hover:bg-hover focus-visible:ring-accent mt-3 rounded-md border px-2.5 py-1.5 text-xs font-medium focus-visible:ring-1 focus-visible:outline-none disabled:cursor-wait disabled:opacity-60"
+        >
+          {revealState === "revealing" ? "Revealing…" : "Reveal in transcript"}
+        </button>
+        {revealState === "not-found" ? (
+          <div className="text-muted mt-1.5 text-[10px]">Prompt not found in the transcript</div>
+        ) : revealState === "error" ? (
+          <div className="text-muted mt-1.5 text-[10px]">Reveal unavailable</div>
+        ) : null}
       </PopoverContent>
     </Popover>
   );
@@ -313,6 +410,7 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
         <WorkspaceLinks
           workspaceId={props.workspaceId}
           className="[@media(max-width:768px)]:hidden"
+          menuDirection="up"
         />
         {hasRepository && (
           <>

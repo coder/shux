@@ -1,1 +1,1 @@
-../../.mux/skills/tbench/SKILL.md
+../../.xum/skills/tbench/SKILL.md

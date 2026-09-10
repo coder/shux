@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Download, Loader2, RefreshCw } from "lucide-react";
 import { VERSION } from "@/version";
-import type { UpdateStatus } from "@/common/orpc/types";
+import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
-import MuxLogoDark from "@/browser/assets/logos/mux-logo-dark.svg?react";
-import MuxLogoLight from "@/browser/assets/logos/mux-logo-light.svg?react";
+import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
+import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import XumLogoLight from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { useAPI } from "@/browser/contexts/API";
 import { useAboutDialog } from "@/browser/contexts/AboutDialogContext";
@@ -14,6 +15,27 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
+
+const channelDescriptions: Record<UpdateChannel, string> = {
+  stable: "Official releases only.",
+  nightly: "Nightly pre-release builds from main.",
+  npm: "Most recently published npm package, including pre-releases.",
+};
+
+const blockerLabels: Record<RestartBlocker["kind"], string> = {
+  "active-streams": "Active streams",
+  "pending-turns": "Pending turns",
+  "workspace-inits": "Workspaces still initializing",
+  "workspace-lifecycle": "Workspaces being archived, removed, forked, or staged",
+  workflows: "Workflow runs in progress",
+  projects: "Projects being cloned or created",
+  requests: "Requests in flight",
+  "desktop-sessions": "Live desktop sessions",
+  "queued-messages": "Sessions with queued messages",
+  "auto-retries": "Pending auto-retries",
+  terminals: "Open terminals",
+  "background-processes": "Running background processes",
+};
 
 interface VersionRecord {
   buildTime?: unknown;
@@ -67,18 +89,19 @@ export function AboutDialog() {
   const { isOpen, close } = useAboutDialog();
   const { api } = useAPI();
   const { theme } = useTheme();
-  const MuxLogo = theme === "dark" || theme.endsWith("-dark") ? MuxLogoDark : MuxLogoLight;
+  const XumLogo = theme === "dark" || theme.endsWith("-dark") ? XumLogoDark : XumLogoLight;
   const { gitDescribe, buildTime } = parseVersionInfo(VERSION satisfies unknown);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ type: "idle" });
   const [channel, setChannel] = useState<UpdateChannel | null>(null);
+  const [supportedChannels, setSupportedChannels] = useState<UpdateChannel[]>([]);
   const [channelLoading, setChannelLoading] = useState(false);
-  const [pendingAction, setPendingAction] = useState<"check" | "download" | "install" | null>(null);
+  const [pendingAction, setPendingAction] = useState<
+    "check" | "download" | "install" | "force-install" | null
+  >(null);
   const channelRequestTokenRef = useRef(0);
 
-  const isDesktop = typeof window !== "undefined" && Boolean(window.api);
-
   useEffect(() => {
-    if (!isOpen || !isDesktop || !api) {
+    if (!isOpen || !api) {
       return;
     }
 
@@ -105,10 +128,10 @@ export function AboutDialog() {
     return () => {
       controller.abort();
     };
-  }, [api, isDesktop, isOpen]);
+  }, [api, isOpen]);
 
   useEffect(() => {
-    if (!isOpen || !isDesktop || !api) {
+    if (!isOpen || !api) {
       return;
     }
 
@@ -118,9 +141,10 @@ export function AboutDialog() {
 
     api.update
       .getChannel()
-      .then((nextChannel) => {
+      .then((result) => {
         if (active && requestToken === channelRequestTokenRef.current) {
-          setChannel(nextChannel);
+          setChannel(result.channel);
+          setSupportedChannels(result.supportedChannels);
         }
       })
       .catch(console.error);
@@ -128,9 +152,9 @@ export function AboutDialog() {
     return () => {
       active = false;
     };
-  }, [api, isDesktop, isOpen]);
+  }, [api, isOpen]);
 
-  const canUseUpdateApi = isDesktop && Boolean(api);
+  const canUseUpdateApi = Boolean(api);
   const isChecking =
     canUseUpdateApi &&
     (updateStatus.type === "checking" ||
@@ -161,7 +185,7 @@ export function AboutDialog() {
     api.update
       .check({ source: "manual" })
       .catch(console.error)
-      // Clear pending if the backend no-ops (e.g. already downloaded) and emits no status event.
+      // Clear pending if the backend no-ops (e.g. a check is already running) and emits no status event.
       .finally(() => setPendingAction((prev) => (prev === "check" ? null : prev)));
   };
 
@@ -177,16 +201,18 @@ export function AboutDialog() {
       .finally(() => setPendingAction((prev) => (prev === "download" ? null : prev)));
   };
 
-  const handleInstall = () => {
+  const installPending = pendingAction === "install" || pendingAction === "force-install";
+  const handleInstall = (options?: { force: boolean }) => {
     if (!api) {
       return;
     }
 
-    setPendingAction("install");
+    const action = options?.force ? "force-install" : "install";
+    setPendingAction(action);
     api.update
-      .install(undefined)
+      .install(options)
       .catch(console.error)
-      .finally(() => setPendingAction((prev) => (prev === "install" ? null : prev)));
+      .finally(() => setPendingAction((prev) => (prev === action ? null : prev)));
   };
 
   return (
@@ -199,7 +225,7 @@ export function AboutDialog() {
         <DialogTitle>About</DialogTitle>
 
         <div className="border-border-medium bg-modal-bg flex justify-center rounded-md border py-6">
-          <MuxLogo className="h-14 w-auto" aria-hidden="true" />
+          <XumLogo className="h-14 w-auto" aria-hidden="true" />
         </div>
 
         <div className="space-y-1 text-sm">
@@ -216,43 +242,36 @@ export function AboutDialog() {
         <div className="border-border-medium space-y-3 border-t pt-3">
           <div className="text-foreground text-sm font-medium">Updates</div>
 
-          {!isDesktop ? (
-            <div className="text-muted text-xs">
-              Desktop updates are available in the Electron app only.
-            </div>
+          {updateStatus.type === "unsupported" ? (
+            <div className="text-muted text-xs">{updateStatus.reason}</div>
           ) : !canUseUpdateApi ? (
-            <div className="text-muted text-xs">Connecting to desktop update service…</div>
+            <div className="text-muted text-xs">Connecting to update service…</div>
           ) : (
             <>
               {channel !== null && (
                 <div className="space-y-2">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-muted text-xs">Channel</span>
                     <ToggleGroup
                       type="single"
                       value={channel}
                       onValueChange={(next) => {
-                        if (next === "stable" || next === "nightly") {
+                        if (next === "stable" || next === "nightly" || next === "npm") {
                           handleChannelChange(next);
                         }
                       }}
-                      disabled={channelLoading}
+                      disabled={channelLoading || isChecking || pendingAction !== null}
                       aria-label="Update channel"
                       size="sm"
                     >
-                      <ToggleGroupItem value="stable" size="sm">
-                        Stable
-                      </ToggleGroupItem>
-                      <ToggleGroupItem value="nightly" size="sm">
-                        Nightly
-                      </ToggleGroupItem>
+                      {supportedChannels.map((option) => (
+                        <ToggleGroupItem key={option} value={option} size="sm">
+                          {UPDATE_CHANNEL_LABELS[option]}
+                        </ToggleGroupItem>
+                      ))}
                     </ToggleGroup>
                   </div>
-                  <div className="text-muted text-xs">
-                    {channel === "stable"
-                      ? "Official releases only."
-                      : "Nightly pre-release builds from main."}
-                  </div>
+                  <div className="text-muted text-xs">{channelDescriptions[channel]}</div>
                 </div>
               )}
 
@@ -271,8 +290,8 @@ export function AboutDialog() {
               )}
 
               {updateStatus.type === "available" && (
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-foreground text-xs">
+                <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                  <div className="text-foreground min-w-0 text-xs break-words">
                     Update available: <span className="font-mono">{updateStatus.info.version}</span>
                   </div>
                   <Button
@@ -292,16 +311,23 @@ export function AboutDialog() {
 
               {updateStatus.type === "downloading" && (
                 <div className="text-muted text-xs">
-                  Downloading update: {updateStatus.percent}%
+                  {updateStatus.percent === null ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Downloading update…
+                    </span>
+                  ) : (
+                    <>Downloading update: {updateStatus.percent}%</>
+                  )}
                 </div>
               )}
 
-              {updateStatus.type === "downloaded" && (
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-foreground text-xs">
+              {(updateStatus.type === "downloaded" || updateStatus.type === "install-blocked") && (
+                <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center">
+                  <div className="text-foreground min-w-0 text-xs break-words">
                     Ready to install: <span className="font-mono">{updateStatus.info.version}</span>
                   </div>
-                  <Button size="sm" onClick={handleInstall} disabled={pendingAction === "install"}>
+                  <Button size="sm" onClick={() => handleInstall()} disabled={installPending}>
                     {pendingAction === "install" ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     ) : (
@@ -312,8 +338,40 @@ export function AboutDialog() {
                 </div>
               )}
 
+              {updateStatus.type === "install-blocked" && (
+                <>
+                  <div className="text-muted space-y-1 text-xs" role="status">
+                    <div>Finish or stop this work, then retry the restart:</div>
+                    <ul>
+                      {updateStatus.blockers.map((blocker) => (
+                        <li key={blocker.kind}>
+                          {blockerLabels[blocker.kind]}:{" "}
+                          <span className="counter-nums">{blocker.count}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleInstall({ force: true })}
+                      disabled={installPending}
+                    >
+                      {pendingAction === "force-install" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                      Restart anyway
+                    </Button>
+                    <span className="text-muted text-xs">Interrupts the work listed above.</span>
+                  </div>
+                </>
+              )}
+
               {updateStatus.type === "up-to-date" && (
-                <div className="text-muted text-xs">Mux is up to date.</div>
+                <div className="text-muted text-xs">Xum is up to date.</div>
               )}
 
               {updateStatus.type === "idle" && (
@@ -347,7 +405,7 @@ export function AboutDialog() {
                     {updateStatus.phase === "install" && (
                       <Button
                         size="sm"
-                        onClick={handleInstall}
+                        onClick={() => handleInstall()}
                         disabled={pendingAction === "install"}
                       >
                         {pendingAction === "install" ? (

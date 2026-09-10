@@ -2,13 +2,13 @@ import * as vscode from "vscode";
 import assert from "node:assert";
 import { createHash, randomBytes } from "node:crypto";
 
-import { formatRelativeTime } from "mux/browser/utils/ui/dateTime";
+import { formatRelativeTime } from "xum/browser/utils/ui/dateTime";
 import {
   getAllWorkspacesFromFiles,
   getAllWorkspacesFromApi,
   getWorkspacePath,
   WorkspaceWithContext,
-} from "./muxConfig";
+} from "./xumConfig";
 import { checkAuth, checkServerReachable } from "./api/connectionCheck";
 import { createApiClient, type ApiClient } from "./api/client";
 import {
@@ -43,14 +43,14 @@ interface PendingAutoSelectState {
   createdAtMs: number;
 }
 
-let muxLogChannel: vscode.LogOutputChannel | undefined;
+let xumLogChannel: vscode.LogOutputChannel | undefined;
 
-function getMuxLogChannel(): vscode.LogOutputChannel {
-  if (!muxLogChannel) {
-    muxLogChannel = vscode.window.createOutputChannel("Mux", { log: true });
+function getXumLogChannel(): vscode.LogOutputChannel {
+  if (!xumLogChannel) {
+    xumLogChannel = vscode.window.createOutputChannel("Xum", { log: true });
   }
 
-  return muxLogChannel;
+  return xumLogChannel;
 }
 
 function formatLogData(data: unknown): string {
@@ -65,8 +65,12 @@ function formatLogData(data: unknown): string {
   }
 }
 
-function muxLog(level: "debug" | "info" | "warn" | "error", message: string, data?: unknown): void {
-  const channel = getMuxLogChannel();
+function xumLog(
+  level: "debug" | "info" | "warn" | "error",
+  message: string,
+  data?: unknown
+): void {
+  const channel = getXumLogChannel();
   const suffix = data === undefined ? "" : ` ${formatLogData(data)}`;
 
   switch (level) {
@@ -85,20 +89,20 @@ function muxLog(level: "debug" | "info" | "warn" | "error", message: string, dat
   }
 }
 
-function muxLogDebug(message: string, data?: unknown): void {
-  muxLog("debug", message, data);
+function xumLogDebug(message: string, data?: unknown): void {
+  xumLog("debug", message, data);
 }
 
-function muxLogInfo(message: string, data?: unknown): void {
-  muxLog("info", message, data);
+function xumLogInfo(message: string, data?: unknown): void {
+  xumLog("info", message, data);
 }
 
-function muxLogWarn(message: string, data?: unknown): void {
-  muxLog("warn", message, data);
+function xumLogWarn(message: string, data?: unknown): void {
+  xumLog("warn", message, data);
 }
 
-function muxLogError(message: string, data?: unknown): void {
-  muxLog("error", message, data);
+function xumLogError(message: string, data?: unknown): void {
+  xumLog("error", message, data);
 }
 
 function toUiWorkspace(workspace: WorkspaceWithContext): UiWorkspace {
@@ -233,17 +237,17 @@ function formatError(error: unknown): string {
 function describeFailure(failure: ApiConnectionFailure): string {
   switch (failure.kind) {
     case "unreachable":
-      return `mux server is not reachable at ${failure.baseUrl}`;
+      return `xum server is not reachable at ${failure.baseUrl}`;
     case "unauthorized":
-      return `mux server rejected the auth token at ${failure.baseUrl}`;
+      return `xum server rejected the auth token at ${failure.baseUrl}`;
     case "error":
-      return `mux server connection failed at ${failure.baseUrl}`;
+      return `xum server connection failed at ${failure.baseUrl}`;
   }
 }
 
 function getWarningSuffix(failure: ApiConnectionFailure): string {
   if (failure.kind === "unauthorized") {
-    return "Using local file access while mux is running can cause inconsistencies.";
+    return "Using local file access while xum is running can cause inconsistencies.";
   }
   return "Using local file access can cause inconsistencies.";
 }
@@ -253,12 +257,12 @@ async function tryGetApiClient(
 ): Promise<{ client: ApiClient; baseUrl: string } | { failure: ApiConnectionFailure }> {
   assert(context, "tryGetApiClient requires context");
 
-  muxLogDebug("mux: tryGetApiClient start");
+  xumLogDebug("xum: tryGetApiClient start");
 
   try {
     const discovery = await discoverServerConfig(context);
 
-    muxLogDebug("mux: discovered server config", {
+    xumLogDebug("xum: discovered server config", {
       baseUrl: discovery.baseUrl,
       baseUrlSource: discovery.baseUrlSource,
       authTokenSource: discovery.authTokenSource,
@@ -268,7 +272,7 @@ async function tryGetApiClient(
     const client = createApiClient({ baseUrl: discovery.baseUrl, authToken: discovery.authToken });
 
     const reachable = await checkServerReachable(discovery.baseUrl);
-    muxLogDebug("mux: server reachable check", reachable);
+    xumLogDebug("xum: server reachable check", reachable);
     if (reachable.status !== "ok") {
       return {
         failure: {
@@ -280,7 +284,7 @@ async function tryGetApiClient(
     }
 
     const auth = await checkAuth(client);
-    muxLogDebug("mux: auth check", auth);
+    xumLogDebug("xum: auth check", auth);
 
     if (auth.status === "unauthorized") {
       return {
@@ -301,14 +305,14 @@ async function tryGetApiClient(
       };
     }
 
-    muxLogDebug("mux: tryGetApiClient success", { baseUrl: discovery.baseUrl });
+    xumLogDebug("xum: tryGetApiClient success", { baseUrl: discovery.baseUrl });
 
     return {
       client,
       baseUrl: discovery.baseUrl,
     };
   } catch (error) {
-    muxLogError("mux: tryGetApiClient threw", { error: formatError(error) });
+    xumLogError("xum: tryGetApiClient threw", { error: formatError(error) });
 
     return {
       failure: {
@@ -352,7 +356,7 @@ async function getWorkspacesForCommand(
 
   if (modeSetting === "server-only") {
     const selection = await vscode.window.showErrorMessage(
-      `mux: ${describeFailure(failure)}. (${failure.error})`,
+      `xum: ${describeFailure(failure)}. (${failure.error})`,
       ACTION_FIX_CONNECTION_CONFIG
     );
 
@@ -367,13 +371,13 @@ async function getWorkspacesForCommand(
   if (didShowFallbackPrompt) {
     sessionPreferredMode = "file";
     void vscode.window.showWarningMessage(
-      `mux: ${describeFailure(failure)}. Falling back to local file access. Run "mux: Configure Connection" to fix.`
+      `xum: ${describeFailure(failure)}. Falling back to local file access. Run "xum: Configure Connection" to fix.`
     );
     return getAllWorkspacesFromFiles();
   }
 
   const selection = await vscode.window.showWarningMessage(
-    `mux: ${describeFailure(failure)}. ${getWarningSuffix(failure)}`,
+    `xum: ${describeFailure(failure)}. ${getWarningSuffix(failure)}`,
     ACTION_FIX_CONNECTION_CONFIG,
     ACTION_USE_LOCAL_FILES,
     ACTION_CANCEL
@@ -401,7 +405,7 @@ async function getWorkspacesForCommand(
   // Still can't connect; fall back without prompting again.
   sessionPreferredMode = "file";
   void vscode.window.showWarningMessage(
-    `mux: ${describeFailure(retry.failure)}. Falling back to local file access. (${retry.failure.error})`
+    `xum: ${describeFailure(retry.failure)}. Falling back to local file access. (${retry.failure.error})`
   );
   return getAllWorkspacesFromFiles();
 }
@@ -501,12 +505,12 @@ function createWorkspaceQuickPickItem(
 }
 
 /**
- * Command: Open a mux workspace
+ * Command: Open a xum workspace
  */
 async function openWorkspaceCommand(
   context: vscode.ExtensionContext,
   options?: {
-    chatViewProvider?: MuxChatViewProvider;
+    chatViewProvider?: XumChatViewProvider;
   }
 ): Promise<void> {
   // Get all workspaces, this is intentionally not cached.
@@ -517,13 +521,15 @@ async function openWorkspaceCommand(
 
   if (workspaces.length === 0) {
     const selection = await vscode.window.showInformationMessage(
-      "No mux workspaces found. Create a workspace in mux first.",
-      "Open mux"
+      "No Xum workspaces found. Create a workspace in Xum first.",
+      "Open Xum"
     );
 
-    // User can't easily open mux from VS Code, so just inform them
-    if (selection === "Open mux") {
-      vscode.window.showInformationMessage("Please open the mux application to create workspaces.");
+    // User can't easily open Xum from VS Code, so just inform them
+    if (selection === "Open Xum") {
+      vscode.window.showInformationMessage(
+        "Please open the Xum application to create workspaces."
+      );
     }
     return;
   }
@@ -535,7 +541,7 @@ async function openWorkspaceCommand(
   const quickPick = vscode.window.createQuickPick<
     vscode.QuickPickItem & { workspace: WorkspaceWithContext }
   >();
-  quickPick.placeholder = "Select a mux workspace to open";
+  quickPick.placeholder = "Select a xum workspace to open";
   quickPick.matchOnDescription = true;
   quickPick.matchOnDetail = false;
   quickPick.items = allItems;
@@ -614,7 +620,7 @@ async function configureConnectionCommand(context: vscode.ExtensionContext): Pro
         ...(hasToken ? ([{ label: "Clear auth token" }] as const) : ([] as const)),
         { label: "Done" },
       ],
-      { placeHolder: "Configure mux server connection" }
+      { placeHolder: "Configure xum server connection" }
     );
 
     if (!pick || pick.label === "Done") {
@@ -623,7 +629,7 @@ async function configureConnectionCommand(context: vscode.ExtensionContext): Pro
 
     if (pick.label === "Set server URL") {
       const value = await vscode.window.showInputBox({
-        title: "mux server URL",
+        title: "xum server URL",
         value: currentUrl,
         prompt: "Example: http://127.0.0.1:3000 (leave blank for auto-discovery)",
         validateInput(input) {
@@ -663,8 +669,8 @@ async function configureConnectionCommand(context: vscode.ExtensionContext): Pro
 
     if (pick.label === "Set auth token") {
       const token = await vscode.window.showInputBox({
-        title: "mux server auth token",
-        prompt: "Paste the mux server auth token",
+        title: "xum server auth token",
+        prompt: "Paste the xum server auth token",
         password: true,
         validateInput(input) {
           return input.trim().length > 0 ? null : "Token cannot be empty";
@@ -689,23 +695,23 @@ async function configureConnectionCommand(context: vscode.ExtensionContext): Pro
 async function debugConnectionCommand(context: vscode.ExtensionContext): Promise<void> {
   assert(context, "debugConnectionCommand requires context");
 
-  const output = getMuxLogChannel();
+  const output = getXumLogChannel();
   output.show(true);
 
-  muxLogInfo("mux: debugConnection start");
+  xumLogInfo("xum: debugConnection start");
 
   let discovery: Awaited<ReturnType<typeof discoverServerConfig>>;
   try {
     discovery = await discoverServerConfig(context);
   } catch (error) {
-    muxLogError("mux: debugConnection discovery failed", { error: formatError(error) });
+    xumLogError("xum: debugConnection discovery failed", { error: formatError(error) });
     void vscode.window.showErrorMessage(
-      `mux: Failed to discover server config. (${formatError(error)})`
+      `xum: Failed to discover server config. (${formatError(error)})`
     );
     return;
   }
 
-  muxLogInfo("mux: debugConnection discovered server config", {
+  xumLogInfo("xum: debugConnection discovered server config", {
     baseUrl: discovery.baseUrl,
     baseUrlSource: discovery.baseUrlSource,
     authTokenSource: discovery.authTokenSource,
@@ -713,11 +719,11 @@ async function debugConnectionCommand(context: vscode.ExtensionContext): Promise
   });
 
   const reachable = await checkServerReachable(discovery.baseUrl, { timeoutMs: 2_000 });
-  muxLogInfo("mux: debugConnection server reachable", reachable);
+  xumLogInfo("xum: debugConnection server reachable", reachable);
 
   if (reachable.status !== "ok") {
     void vscode.window.showErrorMessage(
-      `mux: Server not reachable at ${discovery.baseUrl}. (${reachable.error})`
+      `xum: Server not reachable at ${discovery.baseUrl}. (${reachable.error})`
     );
     return;
   }
@@ -725,16 +731,16 @@ async function debugConnectionCommand(context: vscode.ExtensionContext): Promise
   const client = createApiClient({ baseUrl: discovery.baseUrl, authToken: discovery.authToken });
 
   const auth = await checkAuth(client, { timeoutMs: 2_000 });
-  muxLogInfo("mux: debugConnection auth", auth);
+  xumLogInfo("xum: debugConnection auth", auth);
 
   if (auth.status !== "ok") {
     const hint =
       auth.status === "unauthorized"
-        ? ' Run "mux: Configure Connection" to update the auth token.'
+        ? ' Run "xum: Configure Connection" to update the auth token.'
         : "";
 
     void vscode.window.showErrorMessage(
-      `mux: Failed to authenticate at ${discovery.baseUrl}. (${auth.error})${hint}`
+      `xum: Failed to authenticate at ${discovery.baseUrl}. (${auth.error})${hint}`
     );
     return;
   }
@@ -743,15 +749,15 @@ async function debugConnectionCommand(context: vscode.ExtensionContext): Promise
   try {
     const workspaces = await getAllWorkspacesFromApi(client);
     workspaceCount = workspaces.length;
-    muxLogInfo("mux: debugConnection listed workspaces", { count: workspaceCount });
+    xumLogInfo("xum: debugConnection listed workspaces", { count: workspaceCount });
   } catch (error) {
-    muxLogWarn("mux: debugConnection list workspaces failed", { error: formatError(error) });
+    xumLogWarn("xum: debugConnection list workspaces failed", { error: formatError(error) });
   }
 
   void vscode.window.showInformationMessage(
     workspaceCount === null
-      ? `mux: Connected to ${discovery.baseUrl} (auth ok).`
-      : `mux: Connected to ${discovery.baseUrl} (auth ok). Workspaces: ${workspaceCount}.`
+      ? `xum: Connected to ${discovery.baseUrl} (auth ok).`
+      : `xum: Connected to ${discovery.baseUrl} (auth ok). Workspaces: ${workspaceCount}.`
   );
 }
 
@@ -761,7 +767,7 @@ async function getWorkspacesForSidebar(
   assert(context, "getWorkspacesForSidebar requires context");
 
   const modeSetting: ConnectionMode = getConnectionModeSetting();
-  muxLogDebug("mux: getWorkspacesForSidebar", { modeSetting });
+  xumLogDebug("xum: getWorkspacesForSidebar", { modeSetting });
 
   const tryReadFromFiles = async (): Promise<
     { workspaces: WorkspaceWithContext[] } | { error: string }
@@ -780,7 +786,7 @@ async function getWorkspacesForSidebar(
         workspaces: [],
         status: {
           mode: "file",
-          error: `Failed to read mux workspaces from local files. (${fileResult.error})`,
+          error: `Failed to read xum workspaces from local files. (${fileResult.error})`,
         },
       };
     }
@@ -843,7 +849,7 @@ async function getWorkspacesForSidebar(
         status: {
           mode: "api",
           baseUrl: api.baseUrl,
-          error: `Failed to list mux workspaces from server. (${apiError})`,
+          error: `Failed to list xum workspaces from server. (${apiError})`,
         },
       };
     }
@@ -855,7 +861,7 @@ async function getWorkspacesForSidebar(
         status: {
           mode: "api",
           baseUrl: api.baseUrl,
-          error: `Failed to list mux workspaces from server. (${apiError}). Additionally, reading local workspaces failed. (${fileResult.error})`,
+          error: `Failed to list xum workspaces from server. (${apiError}). Additionally, reading local workspaces failed. (${fileResult.error})`,
         },
       };
     }
@@ -865,7 +871,7 @@ async function getWorkspacesForSidebar(
       status: {
         mode: "api",
         baseUrl: api.baseUrl,
-        error: `Failed to list mux workspaces from server; falling back to local file access. (${apiError})`,
+        error: `Failed to list xum workspaces from server; falling back to local file access. (${apiError})`,
       },
     };
   }
@@ -879,10 +885,10 @@ function renderChatViewHtml(
   assert(typeof traceId === "string" && traceId.length > 0, "traceId must be a non-empty string");
 
   const scriptUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, "out", "muxChatView.js")
+    vscode.Uri.joinPath(extensionUri, "out", "xumChatView.js")
   );
   const styleUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(extensionUri, "out", "muxChatView.css")
+    vscode.Uri.joinPath(extensionUri, "out", "xumChatView.css")
   );
   const katexStyleUri = webview.asWebviewUri(
     vscode.Uri.joinPath(extensionUri, "out", "katex", "katex.min.css")
@@ -892,12 +898,12 @@ function renderChatViewHtml(
   const csp = [
     "default-src 'none'",
     `img-src ${webview.cspSource} https: data:`,
-    // Many mux components use inline styles (e.g., FileIcon).
+    // Many xum components use inline styles (e.g., FileIcon).
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `script-src ${webview.cspSource} 'nonce-${nonce}'`,
     `font-src ${webview.cspSource} https: data:`,
     // Allow webview to fetch additional local assets (e.g. source maps, wasm) without
-    // enabling arbitrary network access to the mux server.
+    // enabling arbitrary network access to the xum server.
     `connect-src ${webview.cspSource}`,
     // Shiki uses a Web Worker when available.
     `worker-src ${webview.cspSource} blob:`,
@@ -919,7 +925,7 @@ function renderChatViewHtml(
 </html>`;
 
   const htmlHash = createHash("sha256").update(html).digest("hex").slice(0, 12);
-  muxLogDebug("mux.chatView: renderChatViewHtml", {
+  xumLogDebug("mux.chatView: renderChatViewHtml", {
     traceId,
     scriptUri: scriptUri.toString(),
     styleUri: styleUri.toString(),
@@ -935,7 +941,7 @@ function renderChatViewHtml(
   return html;
 }
 
-class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
+class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
 
   private nextWebviewMessageSeq = 1;
@@ -998,7 +1004,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       stream.controller.abort();
       // Best-effort: allow the iterator to clean up server-side.
       void stream.iterator.return?.().catch((error) => {
-        muxLogWarn("mux.chatView: stream iterator return failed during dispose", {
+        xumLogWarn("mux.chatView: stream iterator return failed during dispose", {
           streamId,
           error: formatError(error),
         });
@@ -1029,13 +1035,13 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
-    muxLogDebug("mux.chatView: resolveWebviewView", { visible: view.visible });
+    xumLogDebug("mux.chatView: resolveWebviewView", { visible: view.visible });
 
     // New view instance; clear any previous timers.
     this.clearReadyProbeInterval();
 
     this.traceId = randomBytes(8).toString("hex");
-    muxLogDebug("mux.chatView: traceId assigned", { traceId: this.traceId });
+    xumLogDebug("mux.chatView: traceId assigned", { traceId: this.traceId });
 
     this.view = view;
     this.isWebviewReady = false;
@@ -1051,7 +1057,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         ],
       };
 
-      muxLogDebug("mux.chatView: webview.options set", {
+      xumLogDebug("mux.chatView: webview.options set", {
         enableScripts: view.webview.options.enableScripts ?? false,
         localResourceRoots: (view.webview.options.localResourceRoots ?? []).map((uri) =>
           uri.toString()
@@ -1059,7 +1065,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       });
 
       const visibilityDisposable = view.onDidChangeVisibility(async () => {
-        muxLogDebug("mux.chatView: view visibility changed", { visible: view.visible });
+        xumLogDebug("mux.chatView: view visibility changed", { visible: view.visible });
 
         if (!view.visible) {
           return;
@@ -1089,14 +1095,14 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
             ? (msg as { __muxMeta?: unknown }).__muxMeta
             : undefined;
 
-        muxLogDebug("mux.chatView: <- webview message", {
+        xumLogDebug("mux.chatView: <- webview message", {
           traceId: this.traceId,
           type: msgType,
           meta,
         });
 
         void this.onWebviewMessage(msg).catch((error) => {
-          muxLogError("mux.chatView: error handling webview message", {
+          xumLogError("mux.chatView: error handling webview message", {
             error: formatError(error),
           });
           console.error("mux.chatView: error handling webview message", error);
@@ -1110,7 +1116,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       viewDisposables.push(messageDisposable);
 
       view.onDidDispose(() => {
-        muxLogDebug("mux.chatView: disposed");
+        xumLogDebug("mux.chatView: disposed");
         visibilityDisposable.dispose();
         messageDisposable.dispose();
         this.traceId = null;
@@ -1126,7 +1132,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       );
 
       const html = renderChatViewHtml(view.webview, this.context.extensionUri, traceId);
-      muxLogDebug("mux.chatView: setting webview.html", { traceId, htmlLength: html.length });
+      xumLogDebug("mux.chatView: setting webview.html", { traceId, htmlLength: html.length });
       view.webview.html = html;
 
       // While debugging the stuck "Loading mux..." state, this sends a message to the webview
@@ -1134,13 +1140,13 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       let probeAttempts = 0;
       this.readyProbeInterval = setInterval(() => {
         if (this.view !== view) {
-          muxLogDebug("mux.chatView: stopping debugProbe (view changed)");
+          xumLogDebug("mux.chatView: stopping debugProbe (view changed)");
           this.clearReadyProbeInterval();
           return;
         }
 
         if (this.isWebviewReady) {
-          muxLogDebug("mux.chatView: stopping debugProbe (ready received)");
+          xumLogDebug("mux.chatView: stopping debugProbe (ready received)");
           this.clearReadyProbeInterval();
           return;
         }
@@ -1151,14 +1157,14 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
         void view.webview.postMessage({ type: "debugProbe", attempt, sentAtMs }).then(
           (delivered) => {
-            muxLogDebug("mux.chatView: -> debugProbe", {
+            xumLogDebug("mux.chatView: -> debugProbe", {
               traceId: this.traceId,
               attempt,
               delivered,
             });
           },
           (error) => {
-            muxLogWarn("mux.chatView: debugProbe postMessage failed", {
+            xumLogWarn("mux.chatView: debugProbe postMessage failed", {
               traceId: this.traceId,
               attempt,
               error: formatError(error),
@@ -1167,7 +1173,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         );
 
         if (attempt >= 15) {
-          muxLogWarn("mux.chatView: stopping debugProbe after max attempts", {
+          xumLogWarn("mux.chatView: stopping debugProbe after max attempts", {
             maxAttempts: attempt,
           });
           this.clearReadyProbeInterval();
@@ -1183,11 +1189,11 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           return;
         }
 
-        muxLogWarn("mux.chatView: webview has not sent ready after 2s", {
+        xumLogWarn("mux.chatView: webview has not sent ready after 2s", {
           traceId: this.traceId,
           visible: view.visible,
           cspSource: view.webview.cspSource,
-          hint: "Open Webview Developer Tools and look for CSP/script errors; also check Output > Mux.",
+          hint: "Open Webview Developer Tools and look for CSP/script errors; also check Output > Xum.",
         });
       }, 2_000);
       this.readyProbeTimeouts.push(readyWarnTimeout);
@@ -1201,16 +1207,16 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           return;
         }
 
-        muxLogError("mux.chatView: webview has not sent ready after 10s", {
+        xumLogError("mux.chatView: webview has not sent ready after 10s", {
           traceId: this.traceId,
           visible: view.visible,
           cspSource: view.webview.cspSource,
-          hint: "Open Webview Developer Tools and look for CSP/script errors; also check Output > Mux.",
+          hint: "Open Webview Developer Tools and look for CSP/script errors; also check Output > Xum.",
         });
       }, 10_000);
       this.readyProbeTimeouts.push(readyErrorTimeout);
     } catch (error) {
-      muxLogError("mux.chatView: resolveWebviewView failed", {
+      xumLogError("mux.chatView: resolveWebviewView failed", {
         traceId: this.traceId,
         error: formatError(error),
       });
@@ -1229,7 +1235,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       // Best-effort: show something in the UI even if the React bundle fails to load.
       try {
         view.webview.html =
-          '<!DOCTYPE html><html lang="en"><body><h3>Failed to load mux chat view</h3><p>Check Output > Mux for details.</p></body></html>';
+          '<!DOCTYPE html><html lang="en"><body><h3>Failed to load xum chat view</h3><p>Check Output > Xum for details.</p></body></html>';
       } catch {
         // Ignore - best effort only.
       }
@@ -1241,7 +1247,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
     if (!this.view) {
       if (shouldLog) {
-        muxLogDebug("mux.chatView: -> drop postMessage (no view)", {
+        xumLogDebug("mux.chatView: -> drop postMessage (no view)", {
           traceId: this.traceId,
           type: message.type,
         });
@@ -1251,7 +1257,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
     if (!this.isWebviewReady) {
       if (shouldLog) {
-        muxLogDebug("mux.chatView: -> drop postMessage (webview not ready)", {
+        xumLogDebug("mux.chatView: -> drop postMessage (webview not ready)", {
           traceId: this.traceId,
           type: message.type,
         });
@@ -1271,7 +1277,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     void this.view.webview.postMessage(envelope).then(
       (delivered) => {
         if (shouldLog) {
-          muxLogDebug("mux.chatView: -> postMessage", {
+          xumLogDebug("mux.chatView: -> postMessage", {
             traceId: this.traceId,
             seq,
             type: message.type,
@@ -1280,7 +1286,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         }
       },
       (error) => {
-        muxLogWarn("mux.chatView: postMessage failed", {
+        xumLogWarn("mux.chatView: postMessage failed", {
           traceId: this.traceId,
           seq,
           type: message.type,
@@ -1298,12 +1304,12 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
     switch (msg.type) {
       case "debugLog":
-        muxLogDebug(`mux.chatView(webview): ${msg.message}`, msg.data);
+        xumLogDebug(`mux.chatView(webview): ${msg.message}`, msg.data);
         return;
 
       case "copyDebugLog": {
         const text = msg.text;
-        muxLogInfo("mux.chatView: copyDebugLog requested", {
+        xumLogInfo("mux.chatView: copyDebugLog requested", {
           traceId: this.traceId,
           length: text.length,
         });
@@ -1312,7 +1318,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         this.postMessage({
           type: "uiNotice",
           level: "info",
-          message: "Copied mux debug log to clipboard.",
+          message: "Copied xum debug log to clipboard.",
         });
         return;
       }
@@ -1350,7 +1356,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
 
       case "ready":
-        muxLogDebug("mux.chatView: ready handshake received", { traceId: this.traceId });
+        xumLogDebug("mux.chatView: ready handshake received", { traceId: this.traceId });
         this.isWebviewReady = true;
         this.clearReadyProbeInterval();
 
@@ -1383,13 +1389,13 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   private async refreshWorkspaces(): Promise<void> {
     const startedAt = Date.now();
     const generation = ++this.refreshWorkspacesGeneration;
-    muxLogDebug("mux.chatView: refreshWorkspaces start", { traceId: this.traceId, generation });
+    xumLogDebug("mux.chatView: refreshWorkspaces start", { traceId: this.traceId, generation });
 
     try {
       const result = await getWorkspacesForSidebar(this.context);
 
       if (generation !== this.refreshWorkspacesGeneration) {
-        muxLogDebug("mux.chatView: refreshWorkspaces stale result discarded", {
+        xumLogDebug("mux.chatView: refreshWorkspaces stale result discarded", {
           traceId: this.traceId,
           generation,
         });
@@ -1410,7 +1416,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       // Intentionally do not auto-select a workspace; the user must explicitly choose one.
       await this.updateChatSubscription();
 
-      muxLogDebug("mux.chatView: refreshWorkspaces done", {
+      xumLogDebug("mux.chatView: refreshWorkspaces done", {
         traceId: this.traceId,
         durationMs: Date.now() - startedAt,
         workspaceCount: this.workspaces.length,
@@ -1418,13 +1424,13 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         hasError: Boolean(this.connectionStatus.error),
       });
     } catch (error) {
-      muxLogError("mux.chatView: refreshWorkspaces failed", {
+      xumLogError("mux.chatView: refreshWorkspaces failed", {
         traceId: this.traceId,
         durationMs: Date.now() - startedAt,
         error: formatError(error),
       });
 
-      const message = `Failed to load mux workspaces. (${formatError(error)})`;
+      const message = `Failed to load xum workspaces. (${formatError(error)})`;
 
       this.connectionStatus = { mode: "file", error: message };
       this.workspaces = [];
@@ -1489,7 +1495,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.activeOrpcStreams.delete(streamId);
 
     void stream.iterator.return?.().catch((error) => {
-      muxLogWarn("mux.chatView: stream iterator return failed", {
+      xumLogWarn("mux.chatView: stream iterator return failed", {
         streamId,
         error: formatError(error),
       });
@@ -1575,7 +1581,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
           type: "orpcResponse",
           requestId: args.requestId,
           ok: false,
-          error: "mux server connection required",
+          error: "xum server connection required",
         });
         return;
       }
@@ -1708,7 +1714,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       this.postMessage({
         type: "uiNotice",
         level: "error",
-        message: this.connectionStatus.error ?? "mux server unavailable",
+        message: this.connectionStatus.error ?? "xum server unavailable",
       });
 
       controller.abort();
@@ -1775,7 +1781,7 @@ class MuxChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
 
 async function maybeAutoRevealChatViewFromPendingSelection(
   context: vscode.ExtensionContext,
-  provider: MuxChatViewProvider
+  provider: XumChatViewProvider
 ): Promise<void> {
   const pending = await getPendingAutoSelectWorkspace(context);
   if (!pending) {
@@ -1800,12 +1806,12 @@ async function maybeAutoRevealChatViewFromPendingSelection(
  * Activate the extension
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  muxLogInfo("mux: activate", {
+  xumLogInfo("xum: activate", {
     connectionMode: getConnectionModeSetting(),
     workspaceFolder: vscode.workspace.workspaceFolders?.[0]?.uri.toString() ?? null,
   });
 
-  const chatViewProvider = new MuxChatViewProvider(context);
+  const chatViewProvider = new XumChatViewProvider(context);
 
   context.subscriptions.push(chatViewProvider);
   context.subscriptions.push(

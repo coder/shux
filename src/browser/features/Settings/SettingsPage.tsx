@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import {
   ArrowLeft,
+  Blocks,
   Brain,
   Menu,
   Settings,
@@ -15,7 +16,10 @@ import {
   Shield,
   ShieldCheck,
   Server,
+  Monitor,
   Lock,
+  ArchiveRestore,
+  ScrollText,
 } from "lucide-react";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
@@ -30,13 +34,17 @@ import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
+import { PluginsSettingsSection } from "./Sections/PluginsSettingsSection";
 import { SecretsSection } from "./Sections/SecretsSection";
+import { InstructionsSection } from "./Sections/InstructionsSection";
 import { LayoutsSection } from "./Sections/LayoutsSection";
 import { RuntimesSection } from "./Sections/RuntimesSection";
 import { ExperimentsSection } from "./Sections/ExperimentsSection";
 import { ServerAccessSection } from "./Sections/ServerAccessSection";
+import { RemoteConnectionSection } from "./Sections/RemoteConnectionSection";
 import { KeybindsSection } from "./Sections/KeybindsSection";
 import { SecuritySection } from "./Sections/SecuritySection";
+import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
 const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
@@ -53,6 +61,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "instructions",
+    label: "Instructions",
+    icon: <ScrollText className="h-4 w-4" />,
+    component: InstructionsSection,
   },
   {
     id: "providers",
@@ -123,9 +137,31 @@ interface SettingsSectionRedirect {
 
 export function getSettingsSections(
   governorEnabled: boolean,
-  memoryEnabled: boolean
+  memoryEnabled: boolean,
+  agentPluginsEnabled: boolean,
+  remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
+  if (remoteConnectionAvailable) {
+    const serverAccessIndex = sections.findIndex((section) => section.id === "server-access");
+    sections.splice(serverAccessIndex + 1, 0, {
+      id: "remote-connection",
+      label: "Remote Connection",
+      icon: <Monitor className="h-4 w-4 shrink-0" />,
+      component: RemoteConnectionSection,
+    });
+  }
+  if (agentPluginsEnabled) {
+    // Next to MCP: plugins contribute skills + MCP servers.
+    const mcpIndex = sections.findIndex((section) => section.id === "mcp");
+    sections.splice(mcpIndex + 1, 0, {
+      id: "plugins",
+      label: "Plugins",
+      icon: <Blocks className="h-4 w-4" />,
+      component: PluginsSettingsSection,
+      experimental: true,
+    });
+  }
   if (memoryEnabled) {
     sections.push({
       id: "memory",
@@ -134,6 +170,13 @@ export function getSettingsSections(
       component: MemorySection,
     });
   }
+  sections.push({
+    id: "backup",
+    label: "Backup",
+    icon: <ArchiveRestore className="h-4 w-4" />,
+    component: BackupSection,
+    experimental: true,
+  });
   if (governorEnabled) {
     sections.push({
       id: "governor",
@@ -148,7 +191,9 @@ export function getSettingsSections(
 export function getSettingsSectionRedirect(
   activeSection: string,
   governorEnabled: boolean,
-  memoryEnabled: boolean
+  memoryEnabled: boolean,
+  agentPluginsEnabled: boolean,
+  remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
@@ -159,6 +204,14 @@ export function getSettingsSectionRedirect(
   }
 
   if (!memoryEnabled && activeSection === "memory") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  }
+
+  if (!agentPluginsEnabled && activeSection === "plugins") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  }
+
+  if (!remoteConnectionAvailable && activeSection === "remote-connection") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -175,10 +228,18 @@ export function SettingsPage(props: SettingsPageProps) {
   const onboardingPause = useOnboardingPause();
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const remoteConnectionAvailable = window.api?.remoteConnection != null;
 
-  // Keep routing on a valid section when experiment-owned settings move or disappear.
+  // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
-    const redirect = getSettingsSectionRedirect(activeSection, governorEnabled, memoryEnabled);
+    const redirect = getSettingsSectionRedirect(
+      activeSection,
+      governorEnabled,
+      memoryEnabled,
+      agentPluginsEnabled,
+      remoteConnectionAvailable
+    );
     if (!redirect) {
       return;
     }
@@ -189,7 +250,14 @@ export function SettingsPage(props: SettingsPageProps) {
     }
 
     setActiveSection(redirect.section);
-  }, [activeSection, setActiveSection, governorEnabled, memoryEnabled]);
+  }, [
+    activeSection,
+    setActiveSection,
+    governorEnabled,
+    memoryEnabled,
+    agentPluginsEnabled,
+    remoteConnectionAvailable,
+  ]);
 
   // Close settings on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
   // Popover, Dialog) that call stopPropagation/preventDefault on Escape get first
@@ -208,7 +276,12 @@ export function SettingsPage(props: SettingsPageProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [close]);
-  const sections = getSettingsSections(governorEnabled, memoryEnabled);
+  const sections = getSettingsSections(
+    governorEnabled,
+    memoryEnabled,
+    agentPluginsEnabled,
+    remoteConnectionAvailable
+  );
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
@@ -272,6 +345,9 @@ export function SettingsPage(props: SettingsPageProps) {
               >
                 {section.icon}
                 {section.label}
+                {section.experimental && (
+                  <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
+                )}
               </Button>
             ))}
           </nav>
@@ -293,6 +369,9 @@ export function SettingsPage(props: SettingsPageProps) {
                 >
                   {section.icon}
                   {section.label}
+                  {section.experimental && (
+                    <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
+                  )}
                 </Button>
               ))}
             </nav>

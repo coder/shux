@@ -3,7 +3,7 @@ title: Agentic Git Identity
 description: Configure a separate Git identity for AI-generated commits
 ---
 
-Configure Mux to use a separate Git identity for AI-generated commits, making it easy to distinguish between human and AI contributions. Reasons to use a separate identity include:
+Configure Xum to use a separate Git identity for AI-generated commits, making it easy to distinguish between human and AI contributions. Reasons to use a separate identity include:
 
 - Clear attribution
 - Preventing (accidental) destructive actions
@@ -38,7 +38,7 @@ Classic tokens are easier to configure than fine-grained tokens for repository a
 2. Go to [Settings → Developer settings → Personal access tokens → Tokens (classic)](https://github.com/settings/tokens)
 3. Click "Generate new token (classic)"
 4. Configure the token:
-   - **Note**: "Mux agent token" (or similar)
+   - **Note**: "Xum agent token" (or similar)
    - **Expiration**: Choose based on your security preferences
    - **Scopes**: Select `repo` (Full control of private repositories)
 5. Click "Generate token"
@@ -46,9 +46,9 @@ Classic tokens are easier to configure than fine-grained tokens for repository a
 
 ## Step 3: Configure Git Identity
 
-Add the Git identity environment variables as [Project Secrets](/config/project-secrets) in Mux:
+Add the Git identity environment variables as [Project Secrets](/config/project-secrets) in Xum:
 
-1. Open Mux and find your project in the sidebar
+1. Open Xum and find your project in the sidebar
 2. Click the 🔑 key icon to open the secrets modal
 3. Add the following four secrets:
    - `GIT_AUTHOR_NAME` = `Your Name (Agent)`
@@ -60,7 +60,7 @@ Add the Git identity environment variables as [Project Secrets](/config/project-
 These environment variables will be automatically injected when the agent runs Git commands in that project.
 
 <Info>
-  If you need the agent identity outside of Mux, you can alternatively set these as global
+  If you need the agent identity outside of Xum, you can alternatively set these as global
   environment variables in your shell configuration (`~/.zshrc`, `~/.bashrc`, etc.)
 </Info>
 
@@ -121,7 +121,7 @@ For guaranteed attribution, you can use Git's built-in hooks instead:
 
 ### Using a Git Hook
 
-Create a `prepare-commit-msg` hook that adds co-author attribution only when running inside Mux:
+Create a `prepare-commit-msg` hook that adds co-author attribution only when running inside Xum:
 
 ```bash
 #!/bin/bash
@@ -130,8 +130,8 @@ Create a `prepare-commit-msg` hook that adds co-author attribution only when run
 COMMIT_MSG_FILE=$1
 COMMIT_SOURCE=$2
 
-# Only add co-author when running in Mux
-if [ -z "$MUX_RUNTIME" ]; then
+# Only add co-author when running in Xum
+if [ -z "$XUM_RUNTIME" ]; then
   exit 0
 fi
 
@@ -155,7 +155,7 @@ chmod +x .git/hooks/prepare-commit-msg
 
 <Info>
   This approach uses your normal Git identity for commits, but adds a trailer indicating AI
-  involvement. The hook only activates inside Mux workspaces (detected via `MUX_RUNTIME`).
+  involvement. The hook only activates inside Xum workspaces (detected via `XUM_RUNTIME`).
 </Info>
 
 ### Comparison

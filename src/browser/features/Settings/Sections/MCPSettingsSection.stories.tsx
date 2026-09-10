@@ -1,3 +1,8 @@
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
+import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
@@ -15,6 +20,7 @@ import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
+import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { MCPSettingsSection } from "./MCPSettingsSection";
 
 const MOCK_TOOLS = [
@@ -424,5 +430,201 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
     await userEvent.click(moreActionsButton);
     await body.findByRole("button", { name: /Re-login/i });
     await body.findByRole("button", { name: /^Logout$/i });
+  },
+};
+
+function setupDesignStory(
+  enabled = true,
+  reuseEnabled = false,
+  sibling?: { disconnect: () => void }
+): APIClient {
+  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  let revision = 0;
+  updates.push({ enabled, revision });
+  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
+  const client = setupMCPSettingsSectionStory({
+    servers: enabled
+      ? {
+          claude_design: {
+            transport: "http",
+            url: CLAUDE_DESIGN_URL,
+            managed: "claude-design",
+            disabled: true,
+          },
+        }
+      : {},
+  });
+  let status: ClaudeDesignStatus = {
+    state: reuseEnabled ? "connected" : "disabled",
+    backendHost: "remote-backend.example.test",
+    platform: "linux",
+    settings: {
+      source: { type: "file", path: "/home/example/.claude/.credentials.json" },
+      reuseEnabled,
+      serverEnabled: sibling !== undefined,
+    },
+  };
+  client.experiments = {
+    onDesignChange: (_input, { signal } = {}) => {
+      signal?.addEventListener("abort", updates.end, { once: true });
+      return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
+    },
+    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
+    setOverride: () => Promise.resolve(),
+  };
+  client.mcp.designStatus = () => Promise.resolve(status);
+  client.mcp.configureDesign = (settings) => {
+    status = {
+      ...status,
+      settings: { ...status.settings, ...settings },
+      state: settings.reuseEnabled ? "not_configured" : "disabled",
+    };
+    updates.push({ enabled, revision: ++revision });
+    return Promise.resolve(status);
+  };
+  if (sibling) {
+    client.mcp.list = () =>
+      Promise.resolve({
+        claude_design: {
+          transport: "http",
+          url: CLAUDE_DESIGN_URL,
+          managed: "claude-design",
+          disabled: !status.settings.serverEnabled,
+        },
+      });
+    sibling.disconnect = () => {
+      status = {
+        ...status,
+        state: "disabled",
+        settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
+      };
+      updates.push({ enabled, revision: ++revision });
+    };
+  }
+  client.mcp.test = () => {
+    status = { ...status, state: "consent_required" };
+    return Promise.resolve({ success: false, error: "Claude Design: consent_required" });
+  };
+  return client;
+}
+
+export const ClaudeDesignOptIn: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const connect = await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Login" })).toBeNull();
+    await expect(canvas.queryByRole("button", { name: "Edit server" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await userEvent.click(connect);
+    await canvas.findByText(/Design requires consent/);
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPhone: Story = {
+  ...ClaudeDesignOptIn,
+  tags: ["claude-design"],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+  // The test-runner ignores viewport globals; the wrapper enforces the contract there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory()}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async (context) => {
+    await ClaudeDesignOptIn.play?.(context);
+    const card = within(context.canvasElement).getByRole("region", { name: "Claude Design" });
+    await expect(card.getBoundingClientRect().width).toBeLessThanOrEqual(375);
+    await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+  },
+};
+
+export const ClaudeDesignDisabled: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(false)}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("No MCP servers configured yet.");
+    await expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull();
+  },
+};
+
+export const ClaudeDesignConflictDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict remoteDisabled={false} onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    await userEvent.click(disconnect);
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignPolicyDisconnect: Story = {
+  ...ClaudeDesignConflictDisconnect,
+  tags: ["claude-design"],
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true)}>
+      <ClaudeDesignCard conflict={false} remoteDisabled onChange={() => Promise.resolve()} />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const disconnect = await canvas.findByRole("button", { name: "Disconnect" });
+    await expect(canvas.getByRole("button", { name: "Retry connection" })).toBeDisabled();
+    await expect(disconnect).toBeEnabled();
+    disconnect.focus();
+    await userEvent.keyboard("{Control>}{Shift>}d{/Shift}{/Control}");
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+  },
+};
+
+export const ClaudeDesignSiblingDisconnect: Story = {
+  tags: ["claude-design"],
+  render: () => {
+    const sibling: { disconnect: () => void } = { disconnect: () => undefined };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => setupDesignStory(true, true, sibling)}>
+        <button onClick={() => sibling.disconnect()}>Disconnect in sibling window</button>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Retry connection" });
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Disconnect in sibling window" }));
+    await canvas.findByRole("button", { name: "Use Claude Code credentials" });
+    await expect(canvas.queryByRole("button", { name: "Retry connection" })).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Disconnect" })).toBeDisabled();
+    await expect(
+      canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
+    ).not.toBeChecked();
   },
 };

@@ -1,6 +1,20 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import * as ActualAPIModule from "@/browser/contexts/API";
+import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+
+// Snapshot values, not Bun's live module namespaces, before installing overrides.
+const actualAPI = { ...ActualAPIModule };
+const actualExperiments = { ...ActualExperimentsModule };
+const actualTelemetry = { ...ActualTelemetryModule };
+
+afterAll(() => {
+  void mock.module("@/browser/contexts/API", () => actualAPI);
+  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
+});
 
 type PrereqStatus =
   | { available: true }
@@ -46,6 +60,7 @@ let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
 
 void mock.module("@/browser/contexts/API", () => ({
+  ...actualAPI,
   useAPI: () => ({
     api: mockApi,
     status: "connected" as const,
@@ -56,6 +71,7 @@ void mock.module("@/browser/contexts/API", () => ({
 }));
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+  ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
@@ -66,6 +82,7 @@ void mock.module("@/browser/contexts/ExperimentsContext", () => ({
 }));
 
 void mock.module("@/browser/hooks/useTelemetry", () => ({
+  ...actualTelemetry,
   useTelemetry: () => ({
     experimentOverridden: mock(() => undefined),
   }),
@@ -166,6 +183,32 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.clearInterval = originalClearInterval;
   });
 
+  test.each([false, true])(
+    "hides compaction switches even when their stored flags are %s",
+    (enabled) => {
+      experimentEnabled = false;
+      experimentValues = {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      };
+      const view = render(<ExperimentsSection />);
+      expect(view.queryByLabelText("Toggle Continuous Compaction")).toBeNull();
+      expect(view.queryByLabelText("Toggle Token-budget context windows")).toBeNull();
+      for (const name of [
+        "Programmatic Tool Calling",
+        "Agent Memory",
+        "Multi-project workspaces",
+        "Workspace Heartbeats",
+      ]) {
+        expect(view.getByRole("switch", { name: `Toggle ${name}` })).toBeTruthy();
+      }
+      expect(experimentValues).toEqual({
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
+      });
+    }
+  );
+
   test("shows heartbeat defaults inline only when its experiment is enabled", async () => {
     // Goal defaults moved out of ExperimentsSection into the Goal tab
     // (`GoalDefaultsSection`); goals graduated to GA so it is no longer
@@ -191,6 +234,46 @@ describe("PortableDesktopExperimentWarning", () => {
     // Goal defaults are no longer rendered in the Experiments panel —
     // they live in the Goal tab now.
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
+  });
+
+  test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+    };
+    const view = render(<ExperimentsSection />);
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.getByLabelText("Toggle Memory Intuition").getAttribute("aria-checked")).toBe(
+      "true"
+    );
+
+    fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
+    view.rerender(<ExperimentsSection />);
+    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    expect(experimentValues[EXPERIMENT_IDS.MEMORY_INTUITION]).toBe(true);
+  });
+
+  test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
+    };
+
+    const view = render(<ExperimentsSection />);
+
+    // Hidden from the flat list and no nested panel while the parent is off.
+    expect(view.queryByLabelText("Toggle RLM Mode")).toBeNull();
+
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+    };
+    view.rerender(<ExperimentsSection />);
+
+    expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
   });
 
   test("reloads experiment settings when inline controls remount", async () => {
@@ -405,9 +488,9 @@ describe("PortableDesktopExperimentWarning", () => {
     await waitFor(() => {
       expect(getPrereqStatus).toHaveBeenCalledTimes(2);
     });
-    expect(view.getByRole("button", { name: "Restart Mux" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "Restart Xum" })).toBeTruthy();
 
-    fireEvent.click(view.getByRole("button", { name: "Restart Mux" }));
+    fireEvent.click(view.getByRole("button", { name: "Restart Xum" }));
 
     await waitFor(() => {
       expect(restartApp).toHaveBeenCalledTimes(1);
@@ -435,7 +518,7 @@ describe("PortableDesktopExperimentWarning", () => {
       expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
     });
 
-    fireEvent.click(view.getByRole("button", { name: "Restart Mux" }));
+    fireEvent.click(view.getByRole("button", { name: "Restart Xum" }));
 
     await waitFor(() => {
       expect(view.container.textContent).toContain("Restart is only available in the desktop app.");

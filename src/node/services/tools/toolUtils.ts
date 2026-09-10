@@ -10,6 +10,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { log } from "@/node/services/log";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 
 export function requireWorkspaceId(config: ToolConfiguration, toolName: string): string {
   assert(config.workspaceId, `${toolName} requires workspaceId`);
@@ -19,6 +20,15 @@ export function requireWorkspaceId(config: ToolConfiguration, toolName: string):
 export function requireTaskService(config: ToolConfiguration, toolName: string): TaskService {
   assert(config.taskService, `${toolName} requires taskService`);
   return config.taskService;
+}
+
+export function requireWorkspaceTurnManager(
+  config: ToolConfiguration,
+  toolName: string
+): WorkspaceTurnManager {
+  const manager = config.workspaceTurnManager ?? config.taskService;
+  assert(manager, toolName + " requires workspaceTurnManager");
+  return manager as WorkspaceTurnManager;
 }
 
 export function parseToolResult<TSchema>(
@@ -89,17 +99,75 @@ export async function emitWorkflowRunAttachedEvent(input: {
 export async function recordBackgroundWorkflowRunReference(
   config: ToolConfiguration,
   runId: string,
-  createdAtMs: number
+  createdAtMs: number,
+  options?: {
+    /**
+     * Pre-launch records must not fail soft: the sidecar is the kernel invocation's only
+     * durable provenance, and starting the runner without it lets a fast terminal run have
+     * its wake permanently marked superseded. Throwing before dispatch leaves the run
+     * pending and resumable (workflow_resume re-records), so the caller surfaces a loud,
+     * recoverable launch failure instead. Post-dispatch records stay best-effort because the
+     * run already started and failing the tool would strand it.
+     */
+    propagateWriteFailure?: boolean;
+  }
 ): Promise<void> {
   const workspaceSessionDir = config.workspaceSessionDir;
   if (workspaceSessionDir == null || workspaceSessionDir.length === 0) {
+    if (options?.propagateWriteFailure === true) {
+      throw new Error(
+        `Cannot record workflow run provenance without a workspace session dir: ${runId}`
+      );
+    }
     log.warn("Skipping agent workflow run reference without workspace session dir", { runId });
     return;
   }
 
+  // Snapshot which invocation-decision row is newest at launch so the terminal-wake
+  // currentness check compares row identity instead of wall-clock order, which clock
+  // corrections can reorder (see WorkspaceService.isWorkflowInvocationCurrent). A history read
+  // failure must not be persisted as a verified-empty boundary (null): record without the
+  // field instead, so the run stays rediscoverable (listAgentReferencedWorkflowRunIds) and a
+  // later workflow_resume re-record can repair provenance, while the unverifiable boundary
+  // fails safe to a not-current wake instead of guessing from wall-clock order.
+  let afterBoundaryMessageId: string | null | undefined;
+  const taskService = config.taskService;
+  if (config.workspaceId != null && taskService?.getWorkflowInvocationBoundaryMessageId != null) {
+    try {
+      afterBoundaryMessageId = await taskService.getWorkflowInvocationBoundaryMessageId(
+        config.workspaceId,
+        runId
+      );
+    } catch (error: unknown) {
+      log.error("Failed to snapshot workflow invocation boundary for run reference", {
+        runId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   try {
-    await recordAgentWorkflowRunReference({ workspaceSessionDir, runId, createdAtMs });
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir,
+      runId,
+      createdAtMs,
+      ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
+      ...(config.agentId != null && config.agentId.length > 0
+        ? {
+            agentId: config.agentId,
+            // The pin pairs with the identity: null records a verified-unpinned launch so the
+            // wake never inherits another row's pin (see AgentWorkflowRunReference).
+            strictAgentResolution:
+              config.strictAgentResolution != null && config.strictAgentResolution !== false
+                ? config.strictAgentResolution
+                : null,
+          }
+        : {}),
+    });
   } catch (error: unknown) {
+    if (options?.propagateWriteFailure === true) {
+      throw error;
+    }
     log.warn("Failed to record agent workflow run reference", {
       runId,
       error: getErrorMessage(error),

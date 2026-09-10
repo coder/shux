@@ -32,6 +32,12 @@ interface HarnessOptions {
   activeWorkspaces?: WorkspaceInfo[];
   archivedWorkspaces?: WorkspaceInfo[];
   workspaceActivity?: WorkspaceActivityById;
+  /**
+   * Resolve activity.list with null — the backend's read-failure signal for
+   * an unreadable extensionMetadata.json (getActivityList never rejects; it
+   * logs and returns null so callers can tell failure from an idle {}).
+   */
+  activityListUnavailable?: boolean;
   onChatEvents?: WorkspaceChatMessage[];
   onChatStream?: AsyncIterable<WorkspaceChatMessage>;
   requireTrustedProjectForCreate?: boolean;
@@ -133,7 +139,12 @@ function createMockServer(options?: HarnessOptions): MockServer {
         return input?.archived ? archivedWorkspaces : activeWorkspaces;
       },
       activity: {
-        list: async () => workspaceActivity,
+        list: async () => {
+          if (options?.activityListUnavailable) {
+            return null;
+          }
+          return workspaceActivity;
+        },
       },
       getInfo: async ({ workspaceId }: { workspaceId: string }) =>
         allWorkspacesById.get(workspaceId) ?? null,
@@ -391,6 +402,30 @@ describe("ACP session list/resume/fork support", () => {
     expect(secondPage.sessions.map((session) => session.sessionId)).toEqual(["ws-archived"]);
     expect(secondPage.nextCursor).toBeUndefined();
     expect(harness.listCalls.slice(0, 2)).toEqual([{ archived: false }, { archived: true }]);
+  });
+
+  it("lists sessions when the activity list is unavailable", async () => {
+    // activity.list resolves null when extensionMetadata.json is unreadable
+    // so the renderer can keep cached state; ACP has none, so session
+    // listing must degrade to no-activity sorting instead of failing
+    // wholesale.
+    const workspace = createWorkspaceInfo({
+      id: "ws-no-activity",
+      projectPath: "/repo/a",
+      namedWorkspacePath: "/repo/a/.mux/ws-no-activity",
+      createdAt: "2026-02-18T10:00:00.000Z",
+    });
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      activityListUnavailable: true,
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+
+    const response = await harness.agent.listSessions({ cwd: "/repo/a/" });
+    expect(response.sessions.map((session) => session.sessionId)).toEqual(["ws-no-activity"]);
+    // Falls back to createdAt when no activity recency is available.
+    expect(response.sessions[0]?.updatedAt).toBe("2026-02-18T10:00:00.000Z");
   });
 
   it("lists and resumes sessions from a sub-project cwd", async () => {

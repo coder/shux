@@ -3,8 +3,10 @@ import { useActiveGoalCount } from "@/browser/stores/WorkspaceStore";
 
 const ACTIVE_GOAL_WARNING_THRESHOLD = 3;
 const AUTO_DISMISS_MS = 5_000;
+// max() keeps the toast below the iOS standalone status-bar band (black-translucent
+// positions fixed elements against the full screen, including the top safe area).
 const wrapperClassName =
-  "pointer-events-none fixed top-4 right-4 z-[10000] max-w-[min(420px,calc(100vw-2rem))] [&>*]:pointer-events-auto";
+  "pointer-events-none fixed top-[max(1rem,env(safe-area-inset-top,0px))] right-4 z-[10000] max-w-[min(420px,calc(100vw-2rem))] [&>*]:pointer-events-auto";
 
 interface ActiveGoalsWarningToastProps {
   activeGoalCount: number;

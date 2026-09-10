@@ -1,4 +1,6 @@
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { log } from "@/node/services/log";
@@ -7,6 +9,21 @@ import { getErrorMessage } from "@/common/utils/errors";
 export interface BeforeArchiveHookArgs {
   workspaceId: string;
   workspaceMetadata: WorkspaceMetadata;
+  /**
+   * Coder archive-policy snapshot taken by the archive operation when it enforced its
+   * remote-deletion guard. Hooks that stop/delete Coder workspaces must use this value (not a
+   * fresh config read) so a concurrent settings flip cannot delete a remote workspace past a
+   * caller that forbade it.
+   */
+  coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
+  /**
+   * Set by model-driven archives: a hook that would stop a running remote environment must
+   * first verify that no detached background job survives on it (remote spawn records are
+   * invisible to the host-local crash-orphan scans), failing closed when the probe cannot
+   * prove absence. User-mediated archives leave this unset — they are the documented escape
+   * hatch for over-refusals.
+   */
+  refuseStopUnderUnverifiedRemoteJobs?: boolean;
 }
 
 export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<void>>;
@@ -14,6 +31,12 @@ export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<
 export interface AfterArchiveHookArgs {
   workspaceId: string;
   workspaceMetadata: WorkspaceMetadata;
+  /**
+   * Behavior snapshot taken by the archive operation when it decided whether to capture a
+   * worktree snapshot. Hooks that delete checkouts must use this value (not a fresh config
+   * read) so a concurrent settings flip cannot delete a checkout that was never snapshotted.
+   */
+  worktreeArchiveBehavior?: WorktreeArchiveBehavior;
 }
 
 export type AfterArchiveHook = (args: AfterArchiveHookArgs) => Promise<Result<void>>;

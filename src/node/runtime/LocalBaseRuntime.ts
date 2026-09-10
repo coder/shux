@@ -25,11 +25,15 @@ import { shellQuote } from "@/common/utils/shell";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { expandTilde } from "./tildeExpansion";
-import { getInitHookPath, createLineBufferedLoggers } from "./initHook";
+import {
+  createLineBufferedLoggers,
+  findInitHookRelativePath,
+  runWorkspaceInitHook,
+} from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { sanitizeMuxChildEnv } from "./childProcessEnv";
+import { sanitizeXumChildEnv } from "./childProcessEnv";
 
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
@@ -66,11 +70,7 @@ export abstract class LocalBaseRuntime implements Runtime {
     try {
       await fsPromises.access(cwd);
     } catch (err) {
-      throw new RuntimeErrorClass(
-        `Working directory does not exist: ${cwd}`,
-        "exec",
-        err instanceof Error ? err : undefined
-      );
+      throw new RuntimeErrorClass(`Working directory does not exist: ${cwd}`, "exec", err);
     }
 
     const bashPath = getBashPath();
@@ -85,10 +85,20 @@ export abstract class LocalBaseRuntime implements Runtime {
       .map(([key, value]) => buildShellExport(key, value))
       .join("\n");
 
-    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${command}`];
+    // Expand host-side with the same semantics as local file I/O: expandTilde
+    // routes ~/.xum (and legacy homes) through getXumHome, which in-shell $HOME
+    // expansion would miss (XUM_ROOT, dev suffix), and relative values resolve
+    // against the exec cwd, matching the shell's $PWD when the exports run.
+    const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
+      .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
+      .join("\n");
+    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`];
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    const mergedEnv = sanitizeMuxChildEnv({ ...process.env, ...(options.env ?? {}) });
+    const mergedEnv = sanitizeXumChildEnv({
+      ...process.env,
+      ...(options.env ?? {}),
+    });
     const basePath =
       (options.env?.PATH && options.env.PATH.length > 0
         ? mergedEnv.PATH
@@ -117,8 +127,11 @@ export abstract class LocalBaseRuntime implements Runtime {
     const disposable = new DisposableProcess(childProcess);
 
     // Convert Node.js streams to Web Streams
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdout = Readable.toWeb(childProcess.stdout) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stderr = Readable.toWeb(childProcess.stderr) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin) as unknown as WritableStream<Uint8Array>;
 
     // No stream cleanup in DisposableProcess - streams close naturally when process exits
@@ -209,42 +222,78 @@ export abstract class LocalBaseRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
-  readFile(filePath: string, _abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before reading (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
-    const nodeStream = fs.createReadStream(expandedPath);
+  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+    const resolvedPath = path.resolve(expandTilde(filePath));
+    const nodeStream = fs.createReadStream(resolvedPath);
 
     // Handle errors by wrapping in a transform
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+    const reader = webStream.getReader();
 
+    // r19: honor caller aborts (kernel deadline, workspace removal), not just
+    // consumer cancellation — a FIFO or blocked network-mounted file can
+    // stall before yielding enough bytes for a consumer-side ceiling to
+    // cancel, leaving the pending read and its fd blocked forever. Aborting
+    // cancels the inner reader, which destroys the node stream and settles
+    // the pinned read.
+    const onAbort = () => {
+      void reader.cancel(abortSignal?.reason).catch(() => undefined);
+    };
+    if (abortSignal?.aborted) {
+      onAbort();
+    } else {
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+    }
+    const cleanupAbortForwarder = () => {
+      abortSignal?.removeEventListener("abort", onAbort);
+    };
+
+    // Pull-based (not an eager start loop): consumers control the read rate
+    // (backpressure), and cancellation can reach the source — the old eager
+    // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
+    // byte ceiling on /dev/zero) abandoned the reader and leaked the open
+    // file handle (r18).
     return new ReadableStream<Uint8Array>({
-      async start(controller: ReadableStreamDefaultController<Uint8Array>) {
+      pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
         try {
-          const reader = webStream.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
+          const { done, value } = await reader.read();
+          // reader.cancel() settles a pinned read as {done: true}; surface
+          // the abort as an error rather than a clean EOF so consumers do
+          // not mistake a truncated read for the whole file.
+          if (abortSignal?.aborted) {
+            cleanupAbortForwarder();
+            controller.error(new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io"));
+            return;
           }
-          controller.close();
+          if (done) {
+            cleanupAbortForwarder();
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
         } catch (err) {
+          cleanupAbortForwarder();
           controller.error(
             new RuntimeErrorClass(
               `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
               "file_io",
-              err instanceof Error ? err : undefined
+              err
             )
           );
         }
+      },
+      cancel: async (reason: unknown) => {
+        cleanupAbortForwarder();
+        // Destroys the underlying node stream and closes the fd.
+        await reader.cancel(reason);
       },
     });
   }
 
   writeFile(filePath: string, _abortSignal?: AbortSignal): WritableStream<Uint8Array> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before writing (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const canonicalPath = path.resolve(expandTilde(filePath));
     let tempPath: string;
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let resolvedPath: string;
@@ -254,13 +303,12 @@ export abstract class LocalBaseRuntime implements Runtime {
       async start() {
         // Resolve symlinks to write through them (preserves the symlink)
         try {
-          resolvedPath = await fsPromises.realpath(expandedPath);
+          resolvedPath = await fsPromises.realpath(canonicalPath);
           // Save original permissions to restore after write
           const stat = await fsPromises.stat(resolvedPath);
           originalMode = stat.mode;
         } catch {
-          // If file doesn't exist, use the expanded path and default permissions
-          resolvedPath = expandedPath;
+          resolvedPath = canonicalPath;
           originalMode = undefined;
         }
 
@@ -291,7 +339,7 @@ export abstract class LocalBaseRuntime implements Runtime {
           throw new RuntimeErrorClass(
             `Failed to write file ${filePath}: ${getErrorMessage(err)}`,
             "file_io",
-            err instanceof Error ? err : undefined
+            err
           );
         }
       },
@@ -313,10 +361,9 @@ export abstract class LocalBaseRuntime implements Runtime {
 
   async stat(filePath: string, _abortSignal?: AbortSignal): Promise<FileStat> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before stat (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const resolvedPath = path.resolve(expandTilde(filePath));
     try {
-      const stats = await fsPromises.stat(expandedPath);
+      const stats = await fsPromises.stat(resolvedPath);
       return {
         size: stats.size,
         modifiedTime: stats.mtime,
@@ -326,7 +373,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       throw new RuntimeErrorClass(
         `Failed to stat ${filePath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -335,14 +382,14 @@ export abstract class LocalBaseRuntime implements Runtime {
     if (abortSignal?.aborted) {
       throw new RuntimeErrorClass("Operation aborted before directory creation", "file_io");
     }
-    const expandedPath = expandTilde(dirPath);
+    const resolvedPath = path.resolve(expandTilde(dirPath));
     try {
-      await fsPromises.mkdir(expandedPath, { recursive: true });
+      await fsPromises.mkdir(resolvedPath, { recursive: true });
     } catch (err) {
       throw new RuntimeErrorClass(
         `Failed to create directory ${dirPath}: ${getErrorMessage(err)}`,
         "file_io",
-        err instanceof Error ? err : undefined
+        err
       );
     }
   }
@@ -402,8 +449,8 @@ export abstract class LocalBaseRuntime implements Runtime {
     return Promise.resolve(isWindows ? (process.env.TEMP ?? "C:\\Temp") : "/tmp");
   }
 
-  getMuxHome(): string {
-    return "~/.mux";
+  getXumHome(): string {
+    return "~/.xum";
   }
 
   /**
@@ -413,23 +460,37 @@ export abstract class LocalBaseRuntime implements Runtime {
     return Promise.resolve({ ready: true });
   }
 
+  protected initLocalWorkspace(params: WorkspaceInitParams, runtimeType: "local" | "worktree") {
+    return runWorkspaceInitHook({
+      params,
+      runtimeType,
+      findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
+      runHook: ({ hookRelativePath, xumEnv, initLogger, abortSignal }) =>
+        this.runInitHook(
+          params.workspacePath,
+          this.normalizePath(hookRelativePath, params.workspacePath),
+          xumEnv,
+          initLogger,
+          abortSignal
+        ),
+    });
+  }
+
   /**
-   * Helper to run .mux/init hook if it exists and is executable.
+   * Helper to run .xum/init hook if it exists and is executable.
    * Shared between WorktreeRuntime and LocalRuntime.
    * @param workspacePath - Path to the workspace directory
-   * @param muxEnv - MUX_ environment variables (from getMuxEnv)
+   * @param xumEnv - Canonical XUM_ variables plus legacy MUX_ aliases
    * @param initLogger - Logger for streaming output
    * @param abortSignal - Optional abort signal
    */
   protected async runInitHook(
     workspacePath: string,
-    muxEnv: Record<string, string>,
+    hookPath: string,
+    xumEnv: Record<string, string>,
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    // Hook path is derived from MUX_PROJECT_PATH in muxEnv
-    const projectPath = muxEnv.MUX_PROJECT_PATH;
-    const hookPath = getInitHookPath(projectPath);
     initLogger.logStep(`Running init hook: ${hookPath}`);
 
     if (abortSignal?.aborted) {
@@ -437,7 +498,6 @@ export abstract class LocalBaseRuntime implements Runtime {
       return;
     }
 
-    // Create line-buffered loggers
     const loggers = createLineBufferedLoggers(initLogger);
 
     return new Promise<void>((resolve) => {
@@ -447,7 +507,7 @@ export abstract class LocalBaseRuntime implements Runtime {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
-          ...muxEnv,
+          ...xumEnv,
         },
         // Prevent console window from appearing on Windows
         windowsHide: true,

@@ -45,6 +45,8 @@ describe("validatePluginManifest", () => {
       repository: "https://github.com/example/hello-plugin",
       license: "MIT",
       keywords: ["testing", "example"],
+      // Carried through opaquely for Mux namespace consumers (plugin hooks).
+      extensions: { "com.example.tool": { anything: [1, 2, 3] } },
     });
     expect(result.warnings).toEqual([]);
   });
@@ -72,6 +74,14 @@ describe("validatePluginManifest", () => {
       if (!result.ok) throw new Error("expected ok");
       expect(result.warnings.some((w) => w.includes("extensions"))).toBe(true);
     }
+  });
+
+  test("object extensions are carried through for namespace consumers", () => {
+    const extensions = { mux: { hooks: { tools: ["file_read"] } } };
+    const result = validatePluginManifest(minimalManifest({ extensions }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.manifest.extensions).toEqual(extensions);
   });
 
   test("extension namespace member contents are never validated", () => {
@@ -167,6 +177,69 @@ describe("validatePluginManifest", () => {
       if (result.ok) throw new Error(`expected rejection for ${JSON.stringify(fields)}`);
       expect(result.reason).toBe("invalid-manifest");
     }
+  });
+
+  test("round-trips a contributes block with every member", () => {
+    const contributes = {
+      skills: "my-skills",
+      mcp: "config/mcp.json",
+      agents: "my-agents",
+      workflows: "scripts",
+      hooks: "lib/hooks.js",
+      slashCommands: [
+        { name: "greet", description: "Say hello", expansion: "Please greet the user warmly." },
+        { name: "review", expansion: "Review the current diff." },
+      ],
+    };
+    const result = validatePluginManifest(minimalManifest({ contributes }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.manifest.contributes).toEqual(contributes);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test("non-object contributes loads with a warning and is ignored", () => {
+    for (const contributes of ["nope", 5, [1], null]) {
+      const result = validatePluginManifest(minimalManifest({ contributes }));
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("expected ok");
+      expect(result.warnings.some((w) => w.includes("contributes"))).toBe(true);
+      expect(result.manifest.contributes).toBeUndefined();
+    }
+  });
+
+  test("unsafe contributes paths warn and fall back to the default location", () => {
+    for (const skills of ["/abs/path", "C:\\win", "~/home", "../escape", "a/../../b", "", 42]) {
+      const result = validatePluginManifest(minimalManifest({ contributes: { skills } }));
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("expected ok");
+      expect(result.warnings.some((w) => w.includes("contributes.skills"))).toBe(true);
+      expect(result.manifest.contributes?.skills).toBeUndefined();
+    }
+  });
+
+  test("invalid slash command entries are skipped without breaking valid siblings", () => {
+    const result = validatePluginManifest(
+      minimalManifest({
+        contributes: {
+          slashCommands: [
+            "not-an-object",
+            { name: "Bad Name", expansion: "x" },
+            { name: "no-expansion" },
+            { name: "blank-expansion", expansion: "   " },
+            { name: "bad-description", expansion: "x", description: 5 },
+            { name: "ok", expansion: "works" },
+            { name: "ok", expansion: "duplicate loses" },
+          ],
+        },
+      })
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.manifest.contributes?.slashCommands).toEqual([
+      { name: "ok", expansion: "works" },
+    ]);
+    expect(result.warnings.length).toBeGreaterThanOrEqual(6);
   });
 
   test("rejects non-object documents as invalid-manifest", () => {

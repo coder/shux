@@ -57,6 +57,29 @@ also allowed; `export {...}` lists are not. The export keywords are stripped lex
 sandbox evaluation, so never start a line inside a template literal with `export ` — it would be
 silently rewritten.
 
+### Declaring phases up front (`meta.phases`)
+
+Declare the workflow's phase manifest statically so Xum can render the full phase rail before and during execution (pre-run preview, live progress, "phase 2/5" summaries):
+
+```js
+export const meta = {
+  description: "Multi-angle research with adversarial verification",
+  phases: [
+    { name: "scope", label: "Scope", description: "Pick research angles" },
+    { name: "search-fetch", label: "Search & Fetch", parallel: true },
+    { name: "verify", label: "Adversarial verification", parallel: true },
+    { name: "synthesize", label: "Synthesize" },
+  ],
+};
+```
+
+Rules:
+
+- `name` (required) must match the string passed to `phase(name)` at runtime; names must be unique and non-empty (max 120 chars, max 64 phases). `label` and `description` are optional display metadata; `parallel: true` renders a fan-out badge. Unknown keys are rejected.
+- Invalid declarations fail run creation with every issue enumerated; omitting `meta.phases` changes nothing. `meta.phases` must be part of a static, immutable `export const meta` object literal that the script never references again — a `meta` the static parser cannot read that may still supply `phases` (a variable reference like `{ phases }`, a spread, or a computed key), or a `let`/reassigned/mutated `meta`, is rejected at run start rather than silently treated as undeclared.
+- Reconciliation is lenient: phases the script visits but did not declare still render (inserted chronologically), declared-but-unvisited phases show as skipped/not-reached once the run settles, and revisiting a phase (loops) is fine.
+- Workflows without `meta.phases` get a best-effort inferred rail only when the script stays inside a conservative safe subset: a canonical `{ phase }` binding on an immutable default export, called directly with string literals from the function's own body. Dynamic phase names (`"implement-" + key`), aliasing, nested-scope calls, `eval`/`with`, or reaching the runtime's internals all fall back to observed-only rendering — declare `meta.phases` instead.
+
 Packaged reusable workflows should live inside skill directories and be invoked with `skill://<skill-name>/<file.js>`. Explicit workspace workflow files require Project Trust.
 
 ## Running workflows
@@ -89,10 +112,10 @@ Fit check before codifying: the conductor cannot run host operations directly, s
 
 ### Attention policy (internal, not author-settable)
 
-Mux persists an internal attention policy for background work and uses it to decide whether your workspace must await the work before ending its turn. You do not set this field in v1 — it is derived from `run_in_background`:
+Xum persists an internal attention policy for background work and uses it to decide whether your workspace must await the work before ending its turn. You do not set this field in v1 — it is derived from `run_in_background`:
 
 - Foreground/default runs are **blocking**: their result is needed before you can continue.
-- `run_in_background: true` runs are **notify-on-terminal**: non-blocking, and Mux wakes the owning workspace with the terminal workflow result when the run finishes. `workflow_resume({ run_in_background: true })` also makes the run notify-on-terminal.
+- `run_in_background: true` runs are **notify-on-terminal**: non-blocking, and Xum wakes the owning workspace with the terminal workflow result when the run finishes. `workflow_resume({ run_in_background: true })` also makes the run notify-on-terminal.
 - Workflow-owned `agent()`, `parallel()`, `pipeline()`, and nested `workflow()` steps are blocking from the conductor's perspective because their outputs are durable step results delivered through the journal — there is no generic parent wake-up for them.
 
 There is no public `attentionPolicy`/`attention_policy` argument and no "silent background" mode in v1.
@@ -103,7 +126,7 @@ For condition-driven monitors (CI, mergeability, review arrival, deployment heal
 
 Runs are durable, so stopping one is non-destructive:
 
-- `task_terminate` with a `wfr_...` run ID interrupts the run; the event journal is preserved.
+- `task_stop` with a `wfr_...` run ID interrupts the run; the event journal is preserved.
 - `workflow_resume` continues an `interrupted` (or crash-orphaned `running`/`backgrounded`) run from its last durable event — completed steps are replayed from the journal, never re-executed. Resuming a `completed` run just returns its existing result.
 - For `failed` runs, `workflow_resume` with `mode: "retry_from_checkpoint"` re-executes work after the last checkpoint; it is rejected when unfinished patch steps make that unsafe — start a fresh `workflow_run` instead.
 - After an app restart, rediscover resumable runs with `task_list` (statuses `interrupted`/`failed`).
@@ -136,7 +159,7 @@ workflow_run({
 });
 ```
 
-If the workflow declares `meta.argsSchema`, Mux coerces and validates structured args against that schema before `args` reaches the workflow. Prefer domain-specific fields such as `topic`, `brief`, or `target`; reserve `input` for workflows that intentionally accept a single opaque text blob:
+If the workflow declares `meta.argsSchema`, Xum coerces and validates structured args against that schema before `args` reaches the workflow. Prefer domain-specific fields such as `topic`, `brief`, or `target`; reserve `input` for workflows that intentionally accept a single opaque text blob:
 
 ```js
 const s = mux.schema;
@@ -257,7 +280,7 @@ const reviews = parallel(
 );
 ```
 
-Timeouts are optional and explicit. Mux does not provide default workflow-agent timeout durations. When `timeout` is present, both `softMs` and `graceMs` are required positive integer millisecond values:
+Timeouts are optional and explicit. Xum does not provide default workflow-agent timeout durations. When `timeout` is present, both `softMs` and `graceMs` are required positive integer millisecond values:
 
 ```js
 const report = agent("Investigate and report useful partial findings if time expires", {
@@ -278,7 +301,7 @@ const report = agent("Investigate and report useful partial findings if time exp
 });
 ```
 
-The soft budget starts when the child task begins running; queued/starting time does not count. If the soft timeout expires, Mux soft-interrupts the child turn, asks for a final assistant response (or requires `propose_plan` for Plan agents), and waits for the explicit grace period. Schema-backed agents must send valid structured output through `agent_report` before that final response. A valid response during grace completes the step normally; otherwise Mux hard-times-out the child and fails the step. Design schemas so partial-but-useful results can still be represented.
+The soft budget starts when the child task begins running; queued/starting time does not count. If the soft timeout expires, Xum soft-interrupts the child turn, asks for a final assistant response (or requires `propose_plan` for Plan agents), and waits for the explicit grace period. Schema-backed agents must send valid structured output through `agent_report` before that final response. A valid response during grace completes the step normally; otherwise Xum hard-times-out the child and fails the step. Design schemas so partial-but-useful results can still be represented.
 
 ### `parallel(thunks, options?)`
 

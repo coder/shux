@@ -1,11 +1,9 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import type { StreamEndEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
-import type {
-  ProvidersConfigMap,
-  SendMessageOptions,
-  WorkspaceChatMessage,
-} from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -13,13 +11,17 @@ import {
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 describe("AgentSession on-send auto-compaction snapshot deferral", () => {
@@ -48,12 +50,16 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("does not persist or emit snapshots before forced on-send compaction", async () => {
     const workspaceId = "ws-auto-compaction-snapshot-deferral";
 
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
-    const { session, historyService, events } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      captureEvents: true,
-    });
+    const streamMessage = mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
+    const { session, historyService, events, backgroundProcessManager } =
+      await createSessionHarness({
+        workspaceId,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        captureEvents: true,
+      });
+    const cleanupSpy = spyOn(backgroundProcessManager, "cleanup");
 
     const syntheticSnapshot = createMuxMessage(
       "file-snapshot-1",
@@ -93,10 +99,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
     const result = await session.sendMessage("please inspect @foo.ts", {
       model: "openai:gpt-4o",
       agentId: "exec",
       disableWorkspaceAgents: true,
+      toolPolicy: restrictedPolicy,
     });
 
     expect(result.success).toBe(true);
@@ -118,6 +126,15 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionMessage).toBeDefined();
     expect(persistedCompactionMessage?.metadata?.disableWorkspaceAgents).toBe(true);
+    // The durable follow-up must keep the caller's restrictions: the redispatched turn
+    // reconstructs its options from this persisted request, and dropping the policy there
+    // would resume the conversation allow-all after compaction.
+    const followUpContent =
+      persistedCompactionMessage?.metadata?.muxMetadata?.type === "compaction-request"
+        ? persistedCompactionMessage.metadata.muxMetadata.parsed.followUpContent
+        : undefined;
+    expect(followUpContent?.toolPolicy).toEqual(restrictedPolicy);
+    expect(followUpContent?.disableWorkspaceAgents).toBe(true);
 
     const emittedSnapshot = events.some(
       (message) =>
@@ -127,18 +144,60 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         message.id === "file-snapshot-1"
     );
     expect(emittedSnapshot).toBe(false);
+    expect(cleanupSpy).not.toHaveBeenCalled();
 
-    session.dispose();
+    await session.dispose();
+  });
+
+  test("tracks a compaction request when a synthetic snapshot follows it", async () => {
+    const model = "openai:gpt-4o";
+    const { session } = await createSessionHarness({
+      workspaceId: "ws-auto-compaction-request-correlation",
+    });
+    const compactionMetadata = {
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: {},
+      source: "auto-compaction" as const,
+    };
+    const compactionRequest = createMuxMessage(
+      "compaction-request",
+      "user",
+      "Summarize the conversation",
+      {
+        synthetic: true,
+        muxMetadata: compactionMetadata,
+      }
+    );
+    const snapshot = createMuxMessage("file-change", "user", "<file-change />", {
+      synthetic: true,
+    });
+    const internals = session as unknown as {
+      resolveCompactionRequest: (
+        history: MuxMessage[],
+        modelString: string,
+        options: SendMessageOptions
+      ) => { id: string; source?: string } | undefined;
+    };
+
+    const request = internals.resolveCompactionRequest([compactionRequest, snapshot], model, {
+      model,
+      agentId: "compact",
+      muxMetadata: compactionMetadata,
+    });
+
+    expect(request).toMatchObject({
+      id: compactionRequest.id,
+      source: "auto-compaction",
+    });
+
+    await session.dispose();
   });
 
   test("does not materialize skill snapshots (or run their directives) on deferred on-send compaction turns", async () => {
     const workspaceId = "ws-auto-compaction-skill-snapshot-deferral";
 
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const internals = session as unknown as {
       materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
@@ -178,10 +237,85 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(result.success).toBe(true);
     expect(materializeSkillSnapshots).not.toHaveBeenCalled();
 
-    session.dispose();
+    await session.dispose();
   });
 
-  test("preserves goal kind on auto-compaction follow-up requests", async () => {
+  test("stamps on-send auto-compaction requests with the RLM keep-recent tail only when RLM is on", async () => {
+    const runCase = async (args: {
+      workspaceId: string;
+      experiments?: SendMessageOptions["experiments"];
+    }) => {
+      const { session, historyService } = await createSessionHarness({
+        workspaceId: args.workspaceId,
+      });
+
+      // Seed a prior turn so the keep-recent selector has a safe user boundary
+      // (u1 @ seq 2) with a provider-eligible head (u0, a0) before it.
+      for (const message of [
+        createMuxMessage("u0", "user", "old question"),
+        createMuxMessage("a0", "assistant", "old answer"),
+        createMuxMessage("u1", "user", "recent question"),
+        createMuxMessage("a1", "assistant", "recent answer"),
+      ]) {
+        const seedResult = await historyService.appendToHistory(args.workspaceId, message);
+        if (!seedResult.success) throw new Error(seedResult.error);
+      }
+
+      const internals = session as unknown as { compactionMonitor: CompactionMonitor };
+      internals.compactionMonitor = {
+        checkBeforeSend: mock(() => ({
+          shouldShowWarning: true,
+          shouldForceCompact: true,
+          usagePercentage: 99,
+          thresholdPercentage: 85,
+        })),
+        checkMidStream: mock(() => false),
+        resetForNewStream: mock(() => undefined),
+        setThreshold: mock(() => undefined),
+        getThreshold: mock(() => 0.85),
+      } as unknown as CompactionMonitor;
+
+      const result = await session.sendMessage("next question", {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        ...(args.experiments ? { experiments: args.experiments } : {}),
+      });
+      expect(result.success).toBe(true);
+
+      const historyResult = await historyService.getHistoryFromLatestBoundary(args.workspaceId);
+      if (!historyResult.success) throw new Error(String(historyResult.error));
+      const request = historyResult.data.find(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      );
+      expect(request).toBeDefined();
+
+      await session.dispose();
+      const muxMetadata = request?.metadata?.muxMetadata;
+      return muxMetadata?.type === "compaction-request" ? muxMetadata.keepRecentTail : undefined;
+    };
+
+    // RLM on (sub-experiment of PTC): stamped with u1's historySequence.
+    const stamped = await runCase({
+      workspaceId: "ws-auto-compaction-rlm-stamp-on",
+      experiments: { programmaticToolCalling: true, rlm: true },
+    });
+    expect(stamped).toEqual({ startHistorySequence: 2 });
+    await historyCleanup?.();
+
+    // RLM flag without a PTC parent flag stays inert.
+    const inert = await runCase({
+      workspaceId: "ws-auto-compaction-rlm-stamp-inert",
+      experiments: { rlm: true },
+    });
+    expect(inert).toBeUndefined();
+    await historyCleanup?.();
+
+    // RLM off: byte-identical request metadata (no stamp).
+    const unstamped = await runCase({ workspaceId: "ws-auto-compaction-rlm-stamp-off" });
+    expect(unstamped).toBeUndefined();
+  });
+
+  test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {
     const { session } = await createSessionHarness({
       workspaceId: "ws-auto-compaction-goal-kind",
     });
@@ -193,6 +327,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
           options: SendMessageOptions;
           modelForStream: string;
           goalKind?: typeof GOAL_CONTINUATION_KIND;
+          goalId?: string;
         }) => CompactionFollowUpRequest;
       }
     ).buildAutoCompactionFollowUp({
@@ -200,10 +335,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       options: { model: "openai:gpt-4o", agentId: "exec" },
       modelForStream: "openai:gpt-4o",
       goalKind: GOAL_CONTINUATION_KIND,
+      goalId: "goal-compaction-scope",
     });
 
     expect(followUp.goalKind).toBe(GOAL_CONTINUATION_KIND);
-    session.dispose();
+    // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
+    // stay goal-scoped instead of degrading to a legacy unscoped row.
+    expect(followUp.goalId).toBe("goal-compaction-scope");
+    await session.dispose();
   });
 
   test("triggers on-send compaction at threshold even before force buffer", async () => {
@@ -212,7 +351,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session } = await createSessionHarness({
       workspaceId,
@@ -247,7 +386,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(hasCompactionRequest).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("uses preferred compaction model for on-send auto-compaction requests", async () => {
@@ -256,12 +395,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const compactionModel = "openai:gpt-4o-mini";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -301,7 +441,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     expect(compactionRequestMessage?.metadata?.muxMetadata?.requestedModel).toBe(compactionModel);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does not trigger compaction at 200K threshold when 1M context is preserved after agent routing", async () => {
@@ -310,7 +450,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -364,7 +504,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionRequest).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("does trigger compaction at the default beta Anthropic threshold when beta features disable 1M", async () => {
@@ -373,7 +513,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamRequests: unknown[] = [];
     const streamMessage = mock((request: unknown) => {
       streamRequests.push(request);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
@@ -426,17 +566,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionRequest).toBe(true);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction model inherit uses caller-provided baseOptions.model when no preferred model configured", async () => {
     const workspaceId = "ws-auto-compaction-inherit-base-options-model";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const inheritedModel = "anthropic:claude-sonnet-4-6";
     const baseOptions: SendMessageOptions = {
@@ -475,26 +611,61 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequest.metadata.requestedModel).toBe(inheritedModel);
     expect(compactionRequest.metadata.parsed?.model).toBe(inheritedModel);
 
-    session.dispose();
+    await session.dispose();
+  });
+
+  test("clears strictAgentResolution on the internal compact request", async () => {
+    const workspaceId = "ws-auto-compaction-clears-strict";
+
+    const { session } = await createSessionHarness({ workspaceId });
+
+    // A strict explicit-agent workspace turn hitting auto-compaction: the internal
+    // request intentionally runs the hidden compact agent, so the strict gate must not
+    // apply to it (it would reject compact as not selectable and break compaction).
+    const baseOptions: SendMessageOptions = {
+      model: "anthropic:claude-sonnet-4-6",
+      agentId: "plan",
+      strictAgentResolution: true,
+    };
+    const followUpContent: CompactionFollowUpRequest = {
+      text: "Continue",
+      model: baseOptions.model,
+      agentId: "plan",
+    };
+
+    const internals = session as unknown as {
+      buildAutoCompactionRequest: (params: {
+        followUpContent: CompactionFollowUpRequest;
+        baseOptions: SendMessageOptions;
+        reason: "on-send" | "mid-stream";
+      }) => { sendOptions: SendMessageOptions };
+    };
+
+    const compactionRequest = internals.buildAutoCompactionRequest({
+      followUpContent,
+      baseOptions,
+      reason: "mid-stream",
+    });
+
+    expect(compactionRequest.sendOptions.agentId).toBe("compact");
+    expect(compactionRequest.sendOptions.strictAgentResolution).toBeUndefined();
+
+    await session.dispose();
   });
 
   test("compaction model explicit override takes priority over baseOptions.model", async () => {
     const workspaceId = "ws-auto-compaction-explicit-model-overrides-base-model";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
     const compactionModel = "openai:gpt-5.5";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
     } as unknown as Config;
-    const { session } = await createSessionHarness({
-      workspaceId,
-      config,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId, config });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -532,27 +703,23 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequest.metadata.requestedModel).toBe(compactionModel);
     expect(compactionRequest.metadata.parsed?.model).toBe(compactionModel);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction thinking level prefers compact agent default over baseOptions", async () => {
     const workspaceId = "ws-auto-compaction-compact-thinking-default";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: {
           compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
         },
       }),
     } as unknown as Config;
-    const { session } = await createSessionHarness({
-      workspaceId,
-      config,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId, config });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -585,17 +752,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // matching desktop /compact (applyCompactionOverrides).
     expect(compactionRequest.sendOptions.thinkingLevel).toBe("high");
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("compaction thinking level falls back to baseOptions when compact default is unset", async () => {
     const workspaceId = "ws-auto-compaction-base-thinking-fallback";
 
-    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -626,13 +789,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     expect(compactionRequest.sendOptions.thinkingLevel).toBe("medium");
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("threads providers config into pre-send and mid-stream compaction checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { config, historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const providersConfig = {
@@ -644,7 +807,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
           },
         ],
       },
-    } as unknown as ProvidersConfigMap;
+    };
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -661,7 +825,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         usage,
       });
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-providers-config",
@@ -673,10 +837,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         },
       });
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -692,12 +857,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         void _queued;
       }),
     } as unknown as BackgroundProcessManager;
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-      loadProvidersConfig: () => providersConfig,
-    } as unknown as Config;
 
     const session = new AgentSession({
       workspaceId,
@@ -740,7 +899,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       providersConfig,
     });
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("seeds on-send compaction usage from the active compaction epoch only", async () => {
@@ -793,8 +952,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(appendCurrentEpochUser.success).toBe(true);
 
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -812,8 +974,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -851,7 +1015,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(result.success).toBe(true);
     expect(checkBeforeSend).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
@@ -889,11 +1053,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const stopStream = mock((_workspaceId: string) => {
-      aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "assistant-mid-stream",
@@ -904,6 +1068,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -921,8 +1086,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -992,7 +1159,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(streamError?.error).toContain("mid-stream compaction dispatch failed");
     expect(stopStream).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("hides default follow-up sentinel in mid-stream auto-compaction prompts", async () => {
@@ -1037,11 +1204,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         });
       }
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const stopStream = mock((_workspaceId: string) => {
-      aiEmitter.emit("stream-abort", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-abort",
         workspaceId,
         messageId: "assistant-mid-stream",
@@ -1052,6 +1219,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1069,8 +1237,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1101,10 +1271,21 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
-    const result = await session.sendMessage("hello", {
-      model: "openai:gpt-4o",
-      agentId: "exec",
-    });
+    const workspaceTurnMetadata = {
+      type: "workspace-turn-task",
+      taskHandleId: "wst_mid_stream_compaction",
+      ownerWorkspaceId: "parent-mid-stream-compaction",
+      turnId: "turn-mid-stream-compaction",
+    } as const;
+    const result = await session.sendMessage(
+      "hello",
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: workspaceTurnMetadata,
+      },
+      { agentInitiated: true }
+    );
 
     expect(result.success).toBe(true);
 
@@ -1121,12 +1302,324 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     expect(compactionRequestMessage).toBeDefined();
 
+    const compactionRequestMetadata = compactionRequestMessage?.metadata?.muxMetadata;
+    expect(compactionRequestMetadata?.type).toBe("compaction-request");
+    if (compactionRequestMetadata?.type !== "compaction-request") {
+      throw new Error("Expected a persisted mid-stream compaction request");
+    }
+    expect(compactionRequestMetadata.parsed.followUpContent?.muxMetadata).toEqual(
+      workspaceTurnMetadata
+    );
+    expect(compactionRequestMetadata.parsed.followUpContent?.agentInitiated).toBe(true);
+
     const compactionRequestText =
       compactionRequestMessage?.parts.find((part) => part.type === "text")?.text ?? "";
     expect(compactionRequestText).not.toContain("The user wants to continue with:");
     expect(compactionRequestText).not.toContain("[CONTINUE]");
     expect(stopStream).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
+  });
+});
+
+describe("AgentSession on-send auto-compaction for synthetic guidance sends", () => {
+  let historyCleanup: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    await historyCleanup?.();
+  });
+
+  interface GuidanceStreamFixture {
+    session: AgentSession;
+    aiService: Pick<AIService, "getWorkspaceMetadata">;
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
+    aiEmitter: EventEmitter;
+    streamHistories: MuxMessage[][];
+    events: WorkspaceChatMessage[];
+  }
+
+  /**
+   * Harness that mimics a parent workspace sending guidance to a child task:
+   * sendMessage with internal {synthetic, agentInitiated} and a mock AI stream
+   * that completes with a prose summary so compaction can finish end-to-end.
+   */
+  async function createGuidanceHarness(args: {
+    workspaceId: string;
+    summaryText?: string;
+  }): Promise<GuidanceStreamFixture> {
+    const workspaceId = args.workspaceId;
+    const streamHistories: MuxMessage[][] = [];
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((request: unknown) => {
+      const requestMessages =
+        typeof request === "object" && request !== null && "messages" in request
+          ? (request as { messages?: unknown }).messages
+          : undefined;
+      streamHistories.push(Array.isArray(requestMessages) ? (requestMessages as MuxMessage[]) : []);
+
+      aiEmitter.emit("stream-start", {
+        type: "stream-start",
+        workspaceId,
+        messageId: `assistant-${streamHistories.length}`,
+        model: "openai:gpt-4o",
+        historySequence: streamHistories.length,
+        startTime: Date.now(),
+      });
+
+      const usage = {
+        inputTokens: 42,
+        outputTokens: 10,
+        totalTokens: 52,
+      };
+      const streamEnd: StreamEndEvent = {
+        type: "stream-end",
+        workspaceId,
+        messageId: `assistant-${streamHistories.length}`,
+        parts: [{ type: "text", text: args.summaryText ?? "Summary of the conversation so far." }],
+        metadata: {
+          model: "openai:gpt-4o",
+          usage,
+          contextUsage: usage,
+        },
+      };
+      aiEmitter.emit("stream-end", streamEnd);
+      return Promise.resolve(
+        Ok({
+          messageId: streamEnd.messageId,
+          completion: Promise.resolve({ status: "completed" as const, streamEnd }),
+        })
+      );
+    });
+
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      aiEmitter,
+      aiServiceOverrides: {
+        isStreaming: mock((_workspaceId: string) => false),
+        stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+        getWorkspaceMetadata: mock((_workspaceId: string) =>
+          // No real workspace behind the test session; skip @file snapshot materialization.
+          Promise.resolve(Err("no workspace metadata in test"))
+        ),
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    historyCleanup = harness.cleanup;
+
+    // Cross the on-send threshold unconditionally.
+    (harness.session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 95,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+
+    return {
+      session: harness.session,
+      aiService: harness.aiService,
+      historyService: harness.historyService,
+      aiEmitter,
+      streamHistories,
+      events: harness.events,
+    };
+  }
+
+  async function waitFor(
+    predicate: () => boolean | Promise<boolean>,
+    timeoutMs = 2000
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate()) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return predicate();
+  }
+
+  test("applies compaction when synthetic agent-initiated send crosses the threshold", async () => {
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-synthetic-guidance",
+    });
+
+    const result = await fixture.session.sendMessage(
+      "Updated guidance from parent: focus on the failing tests.",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { synthetic: true, agentInitiated: true, startStreamInBackground: true }
+    );
+    expect(result.success).toBe(true);
+
+    // First stream must carry the persisted compaction request.
+    await waitFor(() => fixture.streamHistories.length >= 1);
+    expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
+    const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(firstRequestHasCompactionRequest).toBe(true);
+
+    // Compaction must complete: a boundary summary lands in durable history.
+    const boundaryLanded = await waitFor(async () => {
+      const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
+        "ws-auto-compaction-synthetic-guidance"
+      );
+      return (
+        historyResult.success &&
+        historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
+      );
+    });
+    expect(boundaryLanded).toBe(true);
+
+    // The original guidance text is re-dispatched as the post-compaction follow-up.
+    const followUpDispatched = await waitFor(() =>
+      fixture.streamHistories.some((history) =>
+        history.some(
+          (message) =>
+            message.role === "user" &&
+            message.parts.some(
+              (part) => part.type === "text" && part.text.includes("focus on the failing tests")
+            )
+        )
+      )
+    );
+    expect(followUpDispatched).toBe(true);
+
+    expect(
+      fixture.events.some(
+        (event) => (event as { type?: string }).type === "auto-compaction-triggered"
+      )
+    ).toBe(true);
+    expect(
+      fixture.events.some(
+        (event) => (event as { type?: string }).type === "auto-compaction-completed"
+      )
+    ).toBe(true);
+
+    await fixture.session.dispose();
+  });
+
+  // Characterization: sends carrying preTurnMessages (family-message payloads)
+  // intentionally skip on-send compaction. The trigger row references its
+  // payload by message ID, so compacting the payload away would dangle that
+  // reference, and the follow-up metadata cannot carry pre-turn rows. Mid-stream
+  // forcing remains the context-limit backstop for these sends.
+  test("family-payload sends with preTurnMessages skip on-send compaction", async () => {
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-family-payload",
+    });
+
+    const payloadRow = createMuxMessage("payload-1", "assistant", "[Untrusted family message]", {
+      timestamp: Date.now(),
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "family-message" },
+    });
+
+    const result = await fixture.session.sendMessage(
+      "Child task abc sent a family message recorded in assistant message payload-1.",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { synthetic: true, agentInitiated: true, preTurnMessages: [payloadRow] }
+    );
+    expect(result.success).toBe(true);
+
+    // No on-send compaction request is created for family-payload sends.
+    expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
+    const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(firstRequestHasCompactionRequest).toBe(false);
+
+    // The payload and trigger persist as a normal turn instead.
+    const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
+      "ws-auto-compaction-family-payload"
+    );
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`failed to load history: ${String(historyResult.error)}`);
+    }
+    expect(historyResult.data.some((message) => message.id === "payload-1")).toBe(true);
+
+    await fixture.session.dispose();
+  });
+
+  test("startup retry of an interrupted compaction keeps compaction identity", async () => {
+    const workspaceId = "ws-compaction-startup-retry";
+    const fixture = await createGuidanceHarness({ workspaceId });
+    spyOn(fixture.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/project",
+        runtimeConfig: { type: "local" },
+      })
+    );
+
+    // Simulate a crash mid-compaction: durable compaction request row followed
+    // by a synthetic row (e.g. a file-change notice) appended before resume.
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-prior", "assistant", "prior context", {
+        timestamp: Date.now(),
+        model: "openai:gpt-4o",
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-req-1", "user", "Summarize the conversation.", {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          commandPrefix: "/compact",
+          parsed: {},
+          requestedModel: "openai:gpt-4o",
+          source: "auto-compaction",
+        },
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("file-change-1", "user", "<system-file-update>foo.ts</system-file-update>", {
+        timestamp: Date.now(),
+        synthetic: true,
+      })
+    );
+
+    const outcome = await (
+      fixture.session as unknown as {
+        scheduleStartupAutoRetryIfNeeded: () => Promise<string>;
+      }
+    ).scheduleStartupAutoRetryIfNeeded();
+    expect(outcome).toBe("completed");
+
+    // The resumed stream must still be tracked as a compaction request.
+    const streamed = await waitFor(() => fixture.streamHistories.length >= 1, 5000);
+    expect(streamed).toBe(true);
+    const retriedRequestHasCompactionRow = fixture.streamHistories[0].some(
+      (message) =>
+        message.id === "compaction-req-1" ||
+        message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(retriedRequestHasCompactionRow).toBe(true);
+
+    // Compaction must complete on the resumed stream instead of the summary
+    // being recorded as a plain assistant response.
+    const boundaryLanded = await waitFor(async () => {
+      const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(workspaceId);
+      return (
+        historyResult.success &&
+        historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
+      );
+    });
+    expect(boundaryLanded).toBe(true);
+
+    await fixture.session.dispose();
   });
 });

@@ -10,7 +10,7 @@ import { log } from "@/node/services/log";
 export class DisposableTempDir implements Disposable {
   public readonly path: string;
 
-  constructor(prefix = "mux-temp") {
+  constructor(prefix = "xum-temp") {
     // Create unique temp directory
     const id = Math.random().toString(16).substring(2, 10);
     this.path = path.join(os.tmpdir(), `${prefix}-${id}`);

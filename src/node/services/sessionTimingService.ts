@@ -1,6 +1,6 @@
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
 import type { Config } from "@/node/config";
@@ -33,6 +33,7 @@ import { createDeltaStorage, type DeltaRecordStorage } from "@/common/utils/toke
 import { log } from "./log";
 import type { TelemetryService } from "./telemetryService";
 import { roundToBase2 } from "@/common/telemetry/utils";
+import { getErrorMessage } from "@/common/utils/errors";
 
 const SESSION_TIMING_FILE = "session-timing.json";
 const SESSION_TIMING_VERSION = 2 as const;
@@ -156,7 +157,7 @@ function validateTiming(params: {
  *
  * Backend source-of-truth for timing stats.
  * - Keeps active stream timing in memory
- * - Persists cumulative session timing to ~/.mux/sessions/{workspaceId}/session-timing.json
+ * - Persists cumulative session timing to ~/.xum/sessions/{workspaceId}/session-timing.json
  * - Emits snapshots to oRPC subscribers
  */
 export class SessionTimingService {
@@ -330,7 +331,7 @@ export class SessionTimingService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), SESSION_TIMING_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, SESSION_TIMING_FILE);
   }
 
   private async readTimingFile(workspaceId: string): Promise<SessionTimingFile> {
@@ -496,6 +497,15 @@ export class SessionTimingService {
     });
     this.timingFileCache.set(workspaceId, loaded);
     return loaded;
+  }
+
+  async clearTimingFileForApi(workspaceId: string) {
+    try {
+      await this.clearTimingFile(workspaceId);
+      return { success: true as const, data: undefined };
+    } catch (error) {
+      return { success: false as const, error: getErrorMessage(error) };
+    }
   }
 
   async clearTimingFile(workspaceId: string): Promise<void> {
@@ -702,7 +712,15 @@ export class SessionTimingService {
     assert(typeof data.workspaceId === "string" && data.workspaceId.length > 0);
     assert(typeof data.messageId === "string" && data.messageId.length > 0);
 
-    const model = normalizeToCanonical(data.model);
+    // Timing aggregation key: coder: models use the backend's request-pinned
+    // metadata identity — name-only canonicalization would merge a
+    // cross-typed instance (coder:openai/<claude> on the Anthropic wire)
+    // into direct openai:<claude> rows, corrupting per-model latency and
+    // throughput statistics. Mirrors the session-usage ledger keying.
+    const model =
+      data.model.startsWith("coder:") && data.metadataModel
+        ? data.metadataModel
+        : normalizeToCanonical(data.model);
 
     // Validate mode: stats schema only accepts "plan" | "exec" for now.
     // Custom modes will need schema updates when supported.

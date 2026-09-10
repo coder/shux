@@ -5,4 +5,5 @@ export interface SettingsSection {
   label: string;
   icon: ReactNode;
   component: React.ComponentType;
+  experimental?: boolean;
 }

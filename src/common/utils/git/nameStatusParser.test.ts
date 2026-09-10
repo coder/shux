@@ -42,4 +42,11 @@ describe("parseNameStatus", () => {
       { filePath: "other.ts", changeType: "added" },
     ]);
   });
+
+  it("preserves trailing whitespace in the last line's file path", () => {
+    // A whole-output trim would rewrite a file literally named ".env " to ".env",
+    // desyncing name-status paths from the exact paths parseNumstat preserves and
+    // losing the file's change status (e.g. deletion) in the tree.
+    expect(parseNameStatus("D\t.env \n")).toEqual([{ filePath: ".env ", changeType: "deleted" }]);
+  });
 });

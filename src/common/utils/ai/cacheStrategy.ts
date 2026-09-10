@@ -3,7 +3,15 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGpt56FamilyModel } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
+import {
+  wouldRouteOpenAIThroughCodexOauth,
+  type CodexOauthRoutingOptions,
+} from "@/common/utils/providers/codexOauthRouting";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "./models";
 
@@ -15,10 +23,73 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "./models";
  */
 export type AnthropicCacheTtl = "5m" | "1h";
 
+function isAnthropicCacheTtl(value: unknown): value is AnthropicCacheTtl {
+  return value === "5m" || value === "1h";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Recover the Anthropic cache TTL from merged provider options. Users can set
+ * cacheControl.ttl through per-model providerOptions extras (modelParameters),
+ * so manual cache markers must honor it when the dedicated mux-level
+ * anthropic.cacheTtl setting is unset.
+ */
+export function getAnthropicCacheTtl(
+  providerOptions?: Record<string, unknown>
+): AnthropicCacheTtl | undefined {
+  const anthropicOptions = providerOptions?.anthropic;
+  if (!isRecord(anthropicOptions)) {
+    return undefined;
+  }
+  const cacheControl = anthropicOptions.cacheControl;
+  if (!isRecord(cacheControl)) {
+    return undefined;
+  }
+  return isAnthropicCacheTtl(cacheControl.ttl) ? cacheControl.ttl : undefined;
+}
+
 /**
  * Check if a model supports Anthropic cache control.
+ *
+ * Coder gateway strings resolve their wire from instance metadata FIRST (raw
+ * identity, before name-based normalization): a custom-named Anthropic
+ * instance (coder:prod-anthropic/<model>) stays gateway-scoped yet speaks
+ * Anthropic on the wire, so cache markers must apply; conversely a canonical
+ * name with a non-Anthropic type must not get them. Without a providersConfig
+ * the name convention (normalizeToCanonical) is the only signal available.
  */
-export function supportsAnthropicCache(modelString: string): boolean {
+export function supportsAnthropicCache(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): boolean {
+  // ZDR: the backend-authoritative disableBetaFeatures flag turns prompt
+  // caching off for every Anthropic-wire route (direct, mux-gateway,
+  // Coder instances). The provider fetch wrapper only skips INJECTING
+  // markers — it never strips ones already serialized by these helpers —
+  // so eligibility itself must be rejected here.
+  if (providersConfig?.anthropic?.disableBetaFeatures === true) {
+    return false;
+  }
+  // Custom providers (including ones shadowing built-in ids) speak the wire
+  // their providerType selects; name normalization below cannot see that.
+  const colonIndex = modelString.indexOf(":");
+  const prefixEntry =
+    colonIndex > 0 ? providersConfig?.[modelString.slice(0, colonIndex)] : undefined;
+  if (isCustomProviderConfig(prefixEntry)) {
+    return customProviderWireOrigin(prefixEntry.providerType) === "anthropic";
+  }
+  if (modelString.startsWith("coder:") && !isCustomProviderConfig(providersConfig?.coder)) {
+    const wire = resolveCoderWireCanonicalModel(
+      modelString.slice("coder:".length),
+      providersConfig?.coder
+    );
+    if (wire) {
+      return wire.origin === "anthropic";
+    }
+  }
   const normalized = normalizeToCanonical(modelString);
   // After normalizeToCanonical, all gateway Anthropic models normalize to "anthropic:..."
   // so we only need to check for the "anthropic:" prefix.
@@ -96,10 +167,11 @@ function addCacheControlToLastContentPart(
 export function applyCacheControl(
   messages: ModelMessage[],
   modelString: string,
-  cacheTtl?: AnthropicCacheTtl | null
+  cacheTtl?: AnthropicCacheTtl | null,
+  providersConfig?: ProvidersConfigMap | null
 ): ModelMessage[] {
   // Only apply cache control for Anthropic models
-  if (!supportsAnthropicCache(modelString)) {
+  if (!supportsAnthropicCache(modelString, providersConfig)) {
     return messages;
   }
 
@@ -126,9 +198,10 @@ export function applyCacheControl(
 export function createCachedSystemMessage(
   systemContent: string,
   modelString: string,
-  cacheTtl?: AnthropicCacheTtl | null
+  cacheTtl?: AnthropicCacheTtl | null,
+  providersConfig?: ProvidersConfigMap | null
 ): ModelMessage | null {
-  if (!systemContent || !supportsAnthropicCache(modelString)) {
+  if (!systemContent || !supportsAnthropicCache(modelString, providersConfig)) {
     return null;
   }
 
@@ -186,7 +259,8 @@ function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
 export function openaiExplicitPromptCachingAvailable(
   modelString: string,
   routeProvider: string | undefined,
-  providersConfig: ProvidersConfigMap | null
+  providersConfig: ProvidersConfigMap | null,
+  options?: CodexOauthRoutingOptions
 ): boolean {
   if (routeProvider !== "openai") {
     return false;
@@ -223,7 +297,7 @@ export function openaiExplicitPromptCachingAvailable(
     return false;
   }
 
-  if (wouldRouteOpenAIThroughCodexOauth(normalized, providersConfig)) {
+  if (wouldRouteOpenAIThroughCodexOauth(normalized, providersConfig, options)) {
     return false;
   }
 
@@ -240,7 +314,7 @@ export function openaiExplicitPromptCachingAvailable(
 
 /**
  * Create a structured system message carrying one explicit GPT-5.6 prompt
- * cache breakpoint at the end of Mux's stable system/developer instructions.
+ * cache breakpoint at the end of Xum's stable system/developer instructions.
  *
  * The AI SDK reads message-level providerOptions.openai.promptCacheBreakpoint
  * on system messages (string content — not a content-part array) and
@@ -253,11 +327,12 @@ export function createOpenAICachedSystemMessage(
   systemContent: string,
   modelString: string,
   routeProvider: string | undefined,
-  providersConfig: ProvidersConfigMap | null
+  providersConfig: ProvidersConfigMap | null,
+  options?: CodexOauthRoutingOptions
 ): SystemModelMessage | null {
   if (
     !systemContent ||
-    !openaiExplicitPromptCachingAvailable(modelString, routeProvider, providersConfig)
+    !openaiExplicitPromptCachingAvailable(modelString, routeProvider, providersConfig, options)
   ) {
     return null;
   }
@@ -291,10 +366,15 @@ export function createOpenAICachedSystemMessage(
 export function applyCacheControlToTools<T extends Record<string, Tool>>(
   tools: T,
   modelString: string,
-  cacheTtl?: AnthropicCacheTtl | null
+  cacheTtl?: AnthropicCacheTtl | null,
+  providersConfig?: ProvidersConfigMap | null
 ): T {
   // Only apply cache control for Anthropic models
-  if (!supportsAnthropicCache(modelString) || !tools || Object.keys(tools).length === 0) {
+  if (
+    !supportsAnthropicCache(modelString, providersConfig) ||
+    !tools ||
+    Object.keys(tools).length === 0
+  ) {
     return tools;
   }
 
@@ -307,6 +387,7 @@ export function applyCacheControlToTools<T extends Record<string, Tool>>(
   // Clone tools and add cache control ONLY to the last tool
   // Anthropic caches everything up to the cache breakpoint, so marking
   // only the last tool will cache all tools
+  // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   const cachedTools = {} as unknown as T;
   for (const [key, existingTool] of Object.entries(tools)) {
     if (key === lastToolKey) {
@@ -317,12 +398,14 @@ export function applyCacheControlToTools<T extends Record<string, Tool>>(
           existingTool
         ) as ProviderNativeTool;
         cachedProviderTool.providerOptions = cacheOpts;
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         cachedTools[key as keyof T] = cachedProviderTool as unknown as T[keyof T];
       } else if (existingTool.execute == null) {
         // Some MCP/dynamic tools are valid without execute handlers (provider-/client-executed).
         // Keep their runtime shape and attach cache control without forcing recreation.
         const cachedDynamicTool = cloneToolPreservingDescriptors(existingTool);
         cachedDynamicTool.providerOptions = cacheOpts;
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         cachedTools[key as keyof T] = cachedDynamicTool as unknown as T[keyof T];
       } else {
         assert(
@@ -346,10 +429,12 @@ export function applyCacheControlToTools<T extends Record<string, Tool>>(
             Object.defineProperty(cachedTool, marker, descriptor);
           }
         }
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         cachedTools[key as keyof T] = cachedTool as unknown as T[keyof T];
       }
     } else {
       // Other tools are copied as-is
+      // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       cachedTools[key as keyof T] = existingTool as unknown as T[keyof T];
     }
   }

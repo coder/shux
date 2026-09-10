@@ -1,6 +1,7 @@
 import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   isBashOutputEvent,
@@ -92,13 +93,6 @@ export interface WorkspaceChatEventAggregator {
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
-}
-
-function dispatchGoalChildBudgetToast(workspaceId: string, message: string): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, { workspaceId, message })
-  );
 }
 
 function dispatchMuxGatewaySessionExpired(): void {
@@ -206,7 +200,7 @@ export function applyWorkspaceChatEventToAggregator(
 
   if (isGoalBudgetLimitedEvent(event)) {
     if (allowSideEffects && event.causedByChild) {
-      dispatchGoalChildBudgetToast(event.workspaceId, event.message);
+      publishChatError(event.workspaceId, event.message);
     }
     return "ignored";
   }
@@ -232,7 +226,7 @@ export function applyWorkspaceChatEventToAggregator(
     return "immediate";
   }
 
-  // init-* and ChatMuxMessage are handled via the aggregator's unified handleMessage.
+  // init-* and ChatXumMessage are handled via the aggregator's unified handleMessage.
   if (isMuxMessage(event) || isInitStart(event) || isInitOutput(event) || isInitEnd(event)) {
     aggregator.handleMessage(event);
     return "immediate";

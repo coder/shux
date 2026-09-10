@@ -1,14 +1,24 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { IncomingHttpHeaders } from "http";
-import type { Config } from "@/node/config";
+import type {
+  Config,
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { HistoryService } from "@/node/services/historyService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
-import type { OnePasswordService } from "@/node/services/onePasswordService";
+import type { BackupService } from "@/node/services/backup/backupService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { EditorService } from "@/node/services/editorService";
@@ -24,8 +34,10 @@ import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
+import type { RefineService } from "@/node/services/refinement/refineService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
@@ -47,10 +59,24 @@ import type { AnalyticsService } from "@/node/services/analytics/analyticsServic
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
+import type { WithEffectContext } from "@orpc/experimental-effect";
+import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
-export interface ORPCContext {
+/**
+ * `WithEffectContext` adds the `"effect/context"` key carrying the Effect
+ * services available to Effect-native handlers (the app runtime's built
+ * service context, `ServiceContainer.runtime.context`).
+ */
+export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   config: Config;
+  sessionLocator: WorkspaceSessionLocator;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: SecretsStore;
+  fileLeaseManager: FileLeaseManager;
   aiService: AIService;
+  historyService: HistoryService;
+  streamManager: StreamManager;
+  initStateManager: InitStateManager;
   projectService: ProjectService;
   workspaceService: WorkspaceService;
   taskService: TaskService;
@@ -58,8 +84,9 @@ export interface ORPCContext {
   muxGatewayOauthService: MuxGatewayOauthService;
   muxGovernorOauthService: MuxGovernorOauthService;
   codexOauthService: CodexOauthService;
+  coderOauthService: CoderOauthService;
   copilotOauthService: CopilotOauthService;
-  onePasswordService?: OnePasswordService | null;
+  backupService: BackupService;
   terminalService: TerminalService;
   editorService: EditorService;
   windowService: WindowService;
@@ -72,6 +99,7 @@ export interface ORPCContext {
   mcpOauthService: McpOauthService;
   workspaceMcpOverridesService: WorkspaceMcpOverridesService;
   mcpServerManager: MCPServerManager;
+  agentPluginInstallService: AgentPluginInstallService;
   sessionTimingService: SessionTimingService;
   timelineService: TimelineService;
   telemetryService: TelemetryService;
@@ -79,6 +107,7 @@ export interface ORPCContext {
   memoryService: MemoryService;
   memoryMetaService: MemoryMetaService;
   memoryConsolidationService: MemoryConsolidationService;
+  refineService: RefineService;
   sessionUsageService: SessionUsageService;
   instructionsService: InstructionsService;
   workspaceGoalService: WorkspaceGoalService;

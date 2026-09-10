@@ -19,6 +19,8 @@ import {
   TERMINAL_ICON_FALLBACK_FAMILY,
 } from "@/browser/terminal/terminalFontFamily";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
+import { TerminalBadgeOverlay } from "@/browser/components/TerminalView/TerminalBadgeOverlay";
+import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 
 function canLoadFontFamily(primary: string, fontSize: number): boolean {
   const family = stripOuterQuotes(primary).trim();
@@ -129,6 +131,21 @@ interface TerminalViewProps {
   autoFocus?: boolean;
   /** Called when the terminal process exits. */
   onExit?: (exitCode: number) => void;
+  /**
+   * Workspace/tab identity for the badge overlay. When omitted (pop-out
+   * window), workspace names are resolved via the API and the tab name
+   * falls back to the latest OSC title.
+   */
+  workspaceName?: string;
+  projectName?: string;
+  tabName?: string;
+  /** 0-based tab position for the badge's {index} token; unknown in pop-out windows. */
+  tabIndex?: number;
+  /**
+   * OSC title carried over from before a pop-out handoff, so the badge doesn't
+   * reset to "Terminal" until the shell emits another title.
+   */
+  initialTitle?: string;
 }
 
 export function TerminalView({
@@ -140,6 +157,11 @@ export function TerminalView({
   onAutoFocusConsumed,
   autoFocus = true,
   onExit,
+  workspaceName,
+  projectName,
+  tabName,
+  tabIndex,
+  initialTitle,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -171,6 +193,16 @@ export function TerminalView({
   routerRef.current = router;
   sessionIdRef.current = sessionId;
 
+  // Pop-out windows have no WorkspaceProvider, so the badge overlay's
+  // workspace identity is resolved here alongside the window title.
+  const [resolvedNames, setResolvedNames] = useState<{
+    workspaceName: string;
+    projectName: string;
+  } | null>(null);
+  // Latest OSC 0/1/2 title; badge fallback for pop-out windows where the
+  // sidebar's per-tab title map is unavailable.
+  const [oscTitle, setOscTitle] = useState<string | null>(initialTitle ?? null);
+
   // Set window title (dedicated terminal window only)
   useEffect(() => {
     if (!api || !setDocumentTitle) return;
@@ -180,6 +212,7 @@ export function TerminalView({
         const workspace = workspaces.find((ws) => ws.id === workspaceId);
         if (workspace) {
           document.title = `Terminal — ${workspace.projectName}/${workspace.name}`;
+          setResolvedNames({ workspaceName: workspace.name, projectName: workspace.projectName });
         } else {
           document.title = `Terminal — ${workspaceId}`;
         }
@@ -556,6 +589,7 @@ export function TerminalView({
         // Terminal title changes (from OSC escape sequences like "echo -ne '\033]0;Title\007'")
         // Use ref to always get latest callback
         disposeOnTitleChange = terminal.onTitleChange((title: string) => {
+          setOscTitle(title);
           onTitleChangeRef.current?.(title);
         });
 
@@ -887,6 +921,14 @@ export function TerminalView({
         >
           <span className="text-muted animate-pulse text-sm">Connecting...</span>
         </div>
+      )}
+      {!showLoading && (
+        <TerminalBadgeOverlay
+          workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? workspaceId}
+          projectName={projectName ?? resolvedNames?.projectName ?? ""}
+          tabName={tabName ?? oscTitle ?? getTerminalTabFallbackName(0)}
+          tabIndex={tabIndex}
+        />
       )}
     </div>
   );

@@ -25,7 +25,9 @@ describe("TelemetryService feature flag properties", () => {
       VITEST: process.env.VITEST,
       CI: process.env.CI,
       GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+      XUM_DISABLE_TELEMETRY: process.env.XUM_DISABLE_TELEMETRY,
       MUX_DISABLE_TELEMETRY: process.env.MUX_DISABLE_TELEMETRY,
+      XUM_E2E: process.env.XUM_E2E,
       MUX_E2E: process.env.MUX_E2E,
       TEST_INTEGRATION: process.env.TEST_INTEGRATION,
     };
@@ -36,7 +38,9 @@ describe("TelemetryService feature flag properties", () => {
     delete process.env.VITEST;
     delete process.env.CI;
     delete process.env.GITHUB_ACTIONS;
+    delete process.env.XUM_DISABLE_TELEMETRY;
     delete process.env.MUX_DISABLE_TELEMETRY;
+    delete process.env.XUM_E2E;
     delete process.env.MUX_E2E;
     delete process.env.TEST_INTEGRATION;
 

@@ -21,7 +21,7 @@ import type { BrowserWindow, WebContents } from "electron";
 
 import { type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
@@ -43,7 +43,7 @@ interface TestServerHandle {
 async function createTestServer(): Promise<TestServerHandle> {
   // Create temp dir for config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-server-test-"));
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
 
   // Mock BrowserWindow
   const mockWindow: BrowserWindow = {
@@ -56,7 +56,7 @@ async function createTestServer(): Promise<TestServerHandle> {
   } as unknown as BrowserWindow;
 
   // Initialize services
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   await services.initialize();
   services.windowService.setMainWindow(mockWindow);
 
@@ -85,7 +85,8 @@ async function createTestServer(): Promise<TestServerHandle> {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
   return createORPCClient(link) as RouterClient<AppRouter>;
@@ -107,7 +108,8 @@ async function createWebSocketClient(wsUrl: string): Promise<WebSocketClientHand
     ws.on("error", reject);
   });
 
-  const link = new WebSocketRPCLink({ websocket: ws as unknown as globalThis.WebSocket });
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
+  const link = new WebSocketRPCLink({ connect: () => ws as unknown as globalThis.WebSocket });
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
   const client = createORPCClient(link) as RouterClient<AppRouter>;
 

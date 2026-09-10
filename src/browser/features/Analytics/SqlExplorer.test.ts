@@ -23,21 +23,23 @@ INSERT INTO events (
   output_tokens,
   reasoning_tokens,
   cached_tokens,
-  cache_create_tokens
-) VALUES (
-  'workspace-1',
-  'openai:gpt-4.1',
-  1.25,
-  DATE '2026-03-01',
-  'agent-1',
-  520,
-  'high',
-  100,
-  50,
-  10,
-  5,
-  2
-)
+  cache_create_tokens,
+  tool_name,
+  requested_model,
+  refused_models_json
+) VALUES
+  -- Ordinary committed turn.
+  ('workspace-1', 'openai:gpt-4.1', 1.25, DATE '2026-03-01', 'agent-1', 520, 'high',
+   100, 50, 10, 5, 2, NULL, NULL, NULL),
+  -- Downgraded turn: answered by the fallback model, downgrade metadata on the main row.
+  ('workspace-1', 'openai:gpt-4.1', 0.42, DATE '2026-03-02', 'agent-1', 610, 'high',
+   80, 40, 0, 0, 0, NULL, 'anthropic:fable-1', '["anthropic:fable-1"]'),
+  -- Refused fallback hop recorded on the committed downgraded turn.
+  ('workspace-1', 'anthropic:fable-1', 0, DATE '2026-03-02', 'agent-1', NULL, 'high',
+   12, 0, 0, 0, 0, 'model_fallback_refusal', NULL, NULL),
+  -- Zero-usage terminal refusal on a turn that never committed.
+  ('workspace-1', 'anthropic:fable-1', 0, DATE '2026-03-03', 'agent-1', NULL, NULL,
+   0, 0, 0, 0, 0, 'headless:refused_stream', NULL, NULL)
 `;
 
 type SampleQuery = (typeof SAMPLE_QUERIES)[number];

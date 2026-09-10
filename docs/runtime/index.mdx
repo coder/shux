@@ -1,9 +1,9 @@
 ---
 title: Runtimes
-description: Configure where and how Mux executes agent workspaces
+description: Configure where and how Xum executes agent workspaces
 ---
 
-Runtimes determine where and how Mux executes agent workspaces.
+Runtimes determine where and how Xum executes agent workspaces.
 
 | Runtime                                    | Isolation                                  | Best For                                    |
 | ------------------------------------------ | ------------------------------------------ | ------------------------------------------- |
@@ -19,7 +19,7 @@ Choose a runtime when creating a workspace.
 
 ## Init Hooks
 
-[Init hooks](/hooks/init) and agent bash tool executions can detect the runtime type via the `MUX_RUNTIME` environment variable:
+[Init hooks](/hooks/init) and agent bash tool executions can detect the runtime type via the `XUM_RUNTIME` environment variable:
 
 - `local` — Local runtime
 - `worktree` — Worktree runtime

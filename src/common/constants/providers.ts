@@ -21,8 +21,10 @@ export type ProviderName =
   | "xai"
   | "deepseek"
   | "moonshotai"
+  | "zai"
   | "openrouter"
   | "github-copilot"
+  | "coder"
   | "bedrock"
   | "ollama";
 
@@ -56,7 +58,9 @@ const fromSlashSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex === -1) {
+  // Reject leading/trailing separators: an empty origin or model id would
+  // otherwise canonicalize to invalid ":model" / "origin:" identities.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -66,11 +70,34 @@ const fromSlashSeparatedGatewayModelId = (
   };
 };
 
+// Coder gateway route origins that carry canonical identity: only these
+// DEFAULT-NAMED instances canonicalize (coder:anthropic/x ≙ anthropic:x).
+// Every other instance name — custom names (prod-anthropic), non-canonical
+// types (openai-compat), and instances named after other direct providers
+// (google) — must stay gateway-scoped: rewriting coder:google/x to google:x
+// would route the request to the DIRECT provider, silently bypassing the
+// gateway the user explicitly selected (or failing without direct
+// credentials), because this static route table cannot restore
+// instance-name prefixes.
+const CODER_CANONICAL_GATEWAY_ROUTES: ProviderName[] = ["anthropic", "openai"];
+
+const fromCoderGatewayModelId = (
+  gatewayModelId: string
+): { origin: string; modelId: string } | null => {
+  const parsed = fromSlashSeparatedGatewayModelId(gatewayModelId);
+  return parsed != null &&
+    (CODER_CANONICAL_GATEWAY_ROUTES as readonly string[]).includes(parsed.origin)
+    ? parsed
+    : null;
+};
+
 const fromDotSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf(".");
-  if (separatorIndex <= 0) {
+  // Reject leading/trailing separators (empty origin or model id) — see
+  // fromSlashSeparatedGatewayModelId.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -83,7 +110,7 @@ const fromDotSeparatedGatewayModelId = (
 // Order determines display order in UI (Settings, model selectors, etc.)
 export const PROVIDER_DEFINITIONS = {
   "mux-gateway": {
-    displayName: "Mux Gateway",
+    displayName: "Xum Gateway",
     import: () => import("ai"),
     factoryName: "createGateway",
     requiresApiKey: true, // Uses couponCode
@@ -136,12 +163,20 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  zai: {
+    displayName: "Z.ai",
+    import: () => import("@ai-sdk/zai"),
+    factoryName: "createZai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
   openrouter: {
     displayName: "OpenRouter",
     import: () => import("@openrouter/ai-sdk-provider"),
     factoryName: "createOpenRouter",
     requiresApiKey: true,
     kind: "gateway",
+    // OpenRouter uses the hyphenated vendor slug "z-ai", so direct "zai" routing is not inferred.
     routes: ["anthropic", "openai", "google", "xai", "deepseek", "moonshotai"],
     passthrough: false,
     toGatewayModelId: toSlashSeparatedGatewayModelId,
@@ -159,6 +194,22 @@ export const PROVIDER_DEFINITIONS = {
     // Intentionally omit fromGatewayModelId: github-copilot:* model strings are canonical identities
     // with Copilot-specific pricing/capabilities, including non-OpenAI families like Claude.
     toGatewayModelId: (_origin, modelId) => modelId,
+  },
+  coder: {
+    displayName: "Coder",
+    // Nominal import only: the model factory branches per provider instance
+    // (wire protocol derived from the instance's type) because Coder's AI
+    // Gateway exposes per-instance endpoints.
+    import: () => import("@ai-sdk/openai"),
+    factoryName: "createOpenAI",
+    requiresApiKey: false, // Uses "Login with Coder" OAuth tokens
+    kind: "gateway",
+    routes: CODER_CANONICAL_GATEWAY_ROUTES,
+    // The AI Gateway is a transparent proxy to the configured upstreams, so
+    // canonical model identity (and providerOptions namespaces) are preserved.
+    passthrough: true,
+    toGatewayModelId: toSlashSeparatedGatewayModelId,
+    fromGatewayModelId: fromCoderGatewayModelId,
   },
   bedrock: {
     displayName: "Bedrock",

@@ -1,8 +1,9 @@
+import { createConfigStores } from "@/node/config";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
 import type { BrowserWindow, WebContents } from "electron";
-import { Config } from "../../src/node/config";
+import type { Config } from "../../src/node/config";
 import { ServiceContainer } from "../../src/node/services/serviceContainer";
 import { setOpenSSHHostKeyPolicyMode } from "../../src/node/runtime/sshConnectionPool";
 import {
@@ -58,7 +59,8 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-"));
 
   // Create config with temporary directory
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
+  const config = stores.config;
 
   // Some UI tests render ProjectPage, which now hard-blocks workspace creation when no providers
   // are configured. For non-integration tests, seed a dummy provider so the UI can render.
@@ -66,7 +68,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
   // real env-backed credentials used by tests like name generation).
   if (!shouldRunIntegrationTests()) {
-    config.saveProvidersConfig({
+    stores.providersConfigStore.saveProvidersConfig({
       anthropic: { apiKey: "test-key-for-ui-tests" },
     });
   }
@@ -75,7 +77,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const mockWindow = createMockBrowserWindow();
 
   // Create ServiceContainer instance
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   // IPC tests run SSH against Docker containers with ephemeral host keys and no
   // interactive UI for host-key approval. Reset to headless-fallback so the
   // ServiceContainer's "strict" mode doesn't block Docker SSH connections.

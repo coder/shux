@@ -54,7 +54,7 @@ export const NotEnrolled: Story = {
   render: () => renderGovernorSection(() => setupGovernorStory()),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByRole("button", { name: /enroll in mux governor/i });
+    await canvas.findByRole("button", { name: /enroll in xum governor/i });
   },
 };
 

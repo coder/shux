@@ -1,18 +1,18 @@
 ---
 title: Telemetry
-description: What Mux collects, what it doesn’t, and how to disable it
+description: What Xum collects, what it doesn’t, and how to disable it
 ---
 
-Mux collects anonymous usage telemetry to help improve the product.
+Xum collects anonymous usage telemetry to help improve the product.
 
 ## Privacy policy
 
-- **No personal information**: Mux does not collect usernames, project names, file paths, or code content.
+- **No personal information**: Xum does not collect usernames, project names, file paths, or code content.
 - **Random IDs only**: Only randomly generated workspace IDs are sent.
 - **No hashing**: Hashing is vulnerable to rainbow table attacks.
 - **Transparent payload**: See exactly what is sent in [`src/common/telemetry/payload.ts`](https://github.com/coder/mux/blob/main/src/common/telemetry/payload.ts).
 
-## What Mux tracks
+## What Xum tracks
 
 All telemetry events include basic system information:
 
@@ -28,7 +28,7 @@ All telemetry events include basic system information:
 - **Message sending**: When messages are sent (model, mode, message length rounded to base-2)
 - **Errors**: Error types and context (no sensitive data)
 
-### What Mux does _not_ track
+### What Xum does _not_ track
 
 - Your messages or code
 - Project names or file paths
@@ -38,10 +38,10 @@ All telemetry events include basic system information:
 
 ## Disabling telemetry
 
-To disable telemetry, set `MUX_DISABLE_TELEMETRY` before starting the app:
+To disable telemetry, set `XUM_DISABLE_TELEMETRY` before starting the app:
 
 ```bash
-MUX_DISABLE_TELEMETRY=1 mux
+XUM_DISABLE_TELEMETRY=1 xum
 ```
 
 This disables telemetry collection at the backend level.

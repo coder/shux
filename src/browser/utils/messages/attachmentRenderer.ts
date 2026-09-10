@@ -5,6 +5,7 @@ import type {
   LoadedSkillsSnapshotAttachment,
   EditedFilesReferenceAttachment,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import {
   AGENT_SKILL_BODY_TRUNCATION_NOTE,
@@ -124,6 +125,27 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
+ * SECURITY AUDIT: this attachment lands in a synthetic <system-update> block
+ * inside a USER-role post-compaction message — a high-trust channel that
+ * recurs on every turn after compaction summarized the original tool results
+ * away. File paths are repo-controlled bytes: tag-syntax escaping preserved
+ * instruction prose (Codex r48), and any charset allowlist still lets
+ * separator characters encode readable instructions
+ * (IGNORE_ALL_PREVIOUS_INSTRUCTIONS, r49). No filter renders attacker text
+ * safe in this channel, so NO path bytes are rendered at all — only the
+ * count, which is derived from list length, not attacker content. The model
+ * loses the per-path dedup hint and may re-read a file; that is the accepted
+ * cost of closing a persistent prompt-injection channel.
+ */
+function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): string {
+  const count = attachment.paths.length;
+  return (
+    `${count} previously read file${count === 1 ? "" : "s"} had their contents ` +
+    `summarized away by compaction; re-read files when their contents are needed again.`
+  );
+}
+
+/**
  * Render an edited files reference attachment to content string.
  */
 function renderEditedFilesReference(attachment: EditedFilesReferenceAttachment): string {
@@ -157,6 +179,8 @@ export function renderAttachmentToContent(attachment: PostCompactionAttachment):
       return renderEditedFilesReference(attachment);
     case "completed_reports_index":
       return renderCompletedReportsIndex(attachment);
+    case "read_files_reference":
+      return renderReadFilesReference(attachment);
   }
 }
 
@@ -320,8 +344,9 @@ function sortAttachmentsForInjection(
     // Small, high-value handles go before the bulky skill/diff blocks so budget
     // truncation cannot drop them.
     completed_reports_index: 2,
-    loaded_skills_snapshot: 3,
-    edited_files_reference: 4,
+    read_files_reference: 3,
+    loaded_skills_snapshot: 4,
+    edited_files_reference: 5,
   };
 
   return attachments
@@ -409,6 +434,15 @@ export function renderAttachmentsToContentWithBudget(
       omittedLoadedSkills += omittedSkills;
 
       if (content) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "read_files_reference") {
+      // Compact one-liner (paths only) — include whole or not at all.
+      const content = renderReadFilesReference(attachment);
+      if (content.length <= remainingForContent) {
         addBlock(wrapSystemUpdate(content));
       }
       continue;

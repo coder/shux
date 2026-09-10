@@ -60,6 +60,14 @@ export function killProcessTree(pid: number): void {
   }
 }
 
+function terminateCommandTree(child: ChildProcess): void {
+  if (child.pid !== undefined && child.pid > 0) killProcessTree(child.pid);
+  else child.kill("SIGKILL");
+  // The "close" event waits for stdio to close, and descendants may keep those pipes open.
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
 /**
  * Disposable wrapper for child processes that ensures immediate cleanup.
  * Implements TypeScript's explicit resource management (using) for process lifecycle.
@@ -261,6 +269,7 @@ export function execAsync(command: string, options?: ExecAsyncOptions): Disposab
  * Options for execFileAsync.
  */
 export interface ExecFileAsyncOptions {
+  cwd?: string;
   /** Extra environment variables for the child process. */
   env?: Record<string, string | undefined>;
   /** Optional callback for each stderr data chunk from the process. */
@@ -269,6 +278,14 @@ export interface ExecFileAsyncOptions {
   timeoutMs?: number;
   /** Optional signal used to cancel the process. */
   signal?: AbortSignal;
+  /**
+   * Optional cap on buffered stdout and stderr. The child is killed and the promise rejects once
+   * their cumulative output exceeds this. The default is deliberately unbounded for commands like
+   * `git clone` whose output is large but trusted.
+   */
+  maxOutputBytes?: number;
+  /** Kill descendants that may keep inherited stdio open after timeout or abort. */
+  killTreeOnTermination?: boolean;
 }
 
 /**
@@ -303,9 +320,16 @@ export function execFileAsync(
     return new DisposableExec(result);
   }
 
+  const killsProcessTree =
+    options?.maxOutputBytes !== undefined || options?.killTreeOnTermination === true;
   const child = spawn(file, args, {
+    cwd: options?.cwd,
     stdio: ["ignore", "pipe", "pipe"],
     env: options?.env ? { ...process.env, ...options.env } : undefined,
+    // Unix tree termination needs a separate process group, but detaching also hides terminal
+    // signals, so commands that do not kill descendants stay in this process's group. Windows
+    // uses `taskkill /T` because detached children can open a console window.
+    detached: killsProcessTree && process.platform !== "win32",
   });
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const cleanup = () => {
@@ -313,7 +337,11 @@ export function execFileAsync(
     options?.signal?.removeEventListener("abort", onAbort);
   };
   const killChild = () => {
-    if (child.exitCode === null && child.signalCode === null) {
+    if (killsProcessTree) {
+      // Even after the leader exits: a descendant holding the inherited pipes keeps `close`
+      // from firing, and the group outlives its leader while any member survives.
+      terminateCommandTree(child);
+    } else if (child.exitCode === null && child.signalCode === null) {
       child.kill();
     }
   };
@@ -332,10 +360,28 @@ export function execFileAsync(
     let exitCode: number | null = null;
     let exitSignal: string | null = null;
 
-    child.stdout?.on("data", (data) => {
-      stdout += data;
+    let outputOverflow = false;
+    let outputBytes = 0;
+    const maxOutputBytes = options?.maxOutputBytes;
+    const acceptOutput = (data: Buffer): boolean => {
+      if (outputOverflow) return false;
+      // Count chunks across both streams; repeatedly measuring accumulated strings would be
+      // quadratic. For capped commands, checking here bounds heap growth before process exit.
+      outputBytes += data.length;
+      if (maxOutputBytes === undefined || outputBytes <= maxOutputBytes) return true;
+
+      outputOverflow = true;
+      stdout = "";
+      stderr = "";
+      terminateCommandTree(child);
+      return false;
+    };
+
+    child.stdout?.on("data", (data: Buffer) => {
+      if (acceptOutput(data)) stdout += data.toString();
     });
     child.stderr?.on("data", (data: Buffer) => {
+      if (!acceptOutput(data)) return;
       const chunk = data.toString();
       stderr += chunk;
       options?.onStderrData?.(chunk);
@@ -348,14 +394,17 @@ export function execFileAsync(
 
     child.on("close", () => {
       cleanup();
-      if (exitCode === 0 && exitSignal === null) {
+      if (!outputOverflow && exitCode === 0 && exitSignal === null) {
         resolve({ stdout, stderr });
       } else {
-        const errorMsg =
-          stderr.trim() ||
-          (exitSignal
-            ? `Command killed by signal ${exitSignal}`
-            : `Command failed with exit code ${exitCode ?? "unknown"}`);
+        const errorMsg = outputOverflow
+          ? // Named before stderr, because the kill is why this failed and the signal message
+            // alone would read as an unexplained crash.
+            `Command produced more than ${maxOutputBytes ?? 0} bytes of output`
+          : stderr.trim() ||
+            (exitSignal
+              ? `Command killed by signal ${exitSignal}`
+              : `Command failed with exit code ${exitCode ?? "unknown"}`);
         const error = new Error(errorMsg) as Error & {
           code: number | null;
           signal: string | null;

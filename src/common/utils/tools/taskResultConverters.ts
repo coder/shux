@@ -1,7 +1,7 @@
 // Shared helpers for coercing / converting tool results.
 //
 // These are primarily used by the mobile renderer, which needs to display tool calls
-// that may have been produced by older Mux versions.
+// that may have been produced by older Xum versions.
 
 import type { BashToolResult } from "@/common/types/tools";
 

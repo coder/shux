@@ -1,7 +1,8 @@
 import * as fs from "fs/promises";
+import * as net from "node:net";
 import * as os from "os";
 import * as path from "path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
 import type { DesktopActionResult, DesktopScreenshotResult } from "@/common/types/desktop";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -34,6 +35,7 @@ interface PortableDesktopShimConfig {
   screenshotResult?: DesktopScreenshotResult;
   actionResult?: DesktopActionResult;
   actionRecordPath?: string;
+  blockedActionPidPath?: string;
 }
 
 interface PortableDesktopHarness {
@@ -211,6 +213,14 @@ switch (command) {
     break;
   }
   case "keyboard": {
+    if (config.blockedActionPidPath) {
+      process.on("SIGTERM", () => {});
+      fs.writeFileSync(config.blockedActionPidPath + ".tmp", String(process.pid));
+      fs.renameSync(config.blockedActionPidPath + ".tmp", config.blockedActionPidPath);
+      require("net").createConnection(config.blockedActionPidPath + ".sock").on("connect", function () { this.end(); });
+      setInterval(() => {}, 1000);
+      break;
+    }
     assertActionSucceeds("keyboard");
     const positionals = getPositionals();
     appendActionRecord({
@@ -601,6 +611,70 @@ describe("PortableDesktopSession", () => {
         await session.start();
         expect(await session.screenshot()).toEqual(screenshotResult);
       } finally {
+        await session.close();
+      }
+    });
+  });
+
+  test("action timeout waits for a SIGTERM-resistant command to exit", async () => {
+    await withPortableDesktopHarness(async ({ tempDir }) => {
+      if (process.platform === "win32") return;
+      const pidPath = path.join(tempDir, "blocked-action.pid");
+      await writePortableDesktopShim({
+        rootDir: tempDir,
+        installMode: "cache",
+        config: {
+          startupInfo: createStartupInfo({ display: 19, vncPort: 5900, geometry: "1024x768" }),
+          blockedActionPidPath: pidPath,
+        },
+      });
+      process.env.PATH = "";
+      const session = new PortableDesktopSession({
+        workspaceId: "workspace-action-timeout",
+        rootDir: tempDir,
+      });
+      let markReady!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        markReady = resolve;
+      });
+      const readinessServer = net.createServer((socket) => {
+        socket.end();
+        markReady();
+      });
+      await new Promise<void>((resolve, reject) => {
+        readinessServer.once("error", reject);
+        readinessServer.listen(pidPath + ".sock", resolve);
+      });
+      let pid: number | undefined;
+      const timerSpy = spyOn(globalThis, "setTimeout");
+      try {
+        await session.start();
+        timerSpy.mockClear();
+        const action = session.action("key_press", { key: "Return" });
+        await ready;
+        const actionPid = Number(await fs.readFile(pidPath, "utf8"));
+        expect(Number.isInteger(actionPid) && actionPid > 0).toBe(true);
+        pid = actionPid;
+        expect(process.kill(actionPid, 0)).toBe(true);
+        // Fire the real timeout only after the shim has installed its SIGTERM handler.
+        // This tests the deadline path without racing process startup against a short timer.
+        const timeoutHandler = timerSpy.mock.calls.find(
+          ([, delay]) => delay === DESKTOP_DEFAULTS.ACTION_TIMEOUT_MS
+        )?.[0];
+        if (typeof timeoutHandler !== "function") throw new Error("Missing action deadline");
+        timeoutHandler();
+        expect((await action).success).toBe(false);
+        expect(() => process.kill(actionPid, 0)).toThrow();
+      } finally {
+        timerSpy.mockRestore();
+        await new Promise<void>((resolve) => readinessServer.close(() => resolve()));
+        if (pid !== undefined) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (error) {
+            expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+          }
+        }
         await session.close();
       }
     });

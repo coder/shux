@@ -9,7 +9,7 @@ export function StartupConnectionError(props: StartupConnectionErrorProps) {
   return (
     <div className="boot-loader" role="alert" aria-live="polite">
       <div className="boot-loader__inner">
-        <p className="boot-loader__text">Unable to connect to the Mux backend.</p>
+        <p className="boot-loader__text">Unable to connect to the Xum backend.</p>
 
         <p className="boot-loader__text max-w-[720px] text-center">
           <span className="font-medium">Details:</span> {props.error}

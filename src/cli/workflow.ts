@@ -1,14 +1,15 @@
 #!/usr/bin/env bun
 /**
- * `mux workflow` - Headless CLI runner for durable workflow scripts.
+ * `xum workflow` - Headless CLI runner for durable workflow scripts.
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
@@ -18,14 +19,20 @@ import {
   type ParsedThinkingInput,
 } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
-import { resolveModelAlias, defaultModel } from "@/common/utils/ai/models";
+import { defaultModel } from "@/common/utils/ai/models";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
+import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
-import { createCoreServices } from "@/node/services/coreServices";
+import { CoderOauthService } from "@/node/services/coderOauthService";
+import { PolicyService } from "@/node/services/policyService";
+import { ProviderService } from "@/node/services/providerService";
+import { createCoreServices } from "@/node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -37,6 +44,7 @@ import {
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/providerRequirements";
+import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
 import { resolveProjectDir, resolveProjectTrusted } from "./trust";
@@ -82,6 +90,9 @@ interface WorkflowContext {
   services: WorkflowServices;
   session: AgentSession;
   codexOauthService: CodexOauthService;
+  coderOauthService: CoderOauthService;
+  realProviderService: ProviderService;
+  policyService: PolicyService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -158,7 +169,13 @@ async function gatherStdin(): Promise<string> {
 }
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
   if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
     throw new Error(
       `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
@@ -172,12 +189,12 @@ function parseRuntimeConfig(value: string | undefined): RuntimeConfig {
   const parsed = parseRuntimeModeAndHost(value);
   if (!parsed) {
     throw new Error(
-      `Invalid runtime: '${value}'. Use 'local'. Other runtimes are not supported by mux workflow yet.`
+      `Invalid runtime: '${value}'. Use 'local'. Other runtimes are not supported by xum workflow yet.`
     );
   }
   if (parsed.mode !== RUNTIME_MODE.LOCAL) {
     throw new Error(
-      `mux workflow currently supports only local runtime. Unsupported runtime: ${parsed.mode}`
+      `xum workflow currently supports only local runtime. Unsupported runtime: ${parsed.mode}`
     );
   }
   return { type: "local" };
@@ -194,14 +211,20 @@ function generateWorkspaceId(): string {
   return `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function copyPersistentConfig(realConfig: Config, config: Config): Promise<void> {
-  const existingProviders = realConfig.loadProvidersConfig();
+async function copyPersistentConfig(
+  realStores: ConfigStores,
+  runStores: ConfigStores
+): Promise<void> {
+  const realConfig = realStores.config;
+  const config = runStores.config;
+  const realProvidersStore = realStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
   if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
-    config.saveProvidersConfig(existingProviders);
+    runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await config.saveSecretsConfig(existingSecrets);
+    await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
   const existingConfig = realConfig.loadConfigOrDefault();
@@ -219,15 +242,21 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
 
 function buildExperimentsObject(experimentIds: readonly string[]) {
   return {
-    programmaticToolCalling: experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    programmaticToolCallingExclusive: experimentIds.includes(
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-    ),
-    execSubagentHardRestart: experimentIds.includes(EXPERIMENT_IDS.EXEC_SUBAGENT_HARD_RESTART),
-    // Invoking `mux workflow` is an explicit opt-in, so the dynamic-workflows
+    // RLM implies the PTC parent flag: tool assembly only builds
+    // code_execution when the PTC flag is set, so rlm-mode alone would be inert
+    // (the desktop can't express that state — Settings nests RLM under PTC).
+    programmaticToolCalling:
+      experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
+      experimentIds.includes(EXPERIMENT_IDS.RLM),
+    // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
+    // silently dropped and workflow sends ran the non-kernel PTC toolset.
+    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
+    // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
     // experiment is enabled implicitly for this invocation (never persisted).
     dynamicWorkflows: true,
     workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
+    // Loading third-party plugin code stays an explicit per-invocation opt-in.
+    agentPlugins: experimentIds.includes(EXPERIMENT_IDS.AGENT_PLUGINS),
   };
 }
 
@@ -236,36 +265,51 @@ async function disposeWorkflowResources(input: {
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
+  coderOauthService?: CoderOauthService;
+  realProviderService?: ProviderService;
+  policyService?: PolicyService;
 }): Promise<void> {
-  // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-  // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-  input.services?.backgroundProcessManager.beginShutdown();
-  try {
-    input.session?.dispose();
-  } catch (error) {
-    log.warn("mux workflow: failed to dispose session", { error: getErrorMessage(error) });
-  }
-  try {
-    input.services?.mcpServerManager.dispose();
-  } catch (error) {
-    log.warn("mux workflow: failed to dispose MCP server manager", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.codexOauthService?.dispose();
-  } catch (error) {
-    log.warn("mux workflow: failed to dispose Codex OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.services?.backgroundProcessManager.terminateAll();
-  } catch (error) {
-    log.warn("mux workflow: failed to terminate background processes", {
-      error: getErrorMessage(error),
-    });
-  }
+  const services = input.services;
+  // Same shape as `xum run`'s list: every step is contained, reported, and
+  // timed as a `[shutdown]` line; a failing step never skips the ones after it.
+  await runBestEffortCleanup(
+    [
+      ...(services
+        ? [
+            // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+            // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+            {
+              name: "backgroundProcessManager.beginShutdown",
+              run: () => services.backgroundProcessManager.beginShutdown(),
+            },
+            // Interrupt + await the runtime's supervised fibers while their dependencies
+            // are still alive (same slot as ServiceContainer.dispose); never rejects.
+            { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
+          ]
+        : []),
+      // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+      // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+      { name: "session.dispose", run: () => input.session?.beginDispose() },
+      { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
+      { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
+      { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
+      { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
+      { name: "policyService.dispose", run: () => input.policyService?.dispose() },
+      {
+        name: "backgroundProcessManager.terminateAll",
+        run: () => services?.backgroundProcessManager.terminateAll(),
+      },
+      // Last: release the Effect runtime that owns the core graph; never rejects.
+      ...(services
+        ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
+        : []),
+    ],
+    (stepName, error) => {
+      log.warn(`xum workflow: cleanup step failed: ${stepName}`, {
+        error: getErrorMessage(error),
+      });
+    }
+  );
   input.tempDir[Symbol.dispose]();
 }
 
@@ -275,6 +319,9 @@ async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
+    coderOauthService: ctx.coderOauthService,
+    realProviderService: ctx.realProviderService,
+    policyService: ctx.policyService,
   });
 }
 
@@ -286,40 +333,96 @@ async function createWorkflowContext(options: {
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
+  let coderOauthService: CoderOauthService | undefined;
+  let realProviderService: ProviderService | undefined;
+  let policyService: PolicyService | undefined;
   try {
-    const realConfig = new Config();
-    const config = new Config(tempDir.path);
-    await copyPersistentConfig(realConfig, config);
+    const realStores = createConfigStores();
+    const realConfig = realStores.config;
+    const runStores = createConfigStores(tempDir.path);
+    const config = runStores.config;
+    await copyPersistentConfig(realStores, runStores);
 
-    const existingProviders = realConfig.loadProvidersConfig();
+    const realProvidersStore = realStores.providersConfigStore;
+    const realFileLeaseManager = realStores.fileLeaseManager;
+    const runProvidersStore = runStores.providersConfigStore;
+    const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        config.saveProvidersConfig(providersFromEnv);
+        runProvidersStore.saveProvidersConfig(providersFromEnv);
       }
     }
 
     const workspaceId = generateWorkspaceId();
-    assert(workspaceId.length > 0, "mux workflow generated an empty workspace id");
+    assert(workspaceId.length > 0, "xum workflow generated an empty workspace id");
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
+    // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless
+    // workflows too, matching the desktop wiring: without this, `xum workflow`
+    // would keep using providers/models/credentials that providerAccess now
+    // denies. Bind to the REAL config so governor enrollment settings
+    // (muxGovernorUrl/Token) are honored.
+    policyService = new PolicyService(realConfig);
+    await policyService.initialize();
+
     services = createCoreServices({
-      config,
+      ...runStores,
+      policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
-    codexOauthService = new CodexOauthService(config, services.providerService);
-    services.aiService.setCodexOauthService(codexOauthService);
+    codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
+    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
+    // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
+    // Coder rotates the refresh token on every use, so persisting rotations
+    // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
+    // (dead) refresh token once this CLI session exits.
+    realProviderService = new ProviderService(
+      realConfig,
+      policyService,
+      realProvidersStore,
+      realFileLeaseManager
+    );
+    coderOauthService = new CoderOauthService(
+      realProvidersStore,
+      realFileLeaseManager,
+      realProviderService,
+      undefined,
+      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
+      // for token refreshes/issuer checks, and denied providers fail closed.
+      policyService
+    );
+    services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
+    // Const capture: `services` is a `let`, so the deferred sanitize closure
+    // below would lose TypeScript's definite-assignment narrowing.
+    const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      effectRunner: services.runtime.get(EffectRunnerTag),
+      appFiberScope: services.appFiberScope,
       workspaceId,
       config,
       historyService: services.historyService,
       aiService: services.aiService,
+      streamManager: services.streamManager,
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,
+      // Direct CLI registration bypasses WorkspaceService.create, so a
+      // preserved checkout could carry a stale `plugin:` MCP override into a
+      // same-name reinstall on the first send; sanitize before announcing.
+      // realConfig: the ephemeral CLI config has no workspace records, so the
+      // live-sibling scan needs the persistent one or it would prune enables a
+      // desktop workspace on this checkout still owns.
+      sanitizeCliWorkspaceRegistration: (args) =>
+        workspaceServiceForSanitize.sanitizeCliRegisteredWorkspace(
+          args.workspaceId,
+          args.workspacePath,
+          args.runtimeConfig,
+          realConfig
+        ),
     });
     services.workspaceService.registerSession(workspaceId, session);
 
@@ -329,7 +432,7 @@ async function createWorkflowContext(options: {
       projectName: path.basename(options.projectDir),
       runtimeConfig,
     });
-    assert(workspacePath.length > 0, "mux workflow workspace path must be non-empty");
+    assert(workspacePath.length > 0, "xum workflow workspace path must be non-empty");
 
     return {
       realConfig,
@@ -343,9 +446,20 @@ async function createWorkflowContext(options: {
       services,
       session,
       codexOauthService,
+      coderOauthService,
+      realProviderService,
+      policyService,
     };
   } catch (error) {
-    await disposeWorkflowResources({ tempDir, services, session, codexOauthService });
+    await disposeWorkflowResources({
+      tempDir,
+      services,
+      session,
+      codexOauthService,
+      coderOauthService,
+      realProviderService,
+      policyService,
+    });
     throw error;
   }
 }
@@ -362,7 +476,7 @@ function createWorkflowService(input: {
     workspaceName: input.ctx.workspaceId,
     workspacePath: input.ctx.workspacePath,
   });
-  const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
+  const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
@@ -381,7 +495,7 @@ function createWorkflowService(input: {
           workspaceId: input.ctx.workspaceId,
           cwd: input.ctx.workspacePath,
           runtime,
-          runtimeTempDir: runtime.normalizePath(".mux/tmp", input.ctx.workspacePath),
+          runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
         },
@@ -392,6 +506,7 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
+        includeAgentPlugins: experiments.agentPlugins,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -411,7 +526,14 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
     argsFile: options.argsFile,
     argsStdin: options.argsStdin,
   });
-  const model = resolveModelAlias(options.model);
+  // Shared normalization (alias resolution + gateway migration + format
+  // validation); an unrecognized -m value fails up front.
+  const model = normalizeModelInput(options.model).model;
+  if (model == null) {
+    throw new Error(
+      `Invalid model "${options.model}". Expected "provider:model-id" or a known alias`
+    );
+  }
   const thinkingLevel = resolveThinkingInput(parseThinkingLevel(options.thinking), model);
   const suppressHuman = options.json === true || options.quiet === true;
   const writeLine = (line = "") => {
@@ -435,6 +557,7 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
+      includeAgentPlugins: buildExperimentsObject(options.experiment).agentPlugins,
     });
     const result = await workflowService.startWorkflow({
       script,
@@ -488,9 +611,9 @@ function configureLogging(options: Pick<WorkflowCLIOptions, "logLevel" | "verbos
 export async function main(): Promise<number> {
   const program = new Command();
   program
-    .name("mux workflow")
+    .name("xum workflow")
     .description(
-      "Run mux workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
+      "Run xum workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
     )
     .option("-d, --dir <path>", "project directory")
     .option("-r, --runtime <runtime>", "runtime type (currently only local is supported)", "local")

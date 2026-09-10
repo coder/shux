@@ -1,10 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { getXumHome } from "@/common/constants/paths";
 import { log } from "@/node/services/log";
 
 const ASKPASS_SCRIPT = `#!/bin/sh
-# mux-askpass — SSH_ASKPASS helper for Mux
+# mux-askpass — SSH_ASKPASS helper for Xum
 # Each invocation is an independent request/response transaction identified
 # by a unique ID, so multiple prompts per SSH handshake are handled correctly.
 # Uses only regular files (no mkfifo) for cross-platform portability.
@@ -43,7 +44,9 @@ async function ensureAskpassScript(): Promise<string> {
     }
   }
 
-  const dir = path.join(os.homedir(), ".mux", "bin");
+  // Write under the canonical home so a missing ~/.mux alias cannot create a
+  // split tree. Keep the mux-askpass filename stable for existing SSH sessions.
+  const dir = path.join(getXumHome(), "bin");
   await fs.promises.mkdir(dir, { recursive: true });
   askpassPath = path.join(dir, "mux-askpass");
   await fs.promises.writeFile(askpassPath, ASKPASS_SCRIPT, { mode: 0o755 });

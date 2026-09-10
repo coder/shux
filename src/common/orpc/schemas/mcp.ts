@@ -3,9 +3,9 @@ import { z } from "zod";
 /**
  * Per-workspace MCP overrides.
  *
- * Stored per-workspace in <workspace>/.mux/mcp.local.jsonc (workspace-local, intended to be gitignored).
+ * Stored per-workspace in <workspace>/.xum/mcp.local.jsonc (workspace-local, intended to be gitignored).
  * Allows workspaces to disable servers or restrict tool allowlists
- * without modifying the project-level .mux/mcp.jsonc.
+ * without modifying the project-level .xum/mcp.jsonc.
  */
 export const WorkspaceMCPOverridesSchema = z.object({
   /** Server names to explicitly disable for this workspace. */
@@ -34,7 +34,7 @@ export const MCPServerPluginProvenanceSchema = z.object({
   pluginName: z.string(),
   serverName: z.string(),
   sourceScope: z.enum(["project", "global"]),
-  /** Installation location discriminator, e.g. ".mux/plugins/demo" (same-name plugins can sit in sibling containers). */
+  /** Installation location discriminator, e.g. ".xum/plugins/demo" (same-name plugins can sit in sibling containers). */
   sourceLocation: z.string(),
 });
 
@@ -51,6 +51,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   }),
   z.object({
     transport: z.literal("http"),
+    managed: z.literal("claude-design").optional(),
     url: z.string(),
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
@@ -74,6 +75,26 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     plugin: MCPServerPluginProvenanceSchema.optional(),
   }),
 ]);
+
+export const MCPPromptDescriptorSchema = z.object({
+  commandKey: z.string(),
+  /** Identity-derived alias (always hash-suffixed); stable across catalog changes. */
+  stableKey: z.string(),
+  serverName: z.string(),
+  promptName: z.string(),
+  description: z.string().optional(),
+  arguments: z
+    .array(
+      z.object({
+        name: z.string(),
+        description: z.string().optional(),
+        required: z.boolean().optional(),
+      })
+    )
+    .optional(),
+});
+
+export type MCPPromptDescriptor = z.infer<typeof MCPPromptDescriptorSchema>;
 
 export const MCPServerMapSchema = z.record(z.string(), MCPServerInfoSchema);
 

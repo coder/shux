@@ -75,7 +75,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
     // Sanity check that the gateway indicator exists (moved to the titlebar).
     const gatewayIndicator = await waitFor(
       () => {
-        const el = canvasElement.querySelector('[aria-label="Mux Gateway routing"]');
+        const el = canvasElement.querySelector('[aria-label="Xum Gateway routing"]');
         if (!el) throw new Error("Gateway indicator not found");
         return el;
       },
@@ -88,7 +88,7 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
       () => {
         const tooltip = document.querySelector('[role="tooltip"]');
         if (!tooltip) throw new Error("Tooltip not visible");
-        if (!tooltip.textContent?.includes("Mux Gateway")) {
+        if (!tooltip.textContent?.includes("Xum Gateway")) {
           throw new Error("Gateway tooltip not visible");
         }
       },

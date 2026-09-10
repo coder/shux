@@ -4,10 +4,22 @@ import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
-import { getModelKey } from "@/common/constants/storage";
+import {
+  getModelKey,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+} from "@/common/constants/storage";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
+import type { UpdateChannel } from "@/common/types/project";
+import {
+  consumePendingPluginsSectionIntent,
+  subscribePluginsSectionIntents,
+  type PluginsSectionIntent,
+} from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { CommandIds } from "@/browser/utils/commandIds";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -34,6 +46,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const params: Parameters<typeof buildCoreSources>[0] = {
     userProjects,
     themePreference: "dark",
+    supportedUpdateChannels: ["stable", "nightly"],
     workspaceMetadata,
     selectedWorkspace: {
       projectPath: "/repo/a",
@@ -54,6 +67,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
     multiProjectWorkspacesEnabled: true,
+    agentPluginsEnabled: false,
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),
@@ -486,6 +500,134 @@ test("multi-project workspace command hides itself when the experiment is disabl
   expect(onStartMultiProjectWorkspaceCreation).not.toHaveBeenCalled();
 });
 
+test("Login with Coder command opens providers expanded on Coder and starts the login", async () => {
+  // Regression: the command must reach the login operation (expand the Coder
+  // provider and start the OAuth flow via the one-shot hints consumed by
+  // ProvidersSection), not merely open the generic Providers section.
+  const onOpenSettings = mock();
+  const actions = getActions({ onOpenSettings });
+  const loginAction = actions.find((a) => a.title === "Settings: Login with Coder");
+
+  expect(loginAction).toBeDefined();
+  await loginAction!.run();
+
+  expect(onOpenSettings).toHaveBeenCalledWith("providers", {
+    expandProvider: "coder",
+    startCoderLogin: true,
+  });
+});
+
+test.each([
+  ["Electron", ["stable", "nightly"]],
+  ["server", ["stable", "nightly", "npm"]],
+  ["unknown", []],
+] satisfies Array<[string, UpdateChannel[]]>)(
+  "update channel actions follow %s capabilities",
+  (_runtime, supportedUpdateChannels) => {
+    const actions = getActions({ onOpenAbout: mock(), supportedUpdateChannels });
+    expect(actions.filter((a) => a.id.startsWith("update:channel:")).map((a) => a.id)).toEqual(
+      supportedUpdateChannels.map(CommandIds.updateChannel)
+    );
+  }
+);
+
+test.each(["stable", "nightly", "npm"] as const)(
+  "update commands persist %s before opening About and need an About opener",
+  async (channel) => {
+    const onOpenAbout = mock();
+    const install = mock(() => Promise.resolve());
+    let settleChannel!: () => void;
+    const setChannel = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          settleChannel = resolve;
+        })
+    );
+    const actions = getActions({
+      onOpenAbout,
+      api: { update: { install, setChannel } } as unknown as APIClient,
+      supportedUpdateChannels: ["stable", "nightly", "npm"],
+    });
+    await actions.find((a) => a.title === "Install Update and Restart")!.run();
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(install).not.toHaveBeenCalledWith({ force: true });
+    expect(onOpenAbout).toHaveBeenCalledTimes(1);
+    await actions.find((a) => a.id === CommandIds.updateInstallForce())!.run();
+    expect(install).toHaveBeenLastCalledWith({ force: true });
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    // About reads the channel when it opens, so the switch must persist before the dialog appears.
+    const switchAction = actions.find((a) => a.id === CommandIds.updateChannel(channel));
+    expect(switchAction).toBeDefined();
+    const switched = switchAction!.run();
+    expect(setChannel).toHaveBeenCalledWith({ channel });
+    expect(onOpenAbout).toHaveBeenCalledTimes(2);
+    settleChannel();
+    await switched;
+    expect(onOpenAbout).toHaveBeenCalledTimes(3);
+    expect(getActions().some((a) => a.title === "Check for Updates")).toBe(false);
+  }
+);
+
+test("Login with Coder command hides itself when a custom provider shadows the coder id", () => {
+  // Regression: an upgraded install can carry a custom OpenAI-compatible
+  // provider named "coder". ProvidersSection hides the OAuth block for
+  // shadowed providers, so the login hint would either surface an invisible
+  // "Set the deployment URL first" error or inject built-in OAuth credentials
+  // into the custom provider's section. The command must follow the UI's
+  // shadow handling and hide itself.
+  const onOpenSettings = mock();
+  const shadowed = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { isCustom: true, baseUrl: "http://localhost:9000/v1" },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(shadowed).toBeDefined();
+  expect(shadowed?.visible?.()).toBe(false);
+
+  // Built-in Coder (no shadow): visible, including when no config exists yet.
+  const builtIn = getActions({
+    onOpenSettings,
+    providersConfig: {
+      coder: { coderOauthSet: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Login with Coder");
+  expect(builtIn?.visible?.()).toBe(true);
+
+  const noConfig = getActions({ onOpenSettings }).find(
+    (a) => a.title === "Settings: Login with Coder"
+  );
+  expect(noConfig?.visible?.()).toBe(true);
+});
+
+test("Disconnect Coder command revokes via RPC and is gated on a stored credential", async () => {
+  // Regression: Disconnect must be keyboard-reachable and must key its
+  // visibility off credential PRESENCE (coderOauthCredentialStored), not
+  // routability — a blob minted for a previously configured deployment URL
+  // must stay revocable.
+  const disconnect = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+  const actions = getActions({
+    api: { coderOauth: { disconnect } } as unknown as APIClient,
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: true },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  });
+  const disconnectAction = actions.find((a) => a.title === "Settings: Disconnect Coder");
+
+  expect(disconnectAction).toBeDefined();
+  expect(disconnectAction?.visible?.()).toBe(true);
+  await disconnectAction!.run();
+  expect(disconnect).toHaveBeenCalledTimes(1);
+
+  // Without a stored credential there is nothing to revoke: hidden.
+  const hidden = getActions({
+    providersConfig: {
+      coder: { coderOauthSet: false, coderOauthCredentialStored: false },
+    } as unknown as Parameters<typeof buildCoreSources>[0]["providersConfig"],
+  }).find((a) => a.title === "Settings: Disconnect Coder");
+  expect(hidden?.visible?.()).toBe(false);
+});
+
 test("project commands exclude system projects from options", async () => {
   const allProjects = new Map<string, ProjectConfig>([
     [
@@ -576,6 +718,7 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     name: "feat-x",
     messages: [],
     queuedMessage: null,
+    pendingSend: null,
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,
@@ -1188,15 +1331,22 @@ test("fast mode command is route-aware and keyboard accessible", async () => {
       selectedWorkspaceState: {
         lifecycle: "active",
         goal: null,
-        currentModel: "openai:gpt-5.6-sol",
+        currentModel: "openai:gpt-6-astra",
       } as unknown as WorkspaceState,
-      getEffectiveComposerModel: () => "openai:gpt-5.6-sol",
+      getEffectiveComposerModel: () => "openai:gpt-6-astra",
       providersConfig: {
-        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+        openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
+        openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
       },
       getRouteForModel: () => "openrouter",
+      onToggleFastMode,
     });
-    expect(gatewayActions.some((action) => action.id === "thinking:toggle-fast-mode")).toBe(false);
+    const gatewayFastAction = gatewayActions.find(
+      (action) => action.id === "thinking:toggle-fast-mode"
+    );
+    expect(gatewayFastAction?.shortcutHint).toBeDefined();
+    await gatewayFastAction?.run();
+    expect(onToggleFastMode).toHaveBeenCalledTimes(4);
   } finally {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -1249,5 +1399,153 @@ test("workspace generate title command dispatches a title-generation request eve
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
+  }
+});
+
+test("toggle flat chat list command flips the persisted sidebar setting", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+
+  try {
+    const toggle = () => {
+      const action = getActions().find((a) => a.id === "nav:toggle-flat-chat-list");
+      expect(action).toBeDefined();
+      void action!.run();
+    };
+
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    expect(getActions().find((a) => a.id === "nav:toggle-flat-chat-list")?.subtitle).toContain(
+      "Flat"
+    );
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("false");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
+test("toggle hide sub-agents command flips the persisted sidebar setting", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+
+  try {
+    const toggle = () => {
+      const action = getActions().find((a) => a.id === "nav:toggle-hide-subagents");
+      expect(action).toBeDefined();
+      void action!.run();
+    };
+
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("true");
+
+    const rebuilt = getActions().find((a) => a.id === "nav:toggle-hide-subagents");
+    expect(rebuilt?.subtitle).toContain("Hidden");
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("false");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  }
+});
+
+test.each(["coder", "mux-gateway", "direct"])(
+  "Pro palette uses the effective %s route instead of stale settings routing",
+  async (route) =>
+    withTestWindow(() => {
+      const model = "coder:prod-openai/gpt-6-astra";
+      const resolveEffectiveRoute = mock((selection: string) => {
+        expect(selection).toBe(model);
+        return route;
+      });
+      const actions = getActions({
+        getEffectiveComposerModel: () => model,
+        providersConfig: {
+          openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "prod-openai", type: "openai" }],
+          },
+        },
+        getRouteForModel: () => "direct",
+        getEffectiveRouteForModel: resolveEffectiveRoute,
+      });
+      expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
+        route !== "mux-gateway"
+      );
+      expect(resolveEffectiveRoute).toHaveBeenCalled();
+    })
+);
+
+test("plugin component action is gated and only targets present managed installs without mutation", async () => {
+  const openSettings = mock(() => undefined);
+  expect(
+    mk({ onOpenSettings: openSettings })
+      .flatMap((source) => source())
+      .find((action) => action.id === CommandIds.pluginsAddComponents())
+  ).toBeUndefined();
+  const api = createMockORPCClient({
+    agentPlugins: {
+      items: [
+        {
+          name: "managed",
+          location: "/plugins/managed",
+          managed: true,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+        {
+          name: "missing",
+          location: "/plugins/missing",
+          managed: true,
+          present: false,
+          skillCount: 0,
+          mcpServerCount: 0,
+        },
+        {
+          name: "unmanaged",
+          location: "/plugins/unmanaged",
+          managed: false,
+          present: true,
+          skillCount: 1,
+          mcpServerCount: 0,
+        },
+      ],
+    },
+  });
+  const mutation = mock(() =>
+    Promise.resolve({ success: false as const, error: "Must use the chooser" })
+  );
+  api.agentPlugins.addComponents = mutation;
+  const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsAddComponents());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt)
+    throw new Error("Expected component plugin picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "add-components", name: "managed" });
+  const received: PluginsSectionIntent[] = [];
+  const unsubscribe = subscribePluginsSectionIntents((intent) => received.push(intent));
+  try {
+    await action.prompt.onSubmit({ pluginName: "managed" });
+    expect(received).toEqual([{ type: "add-components", name: "managed" }]);
+    expect(consumePendingPluginsSectionIntent()).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+    expect(openSettings).toHaveBeenCalledWith("plugins");
+  } finally {
+    unsubscribe();
   }
 });

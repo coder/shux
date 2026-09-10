@@ -80,12 +80,7 @@ function CredentialSharingCheckbox(props: {
   );
 }
 
-function NameErrorDisplay(props: { error: WorkspaceNameUIError }) {
-  // Validation and transport errors are already human-readable plain text.
-  if (props.error.kind === "validation" || props.error.kind === "transport") {
-    return <span className="text-xs text-red-500">{props.error.message}</span>;
-  }
-
+function NameErrorDisplay(props: { error: Extract<WorkspaceNameUIError, { kind: "generation" }> }) {
   const formatted = formatNameGenerationError(props.error.error);
   return (
     <div className="text-primary rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs">
@@ -729,9 +724,13 @@ function CreationControlsContent(props: CreationControlsProps) {
     nameState.setAutoGenerate(!nameState.autoGenerate);
   }, [nameState]);
 
+  const nameTooltipError =
+    nameState.error?.kind === "validation" || nameState.error?.kind === "transport"
+      ? nameState.error
+      : null;
+
   return (
     <div className="mb-3 flex flex-col gap-4">
-      {/* Project name / workspace name header row - wraps on narrow viewports */}
       <div
         className={cn("flex gap-y-2", nameState.error ? "items-start" : "items-center")}
         data-component="WorkspaceNameGroup"
@@ -760,7 +759,7 @@ function CreationControlsContent(props: CreationControlsProps) {
         <div className="flex min-w-0 flex-col gap-1" data-component="WorkspaceNameInputBlock">
           {/* Name input with magic wand */}
           <div className="flex items-center gap-1">
-            <Tooltip>
+            <Tooltip open={nameTooltipError ? true : undefined}>
               <TooltipTrigger asChild>
                 <input
                   id="workspace-name"
@@ -770,19 +769,31 @@ function CreationControlsContent(props: CreationControlsProps) {
                   onFocus={handleInputFocus}
                   placeholder={nameState.isGenerating ? "Generating..." : "workspace-name"}
                   disabled={props.disabled}
+                  aria-invalid={nameState.error ? true : undefined}
                   className={cn(
                     `border-border-medium focus:border-accent h-7 rounded-md
                      border border-transparent bg-transparent text-lg font-semibold 
                      field-sizing-content focus:border focus:bg-bg-dark focus:outline-none 
                      disabled:opacity-50 max-w-[50vw] sm:max-w-[40vw] lg:max-w-[30vw]`,
                     nameState.autoGenerate ? "text-muted" : "text-foreground",
-                    nameState.error && "border-red-500"
+                    // focus:border-red-500 keeps the error border visible while typing;
+                    // focus:border-accent would otherwise override it.
+                    nameState.error && "border-red-500 focus:border-red-500"
                   )}
                 />
               </TooltipTrigger>
-              <TooltipContent align="start" className="max-w-64">
-                A stable identifier used for git branches, worktree folders, and session
-                directories.
+              <TooltipContent
+                align="start"
+                className={cn("max-w-64", nameTooltipError && "border-red-500/40 text-red-500")}
+              >
+                {nameTooltipError ? (
+                  nameTooltipError.message
+                ) : (
+                  <>
+                    Use lowercase letters, numbers, hyphens, underscores, and the <code>/</code>
+                    separator. Slashes in git branches map to hyphens in folder and workspace names.
+                  </>
+                )}
               </TooltipContent>
             </Tooltip>
             {/* Magic wand / loading indicator */}
@@ -816,7 +827,7 @@ function CreationControlsContent(props: CreationControlsProps) {
               </Tooltip>
             )}
           </div>
-          {nameState.error && <NameErrorDisplay error={nameState.error} />}
+          {nameState.error?.kind === "generation" && <NameErrorDisplay error={nameState.error} />}
         </div>
       </div>
 

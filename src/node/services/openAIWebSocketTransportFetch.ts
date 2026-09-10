@@ -108,7 +108,7 @@ export function createOpenAIWebSocketTransportFetch(
       : {};
   const transportFetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
     // The upstream package falls through to globalThis.fetch for non-WebSocket requests.
-    // Pre-filter here so Mux's existing fetch wrappers keep handling those HTTP paths.
+    // Pre-filter here so Xum's existing fetch wrappers keep handling those HTTP paths.
     if (!(await isStreamingResponsesRequest(input, init))) {
       return options.baseFetch(input, init);
     }

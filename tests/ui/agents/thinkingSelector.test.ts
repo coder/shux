@@ -181,9 +181,9 @@ describeIntegration("Thinking selector", () => {
       await expectPressed(within(menu).getByRole("button", { name: /Fast mode/i }), true);
       fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 
-      // Grok uses the same thinking selector with its native low/medium/high ladder,
-      // while Fast mode writes xAI's priority tier instead of OpenAI's.
-      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_45.id);
+      // Grok uses the same thinking selector with its native low/medium/high/xhigh
+      // ladder, while Fast mode writes xAI's priority tier instead of OpenAI's.
+      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_46.id);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {
         throw new Error("Pro toggle should not render for Grok");
@@ -193,6 +193,7 @@ describeIntegration("Thinking selector", () => {
       }
       within(menu).getByRole("option", { name: "Medium" });
       within(menu).getByRole("option", { name: "High" });
+      within(menu).getByRole("option", { name: "Extra High" });
 
       const grokFastToggle = within(menu).getByRole("button", { name: /Fast mode/i });
       await expectPressed(grokFastToggle, false);

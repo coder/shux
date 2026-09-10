@@ -1,18 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
-  COPILOT_MODEL_PREFIXES,
   isCopilotModelAccessible,
   isCopilotRoutableModel,
   normalizeCopilotModelId,
   selectCopilotApiMode,
   toCopilotModelId,
 } from "./modelRouting";
-
-describe("COPILOT_MODEL_PREFIXES", () => {
-  it("exports the shared Copilot model family filters", () => {
-    expect(COPILOT_MODEL_PREFIXES).toEqual(["gpt-5", "claude-", "gemini-3", "grok-code"]);
-  });
-});
 
 describe("isCopilotRoutableModel", () => {
   it("keeps non-Codex models routable through Copilot", () => {
@@ -27,8 +20,16 @@ describe("isCopilotRoutableModel", () => {
 });
 
 describe("selectCopilotApiMode", () => {
+  it("routes catalog-declared Responses-only models by exact id", () => {
+    expect(selectCopilotApiMode("gpt-5.4-mini")).toBe("responses");
+    expect(selectCopilotApiMode("gpt-5.4")).toBe("responses");
+  });
+
+  it("strips provider prefixes before selecting the API mode", () => {
+    expect(selectCopilotApiMode("github-copilot:gpt-5.4-mini")).toBe("responses");
+  });
+
   it("routes Codex-family models to Responses", () => {
-    // opencode routes a wider GPT-5 set through Responses, but Mux scopes that path to Codex first.
     expect(selectCopilotApiMode("gpt-5.3-codex")).toBe("responses");
     expect(selectCopilotApiMode("gpt-5.1-codex-mini")).toBe("responses");
   });
@@ -36,6 +37,7 @@ describe("selectCopilotApiMode", () => {
   it("routes GPT-5 and other Copilot families to chat completions", () => {
     expect(selectCopilotApiMode("gpt-5.5")).toBe("chatCompletions");
     expect(selectCopilotApiMode("gpt-5.5-pro")).toBe("chatCompletions");
+    expect(selectCopilotApiMode("gpt-5-mini")).toBe("chatCompletions");
     expect(selectCopilotApiMode("claude-opus-4-6")).toBe("chatCompletions");
     expect(selectCopilotApiMode("claude-sonnet-4-6")).toBe("chatCompletions");
     expect(selectCopilotApiMode("gemini-3.1-pro-preview")).toBe("chatCompletions");
@@ -48,6 +50,8 @@ describe("selectCopilotApiMode", () => {
   });
 
   it("keeps lookalike model ids on chat completions too", () => {
+    expect(selectCopilotApiMode("gpt-5.4-mini-preview")).toBe("chatCompletions");
+    expect(selectCopilotApiMode("gpt-5.40")).toBe("chatCompletions");
     expect(selectCopilotApiMode("claude")).toBe("chatCompletions");
     expect(selectCopilotApiMode("gemini-30-experimental")).toBe("chatCompletions");
     expect(selectCopilotApiMode("grok-codec-preview")).toBe("chatCompletions");

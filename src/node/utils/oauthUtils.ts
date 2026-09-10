@@ -1,4 +1,7 @@
 import type http from "node:http";
+import { Effect } from "effect";
+import type { Result } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 
 /**
  * Shared OAuth utility functions extracted from the individual OAuth service files.
@@ -6,6 +9,24 @@ import type http from "node:http";
  * These are verbatim-duplicated across codexOauthService, copilotOauthService,
  * muxGatewayOauthService, muxGovernorOauthService, and mcpOauthService.
  */
+
+/**
+ * Fold an Effect pipeline's typed failure channel back into the wire
+ * `Result<_, string>` shape shared by the OAuth services' Promise facades and
+ * handlerGen router procedures. The error type is constrained to carry the
+ * exact user-facing string in `reason`, so the fold maps it 1:1 onto
+ * `Err(reason)` without reformatting; failures without `reason` (e.g. a tag a
+ * caller must branch on first, like MuxGatewaySessionExpiredError) are
+ * rejected at compile time.
+ */
+export function toWireResult<A, E extends { readonly reason: string }>(
+  effect: Effect.Effect<A, E>
+): Effect.Effect<Result<A, string>> {
+  return effect.pipe(
+    Effect.map((value): Result<A, string> => Ok(value)),
+    Effect.catch((error) => Effect.succeed<Result<A, string>>(Err(error.reason)))
+  );
+}
 
 /** A deferred promise with an externally-accessible `resolve` handle. */
 export interface Deferred<T> {
@@ -90,7 +111,7 @@ export function renderOAuthCallbackHtml(options: RenderOAuthCallbackHtmlOptions)
     <p>${message}</p>
     ${
       options.success
-        ? '<p class="muted">Mux should now be in the foreground. You can close this tab.</p>'
+        ? '<p class="muted">Xum should now be in the foreground. You can close this tab.</p>'
         : '<p class="muted">You can close this tab.</p>'
     }
     <script>

@@ -1,5 +1,6 @@
 import { type Locator, type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
@@ -10,7 +11,7 @@ import {
 } from "../utils/perfProfile";
 import { disableReviewTutorial, seedLargeReviewSingleFileDiff } from "../utils/reviewPerfFixture";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const HUNK_ITERATION_COUNT = 60;
 
 test.skip(
@@ -117,7 +118,7 @@ async function primeReviewForHeadDiff(page: Page, workspaceId: string): Promise<
 }
 
 test.describe("immersive review hunk iteration performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   test("perf: iterate hunks in immersive review for a large file", async ({
     page,

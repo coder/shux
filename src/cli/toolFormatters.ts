@@ -1,5 +1,5 @@
 /**
- * CLI tool output formatters for `mux run`
+ * CLI tool output formatters for `xum run`
  *
  * Provides clean, readable formatting for recognized tool calls,
  * with emoji prefixes and structured output similar to the frontend UI.
@@ -26,17 +26,6 @@ import type {
 /** Tool formatters return formatted string or null to fall back to generic */
 type ToolStartFormatter = (toolName: string, args: unknown) => string | null;
 type ToolEndFormatter = (toolName: string, args: unknown, result: unknown) => string | null;
-
-/** Tools that should have their result on a new line (multi-line results) */
-const MULTILINE_RESULT_TOOLS = new Set([
-  "file_edit_replace_string",
-  "file_edit_replace_lines",
-  "file_edit_insert",
-  "bash",
-  "task",
-  "task_await",
-  "code_execution",
-]);
 
 // ============================================================================
 // Utilities
@@ -421,42 +410,41 @@ function formatSimpleSuccessEnd(_toolName: string, _args: unknown, result: unkno
 // Registry and Public API
 // ============================================================================
 
-const startFormatters: Record<string, ToolStartFormatter> = {
-  file_edit_replace_string: formatFileEditStart,
-  file_edit_replace_lines: formatFileEditStart,
-  file_edit_insert: formatFileEditStart,
-  file_read: formatFileReadStart,
-  bash: formatBashStart,
-  task: formatTaskStart,
-  web_fetch: formatWebFetchStart,
-  web_search: formatWebSearchStart,
-  todo_write: formatTodoStart,
-  notify: formatNotifyStart,
-  status_set: formatStatusSetStart,
-  set_exit_code: formatSetExitCodeStart,
-  agent_skill_read: formatAgentSkillReadStart,
-  agent_skill_read_file: formatAgentSkillReadStart,
-  code_execution: formatCodeExecutionStart,
-};
+interface ToolFormatterBinding {
+  start?: ToolStartFormatter;
+  end?: ToolEndFormatter;
+  multilineResult?: true;
+}
 
-const endFormatters: Record<string, ToolEndFormatter> = {
-  file_edit_replace_string: formatFileEditEnd,
-  file_edit_replace_lines: formatFileEditEnd,
-  file_edit_insert: formatFileEditEnd,
-  file_read: formatFileReadEnd,
-  bash: formatBashEnd,
-  task: formatTaskEnd,
-  task_await: formatTaskEnd,
-  web_fetch: formatWebFetchEnd,
-  code_execution: formatCodeExecutionEnd,
-  // Inline tools with simple success markers (prevents generic fallback)
-  web_search: formatSimpleSuccessEnd,
-  todo_write: formatSimpleSuccessEnd,
-  notify: formatSimpleSuccessEnd,
-  status_set: formatSimpleSuccessEnd,
-  set_exit_code: formatSimpleSuccessEnd,
-  agent_skill_read: formatSimpleSuccessEnd,
-  agent_skill_read_file: formatSimpleSuccessEnd,
+const toolFormatters: Record<string, ToolFormatterBinding> = {
+  file_edit_replace_string: {
+    start: formatFileEditStart,
+    end: formatFileEditEnd,
+    multilineResult: true,
+  },
+  file_edit_replace_lines: {
+    start: formatFileEditStart,
+    end: formatFileEditEnd,
+    multilineResult: true,
+  },
+  file_edit_insert: { start: formatFileEditStart, end: formatFileEditEnd, multilineResult: true },
+  file_read: { start: formatFileReadStart, end: formatFileReadEnd },
+  bash: { start: formatBashStart, end: formatBashEnd, multilineResult: true },
+  task: { start: formatTaskStart, end: formatTaskEnd, multilineResult: true },
+  task_await: { end: formatTaskEnd, multilineResult: true },
+  web_fetch: { start: formatWebFetchStart, end: formatWebFetchEnd },
+  web_search: { start: formatWebSearchStart, end: formatSimpleSuccessEnd },
+  todo_write: { start: formatTodoStart, end: formatSimpleSuccessEnd },
+  notify: { start: formatNotifyStart, end: formatSimpleSuccessEnd },
+  status_set: { start: formatStatusSetStart, end: formatSimpleSuccessEnd },
+  set_exit_code: { start: formatSetExitCodeStart, end: formatSimpleSuccessEnd },
+  agent_skill_read: { start: formatAgentSkillReadStart, end: formatSimpleSuccessEnd },
+  agent_skill_read_file: { start: formatAgentSkillReadStart, end: formatSimpleSuccessEnd },
+  code_execution: {
+    start: formatCodeExecutionStart,
+    end: formatCodeExecutionEnd,
+    multilineResult: true,
+  },
 };
 
 /**
@@ -464,7 +452,7 @@ const endFormatters: Record<string, ToolEndFormatter> = {
  * Returns formatted string, or null to use generic fallback.
  */
 export function formatToolStart(payload: ToolCallStartEvent): string | null {
-  const formatter = startFormatters[payload.toolName];
+  const formatter = toolFormatters[payload.toolName]?.start;
   if (!formatter) return null;
 
   try {
@@ -479,7 +467,7 @@ export function formatToolStart(payload: ToolCallStartEvent): string | null {
  * Returns formatted string, or null to use generic fallback.
  */
 export function formatToolEnd(payload: ToolCallEndEvent, startArgs?: unknown): string | null {
-  const formatter = endFormatters[payload.toolName];
+  const formatter = toolFormatters[payload.toolName]?.end;
   if (!formatter) return null;
 
   try {
@@ -519,5 +507,5 @@ export function formatGenericToolEnd(payload: ToolCallEndEvent): string {
  * For single-line results (file_read, web_fetch, etc.), result appears inline.
  */
 export function isMultilineResultTool(toolName: string): boolean {
-  return MULTILINE_RESULT_TOOLS.has(toolName);
+  return toolFormatters[toolName]?.multilineResult === true;
 }

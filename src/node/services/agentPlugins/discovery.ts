@@ -1,9 +1,18 @@
 import * as fsPromises from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 
+import {
+  PROJECT_METADATA_DIR_NAMES,
+  listProjectMetadataRelativePaths,
+} from "@/common/compat/legacyMux";
+import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
+import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import {
   isValidAgentPluginName,
   validatePluginManifest,
@@ -26,13 +35,132 @@ import {
 
 export type AgentPluginScope = "project" | "global";
 
+/**
+ * Tilde-form universal plugins container (`~/.agents/plugins`). Shared by
+ * loader default-roots computations (skills, agent definitions) that resolve
+ * tilde paths through a LocalRuntime.
+ */
+export const UNIVERSAL_AGENT_PLUGINS_CONTAINER = "~/.agents/plugins";
+
+/**
+ * Generous ceiling for a plausible plugin.json (name/description/contributes
+ * declarations). A repository can otherwise put its entire checkout quota
+ * into one unbounded manifest string, and the install consent preview would
+ * ship that through IPC and render it — freezing the app before consent.
+ * Skill/agent markdown already has runtime size caps; this closes the same
+ * hole for the manifest.
+ */
+export const MAX_PLUGIN_MANIFEST_BYTES = 256 * 1024;
+
+/**
+ * Ceiling for hooks.js source. Unlike other components, the hook FILE itself
+ * is read and hashed on every send and evaluated in the Electron main
+ * process, so a repository devoting its checkout quota to one giant script
+ * could stall the app after an accepted install. Enforced here so the
+ * consent preview and runtime discovery exclude the identical component set.
+ */
+export const MAX_PLUGIN_HOOK_SOURCE_BYTES = 1024 * 1024;
+
+export interface PluginFileReadResult {
+  content: string;
+  /** Bytes actually returned (handle-read), for pagination/size metadata. */
+  byteSize: number;
+  /** Modification time from the SAME handle's fstat as the content read. */
+  modifiedTime: Date;
+}
+
+/**
+ * Read a consented plugin component file (hooks.js, mcp.json, agents/*.md,
+ * SKILL.md + referenced skill files, workflows/*.js) through a bounded
+ * handle, revalidating containment and identity AFTER the open.
+ *
+ * Discovery's measurement and the consuming read are separated by an
+ * update-sized TOCTOU window: a managed update (or a checkout flipping an
+ * unmanaged project plugin) can replace the canonical path — or any ANCESTOR
+ * component on it, including the plugin root itself — with a symlink to
+ * existing content outside the plugin root. Staged validation only rejects
+ * links into the managed container, and discovery treats the escaping link
+ * as a capability REMOVAL, so the swapped tree is permitted; a stale
+ * canonical path would then read (and execute/parse) attacker-chosen outside
+ * content. Three post-open checks close this (a promotion is a single swap,
+ * so a link the open followed is still present here):
+ * 1. Root identity: `pluginRoot` is the CANONICAL root discovery resolved
+ *    (legitimate committed root symlinks were already followed there), so it
+ *    must still be fully physical: realpath(pluginRoot) must equal
+ *    pluginRoot. Were the root — or ANY ancestor of it — now a link,
+ *    realpathing root and file would resolve BOTH into the replacement tree
+ *    and containment below would vacuously pass.
+ * 2. Containment recheck: the fully-resolved file path must stay inside the
+ *    plugin root, catching replacement links at any ancestor component.
+ * 3. Leaf identity at the RESOLVED path: the opened object must BE the
+ *    regular file a non-following lstat sees at the fully-resolved pathname.
+ *    Consent-time validation accepts contained relative symlinks (e.g. a
+ *    SKILL.md linking elsewhere inside the plugin), so a contained link is
+ *    legitimate — resolution already proved it stays inside — while a
+ *    concurrent replacement fails the dev/ino match.
+ * The size ceiling is enforced on the same handle (fstat), and the read is
+ * bounded to the fstat-reported byte count so a file growing mid-read stays
+ * capped. Returned metadata comes from that same handle so callers never
+ * pair post-open content with pre-open stat results. Over-blocking is safe —
+ * the caller skips and re-measures on the next discovery.
+ */
+export async function readPluginFileWithinRootCapped(args: {
+  filePath: string;
+  pluginRoot: string;
+  maxBytes: number;
+  /** Component name used in error messages (e.g. "hooks.js"). */
+  label: string;
+}): Promise<PluginFileReadResult> {
+  const { filePath, pluginRoot, maxBytes, label } = args;
+  const handle = await fsPromises.open(filePath, "r");
+  try {
+    const stat = await handle.stat({ bigint: true });
+    const rootReal = await fsPromises.realpath(pluginRoot);
+    if (rootReal !== pluginRoot) {
+      throw new Error(
+        `${label} cannot be read: the plugin root pathname no longer resolves to itself (replaced since discovery): ${pluginRoot}`
+      );
+    }
+    const resolvedPath = await ensurePathContained(pluginRoot, filePath);
+    const linkStat = await fsPromises.lstat(resolvedPath, { bigint: true });
+    if (!linkStat.isFile() || linkStat.dev !== stat.dev || linkStat.ino !== stat.ino) {
+      throw new Error(
+        `${label} is not the regular file discovery measured (symlinked or replaced): ${filePath}`
+      );
+    }
+    if (stat.size > BigInt(maxBytes)) {
+      throw new Error(`${label} is too large (${stat.size} bytes; max ${maxBytes})`);
+    }
+    const buffer = Buffer.alloc(Number(stat.size));
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) {
+        break; // Truncated since the fstat: return what exists.
+      }
+      offset += bytesRead;
+    }
+    return {
+      content: buffer.subarray(0, offset).toString("utf8"),
+      byteSize: offset,
+      modifiedTime: stat.mtime,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 export interface AgentPluginContainer {
-  /** Absolute host path of the container directory (e.g. `<projectRoot>/.mux/plugins`). */
+  /** Absolute host path of the container directory (e.g. `<projectRoot>/.xum/plugins`). */
   path: string;
   scope: AgentPluginScope;
+  /** Only Xum's managed container owns an install registry; other global roots do not. */
+  registryPath?: string;
 }
 
 export interface AgentPluginInfo {
+  /** Managed global imports; absent means legacy/unmanaged import-all. */
+  importedComponents?: AgentPluginImportedComponents;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -46,6 +174,16 @@ export interface AgentPluginInfo {
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
+  /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks, agent-plugins
+   * experiment); present only when it exists, is a regular file, and stays
+   * inside the root. Resolved with the same §6.2 component rules as mcp.json. */
+  hooksPath?: string;
+  /** Canonical `agents/` directory (Mux contributes extension: agents/*.md
+   * agent definitions). Same §6.2 component rules as skills/. */
+  agentsDir?: string;
+  /** Canonical `workflows/` directory (Mux contributes extension: workflows/*.js
+   * scripts resolvable as `plugin://<name>/...`). Same §6.2 component rules as skills/. */
+  workflowsDir?: string;
 }
 
 export interface AgentPluginDiagnostic {
@@ -57,6 +195,7 @@ export interface AgentPluginDiagnostic {
 }
 
 export interface DiscoverAgentPluginsResult {
+  /** Baseline ordered logical registrations; aliases share physical reads and import policy. */
   plugins: AgentPluginInfo[];
   diagnostics: AgentPluginDiagnostic[];
 }
@@ -90,6 +229,8 @@ async function resolveComponentPath(args: {
   componentLabel: string;
   scope: AgentPluginScope;
   diagnostics: AgentPluginDiagnostic[];
+  /** For file components whose whole source gets loaded: exclude oversized files. */
+  maxBytes?: number;
 }): Promise<string | undefined> {
   const candidate = path.join(args.rootReal, args.relativePath);
 
@@ -122,6 +263,18 @@ async function resolveComponentPath(args: {
   const kindOk = args.expectKind === "file" ? stat.isFile() : stat.isDirectory();
   if (!kindOk) {
     const message = `${args.componentLabel} must be a ${args.expectKind === "file" ? "regular file" : "directory"}; ignoring this component`;
+    log.warn(`Agent plugin ${args.rootReal}: ${message}`);
+    args.diagnostics.push({
+      path: candidate,
+      scope: args.scope,
+      severity: "error",
+      message,
+    });
+    return undefined;
+  }
+
+  if (args.maxBytes !== undefined && stat.size > args.maxBytes) {
+    const message = `${args.componentLabel} is too large (${stat.size} bytes; max ${args.maxBytes}); ignoring this component`;
     log.warn(`Agent plugin ${args.rootReal}: ${message}`);
     args.diagnostics.push({
       path: candidate,
@@ -185,6 +338,13 @@ async function discoverPluginAt(args: {
     // plugin.json of the wrong filesystem kind: not a plugin candidate.
     return null;
   }
+  if (manifestStat.size > MAX_PLUGIN_MANIFEST_BYTES) {
+    pushError(
+      manifestPath,
+      `plugin.json is too large (${manifestStat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`
+    );
+    return null;
+  }
 
   let rawManifest: unknown;
   try {
@@ -216,23 +376,32 @@ async function discoverPluginAt(args: {
     );
   }
 
-  const skillsDir = await resolveComponentPath({
-    rootReal,
-    relativePath: "skills",
-    expectKind: "directory",
-    componentLabel: "skills/",
-    scope,
-    diagnostics,
-  });
+  // Manifest `contributes` path members override the conventional component
+  // locations; the manifest validator already restricted them to safe relative
+  // paths, and resolveComponentPath re-enforces realpath containment.
+  const contributes = validation.manifest.contributes;
+  const resolveComponent = (
+    relativePath: string,
+    expectKind: "file" | "directory",
+    options?: { maxBytes?: number }
+  ): Promise<string | undefined> =>
+    resolveComponentPath({
+      rootReal,
+      relativePath,
+      expectKind,
+      componentLabel: expectKind === "directory" ? `${relativePath}/` : relativePath,
+      scope,
+      diagnostics,
+      ...(options?.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
+    });
 
-  const mcpConfigPath = await resolveComponentPath({
-    rootReal,
-    relativePath: "mcp.json",
-    expectKind: "file",
-    componentLabel: "mcp.json",
-    scope,
-    diagnostics,
+  const skillsDir = await resolveComponent(contributes?.skills ?? "skills", "directory");
+  const mcpConfigPath = await resolveComponent(contributes?.mcp ?? "mcp.json", "file");
+  const hooksPath = await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
+    maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
   });
+  const agentsDir = await resolveComponent(contributes?.agents ?? "agents", "directory");
+  const workflowsDir = await resolveComponent(contributes?.workflows ?? "workflows", "directory");
 
   return {
     name: validation.manifest.name,
@@ -243,45 +412,508 @@ async function discoverPluginAt(args: {
     manifest: validation.manifest,
     ...(skillsDir !== undefined ? { skillsDir } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
+    ...(hooksPath !== undefined ? { hooksPath } : {}),
+    ...(agentsDir !== undefined ? { agentsDir } : {}),
+    ...(workflowsDir !== undefined ? { workflowsDir } : {}),
   };
 }
 
-/**
- * Discover Agent Plugins in the given container directories.
- *
- * Containers are scanned in the given order; plugins within a container are
- * ordered alphabetically for determinism. Duplicate plugin names are NOT
- * deduplicated here — downstream consumers key on plugin root path (MCP) or
- * dedupe by skill name at their own precedence rules (skills).
- */
-export async function discoverAgentPlugins(
-  containers: AgentPluginContainer[]
-): Promise<DiscoverAgentPluginsResult> {
-  const plugins: AgentPluginInfo[] = [];
-  const diagnostics: AgentPluginDiagnostic[] = [];
+/** Ordered plugin containers shared by hooks, MCP, skills, and agents. */
+export function computeAgentPluginContainers(args: {
+  xumHome: string;
+  projectRoot?: string;
+  projectTrusted: boolean;
+}): AgentPluginContainer[] {
+  const containers: AgentPluginContainer[] = [];
+  // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
+  // must not contribute plugin containers (hooks.js tool middleware, plugin
+  // MCP, slash commands) even when trusted for delegation; global containers
+  // below stay active. Mirrors the init/tool_env/project-MCP gating.
+  const projectTrusted = args.projectTrusted && !projectAutomationDisabled();
+  if (args.projectRoot !== undefined && projectTrusted && path.isAbsolute(args.projectRoot)) {
+    containers.push(
+      ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+        path: path.join(args.projectRoot!, relativePath),
+        scope: "project" as const,
+      })),
+      { path: path.join(args.projectRoot, ".agents", "plugins"), scope: "project" }
+    );
+  }
+  containers.push({
+    path: path.join(args.xumHome, "plugins"),
+    scope: "global",
+    registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+  });
+  containers.push({ path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" });
+  return containers;
+}
 
-  const seenContainers = new Set<string>();
+/**
+ * Workspace-level plugin discovery for host-local consumers (contributed slash
+ * commands, composition inspector): canonical containers with Project Trust
+ * gating, plus the repo-symlink posture check on project plugin roots (a
+ * committed .xum/plugins/<name> symlink must not resolve outside the checkout).
+ */
+export async function discoverWorkspaceAgentPlugins(args: {
+  workspacePath: string;
+  xumHome: string;
+  projectTrusted: boolean;
+}): Promise<DiscoverAgentPluginsResult> {
+  const containers = computeAgentPluginContainers({
+    xumHome: args.xumHome,
+    projectRoot: args.workspacePath,
+    projectTrusted: args.projectTrusted,
+  });
+  const { plugins, diagnostics } = await discoverAgentPlugins(containers);
+
+  const contained: AgentPluginInfo[] = [];
+  for (const plugin of plugins) {
+    if (plugin.scope === "project") {
+      try {
+        await ensurePathContained(args.workspacePath, plugin.rootPath);
+      } catch (error) {
+        diagnostics.push({
+          path: plugin.rootPath,
+          scope: plugin.scope,
+          severity: "error",
+          message: `Plugin root escapes the project checkout; skipping: ${getErrorMessage(error)}`,
+        });
+        continue;
+      }
+    }
+    contained.push(plugin);
+  }
+
+  return { plugins: contained, diagnostics };
+}
+
+/**
+ * Discover a single Agent Plugin at an arbitrary root directory.
+ *
+ * Public wrapper around the per-entry discovery used by container scans, so
+ * callers (e.g. the install service validating a staged temp clone) can run
+ * the exact same manifest + component validation against a directory that is
+ * not (yet) inside a configured container. Returns `plugin: null` when the
+ * directory is not a valid plugin; diagnostics carry the reasons.
+ */
+export async function discoverAgentPluginAt(args: {
+  pluginDir: string;
+  scope: AgentPluginScope;
+}): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
+  if (!path.isAbsolute(args.pluginDir)) {
+    throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
+  }
+
+  const diagnostics: AgentPluginDiagnostic[] = [];
+  const plugin = await discoverPluginAt({
+    pluginDir: args.pluginDir,
+    containerPath: path.dirname(args.pluginDir),
+    dirName: path.basename(args.pluginDir),
+    scope: args.scope,
+    diagnostics,
+  });
+  return { plugin, diagnostics };
+}
+
+/**
+ * One gated scan: `suppressed` containers must not be scanned at all, and
+ * `confirm()` — called AFTER the scan — returns containers whose scan results
+ * must be DISCARDED because a mutation may have overlapped the scan.
+ */
+export interface AgentPluginDiscoveryGateSession {
+  suppressed: readonly string[];
+  confirm(): Promise<readonly string[]>;
+}
+
+export type AgentPluginDiscoveryGate = (
+  containerPaths: readonly string[]
+) => Promise<AgentPluginDiscoveryGateSession>;
+
+/**
+ * Crash-recovery gate for container scans, so no discovery path (MCP config,
+ * hooks, skills, workflows, agents — they all funnel through
+ * discoverAgentPlugins) can scan the managed container while install-mutation
+ * journal recovery is pending or failed: an agent request arriving right
+ * after a crash would otherwise load an orphaned promotion — hook included —
+ * before cleanup ran. The gate receives the container paths being scanned,
+ * resolves the session up front, and must never reject.
+ *
+ * The DEFAULT gate derives suppression directly from surviving journal files
+ * in each container's sibling staging root: processes that never construct
+ * AgentPluginInstallService (headless `mux workflow` resolving plugin://
+ * scripts) must not execute an unreconciled managed tree either. They never
+ * RUN recovery, so a journal keeps the managed container suppressed until a
+ * desktop/server session reconciles it. AgentPluginInstallService replaces
+ * this with a gate that ADDS health-tracked suppression at construction:
+ * when recovery FAILED (unreadable registry, failed restore/quarantine),
+ * merely waiting would release discovery over the unreconciled tree, so the
+ * managed container stays omitted until a later recovery attempt succeeds.
+ *
+ * A single pre-scan journal check is not enough across processes: a desktop
+ * install/update in ANOTHER process can write its journal and promote a tree
+ * after the check but before (or during) the scan, and can even complete its
+ * whole journal lifetime inside that window. The session therefore re-reads
+ * each container's mutation state in `confirm()` and discards containers
+ * whose journals appeared or whose mutation EPOCH changed (the install
+ * service bumps the epoch before every journal deletion, so a fully
+ * completed transaction cannot hide).
+ */
+export async function journalDerivedDiscoveryGate(
+  containerPaths: readonly string[]
+): Promise<AgentPluginDiscoveryGateSession> {
+  const pre = new Map(
+    await Promise.all(
+      containerPaths.map(
+        async (containerPath) =>
+          [containerPath, await readContainerMutationState(containerPath)] as const
+      )
+    )
+  );
+  return {
+    suppressed: containerPaths.filter((containerPath) => {
+      const state = pre.get(containerPath);
+      return state?.hasJournals === true || isMutationEpochUnreadable(state?.epoch);
+    }),
+    confirm: async () => {
+      const flagged = await Promise.all(
+        containerPaths.map(async (containerPath) => {
+          const post = await readContainerMutationState(containerPath);
+          const preEpoch = pre.get(containerPath)?.epoch;
+          const changed =
+            post.hasJournals ||
+            isMutationEpochUnreadable(preEpoch) ||
+            isMutationEpochUnreadable(post.epoch) ||
+            post.epoch !== preEpoch;
+          return changed ? [containerPath] : [];
+        })
+      );
+      return flagged.flat();
+    },
+  };
+}
+
+let discoveryGate: AgentPluginDiscoveryGate = journalDerivedDiscoveryGate;
+
+export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): void {
+  discoveryGate = gate;
+}
+
+/** Missing containers stay optional; other identity failures must never become unmanaged scans. */
+async function resolveAgentPluginContainerPath(containerPath: string): Promise<string | undefined> {
+  try {
+    return await fsPromises.realpath(containerPath);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+/** Canonical project plugins shadow same-named legacy copies during ordered scans. */
+export async function discoverAgentPlugins(
+  containers: AgentPluginContainer[],
+  options?: {
+    /** Ownership and recovery authority only; never scanned or registered as MCP views. */
+    managedHome?: string;
+  }
+): Promise<DiscoverAgentPluginsResult> {
+  let plugins: AgentPluginInfo[] = [];
+  let diagnostics: AgentPluginDiagnostic[] = [];
+  // Consent and recovery belong to the physical container, not its spelling.
+  // Keep baseline lexical registrations for precedence and stable identities,
+  // but collect ownership and gate paths from every alias before reading plugins.
+  const groups = new Map<
+    string,
+    {
+      container: AgentPluginContainer;
+      paths: Set<string>;
+      registryPath?: string;
+      blocked?: boolean;
+      hasScanCandidate: boolean;
+    }
+  >();
+  const canonicalPaths = new Map<string, string | undefined>();
+  const resolveCachedPath = async (input: string) => {
+    if (!canonicalPaths.has(input)) {
+      canonicalPaths.set(input, await resolveAgentPluginContainerPath(input));
+    }
+    return canonicalPaths.get(input);
+  };
+  const groupFor = (canonicalPath: string, container: AgentPluginContainer) => {
+    let group = groups.get(canonicalPath);
+    if (group === undefined) {
+      // A physical target's parent is not registry/journal authority.
+      group = { container, paths: new Set<string>(), hasScanCandidate: false };
+      groups.set(canonicalPath, group);
+    }
+    return group;
+  };
+  const owners = new Map<
+    string,
+    {
+      container: AgentPluginContainer;
+      canonicalPath?: string;
+      ownerHome?: string;
+    }
+  >();
+  let unresolvedOwner = false;
+
+  // Establish ownership BEFORE classifying candidates. Otherwise an owner alias
+  // retargeting between caller-side realpaths can turn a managed tree into import-all.
+  const ownerDescriptors: AgentPluginContainer[] = [...containers];
+  if (options?.managedHome !== undefined) {
+    ownerDescriptors.unshift({
+      path: path.join(options.managedHome, "plugins"),
+      scope: "global",
+      registryPath: path.join(options.managedHome, PLUGIN_REGISTRY_FILE_NAME),
+    });
+  }
+  for (const descriptor of ownerDescriptors) {
+    if (descriptor.registryPath === undefined || owners.has(descriptor.registryPath)) continue;
+    if (!path.isAbsolute(descriptor.path) || !path.isAbsolute(descriptor.registryPath)) {
+      throw new Error(
+        `discoverAgentPlugins: registry owner paths must be absolute: ${descriptor.path}`
+      );
+    }
+    const logicalHome = path.dirname(descriptor.registryPath);
+    const owner = { ...descriptor, path: path.join(logicalHome, "plugins") };
+    const binding: { container: AgentPluginContainer; canonicalPath?: string; ownerHome?: string } =
+      { container: owner };
+    owners.set(descriptor.registryPath, binding);
+    try {
+      binding.canonicalPath = await resolveCachedPath(owner.path);
+      binding.ownerHome = await resolveCachedPath(logicalHome);
+      if (
+        (binding.ownerHome === undefined && binding.canonicalPath !== undefined) ||
+        (binding.ownerHome !== undefined &&
+          (await resolveCachedPath(path.join(binding.ownerHome, "plugins"))) !==
+            binding.canonicalPath)
+      ) {
+        throw new Error("Managed plugin owner changed during container resolution.");
+      }
+      if (binding.canonicalPath !== undefined && binding.ownerHome !== undefined) {
+        const group = groupFor(binding.canonicalPath, owner);
+        group.registryPath = path.join(binding.ownerHome, path.basename(descriptor.registryPath));
+        group.paths.add(owner.path);
+        group.paths.add(path.join(binding.ownerHome, "plugins"));
+      }
+    } catch (error) {
+      unresolvedOwner = true;
+      if (binding.canonicalPath !== undefined)
+        groupFor(binding.canonicalPath, owner).blocked = true;
+      diagnostics.push({
+        path: owner.path,
+        scope: owner.scope,
+        severity: "error",
+        message: getErrorMessage(error),
+      });
+    }
+  }
+
   for (const container of containers) {
     if (!path.isAbsolute(container.path)) {
       throw new Error(`discoverAgentPlugins: container path must be absolute: ${container.path}`);
     }
-    if (seenContainers.has(container.path)) {
+    let canonicalPath: string | undefined;
+    try {
+      canonicalPath = await resolveCachedPath(container.path);
+    } catch (error) {
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "error",
+        message: `Plugin container identity could not be resolved: ${getErrorMessage(error)}`,
+      });
       continue;
     }
-    seenContainers.add(container.path);
-
-    for (const entryName of await listChildDirectories(container.path)) {
-      const plugin = await discoverPluginAt({
-        pluginDir: path.join(container.path, entryName),
-        containerPath: container.path,
-        dirName: entryName,
+    if (canonicalPath === undefined) continue;
+    const group = groupFor(canonicalPath, container);
+    if (!group.hasScanCandidate) group.container = container;
+    group.hasScanCandidate = true;
+    group.paths.add(container.path);
+    if (
+      container.registryPath !== undefined &&
+      owners.get(container.registryPath)?.canonicalPath !== canonicalPath
+    ) {
+      unresolvedOwner = true;
+      group.blocked = true;
+      diagnostics.push({
+        path: container.path,
         scope: container.scope,
-        diagnostics,
+        severity: "error",
+        message: "Managed plugin owner changed during container resolution.",
       });
-      if (plugin) {
-        plugins.push(plugin);
+    }
+  }
+
+  const revalidateOwners = async () => {
+    for (const [registryPath, binding] of owners) {
+      try {
+        // Bypass the operation cache: newly resolved candidates must not inherit
+        // an unmanaged classification from an owner that moved (or disappeared).
+        const canonicalPath = await resolveAgentPluginContainerPath(binding.container.path);
+        const ownerHome = await resolveAgentPluginContainerPath(path.dirname(registryPath));
+        if (
+          canonicalPath !== binding.canonicalPath ||
+          ownerHome !== binding.ownerHome ||
+          (ownerHome !== undefined &&
+            (await resolveAgentPluginContainerPath(path.join(ownerHome, "plugins"))) !==
+              canonicalPath)
+        ) {
+          throw new Error("Managed plugin owner changed during discovery.");
+        }
+      } catch {
+        // An established pinned owner still governs its old tree; uncertainty
+        // must deny otherwise-unowned targets, not drop the old policy or unrelated owners.
+        // Affected scan groups report the ownership failure below.
+        unresolvedOwner = true;
+      }
+      if (binding.canonicalPath !== undefined && binding.ownerHome !== undefined) {
+        try {
+          if (
+            (await resolveAgentPluginContainerPath(binding.ownerHome)) !== binding.ownerHome ||
+            (await resolveAgentPluginContainerPath(path.join(binding.ownerHome, "plugins"))) !==
+              binding.canonicalPath
+          ) {
+            throw new Error("Pinned plugin owner no longer identifies the scanned tree.");
+          }
+        } catch {
+          // A missing pinned home would make its registry read look like a legacy
+          // import-all directory even when the separately stored plugin tree survives.
+          unresolvedOwner = true;
+          const group = groups.get(binding.canonicalPath);
+          if (group !== undefined) group.blocked = true;
+        }
       }
     }
+  };
+  const gateSession = await discoveryGate([
+    ...new Set([...groups.values()].flatMap((group) => [...group.paths])),
+  ]);
+  const suppressedContainers = new Set(gateSession.suppressed);
+  await revalidateOwners();
+  const unownedSuppressedBeforeScan = unresolvedOwner;
+
+  const snapshots = new Map<
+    string,
+    {
+      entryNames: string[];
+      imports: Awaited<ReturnType<typeof readPluginComponentImports>> | undefined;
+      plugins: Map<string, AgentPluginInfo | null>;
+    }
+  >();
+  for (const [
+    canonicalPath,
+    { container, paths, registryPath, blocked, hasScanCandidate },
+  ] of groups) {
+    if (blocked || !hasScanCandidate) continue;
+    if (unresolvedOwner && registryPath === undefined) {
+      // If an owner's identity is unknown, no unmarked alias can safely be
+      // classified as unmanaged. Other established owners remain isolated.
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "error",
+        message: "Plugin container skipped: managed registry ownership could not be resolved.",
+      });
+      continue;
+    }
+    if ([...paths].some((candidate) => suppressedContainers.has(candidate))) {
+      diagnostics.push({
+        path: container.path,
+        scope: container.scope,
+        severity: "warning",
+        message:
+          "Managed plugin container skipped: crash recovery has not completed (see logs); its plugins are unavailable until it succeeds.",
+      });
+      continue;
+    }
+
+    snapshots.set(canonicalPath, {
+      entryNames: await listChildDirectories(canonicalPath),
+      imports:
+        registryPath !== undefined ? await readPluginComponentImports(registryPath) : undefined,
+      plugins: new Map(),
+    });
+  }
+
+  // Every consumer needs logical views: an escaped project view must not hide
+  // a valid global fallback. Replay baseline raw deduplication and shadowing,
+  // while only the first eligible view reads each physical plugin.
+  const seenContainers = new Set<string>();
+  const canonicalProjectPluginNames = new Set<string>();
+  for (const container of containers) {
+    if (seenContainers.has(container.path)) continue;
+    seenContainers.add(container.path);
+    const canonicalPath = canonicalPaths.get(container.path);
+    const snapshot = canonicalPath !== undefined ? snapshots.get(canonicalPath) : undefined;
+    if (snapshot === undefined || canonicalPath === undefined) continue;
+    const projectMetadataIndex =
+      container.scope === "project"
+        ? PROJECT_METADATA_DIR_NAMES.findIndex(
+            (dirName) => dirName === path.basename(path.dirname(container.path))
+          )
+        : -1;
+    for (const entryName of snapshot.entryNames) {
+      if (projectMetadataIndex === 0) canonicalProjectPluginNames.add(entryName);
+      else if (projectMetadataIndex === 1 && canonicalProjectPluginNames.has(entryName)) continue;
+      let plugin = snapshot.plugins.get(entryName);
+      if (plugin === undefined) {
+        plugin = await discoverPluginAt({
+          pluginDir: path.join(canonicalPath, entryName),
+          containerPath: container.path,
+          dirName: entryName,
+          scope: container.scope,
+          diagnostics,
+        });
+        snapshot.plugins.set(entryName, plugin);
+        if (plugin) {
+          const imports = snapshot.imports;
+          plugin.importedComponents =
+            imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
+              ? { skills: [], mcpServers: [] }
+              : imports?.byName.get(entryName);
+        }
+      }
+      if (plugin)
+        plugins.push({ ...plugin, containerPath: container.path, scope: container.scope });
+    }
+  }
+
+  // Post-scan confirmation: a mutation in ANOTHER process (or a concurrent
+  // in-process one) may have started or finished while the scan read the
+  // container, so the trees just read can be transient (an orphaned promotion
+  // that recovery will quarantine, or a mixed old/new update read). Discard
+  // those containers' results rather than hand callers plugin content that
+  // may already be rolled back.
+  const overlapped = new Set(await gateSession.confirm());
+  await revalidateOwners();
+  for (const [canonicalPath, { container, paths, registryPath, blocked }] of groups) {
+    const lostOwnership =
+      blocked === true ||
+      (!unownedSuppressedBeforeScan && unresolvedOwner && registryPath === undefined);
+    if (
+      !snapshots.has(canonicalPath) ||
+      (!lostOwnership && ![...paths].some((candidate) => overlapped.has(candidate))) ||
+      [...paths].some((candidate) => suppressedContainers.has(candidate))
+    ) {
+      continue;
+    }
+    plugins = plugins.filter(
+      (plugin) => canonicalPaths.get(plugin.containerPath) !== canonicalPath
+    );
+    diagnostics = diagnostics.filter(
+      (diagnostic) =>
+        diagnostic.path !== container.path && !diagnostic.path.startsWith(container.path + path.sep)
+    );
+    diagnostics.push({
+      path: container.path,
+      scope: container.scope,
+      severity: "warning",
+      message: lostOwnership
+        ? "Plugin container skipped: managed registry ownership changed during this scan."
+        : "Managed plugin container skipped: a plugin install/update/uninstall overlapped this scan; its plugins are unavailable until the next scan.",
+    });
+    suppressedContainers.add(container.path);
   }
 
   return { plugins, diagnostics };

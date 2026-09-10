@@ -1,24 +1,31 @@
 #!/usr/bin/env bun
 /**
- * `mux run` - First-class CLI for running agent sessions
+ * `xum run` - First-class CLI for running agent sessions
  *
  * Usage:
- *   mux run "Fix the failing tests"
- *   mux run --dir /path/to/project "Add authentication"
- *   mux run --runtime "ssh user@host" "Deploy changes"
+ *   xum run "Fix the failing tests"
+ *   xum run --dir /path/to/project "Add authentication"
+ *   xum run --runtime "ssh user@host" "Deploy changes"
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { Command } from "commander";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import * as fsSync from "fs";
-import { Config, type ProjectConfig } from "../node/config";
+import { createConfigStores } from "../node/config";
+import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
-import { createCoreServices } from "../node/services/coreServices";
+import { CoderOauthService } from "../node/services/coderOauthService";
+import { PolicyService } from "../node/services/policyService";
+import { ProviderService } from "../node/services/providerService";
+import { createCoreServices } from "../node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
   isCaughtUpMessage,
   isReasoningDelta,
@@ -50,7 +57,8 @@ import {
   formatGenericToolEnd,
   isMultilineResultTool,
 } from "./toolFormatters";
-import { defaultModel, resolveModelAlias } from "../common/utils/ai/models";
+import { defaultModel } from "../common/utils/ai/models";
+import { normalizeModelInput } from "../common/utils/ai/normalizeModelInput";
 import {
   buildProvidersFromEnv,
   hasAnyConfiguredProvider,
@@ -75,8 +83,18 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS } from "../common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  type ExperimentId,
+} from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  createRunConfig,
+  prepareRunSessionRootOverride,
+  replacePrivateRunConfigFile,
+  type PreparedRunSessionRoot,
+} from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
   parseGoalBudgetInputCents,
@@ -98,7 +116,7 @@ type CLIMode = "plan" | "exec";
 
 function parseRuntimeConfig(value: string | undefined, srcBaseDir: string): RuntimeConfig {
   if (!value) {
-    // Default to local for `mux run` (no worktree isolation needed for one-off)
+    // Default to local for `xum run` (no worktree isolation needed for one-off)
     return { type: "local" };
   }
 
@@ -128,7 +146,7 @@ function parseRuntimeConfig(value: string | undefined, srcBaseDir: string): Runt
       // worktree-add ~2.2s).
       //
       // Anchoring `srcBaseDir` to the stable `~/mux` location lets the second
-      // and subsequent `mux run` invocations reuse the existing shared base
+      // and subsequent `xum run` invocations reuse the existing shared base
       // repo on the remote, hitting the warm path
       // (`Reusing existing remote project snapshot`) — a single bounded SSH
       // round-trip instead of a full create + sync + push.
@@ -141,7 +159,7 @@ function parseRuntimeConfig(value: string | undefined, srcBaseDir: string): Runt
 }
 
 function parseThinkingLevel(value: string | undefined): ParsedThinkingInput {
-  if (!value) return DEFAULT_THINKING_LEVEL; // Default for mux run
+  if (!value) return DEFAULT_THINKING_LEVEL; // Default for xum run
 
   // Accepts named levels (off, low, med, high, max, xhigh) and numeric (0–N)
   const level = parseThinkingInput(value);
@@ -188,7 +206,7 @@ function generateWorkspaceId(): string {
 }
 
 /**
- * Init logger that prepends elapsed/delta timestamps to each step so `mux run`
+ * Init logger that prepends elapsed/delta timestamps to each step so `xum run`
  * can double as a startup-timing harness (especially useful for SSH workspaces
  * where the slowest phases are hidden inside multi-second remote operations).
  *
@@ -259,13 +277,58 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
+/**
+ * Experiment IDs `xum run` can actually forward, each mapped to its
+ * SendMessageOptions.experiments field. A single table (instead of ad-hoc
+ * `includes` checks) guarantees an ID accepted by `-e` cannot be silently
+ * dropped here — that previously swallowed `rlm-mode`, so PTC+RLM CLI runs
+ * degraded to the flat non-kernel PTC toolset while desktop honored the flag.
+ */
+const SEND_MESSAGE_EXPERIMENT_FIELDS = {
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
+  [EXPERIMENT_IDS.RLM]: "rlm",
+  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
+  // Deliberately absent (accepting them would be a silent no-op or worse,
+  // which is exactly what this table exists to prevent):
+  // - TIMELINE: AIService resolves the timeline experiment exclusively from
+  //   the backend ExperimentsService (the schema's `timeline` request field is
+  //   never read), and `xum run` wires no timeline service.
+  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
+  //   tempDir config root, so persistent memories under the user's Xum home
+  //   would be invisible and new writes deleted on process exit.
+  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
+  //   has a non-empty advisorModelString, which the CLI's ephemeral config
+  //   never carries over.
+  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
+  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
+} as const satisfies Partial<
+  Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
+>;
+
+function isSendMessageExperimentId(
+  value: string
+): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
+  // Own-property check: `in` would also accept Object.prototype names like
+  // "constructor" or "toString", which have no mapping and would silently
+  // produce a garbage experiments field.
+  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
+}
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
+  // App-level experiments (e.g. agent-browser) have no send-options field and
+  // would be silent no-ops in a headless run, so reject them loudly.
+  if (!isSendMessageExperimentId(experimentId)) {
     throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
+      `Unknown or unsupported experiment "${value}". Valid experiments: ${Object.keys(
+        SEND_MESSAGE_EXPERIMENT_FIELDS
+      ).join(", ")}`
     );
   }
   if (previous.includes(experimentId)) {
@@ -276,17 +339,25 @@ function collectExperiments(value: string, previous: string[]): string[] {
 
 /**
  * Convert experiment ID array to the experiments object expected by SendMessageOptions.
+ * Only requested experiments are set (to true); unspecified flags stay undefined so
+ * backend fallbacks apply, mirroring how the desktop renderer sends them.
  */
 function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
   if (experimentIds.length === 0) return undefined;
 
-  return {
-    programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
-    programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
-    execSubagentHardRestart: experimentIds.includes("exec-subagent-hard-restart"),
-    dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-  };
+  const experiments: NonNullable<SendMessageOptions["experiments"]> = {};
+  for (const experimentId of experimentIds) {
+    assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
+    experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
+  }
+  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
+  // when the PTC flag is set, so rlm-mode alone would be silently inert. Imply
+  // the parent flag, mirroring the desktop where Settings nests RLM under the
+  // PTC toggle (PTC is exclusive-only, so RLM then runs the kernel posture).
+  if (experiments.rlm) {
+    experiments.programmaticToolCalling = true;
+  }
+  return experiments;
 }
 
 interface MCPServerEntry {
@@ -313,7 +384,7 @@ function collectMcpServers(value: string, previous: MCPServerEntry[]): MCPServer
 const program = new Command();
 
 program
-  .name("mux run")
+  .name("xum run")
   .description("Run an agent session in the current directory")
   .argument("[message...]", "instruction for the agent (can also be piped via stdin)")
   .option("-d, --dir <path>", "project directory", process.cwd())
@@ -351,17 +422,17 @@ program
     "after",
     `
 Examples:
-  $ mux run "Fix the failing tests"
-  $ mux run --dir /path/to/project "Add authentication"
-  $ mux run --runtime "ssh user@host" "Deploy changes"
-  $ mux run --goal "Fix tests and verify they pass"
-  $ mux run --goal "Ship the refactor" --goal-budget 5.00 --goal-turns 10
-  $ mux run --mode plan "Refactor the auth module"
-  $ mux run --budget 1.50 "Quick code review"
-  $ echo "Add logging" | mux run
-  $ mux run --json "List all files" | jq '.type'
-  $ mux run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
-  $ mux run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
+  $ xum run "Fix the failing tests"
+  $ xum run --dir /path/to/project "Add authentication"
+  $ xum run --runtime "ssh user@host" "Deploy changes"
+  $ xum run --goal "Fix tests and verify they pass"
+  $ xum run --goal "Ship the refactor" --goal-budget 5.00 --goal-turns 10
+  $ xum run --mode plan "Refactor the auth module"
+  $ xum run --budget 1.50 "Quick code review"
+  $ echo "Add logging" | xum run
+  $ xum run --json "List all files" | jq '.type'
+  $ xum run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
+  $ xum run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
 `
   );
 
@@ -392,7 +463,8 @@ interface CLIOptions {
 
 const opts = program.opts<CLIOptions>();
 const keepBackgroundProcesses =
-  opts.keepBackgroundProcesses === true || process.env.MUX_KEEP_BACKGROUND_PROCESSES === "1";
+  opts.keepBackgroundProcesses === true ||
+  resolveXumEnvironmentValue("KEEP_BACKGROUND_PROCESSES", process.env) === "1";
 const messageArg = program.args.join(" ");
 
 async function main(): Promise<number> {
@@ -423,60 +495,75 @@ async function main(): Promise<number> {
 
   if (!message) {
     console.error("Error: No message provided. Pass as argument, pipe via stdin, or use --goal.");
-    console.error('Usage: mux run "Your instruction here"');
+    console.error('Usage: xum run "Your instruction here"');
     process.exit(1);
   }
 
-  // Create ephemeral temp dir for session data (auto-cleaned on exit)
+  // Create the private run config root and default session storage.
   using tempDir = new DisposableTempDir("mux-run");
 
-  // Use real config for providers, but ephemeral temp dir for session data
-  const realConfig = new Config();
-  const config = new Config(tempDir.path);
+  // Read credentials from the real config, then copy them into the private run config.
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
+
+  // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
+  // to collect chat.jsonl and session-usage.json after the process exits.
+  let sessionRootOverride: PreparedRunSessionRoot | undefined;
+  try {
+    sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
+  } catch (error) {
+    console.error(`Error: ${getErrorMessage(error)}`);
+    return 1;
+  }
+  await using preparedSessionRoot = sessionRootOverride;
+  const preparedConfig = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const runStores = createConfigStores(preparedConfig.rootDir);
+  const config = runStores.config;
 
   // Copy providers and secrets from real config to ephemeral config
-  const existingProviders = realConfig.loadProvidersConfig();
-  if (hasAnyConfiguredProvider(existingProviders)) {
-    // Write providers to temp config so services can find them
-    const providersFile = path.join(config.rootDir, "providers.jsonc");
-    fsSync.writeFileSync(providersFile, JSON.stringify(existingProviders, null, 2));
-  }
+  const realProvidersStore = realStores.providersConfigStore;
+  const runProvidersStore = runStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
+  const providersFile = path.join(config.rootDir, "providers.jsonc");
+  await replacePrivateRunConfigFile(
+    providersFile,
+    hasAnyConfiguredProvider(existingProviders)
+      ? JSON.stringify(existingProviders, null, 2)
+      : undefined
+  );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = realConfig.loadSecretsConfig();
-  if (Object.keys(existingSecrets).length > 0) {
-    const secretsFile = path.join(config.rootDir, "secrets.json");
-    fsSync.writeFileSync(secretsFile, JSON.stringify(existingSecrets, null, 2));
-  }
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
+  const secretsFile = path.join(config.rootDir, "secrets.json");
+  await replacePrivateRunConfigFile(
+    secretsFile,
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
+  );
 
   // Copy only project trust metadata so AIService can read trust flags.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
-  const existingConfig = realConfig.loadConfigOrDefault();
-  if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = new Map<string, ProjectConfig>();
-    for (const [projectPath, projectConfig] of existingConfig.projects) {
-      if (projectConfig.trusted === undefined) {
-        continue;
-      }
-
-      trustOnlyProjects.set(projectPath, {
-        workspaces: [],
-        trusted: projectConfig.trusted,
-      });
-    }
-
-    if (trustOnlyProjects.size > 0) {
-      // Config.saveConfig is private (lost-update safety); route through the queue.
-      await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-    }
-  }
+  // Replace the full map so a reused run root cannot retain trust removed from real config.
+  await replaceRunTrustProjects(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
   await ensureDirectory(projectDir);
 
-  const model: string = resolveModelAlias(opts.model);
+  // Trust for a linked worktree is recorded against the main repository, but
+  // TaskService's sub-agent gate looks up this exact checkout path in the
+  // ephemeral config. Materialize effective trust (direct or main-repo
+  // fallback) onto projectDir so trusted worktrees can spawn sub-agents.
+  const projectTrusted = await materializeResolvedTrust(realConfig, config, projectDir);
+
+  // Shared normalization (alias resolution + gateway migration + format
+  // validation); an unrecognized -m value fails up front instead of failing
+  // later inside the stream.
+  const normalizedModel = normalizeModelInput(opts.model).model;
+  if (normalizedModel == null) {
+    throw new Error(`Invalid model "${opts.model}". Expected "provider:model-id" or a known alias`);
+  }
+  const model: string = normalizedModel;
   let runtimeConfig = parseRuntimeConfig(opts.runtime, config.srcDir);
   // Resolve thinking: numeric indices map to the model's allowed levels (0 = lowest)
   const thinkingLevel = resolveThinkingInput(parseThinkingLevel(opts.thinking), model);
@@ -517,13 +604,14 @@ async function main(): Promise<number> {
   };
   const writeThinking = (text: string) => {
     if (suppressHumanOutput) return;
-    // Purple color matching Mux UI thinking blocks (hsl(271, 76%, 53%) = #A855F7)
+    // Purple color matching Xum UI thinking blocks (hsl(271, 76%, 53%) = #A855F7)
     const colored = stderrIsTTY ? chalk.hex("#A855F7")(text) : text;
     process.stderr.write(colored);
   };
   const emitJsonLine = (payload: unknown) => {
     if (emitJson) process.stdout.write(`${JSON.stringify(payload)}\n`);
   };
+  fatalJsonMode = emitJson;
 
   // Log startup info (shown at info+ level, i.e., with --verbose)
   log.info(`Directory: ${projectDir}`);
@@ -537,13 +625,21 @@ async function main(): Promise<number> {
   if (!hasAnyConfiguredProvider(existingProviders)) {
     const providersFromEnv = buildProvidersFromEnv();
     if (hasAnyConfiguredProvider(providersFromEnv)) {
-      config.saveProvidersConfig(providersFromEnv);
+      runProvidersStore.saveProvidersConfig(providersFromEnv);
     } else {
       throw new Error(
         "No provider credentials found. Configure providers.jsonc or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY / MOONSHOT_API_KEY."
       );
     }
   }
+
+  // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless runs
+  // too, matching the desktop wiring: without this, `xum run` would keep using
+  // providers/models/credentials that providerAccess now denies. Bind to the
+  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
+  // honored — the ephemeral tempDir config only receives project trust flags.
+  const policyService = new PolicyService(realConfig);
+  await policyService.initialize();
 
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
@@ -562,8 +658,13 @@ async function main(): Promise<number> {
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
+    streamManager,
+    turnRequestBuilderBindings,
+    runtime: coreRuntime,
+    appFiberScope,
   } = createCoreServices({
-    config,
+    ...runStores,
+    policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
@@ -581,11 +682,33 @@ async function main(): Promise<number> {
       : undefined,
   });
 
-  // `mux run` uses createCoreServices directly (without ServiceContainer), so wire
+  // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
   // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
   // OAuth tokens from providers.jsonc.
-  const codexOauthService = new CodexOauthService(config, providerService);
-  aiService.setCodexOauthService(codexOauthService);
+  const codexOauthService = new CodexOauthService(runProvidersStore, providerService);
+  turnRequestBuilderBindings.codexOauthService = codexOauthService;
+  // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
+  // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
+  // the refresh token on every use, so persisting rotations only to tempDir
+  // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
+  // once this CLI session exits.
+  const realFileLeaseManager = realStores.fileLeaseManager;
+  const realProviderService = new ProviderService(
+    realConfig,
+    policyService,
+    realProvidersStore,
+    realFileLeaseManager
+  );
+  const coderOauthService = new CoderOauthService(
+    realProvidersStore,
+    realFileLeaseManager,
+    realProviderService,
+    undefined,
+    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
+    // token refreshes/issuer checks, and denied providers fail closed.
+    policyService
+  );
+  turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -603,24 +726,40 @@ async function main(): Promise<number> {
       "Set the process exit code for this CLI session. " +
       "Use this in CI/automation to signal success (0) or failure (non-zero). " +
       "For example, exit 1 to block a PR merge when issues are found. " +
-      "Only available in `mux run` CLI mode.",
+      "Only available in `xum run` CLI mode.",
     inputSchema: setExitCodeSchema,
     execute: ({ exit_code }: z.infer<typeof setExitCodeSchema>) => {
       agentExitCode = exit_code;
       return { success: true, exit_code };
     },
   });
-  aiService.setExtraTools({ set_exit_code: setExitCodeTool });
+  turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
+    effectRunner: coreRuntime.get(EffectRunnerTag),
+    appFiberScope,
     workspaceId,
     config,
     historyService,
     aiService,
+    streamManager,
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService,
     keepBackgroundProcesses,
+    // Direct CLI registration bypasses WorkspaceService.create, so a
+    // preserved checkout could carry a stale `plugin:` MCP override into a
+    // same-name reinstall on the first send; sanitize before announcing.
+    // realConfig: the ephemeral CLI config has no workspace records, so the
+    // live-sibling scan needs the persistent one or it would prune enables a
+    // desktop workspace on this checkout still owns.
+    sanitizeCliWorkspaceRegistration: (args) =>
+      workspaceService.sanitizeCliRegisteredWorkspace(
+        args.workspaceId,
+        args.workspacePath,
+        args.runtimeConfig,
+        realConfig
+      ),
   });
   // Register with WorkspaceService so TaskService operations that target the parent
   // workspace (e.g. resumeStream after sub-agent completion) reuse this session
@@ -631,7 +770,7 @@ async function main(): Promise<number> {
   // can run (Docker container, SSH remote checkout), create + init it now so
   // the agent's first tool call doesn't fail with "runtime not ready".
   //
-  // The init logger is timed (`makeTimedCliInitLogger`) so `mux run --verbose`
+  // The init logger is timed (`makeTimedCliInitLogger`) so `xum run --verbose`
   // doubles as a startup-timing harness: each step is annotated with elapsed
   // total + delta-since-last-step, making it easy to see which remote phase
   // (sync / fetch / worktree add / hook) dominates startup latency.
@@ -645,7 +784,7 @@ async function main(): Promise<number> {
     // expands tildes against the local cwd, producing nonsense like
     // `/Users/.../~/mux/...` that subsequently fails SSH path validation.
     // Resolving first makes the runtime config self-consistent and lets
-    // subsequent `mux run` invocations reuse the same stable shared base
+    // subsequent `xum run` invocations reuse the same stable shared base
     // repo on the remote (warm fast-path).
     if (runtimeConfig.type === "ssh" && runtimeConfig.srcBaseDir.startsWith("~")) {
       const probeRuntime = createRuntime(runtimeConfig, {
@@ -679,8 +818,9 @@ async function main(): Promise<number> {
       // Fallback to main
     }
 
-    // Read trust state from real config so trusted projects can run hooks
-    const trusted = realConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted ?? false;
+    // Effective trust (including main-repo fallback for linked worktrees) was
+    // resolved and materialized into the ephemeral config above.
+    const trusted = projectTrusted;
 
     const createEnv = Object.fromEntries(
       Object.entries(process.env).filter(
@@ -752,7 +892,7 @@ async function main(): Promise<number> {
   });
 
   // Note: taskService.initialize() is intentionally NOT called. It resumes tasks from a
-  // previous session, but mux run uses an ephemeral Config (temp dir) with no prior state.
+  // previous session, but xum run uses an ephemeral Config (temp dir) with no prior state.
   // Calling initialize() on a fresh config is a no-op, but skipping it makes the intent
   // clear and avoids any risk of cross-workspace side effects if config were ever shared.
 
@@ -768,7 +908,7 @@ async function main(): Promise<number> {
       ...(opts.serviceTier != null && { openai: { serviceTier: opts.serviceTier } }),
     },
     // Disable UI-only tools that either no-op or require UI interaction in CLI mode:
-    // - ask_user_question: waits for a desktop/mobile answer UI; headless `mux run` cannot answer it
+    // - ask_user_question: waits for a desktop/mobile answer UI; headless `xum run` cannot answer it
     // - status_set: backend no-op, status indicator only visible in desktop UI
     // - todo_write/todo_read: TODO list only visible in desktop UI
     // - notify: sends OS notifications via Electron, silently swallowed in CLI
@@ -783,6 +923,7 @@ async function main(): Promise<number> {
   });
 
   let goalStopReason: string | null = null;
+  let cliGoalId: string | undefined;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -794,6 +935,7 @@ async function main(): Promise<number> {
     if (!setGoalResult.success) {
       throw new Error(`Failed to set CLI goal: ${setGoalResult.error.type}`);
     }
+    cliGoalId = setGoalResult.data.goalId;
     const warning =
       goalBudgetCents == null && goalTurnCap == null
         ? "CLI Goal Run has no --goal-budget or --goal-turns limit. It will continue until the goal is complete or another stop condition occurs."
@@ -857,6 +999,20 @@ async function main(): Promise<number> {
 
   // Budget tracking state
   let budgetExceeded = false;
+  let budgetStop: Promise<void> | null = null;
+  // The budget cap is the user's Stop: go through the retiring interrupt so owed background-process
+  // attention is dismissed, or the after-idle reconcile would start another billed turn before
+  // teardown. The Err case is a stop that did not persist, not a stop that failed. The stream abort
+  // settles the run before retirement is durable, so teardown awaits this promise first.
+  const stopForBudget = (): void => {
+    budgetStop ??= workspaceService
+      .interruptStream(workspaceId, { abandonPartial: false, retireBashMonitorAttention: true })
+      .then((result) => {
+        if (!result.success) {
+          log.warn("Budget stop was not recorded", { workspaceId, error: result.error });
+        }
+      });
+  };
 
   // Centralized output type tracking for spacing
   type OutputType = "none" | "text" | "thinking" | "tool";
@@ -974,6 +1130,7 @@ async function main(): Promise<number> {
             synthetic: true,
             agentInitiated: true,
             goalKind: GOAL_CONTINUATION_KIND,
+            goalId: cliGoalId,
             goalContinuation: true,
           }
         : undefined
@@ -1225,7 +1382,7 @@ async function main(): Promise<number> {
           const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
           emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
           writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
-          void session.interruptStream({ abandonPartial: false });
+          stopForBudget();
         }
       }
       return;
@@ -1273,7 +1430,7 @@ async function main(): Promise<number> {
           const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
           emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
           writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
-          void session.interruptStream({ abandonPartial: false });
+          stopForBudget();
         }
       }
       return;
@@ -1367,6 +1524,7 @@ async function main(): Promise<number> {
           }
         }
         if (finalEvent && isStreamEnd(finalEvent)) {
+          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           const parts = (finalEvent as unknown as { parts?: unknown[] }).parts ?? [];
           for (const part of parts) {
             if (part && typeof part === "object" && "type" in part && part.type === "text") {
@@ -1420,20 +1578,54 @@ async function main(): Promise<number> {
       }
     }
   } finally {
-    unsubscribe();
-    // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-    // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-    backgroundProcessManager.beginShutdown();
-    session.dispose();
-    mcpServerManager.dispose();
-    await codexOauthService.dispose();
-    if (!keepBackgroundProcesses) {
-      await backgroundProcessManager.terminateAll();
-    }
+    // Teardown failures must not flip a finished run into exit 1: a rejection
+    // here would reach main().catch after run-complete was already emitted,
+    // and benchmark harnesses then discard the whole trial as an infra error.
+    // Contain each step, report it, and keep going.
+    await runBestEffortCleanup(
+      [
+        { name: "budgetStop", run: () => budgetStop ?? undefined },
+        { name: "unsubscribe", run: () => unsubscribe() },
+        // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+        // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+        {
+          name: "backgroundProcessManager.beginShutdown",
+          run: () => backgroundProcessManager.beginShutdown(),
+        },
+        // Interrupt + await the runtime's supervised fibers while their
+        // dependencies are still alive (same slot as ServiceContainer.dispose).
+        { name: "appFiberScope.close", run: () => closeScopeBounded(appFiberScope) },
+        // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+        // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+        { name: "session.dispose", run: () => session.beginDispose() },
+        { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
+        { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
+        { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
+        { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
+        { name: "policyService.dispose", run: () => policyService.dispose() },
+        ...(keepBackgroundProcesses
+          ? []
+          : [
+              {
+                name: "backgroundProcessManager.terminateAll",
+                run: () => backgroundProcessManager.terminateAll(),
+              },
+            ]),
+        // Last: release the Effect runtime that owns the core graph.
+        { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
+      ],
+      (stepName, error) => {
+        const message = getErrorMessage(error);
+        process.stderr.write(`[cleanup] ${stepName} failed: ${message}\n`);
+        emitJsonLine({ type: "run-cleanup-error", step: stepName, error: message });
+      }
+    );
   }
 
-  if (budgetExceeded) return 2;
-  if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  let exitOutcome: number;
+  if (budgetExceeded) {
+    exitOutcome = 2;
+  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
@@ -1443,10 +1635,78 @@ async function main(): Promise<number> {
       status: finalGoalRecord?.status ?? null,
       stopReason: reason,
     });
-    return 3;
+    exitOutcome = 3;
+  } else {
+    exitOutcome = agentExitCode ?? 0;
   }
-  return agentExitCode ?? 0;
+  completedExitCode = exitOutcome;
+  return exitOutcome;
 }
+
+// Fatal diagnostics must survive benchmark transports: stderr is a pipe whose
+// buffered bytes process.exit() discards, so a late failure was previously an
+// invisible exit 1 that voided a completed run. Mirror fatal errors onto
+// stdout as JSON (when --json) and flush both streams before exiting.
+let fatalJsonMode = false;
+let completedExitCode: number | null = null;
+
+function reportFatalError(kind: string, prefix: string, error: unknown): void {
+  const message = getErrorMessage(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  try {
+    process.stderr.write(`${prefix}${message}\n${stack ? `${stack}\n` : ""}`);
+  } catch {
+    // stderr may already be gone; the JSON mirror below still records it.
+  }
+  if (fatalJsonMode) {
+    try {
+      process.stdout.write(`${JSON.stringify({ type: "run-fatal", kind, error: message })}\n`);
+    } catch {
+      // Nothing left to report to.
+    }
+  }
+}
+
+function exitAfterStreamFlush(exitCode: number): void {
+  const pending = [process.stdout, process.stderr].filter((stream) => stream.writableNeedDrain);
+  const exit = () => process.exit(exitCode);
+  if (pending.length === 0) {
+    exit();
+    return;
+  }
+  let remaining = pending.length;
+  for (const stream of pending) {
+    let settled = false;
+    const settleOne = () => {
+      if (settled) return;
+      settled = true;
+      remaining -= 1;
+      if (remaining <= 0) exit();
+    };
+    stream.once("drain", settleOne);
+    stream.once("error", settleOne);
+    stream.once("close", settleOne);
+  }
+  // Ref'd on purpose: keep the event loop alive until the flush window closes.
+  setTimeout(exit, 5000);
+}
+
+// Last-resort handlers: without them a stray rejection or throw (e.g. from a
+// fire-and-forget teardown promise) exits 1 with its report lost in an
+// unflushed pipe, and a completed benchmark trial gets discarded as an
+// infrastructure failure.
+process.on("uncaughtException", (error) => {
+  reportFatalError("uncaught-exception", "Uncaught exception: ", error);
+  exitAfterStreamFlush(completedExitCode ?? 1);
+});
+process.on("unhandledRejection", (reason) => {
+  reportFatalError("unhandled-rejection", "Unhandled rejection: ", reason);
+  // After the run outcome is final the normal exit path is already in
+  // flight; report only and let it exit with the real code.
+  if (completedExitCode == null) {
+    exitAfterStreamFlush(1);
+  }
+});
 
 // Keep process alive - Bun may exit when stdin closes even if async work is pending
 const keepAliveInterval = setInterval(() => {
@@ -1461,17 +1721,20 @@ main()
     if (process.stdout.writableNeedDrain) {
       const exit = () => process.exit(exitCode);
       process.stdout.once("drain", exit);
-      // Safety: if the downstream consumer closes (broken pipe) or backpressure
-      // never resolves, exit anyway after 1s to avoid hanging.
+      // Safety: if the downstream consumer closes (broken pipe), exit
+      // immediately. The backpressure timeout must be generous: the final
+      // --json stream-end + run-complete lines can be hundreds of KB, and a
+      // 1s cap was observed truncating them mid-line under pipe backpressure,
+      // silently losing cost telemetry in benchmark runs.
       process.stdout.once("error", exit);
       process.stdout.once("close", exit);
-      setTimeout(exit, 1000).unref();
+      setTimeout(exit, 30_000).unref();
     } else {
       process.exit(exitCode);
     }
   })
   .catch((error) => {
     clearInterval(keepAliveInterval);
-    console.error(`Error: ${getErrorMessage(error)}`);
-    process.exit(1);
+    reportFatalError("run-error", "Error: ", error);
+    exitAfterStreamFlush(1);
   });

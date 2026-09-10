@@ -7,7 +7,6 @@ import {
   Eye,
   EyeOff,
   GripVertical,
-  KeyRound,
   Loader2,
   ShieldCheck,
   X,
@@ -45,7 +44,6 @@ import {
 } from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { Button } from "@/browser/components/Button/Button";
-import { OnePasswordPicker } from "../Components/OnePasswordPicker";
 import {
   Select,
   SelectContent,
@@ -69,20 +67,29 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 import { repairLocalModelPreferencesForRemovedProvider } from "@/browser/utils/modelPreferenceRepair";
 import {
+  CUSTOM_PROVIDER_TYPES,
   formatProviderDisplayName,
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
+  isCustomProviderType,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
+  type CustomProviderType,
 } from "@/common/utils/providers/customProviders";
-import type {
-  AddCustomOpenAICompatibleProviderInput,
-  ProviderConfigInfo,
-} from "@/common/orpc/types";
+import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import type { Result } from "@/common/types/result";
+import { CODER_OAUTH_SERVER_START_PATH } from "@/common/constants/coderOAuth";
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
 type CopilotLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
+
+const CUSTOM_PROVIDER_TYPE_LABELS: Record<CustomProviderType, string> = {
+  "openai-compatible": "OpenAI Chat Completions",
+  "openai-responses": "OpenAI Responses",
+  "anthropic-messages": "Anthropic Messages",
+};
 
 const OPENAI_SERVICE_TIER_UNSET = "unset";
 
@@ -115,6 +122,60 @@ function getServerAuthToken(): string | null {
   return urlToken?.length ? urlToken : getStoredAuthToken();
 }
 
+/**
+ * Flow ID for a Coder login. It doubles as the OAuth `state` (CSRF token), so
+ * it must be unguessable: derived from getRandomValues, which — unlike
+ * Crypto.randomUUID — is available outside secure contexts too (Xum's browser
+ * UI can be served from a plain-HTTP remote origin, where randomUUID is
+ * undefined and would throw before the login even started).
+ */
+function createCoderLoginFlowId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Browser/server-mode "Login with Coder": the Xum server registers the flow
+ * with a redirect URI on its own origin (built server-side from the request
+ * host, so the OAuth callback reaches the server no matter where the browser
+ * runs). A raw HTTP route rather than oRPC because only the HTTP request
+ * carries that public host; the rest of the flow (wait/cancel) stays on oRPC.
+ */
+async function startCoderServerFlow(
+  backendBaseUrl: string,
+  deploymentUrl: string,
+  flowId: string
+): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
+  const startUrl = new URL(`${backendBaseUrl}${CODER_OAUTH_SERVER_START_PATH}`);
+  startUrl.searchParams.set("deploymentUrl", deploymentUrl);
+  startUrl.searchParams.set("flowId", flowId);
+  const authToken = getServerAuthToken();
+  const res = await fetch(startUrl, {
+    headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+  });
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    const prefix = (await res.text()).trim().slice(0, 80);
+    return {
+      success: false,
+      error: `Unexpected response from ${startUrl.pathname} (expected JSON, got ${
+        contentType || "unknown"
+      }): ${prefix}`,
+    };
+  }
+  const json = (await res.json()) as { authorizeUrl?: unknown; flowId?: unknown; error?: unknown };
+  if (!res.ok) {
+    return {
+      success: false,
+      error: typeof json.error === "string" ? json.error : `HTTP ${res.status}`,
+    };
+  }
+  if (typeof json.authorizeUrl !== "string" || typeof json.flowId !== "string") {
+    return { success: false, error: `Invalid response from ${startUrl.pathname}` };
+  }
+  return { success: true, data: { flowId: json.flowId, authorizeUrl: json.authorizeUrl } };
+}
+
 interface FieldConfig {
   key: string;
   label: string;
@@ -123,17 +184,13 @@ interface FieldConfig {
   optional?: boolean;
 }
 
-function isCustomOpenAICompatibleProviderInfo(
+function isCustomProviderInfo(
   providerInfo: ProviderConfigInfo | undefined
 ): providerInfo is ProviderConfigInfo & {
   isCustom: true;
-  providerType: "openai-compatible";
+  providerType: CustomProviderType;
 } {
-  return (
-    providerInfo?.isCustom === true &&
-    providerInfo.providerType === "openai-compatible" &&
-    isCustomOpenAICompatibleProviderConfig(providerInfo)
-  );
+  return providerInfo?.isCustom === true && isCustomProviderConfig(providerInfo);
 }
 
 /**
@@ -141,12 +198,12 @@ function isCustomOpenAICompatibleProviderInfo(
  * Most providers use API Key + Base URL, but some (like Bedrock) have different needs.
  */
 function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo): FieldConfig[] {
-  if (isCustomOpenAICompatibleProviderInfo(providerInfo)) {
+  if (isCustomProviderInfo(providerInfo)) {
     return [
       {
         key: "displayName",
         label: "Display name",
-        placeholder: "My OpenAI-compatible provider",
+        placeholder: "My custom provider",
         type: "text",
       },
       {
@@ -218,6 +275,22 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
     return []; // OAuth-based, no manual key entry
   }
 
+  // Guarded on isCustom: an upgraded install may carry a custom
+  // custom provider named "coder" that intentionally shadows the
+  // built-in (see detectAndLogShadowedProviders); it must keep its custom
+  // API key/base URL fields instead of the built-in deployment field.
+  if (provider === "coder" && providerInfo?.isCustom !== true) {
+    // OAuth-based ("Login with Coder"); only the deployment URL is entered manually.
+    return [
+      {
+        key: "deploymentUrl",
+        label: "Deployment URL",
+        placeholder: "https://coder.example.com",
+        type: "text",
+      },
+    ];
+  }
+
   // Default for most providers
   return [
     { key: "apiKey", label: "API Key", placeholder: "Enter API key", type: "secret" },
@@ -248,6 +321,7 @@ const PROVIDER_KEY_URLS: Partial<Record<ProviderName, string>> = {
   xai: "https://console.x.ai/team/default/api-keys",
   deepseek: "https://platform.deepseek.com/api_keys",
   moonshotai: "https://platform.moonshot.ai/console/api-keys",
+  zai: "https://z.ai/manage-apikey/apikey-list",
   openrouter: "https://openrouter.ai/settings/keys",
   // bedrock: AWS credential chain, no simple key URL
   // ollama: local service, no key needed
@@ -381,10 +455,15 @@ export function ProvidersSection() {
   const effectivePolicy =
     policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
 
-  const { providersExpandedProvider, setProvidersExpandedProvider } = useSettings();
+  const {
+    providersExpandedProvider,
+    setProvidersExpandedProvider,
+    providersStartCoderLogin,
+    setProvidersStartCoderLogin,
+  } = useSettings();
 
   const { api } = useAPI();
-  const { config, refresh, updateOptimistically } = useProvidersConfig();
+  const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { workspaceMetadata, selectedWorkspace, refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(
     () => getAllowedProvidersForUi(effectivePolicy, config),
@@ -402,7 +481,7 @@ export function ProvidersSection() {
   const [xaiServiceTierSaving, setXAIServiceTierSaving] = useState(false);
   // Persist OpenAI ZDR store toggles before publishing UI state so a failed write
   // cannot leave the dropdown claiming disabled while requests still send store=true.
-  // xAI Grok 4.5 always uses store=false in the request path (no settings surface).
+  // xAI frontier Grok always uses store=false in the request path (no settings surface).
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
 
   const routing = useRouting();
@@ -417,10 +496,7 @@ export function ProvidersSection() {
     const policyAllowedSet = new Set(visibleProviders);
 
     for (const provider of visibleProviders) {
-      if (
-        !isBuiltInProvider(provider) ||
-        isCustomOpenAICompatibleProviderInfo(config?.[provider])
-      ) {
+      if (!isBuiltInProvider(provider) || isCustomProviderInfo(config?.[provider])) {
         continue;
       }
 
@@ -428,7 +504,7 @@ export function ProvidersSection() {
     }
 
     for (const [provider, providerInfo] of Object.entries(config ?? {})) {
-      if (!policyAllowedSet.has(provider) || !isCustomOpenAICompatibleProviderInfo(providerInfo)) {
+      if (!policyAllowedSet.has(provider) || !isCustomProviderInfo(providerInfo)) {
         continue;
       }
 
@@ -503,7 +579,7 @@ export function ProvidersSection() {
 
     if (!api) {
       setCodexOauthStatus("error");
-      setCodexOauthError("Mux API not connected.");
+      setCodexOauthError("Xum API not connected.");
       return;
     }
 
@@ -619,7 +695,7 @@ export function ProvidersSection() {
 
     if (!api) {
       setCodexOauthStatus("error");
-      setCodexOauthError("Mux API not connected.");
+      setCodexOauthError("Xum API not connected.");
       return;
     }
 
@@ -693,7 +769,7 @@ export function ProvidersSection() {
 
     if (!api) {
       setCodexOauthStatus("error");
-      setCodexOauthError("Mux API not connected.");
+      setCodexOauthError("Xum API not connected.");
       return;
     }
 
@@ -811,7 +887,7 @@ export function ProvidersSection() {
       if (isDesktop) {
         if (!api) {
           setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError("Mux API not connected.");
+          setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
@@ -966,8 +1042,8 @@ export function ProvidersSection() {
       : muxGatewayLoginInProgress
         ? "Waiting for login..."
         : muxGatewayIsLoggedIn
-          ? "Re-login to Mux Gateway"
-          : "Login to Mux Gateway";
+          ? "Re-login to Xum Gateway"
+          : "Login to Xum Gateway";
 
   // --- GitHub Copilot Device Code Flow ---
   const [copilotLoginStatus, setCopilotLoginStatus] = useState<CopilotLoginStatus>("idle");
@@ -1086,13 +1162,208 @@ export function ProvidersSection() {
     }
   };
 
-  const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
+  // --- Coder OAuth ("Login with Coder") ---
+  const [coderLoginStatus, setCoderLoginStatus] = useState<CodexOauthFlowStatus>("idle");
+  const [coderLoginError, setCoderLoginError] = useState<string | null>(null);
+  const [coderFlowId, setCoderFlowId] = useState<string | null>(null);
+  const [coderAuthorizeUrl, setCoderAuthorizeUrl] = useState<string | null>(null);
+  const coderLoginAttemptRef = useRef(0);
 
-  const [opAvailable, setOpAvailable] = useState(false);
-  const [opPickerProvider, setOpPickerProvider] = useState<string | null>(null);
+  const coderOauthIsConnected = config?.coder?.coderOauthSet === true;
+  // Presence of ANY stored credential (even one minted for a different
+  // deployment URL): it stays disconnectable — disconnect revokes against the
+  // blob's own issuer — otherwise editing the URL would strand a live
+  // full-privilege credential with no way to revoke it from the UI.
+  const coderOauthCredentialStored = config?.coder?.coderOauthCredentialStored === true;
+  const coderDeploymentUrl = config?.coder?.deploymentUrl ?? "";
+  const coderLoginInProgress = coderLoginStatus === "starting" || coderLoginStatus === "waiting";
+
+  // Manual AI Gateway model re-discovery: newly configured providers/models
+  // on the deployment otherwise only appear after a re-login.
+  const [coderModelRefreshState, setCoderModelRefreshState] = useState<
+    { kind: "idle" } | { kind: "refreshing" } | { kind: "error"; message: string }
+  >({ kind: "idle" });
+
+  // Synchronous reentrancy guard: the button's disabled={refreshing} prop
+  // lags a render behind, so repeated or programmatic activation could start
+  // overlapping refreshes whose state updates race. The ref flips before the
+  // first await, making the second activation a deterministic no-op.
+  const coderModelRefreshInFlightRef = useRef(false);
+  const refreshCoderModels = async () => {
+    if (!api || coderModelRefreshInFlightRef.current) {
+      return;
+    }
+    coderModelRefreshInFlightRef.current = true;
+    setCoderModelRefreshState({ kind: "refreshing" });
+    try {
+      const result = await api.coderOauth.refreshModels();
+      if (!result.success) {
+        setCoderModelRefreshState({ kind: "error", message: result.error });
+        return;
+      }
+      setCoderModelRefreshState({ kind: "idle" });
+      await refresh();
+    } catch (err) {
+      setCoderModelRefreshState({ kind: "error", message: getErrorMessage(err) });
+    } finally {
+      coderModelRefreshInFlightRef.current = false;
+    }
+  };
+
+  const cancelCoderLogin = async () => {
+    coderLoginAttemptRef.current++;
+    // Await backend cancellation BEFORE dismissing the attempt: Cancel can
+    // race the OAuth callback/token exchange, and only when cancelDesktopFlow
+    // returns has the backend settled which of them won. Dropping the local
+    // state first would show an idle "cancelled" attempt while the exchange
+    // commits a connected account behind it.
+    if (api && coderFlowId) {
+      try {
+        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+      } catch {
+        // Backend unreachable — clear local state regardless.
+      }
+    }
+    setCoderFlowId(null);
+    setCoderAuthorizeUrl(null);
+    setCoderLoginStatus("idle");
+    setCoderLoginError(null);
+    // The exchange may have won the race: re-fetch so Settings reflects the
+    // authoritative backend outcome (connected vs not).
+    await refresh();
+  };
+
+  // useCallback for effect-dep stability, not memoization: the one-shot
+  // startCoderLogin hint effect below lists this function as a dependency.
+  const startCoderLogin = useCallback(async () => {
+    const attempt = ++coderLoginAttemptRef.current;
+
+    if (!api) {
+      setCoderLoginStatus("error");
+      setCoderLoginError("Xum API not connected.");
+      return;
+    }
+
+    // Cancel any in-progress flow before starting a new one — awaited, so the
+    // old flow cannot commit a login after this replacement attempt begins.
+    if (coderFlowId) {
+      try {
+        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+      } catch {
+        // Proceed anyway; the backend's last-committed-login-wins semantics
+        // still bound the damage if the old flow survives.
+      }
+      if (attempt !== coderLoginAttemptRef.current) return;
+    }
+
+    setCoderLoginError(null);
+    setCoderAuthorizeUrl(null);
+
+    const deploymentUrl = coderDeploymentUrl.trim();
+    if (!deploymentUrl) {
+      setCoderFlowId(null);
+      setCoderLoginStatus("error");
+      setCoderLoginError("Set the deployment URL first.");
+      return;
+    }
+
+    // Generate the flow ID client-side and expose it BEFORE the start RPC:
+    // startDesktopFlow can stall on backend network calls, and Cancel must be
+    // able to reach the attempt (the backend pre-cancels IDs it hasn't
+    // registered yet) instead of abandoning only the frontend state.
+    const flowId = createCoderLoginFlowId();
+    setCoderFlowId(flowId);
+
+    try {
+      setCoderLoginStatus("starting");
+      // Desktop: loopback listener on this machine. Browser (local or remote
+      // server): the redirect lands on the Xum server's own callback route.
+      const startResult = isDesktop
+        ? await api.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
+        : await startCoderServerFlow(backendBaseUrl, deploymentUrl, flowId);
+
+      if (attempt !== coderLoginAttemptRef.current) {
+        // cancelCoderLogin already cancelled this flowId; nothing to clean up.
+        return;
+      }
+
+      if (!startResult.success) {
+        setCoderFlowId(null);
+        setCoderLoginStatus("error");
+        setCoderLoginError(startResult.error);
+        return;
+      }
+
+      const { authorizeUrl } = startResult.data;
+      setCoderAuthorizeUrl(authorizeUrl);
+      setCoderLoginStatus("waiting");
+
+      const waitResult = await api.coderOauth.waitForDesktopFlow({ flowId });
+
+      if (attempt !== coderLoginAttemptRef.current) return;
+
+      if (!waitResult.success) {
+        setCoderLoginStatus("error");
+        setCoderLoginError(waitResult.error);
+        return;
+      }
+
+      setCoderLoginStatus("idle");
+      setCoderFlowId(null);
+      setCoderAuthorizeUrl(null);
+      await refresh();
+    } catch (err) {
+      if (attempt !== coderLoginAttemptRef.current) return;
+      setCoderLoginStatus("error");
+      setCoderLoginError(getErrorMessage(err));
+    }
+  }, [api, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
+
+  const disconnectCoderOauth = async () => {
+    const attempt = ++coderLoginAttemptRef.current;
+    if (!api) return;
+
+    // Awaited: an unsettled flow could otherwise commit a login AFTER the
+    // disconnect below cleared credentials, silently reconnecting the account.
+    if (coderFlowId) {
+      try {
+        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+      } catch {
+        // Proceed with disconnect regardless.
+      }
+      if (attempt !== coderLoginAttemptRef.current) return;
+    }
+    setCoderFlowId(null);
+    setCoderAuthorizeUrl(null);
+    setCoderLoginError(null);
+    setCoderLoginStatus("idle");
+
+    try {
+      const result = await api.coderOauth.disconnect();
+
+      if (attempt !== coderLoginAttemptRef.current) return;
+
+      if (!result.success) {
+        setCoderLoginStatus("error");
+        setCoderLoginError(result.error);
+        return;
+      }
+
+      updateOptimistically("coder", { coderOauthSet: false, coderOauthCredentialStored: false });
+      await refresh();
+    } catch (err) {
+      if (attempt !== coderLoginAttemptRef.current) return;
+      setCoderLoginStatus("error");
+      setCoderLoginError(getErrorMessage(err));
+    }
+  };
+
+  const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
 
   const [customProviderFormOpen, setCustomProviderFormOpen] = useState(false);
   const [customProviderId, setCustomProviderId] = useState("");
+  const [customProviderType, setCustomProviderType] =
+    useState<CustomProviderType>("openai-compatible");
   const [customProviderDisplayName, setCustomProviderDisplayName] = useState("");
   const [customProviderBaseUrl, setCustomProviderBaseUrl] = useState("");
   const [customProviderApiKey, setCustomProviderApiKey] = useState("");
@@ -1113,40 +1384,6 @@ export function ProvidersSection() {
   const [customProviderRemoving, setCustomProviderRemoving] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!api) {
-      setOpAvailable(false);
-      setOpPickerProvider(null);
-      return;
-    }
-
-    let cancelled = false;
-    void api.onePassword
-      .isAvailable()
-      .then((result) => {
-        if (cancelled) {
-          return;
-        }
-
-        setOpAvailable(result.available);
-        if (!result.available) {
-          setOpPickerProvider(null);
-        }
-      })
-      .catch(() => {
-        if (cancelled) {
-          return;
-        }
-
-        setOpAvailable(false);
-        setOpPickerProvider(null);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
-  useEffect(() => {
     if (!providersExpandedProvider) {
       return;
     }
@@ -1155,12 +1392,27 @@ export function ProvidersSection() {
     setProvidersExpandedProvider(null);
   }, [providersExpandedProvider, setProvidersExpandedProvider]);
 
+  // One-shot hint from the "Settings: Login with Coder" command: start the
+  // OAuth login as soon as the providers config has loaded (startCoderLogin
+  // reads the configured deployment URL from it — invoking earlier would
+  // always fail with "Set the deployment URL first."). startCoderLogin handles
+  // the error cases (missing URL, no API) with inline feedback in the expanded
+  // Coder section.
+  useEffect(() => {
+    if (!providersStartCoderLogin || configLoading) {
+      return;
+    }
+
+    setProvidersStartCoderLogin(false);
+    void startCoderLogin();
+  }, [providersStartCoderLogin, setProvidersStartCoderLogin, configLoading, startCoderLogin]);
+
   useEffect(() => {
     if (expandedProvider !== "mux-gateway" || !muxGatewayIsLoggedIn) {
       return;
     }
 
-    // Fetch lazily when the user expands the Mux Gateway provider.
+    // Fetch lazily when the user expands the Xum Gateway provider.
     //
     // Important: avoid auto-retrying after a failure. If the request fails,
     // `muxGatewayAccountStatus` remains null and we'd otherwise trigger a refresh
@@ -1197,11 +1449,9 @@ export function ProvidersSection() {
       return next;
     });
     setEditingField(null);
-    setOpPickerProvider(null);
   };
 
   const handleStartEdit = (provider: string, field: string, fieldConfig: FieldConfig) => {
-    setOpPickerProvider(null);
     setEditingField({ provider, field });
     // For secrets, start empty since we only show masked value
     // For text fields, show current value
@@ -1224,9 +1474,6 @@ export function ProvidersSection() {
     if (field === "apiKey") {
       updateOptimistically(provider, {
         apiKeySet: editValue !== "",
-        apiKeyIsOpRef: false,
-        apiKeyOpRef: undefined,
-        apiKeyOpLabel: undefined,
         apiKeySource: editValue !== "" ? "config" : undefined,
       });
     } else if (field === "displayName") {
@@ -1240,6 +1487,11 @@ export function ProvidersSection() {
       });
     } else if (field === "apiKeyFile") {
       updateOptimistically(provider, { apiKeyFile: editValue || undefined });
+    } else if (field === "deploymentUrl") {
+      // The Coder login handler reads config.coder.deploymentUrl; without this
+      // optimistic update, clicking Login right after saving would use the
+      // previous URL until the async provider refresh lands.
+      updateOptimistically(provider, { deploymentUrl: editValue || undefined });
     }
 
     setEditingField(null);
@@ -1248,10 +1500,59 @@ export function ProvidersSection() {
 
     // Save in background
     void api.providers.setProviderConfig({ provider, keyPath: [field], value: editValue });
-    if (field === "apiKey") {
-      void api.providers.setProviderConfig({ provider, keyPath: ["apiKeyOpLabel"], value: "" });
-    }
   }, [api, editingField, editValue, updateOptimistically]);
+
+  // Per-provider write sequencing: rapid selections queue in click order and
+  // only the NEWEST write's failure reconciles shared state, so a stale
+  // completion cannot roll back or resurrect an older selection. Sequence
+  // numbers are globally monotonic so a queued write can never match a
+  // same-named provider re-added after removal.
+  const providerTypeWritesRef = useRef(new Map<string, { seq: number; chain: Promise<void> }>());
+  const providerTypeWriteSeqRef = useRef(0);
+
+  // Plain function: React Compiler handles memoization.
+  const handleCustomProviderTypeChange = (
+    provider: string,
+    next: CustomProviderType,
+    previous: CustomProviderType | undefined
+  ) => {
+    if (!api) return;
+
+    const writes = providerTypeWritesRef.current;
+    const entry = writes.get(provider) ?? { seq: 0, chain: Promise.resolve() };
+    const seq = ++providerTypeWriteSeqRef.current;
+    const chain = entry.chain.then(async () => {
+      if (writes.get(provider)?.seq !== seq) {
+        // Superseded by a newer selection, or the provider was removed while
+        // this write was queued; issuing it would resurrect the removed
+        // entry (setConfig creates absent provider sections).
+        return;
+      }
+      try {
+        const result = await api.providers.setProviderConfig({
+          provider,
+          keyPath: ["providerType"],
+          value: next,
+        });
+        if (!result.success) {
+          throw new Error(result.error);
+        }
+      } catch {
+        if (writes.get(provider)?.seq !== seq) {
+          return; // Stale: a newer selection owns the shared state.
+        }
+        // The format decides the request wire protocol, so an optimistic
+        // value that failed to persist (policy denial, lock/write failure)
+        // must not keep advertising an adapter the backend never adopted.
+        // Restore the previous value first: refresh() is best-effort and
+        // keeps the optimistic state when the refetch itself fails.
+        updateOptimistically(provider, { providerType: previous });
+        void refresh();
+      }
+    });
+    writes.set(provider, { seq, chain });
+    updateOptimistically(provider, { providerType: next });
+  };
 
   const handleClearField = useCallback(
     (provider: string, field: string) => {
@@ -1261,8 +1562,6 @@ export function ProvidersSection() {
       if (field === "apiKey") {
         updateOptimistically(provider, {
           apiKeySet: false,
-          apiKeyIsOpRef: false,
-          apiKeyOpRef: undefined,
           apiKeySource: undefined,
         });
       } else if (field === "baseUrl") {
@@ -1273,6 +1572,10 @@ export function ProvidersSection() {
         });
       } else if (field === "apiKeyFile") {
         updateOptimistically(provider, { apiKeyFile: undefined });
+      } else if (field === "deploymentUrl") {
+        // Keep the login handler's view (config.coder.deploymentUrl) in sync;
+        // see handleSaveEdit.
+        updateOptimistically(provider, { deploymentUrl: undefined });
       }
 
       // Save in background
@@ -1379,13 +1682,12 @@ export function ProvidersSection() {
   const customProviderDisplayNameError =
     trimmedCustomProviderDisplayName.length === 0 ? "Display name is required." : null;
   const trimmedCustomProviderBaseUrl = customProviderBaseUrl.trim();
-  const customProviderBaseUrlError =
-    trimmedCustomProviderBaseUrl.length === 0
-      ? "Base URL is required."
-      : trimmedCustomProviderBaseUrl.startsWith("http://") ||
-          trimmedCustomProviderBaseUrl.startsWith("https://")
-        ? null
-        : "Base URL must start with http:// or https://.";
+  const customProviderBaseUrlValidation = validateCustomProviderBaseUrl(
+    trimmedCustomProviderBaseUrl
+  );
+  const customProviderBaseUrlError = customProviderBaseUrlValidation.ok
+    ? null
+    : customProviderBaseUrlValidation.reason;
   const showCustomProviderIdError =
     !customProviderIdValidation.ok &&
     (customProviderTouchedFields.providerId || customProviderSubmitAttempted);
@@ -1398,6 +1700,7 @@ export function ProvidersSection() {
 
   const clearCustomProviderForm = useCallback(() => {
     setCustomProviderId("");
+    setCustomProviderType("openai-compatible");
     setCustomProviderDisplayName("");
     setCustomProviderBaseUrl("");
     setCustomProviderApiKey("");
@@ -1424,7 +1727,7 @@ export function ProvidersSection() {
     setCustomProviderSubmitAttempted(true);
 
     if (!api) {
-      setCustomProviderSubmitError("Mux API not connected.");
+      setCustomProviderSubmitError("Xum API not connected.");
       return;
     }
 
@@ -1438,18 +1741,16 @@ export function ProvidersSection() {
     if (
       !providerIdValidation.ok ||
       displayName.length === 0 ||
-      baseUrl.length === 0 ||
-      (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://"))
+      !validateCustomProviderBaseUrl(baseUrl).ok
     ) {
       setCustomProviderSubmitError(null);
       return;
     }
 
-    const models: AddCustomOpenAICompatibleProviderInput["models"] = initialModelId
-      ? [initialModelId]
-      : undefined;
-    const input: AddCustomOpenAICompatibleProviderInput = {
+    const models: AddCustomProviderInput["models"] = initialModelId ? [initialModelId] : undefined;
+    const input: AddCustomProviderInput = {
       provider,
+      providerType: customProviderType,
       displayName,
       baseUrl,
       apiKey: apiKey || undefined,
@@ -1461,7 +1762,7 @@ export function ProvidersSection() {
     setCustomProviderSubmitError(null);
     setCustomProviderNotice(null);
     try {
-      const result = await api.providers.addCustomOpenAICompatibleProvider(input);
+      const result = await api.providers.addCustomProvider(input);
       if (!result.success) {
         setCustomProviderSubmitError(result.error.message);
         return;
@@ -1492,6 +1793,7 @@ export function ProvidersSection() {
     customProviderApiKey,
     customProviderApiKeyFile,
     customProviderBaseUrl,
+    customProviderType,
     customProviderDisplayName,
     customProviderId,
     customProviderInitialModelId,
@@ -1513,7 +1815,7 @@ export function ProvidersSection() {
       if (!api) {
         setCustomProviderRemoveErrors((prev) => ({
           ...prev,
-          [provider]: "Mux API not connected.",
+          [provider]: "Xum API not connected.",
         }));
         return;
       }
@@ -1524,6 +1826,10 @@ export function ProvidersSection() {
       if (!confirmed) {
         return;
       }
+
+      // Invalidate queued format writes: a write draining after removal
+      // would recreate the entry (setConfig creates absent sections).
+      providerTypeWritesRef.current.delete(provider);
 
       const workspaceIds = new Set(workspaceMetadata.keys());
       if (selectedWorkspace) {
@@ -1540,6 +1846,10 @@ export function ProvidersSection() {
             ...prev,
             [provider]: result.error.message,
           }));
+          // The provider survives, but its queued format writes were already
+          // invalidated above; refetch backend truth so an unpersisted
+          // optimistic format cannot linger.
+          void refresh();
           return;
         }
         if (!result.success && result.error.code === "config_repair_failed") {
@@ -1566,12 +1876,13 @@ export function ProvidersSection() {
         setExpandedProvider((prev) => (prev === provider ? null : prev));
         setProvidersExpandedProvider(null);
         setEditingField((prev) => (prev?.provider === provider ? null : prev));
-        setOpPickerProvider((prev) => (prev === provider ? null : prev));
       } catch {
         setCustomProviderRemoveErrors((prev) => ({
           ...prev,
           [provider]: "Failed to remove custom provider.",
         }));
+        // Same reconciliation as the structured-failure path above.
+        void refresh();
       } finally {
         setCustomProviderRemoving((prev) => (prev === provider ? null : prev));
       }
@@ -1591,7 +1902,7 @@ export function ProvidersSection() {
     <div className="space-y-2">
       <p className="text-muted mb-4 text-xs">
         Configure API keys and endpoints for AI providers. Keys are stored in{" "}
-        <code className="text-accent">~/.mux/providers.jsonc</code>
+        <code className="text-accent">~/.xum/providers.jsonc</code>
       </p>
 
       {policyState.status.state === "enforced" && (
@@ -1646,7 +1957,7 @@ export function ProvidersSection() {
               const apiKeySource = providerInfo?.apiKeySource;
               const gatewayRouteTargets =
                 providerDefinition?.kind === "gateway" ? (providerDefinition.routes ?? []) : [];
-              const isCustomOpenAICompatible = isCustomOpenAICompatibleProviderInfo(providerInfo);
+              const isCustom = isCustomProviderInfo(providerInfo);
               const statusDotColor = !enabled
                 ? "bg-warning"
                 : configured
@@ -1696,9 +2007,9 @@ export function ProvidersSection() {
                   {/* Provider settings */}
                   {isExpanded && (
                     <div className="border-border-medium space-y-3 border-t px-4 py-3">
-                      {isBuiltInProvider(provider) && isCustomOpenAICompatible && (
+                      {isBuiltInProvider(provider) && isCustom && (
                         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">
-                          This custom provider id now matches a built-in provider. Mux will keep
+                          This custom provider id now matches a built-in provider. Xum will keep
                           using your custom configuration.
                         </div>
                       )}
@@ -1788,14 +2099,14 @@ export function ProvidersSection() {
                               {muxGatewayLoginStatus === "waiting" && muxGatewayAuthorizeUrl && (
                                 <Button
                                   size="sm"
-                                  aria-label="Copy and open Mux Gateway authorization page"
+                                  aria-label="Copy and open Xum Gateway authorization page"
                                   onClick={() => {
                                     void navigator.clipboard.writeText(muxGatewayAuthorizeUrl);
                                     window.open(muxGatewayAuthorizeUrl, "_blank", "noopener");
                                   }}
                                   className="h-8 px-3 text-xs"
                                 >
-                                  Copy & Open Mux Gateway
+                                  Copy & Open Xum Gateway
                                 </Button>
                               )}
 
@@ -1844,7 +2155,7 @@ export function ProvidersSection() {
                                 Account
                               </label>
                               <span className="text-muted text-xs">
-                                Balance and limits from Mux Gateway
+                                Balance and limits from Xum Gateway
                               </span>
                             </div>
                             <Button
@@ -1969,6 +2280,15 @@ export function ProvidersSection() {
                         const fieldValue = getFieldValue(provider, fieldConfig.key);
                         const fieldDisplayValue = getFieldDisplayValue(provider, fieldConfig.key);
                         const fieldIsSet = isFieldSet(provider, fieldConfig.key, fieldConfig);
+                        const showOpenAIBaseUrlHint =
+                          fieldConfig.key === "baseUrl" &&
+                          provider === "openai" &&
+                          !isCustom &&
+                          // The hint's advice is already applied once Chat
+                          // Completions is selected.
+                          config?.openai?.wireFormat !== "chatCompletions" &&
+                          ((fieldDisplayValue?.trim().length ?? 0) > 0 ||
+                            (isEditing && editValue.trim().length > 0));
 
                         return (
                           <div key={fieldConfig.key}>
@@ -2032,42 +2352,13 @@ export function ProvidersSection() {
                               <>
                                 <div className="flex items-center justify-between">
                                   <span className="text-foreground flex items-center gap-1 font-mono text-xs">
-                                    {fieldConfig.type === "secret" ? (
-                                      fieldIsSet ? (
-                                        fieldConfig.key === "apiKey" &&
-                                        config?.[provider]?.apiKeyIsOpRef ? (
-                                          config?.[provider]?.apiKeyOpRef ? (
-                                            <span className="text-muted inline-flex max-w-[260px] min-w-0 items-center gap-1">
-                                              <KeyRound className="h-3 w-3 shrink-0" />
-                                              <Tooltip>
-                                                <TooltipTrigger asChild>
-                                                  <span className="truncate">
-                                                    {config?.[provider]?.apiKeyOpLabel ??
-                                                      config?.[provider]?.apiKeyOpRef}
-                                                  </span>
-                                                </TooltipTrigger>
-                                                <TooltipContent side="top">
-                                                  {config?.[provider]?.apiKeyOpRef}
-                                                </TooltipContent>
-                                              </Tooltip>
-                                            </span>
-                                          ) : (
-                                            <>
-                                              <KeyRound className="h-3 w-3" />
-                                              Linked to 1Password
-                                            </>
-                                          )
-                                        ) : (
-                                          "••••••••"
-                                        )
-                                      ) : config?.[provider]?.apiKeySource === "keyless" ? (
-                                        "No API key required"
-                                      ) : (
-                                        "Not set"
-                                      )
-                                    ) : (
-                                      (fieldDisplayValue ?? "Default")
-                                    )}
+                                    {fieldConfig.type === "secret"
+                                      ? fieldIsSet
+                                        ? "••••••••"
+                                        : config?.[provider]?.apiKeySource === "keyless"
+                                          ? "No API key required"
+                                          : "Not set"
+                                      : (fieldDisplayValue ?? "Default")}
                                   </span>
                                   <div className="flex gap-2">
                                     {(fieldConfig.type === "text"
@@ -2092,17 +2383,6 @@ export function ProvidersSection() {
                                     >
                                       {fieldIsSet || fieldValue ? "Change" : "Set"}
                                     </Button>
-                                    {opAvailable && fieldConfig.key === "apiKey" && (
-                                      <Button
-                                        variant="ghost"
-                                        size="sm"
-                                        onClick={() => setOpPickerProvider(provider)}
-                                        className="text-muted hover:text-foreground h-auto px-1 py-0 text-xs"
-                                        title="Link to 1Password"
-                                      >
-                                        <KeyRound className="h-3.5 w-3.5" />
-                                      </Button>
-                                    )}
                                   </div>
                                 </div>
                                 {fieldConfig.key === "baseUrl" &&
@@ -2110,40 +2390,149 @@ export function ProvidersSection() {
                                   config?.[provider]?.baseUrlResolved && (
                                     <div className="text-muted mt-1 text-xs">Set by env vars.</div>
                                   )}
-                                {opPickerProvider === provider && fieldConfig.key === "apiKey" && (
-                                  <OnePasswordPicker
-                                    onSelect={(opRef, opLabel) => {
-                                      setOpPickerProvider(null);
-                                      updateOptimistically(provider, {
-                                        apiKeySet: true,
-                                        apiKeyIsOpRef: true,
-                                        apiKeyOpRef: opRef,
-                                        apiKeyOpLabel: opLabel,
-                                      });
-
-                                      if (!api) {
-                                        return;
-                                      }
-
-                                      void api.providers.setProviderConfig({
-                                        provider,
-                                        keyPath: ["apiKey"],
-                                        value: opRef,
-                                      });
-                                      void api.providers.setProviderConfig({
-                                        provider,
-                                        keyPath: ["apiKeyOpLabel"],
-                                        value: opLabel,
-                                      });
-                                    }}
-                                    onCancel={() => setOpPickerProvider(null)}
-                                  />
-                                )}
                               </>
+                            )}
+                            {showOpenAIBaseUrlHint && (
+                              <p className="text-muted mt-1 text-xs">
+                                The OpenAI provider uses the Responses API by default. For
+                                llama.cpp, vLLM, and LM Studio endpoints, set Wire format to Chat
+                                completions below or use Add provider to create a custom
+                                OpenAI-compatible provider.
+                              </p>
                             )}
                           </div>
                         );
                       })}
+
+                      {/* Coder: OAuth login against the configured deployment.
+                          Hidden when a custom provider named
+                          "coder" shadows the built-in — that entry keeps its
+                          custom config and has no OAuth flow. */}
+                      {provider === "coder" && !isCustom && (
+                        <div className="space-y-2">
+                          <div>
+                            <label className="text-foreground block text-xs font-medium">
+                              Authentication
+                            </label>
+                            <span className="text-muted text-xs">
+                              {coderLoginStatus === "starting"
+                                ? "Starting..."
+                                : coderLoginStatus === "waiting"
+                                  ? "Waiting for login..."
+                                  : coderOauthIsConnected
+                                    ? "Connected"
+                                    : "Not connected"}
+                            </span>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Button
+                                size="sm"
+                                onClick={() => {
+                                  void startCoderLogin();
+                                }}
+                                disabled={!api || coderLoginInProgress}
+                              >
+                                {coderLoginStatus === "error"
+                                  ? "Try again"
+                                  : coderOauthIsConnected
+                                    ? "Re-login with Coder"
+                                    : "Login with Coder"}
+                              </Button>
+
+                              {coderLoginStatus === "waiting" && coderAuthorizeUrl && (
+                                <Button
+                                  size="sm"
+                                  aria-label="Copy and open Coder authorization page"
+                                  onClick={() => {
+                                    // Open first: navigator.clipboard is undefined outside
+                                    // secure contexts (plain-HTTP remote origins), and a throw
+                                    // there must not swallow the navigation.
+                                    window.open(coderAuthorizeUrl, "_blank", "noopener");
+                                    void navigator.clipboard?.writeText(coderAuthorizeUrl);
+                                  }}
+                                  className="h-8 px-3 text-xs"
+                                >
+                                  Copy & Open Coder
+                                </Button>
+                              )}
+
+                              {coderLoginInProgress && (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => {
+                                    void cancelCoderLogin();
+                                  }}
+                                >
+                                  Cancel
+                                </Button>
+                              )}
+
+                              {coderOauthIsConnected && (
+                                <Button
+                                  variant="secondary"
+                                  size="sm"
+                                  onClick={() => {
+                                    // Not fire-and-forget: failures stay observable by
+                                    // settling into coderModelRefreshState. The body
+                                    // handles its own errors; this catch surfaces any
+                                    // unexpected rejection in the same error state.
+                                    refreshCoderModels().catch((err: unknown) => {
+                                      setCoderModelRefreshState({
+                                        kind: "error",
+                                        message: getErrorMessage(err),
+                                      });
+                                    });
+                                  }}
+                                  disabled={
+                                    !api ||
+                                    coderLoginInProgress ||
+                                    coderModelRefreshState.kind === "refreshing"
+                                  }
+                                >
+                                  {coderModelRefreshState.kind === "refreshing"
+                                    ? "Refreshing..."
+                                    : "Refresh models"}
+                                </Button>
+                              )}
+
+                              {coderOauthCredentialStored && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => {
+                                    void disconnectCoderOauth();
+                                  }}
+                                  disabled={!api || coderLoginInProgress}
+                                >
+                                  Disconnect
+                                </Button>
+                              )}
+                            </div>
+
+                            {coderLoginStatus === "waiting" && (
+                              <p className="text-muted inline-flex items-center gap-2 text-xs">
+                                <Loader2 aria-hidden className="h-3.5 w-3.5 animate-spin" />
+                                Waiting for authorization...
+                              </p>
+                            )}
+
+                            {coderLoginStatus === "error" && coderLoginError && (
+                              <p className="text-destructive text-xs">
+                                Login failed: {coderLoginError}
+                              </p>
+                            )}
+
+                            {coderModelRefreshState.kind === "error" && (
+                              <p className="text-destructive text-xs">
+                                Model refresh failed: {coderModelRefreshState.message}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
 
                       {/* Anthropic: prompt cache TTL */}
                       {provider === "anthropic" && (
@@ -2429,8 +2818,9 @@ export function ProvidersSection() {
                                 </ToggleGroup>
 
                                 <p className="text-muted text-xs">
-                                  ChatGPT OAuth uses subscription billing (costs included). API key
-                                  uses OpenAI platform billing.
+                                  ChatGPT OAuth costs use API-equivalent estimates. Your plan may
+                                  include usage or charge credits. API keys use OpenAI platform
+                                  billing.
                                 </p>
 
                                 {!codexOauthDefaultAuthIsEditable && (
@@ -2748,9 +3138,37 @@ export function ProvidersSection() {
                         </div>
                       )}
 
-                      {isCustomOpenAICompatible && (
-                        <div className="border-border-light space-y-2 border-t pt-3">
+                      {isCustom && (
+                        <div className="border-border-light space-y-3 border-t pt-3">
                           <div className="flex items-center justify-between gap-3">
+                            <label className="text-foreground block text-xs font-medium">
+                              API format
+                            </label>
+                            <Select
+                              value={providerInfo.providerType}
+                              onValueChange={(next) => {
+                                if (isCustomProviderType(next)) {
+                                  handleCustomProviderTypeChange(
+                                    provider,
+                                    next,
+                                    providerInfo.providerType
+                                  );
+                                }
+                              }}
+                            >
+                              <SelectTrigger className="w-56 max-w-full" aria-label="API format">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {CUSTOM_PROVIDER_TYPES.map((providerType) => (
+                                  <SelectItem key={providerType} value={providerType}>
+                                    {CUSTOM_PROVIDER_TYPE_LABELS[providerType]}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="border-border-light flex items-center justify-between gap-3 border-t pt-3">
                             <div>
                               <label className="text-foreground block text-xs font-medium">
                                 Remove custom provider
@@ -2786,11 +3204,10 @@ export function ProvidersSection() {
               <div className="border-border-medium bg-background-secondary/50 space-y-3 rounded-md border px-3 py-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-foreground text-xs font-medium">
-                      OpenAI-compatible providers
-                    </div>
+                    <div className="text-foreground text-xs font-medium">Add a custom provider</div>
                     <div className="text-muted text-xs">
-                      Add providers that expose an OpenAI-compatible API.
+                      Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
+                      Messages.
                     </div>
                   </div>
                   <Button
@@ -2860,6 +3277,29 @@ export function ProvidersSection() {
                           {customProviderDisplayNameError}
                         </span>
                       )}
+                    </label>
+
+                    <label className="block space-y-1">
+                      <span className="text-muted text-xs">API format</span>
+                      <Select
+                        value={customProviderType}
+                        onValueChange={(next) => {
+                          if (isCustomProviderType(next)) {
+                            setCustomProviderType(next);
+                          }
+                        }}
+                      >
+                        <SelectTrigger className="w-full" aria-label="API format">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {CUSTOM_PROVIDER_TYPES.map((providerType) => (
+                            <SelectItem key={providerType} value={providerType}>
+                              {CUSTOM_PROVIDER_TYPE_LABELS[providerType]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </label>
 
                     <label className="block space-y-1">

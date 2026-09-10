@@ -10,7 +10,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
-import { getMuxHome, getMuxProjectsDir } from "../../../src/common/constants/paths";
+import { getXumHome, getXumProjectsDir } from "../../../src/common/constants/paths";
 import * as os from "os";
 import { shouldRunIntegrationTests, createTestEnvironment, cleanupTestEnvironment } from "../setup";
 import { resolveOrpcClient } from "../helpers";
@@ -21,7 +21,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
   test.concurrent("should resolve bare project name to mux projects dir", async () => {
     const env = await createTestEnvironment();
     const bareName = `mux-test-bare-${Date.now()}`;
-    const expectedPath = path.join(getMuxProjectsDir(), bareName);
+    const expectedPath = path.join(getXumProjectsDir(), bareName);
     const client = resolveOrpcClient(env);
 
     try {
@@ -45,7 +45,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
     const env = await createTestEnvironment();
     const tildeSubpath = `mux-test-tilde-${Date.now()}`;
     const tildeProjectPath = `~/.mux/test-projects/${tildeSubpath}`;
-    const expectedPath = path.join(getMuxHome(), "test-projects", tildeSubpath);
+    const expectedPath = path.join(getXumHome(), "test-projects", tildeSubpath);
     const client = resolveOrpcClient(env);
 
     try {
@@ -69,7 +69,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
     const env = await createTestEnvironment();
     const tildeSubpath = `mux-test-tilde-win-${Date.now()}`;
     const tildeProjectPath = `~\\.mux\\test-projects\\${tildeSubpath}`;
-    const expectedPath = path.join(getMuxHome(), "test-projects", tildeSubpath);
+    const expectedPath = path.join(getXumHome(), "test-projects", tildeSubpath);
     const client = resolveOrpcClient(env);
 
     try {
@@ -92,7 +92,7 @@ describeIntegration("PROJECT_CREATE IPC Handler", () => {
   test.concurrent("should reject duplicate bare project name", async () => {
     const env = await createTestEnvironment();
     const bareName = `mux-test-dup-${Date.now()}`;
-    const expectedPath = path.join(getMuxProjectsDir(), bareName);
+    const expectedPath = path.join(getXumProjectsDir(), bareName);
     const client = resolveOrpcClient(env);
 
     try {

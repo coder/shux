@@ -32,6 +32,7 @@ describe("IdleCompactionService", () => {
   let historyService: HistoryService;
   let mockExtensionMetadata: ExtensionMetadataService;
   let executeIdleCompactionMock: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
+  let loadConfigMock: ReturnType<typeof mock<() => ProjectsConfig>>;
   let service: IdleCompactionService;
   let cleanup: () => Promise<void>;
 
@@ -43,8 +44,8 @@ describe("IdleCompactionService", () => {
 
   beforeEach(async () => {
     // Create mock config
-    mockConfig = {
-      loadConfigOrDefault: mock(() => ({
+    loadConfigMock = mock(
+      (): ProjectsConfig => ({
         projects: new Map<string, ProjectConfig>([
           [
             testProjectPath,
@@ -54,8 +55,9 @@ describe("IdleCompactionService", () => {
             },
           ],
         ]),
-      })),
-    } as unknown as Config;
+      })
+    );
+    mockConfig = { loadConfigOrDefault: loadConfigMock } as unknown as Config;
 
     // Create real history service and seed default idle messages (25 hours ago)
     ({ historyService, cleanup } = await createTestHistoryService());
@@ -96,6 +98,22 @@ describe("IdleCompactionService", () => {
   afterEach(async () => {
     service.stop();
     await cleanup();
+  });
+
+  describe("start/stop on the default runner", () => {
+    // Default-runner smoke (cadence itself is covered on virtual time in
+    // idleCompactionService.testClock.test.ts): with no runner injected the
+    // checker sleeps on Effect's default clock, so nothing may run this early
+    // in INITIAL_CHECK_DELAY_MS, and stop() must close the scope synchronously.
+    test("start() arms the checker on the real clock without an early sweep", async () => {
+      service.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(loadConfigMock).not.toHaveBeenCalled();
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+      service.stop();
+    });
   });
 
   describe("checkEligibility", () => {

@@ -19,6 +19,13 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("runtime_not_ready"), message: z.string() }),
   z.object({ type: z.literal("runtime_start_failed"), message: z.string() }), // Transient - retryable
   z.object({ type: z.literal("policy_denied"), message: z.string() }),
+  z.object({
+    type: z.literal("context_budget_exceeded"),
+    model: z.string(),
+    estimate: z.number().finite().nonnegative(),
+    hardCeiling: z.number().finite(),
+  }),
+  z.object({ type: z.literal("context_budget_blocked"), message: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 
@@ -35,6 +42,7 @@ export const StreamErrorTypeSchema = z.enum([
   "aborted", // User aborted
   "network", // Network/fetch errors
   "context_exceeded", // Context length/token limit exceeded
+  "context_budget_blocked", // Local assembled-request preflight refused an oversized request
   "quota", // Usage quota/billing limits
   "model_not_found", // Model does not exist
   "runtime_not_ready", // Container/runtime doesn't exist or failed to start (permanent)
@@ -43,6 +51,7 @@ export const StreamErrorTypeSchema = z.enum([
   "stream_truncated", // Provider stream closed before its terminal finish event
   "max_output_tokens", // Provider truncated the response at max_tokens (finishReason: "length")
   "model_refusal", // Provider declined to answer (refusal/content-filter); retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure (agent missing/hidden/disabled/provenance changed); deterministic, retrying reproduces it
   "unknown", // Catch-all
 ]);
 

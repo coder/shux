@@ -1,17 +1,18 @@
 {
-  "name": "mux",
-  "version": "0.28.1",
-  "desktopName": "mux.desktop",
-  "description": "mux - coder multiplexer",
+  "name": "@coder/xum",
+  "version": "0.28.5",
+  "desktopName": "xum.desktop",
+  "description": "xum - coding agent multiplexer",
   "author": "Coder",
   "main": "dist/cli/index.js",
   "bin": {
+    "xum": "dist/cli/index.js",
     "mux": "dist/cli/index.js"
   },
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/coder/mux.git"
+    "url": "git+https://github.com/coder/xum.git"
   },
   "publishConfig": {
     "access": "public"
@@ -47,21 +48,21 @@
     "postinstall": "sh scripts/postinstall.sh"
   },
   "dependencies": {
-    "@1password/sdk": "^0.4.0",
     "@agentclientprotocol/sdk": "^0.25.0",
     "@ai-sdk/amazon-bedrock": "^5.0.15",
     "@ai-sdk/anthropic": "^4.0.11",
     "@ai-sdk/deepseek": "^3.0.7",
     "@ai-sdk/google": "^4.0.11",
     "@ai-sdk/moonshotai": "^3.0.15",
-    "@ai-sdk/openai": "^4.0.11",
+    "@ai-sdk/openai": "^4.0.43",
     "@ai-sdk/openai-compatible": "^3.0.7",
-    "@ai-sdk/xai": "^4.0.28",
+    "@ai-sdk/xai": "^4.0.37",
+    "@ai-sdk/zai": "^3.0.2",
     "@aws-sdk/credential-providers": "^3.940.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
-    "@duckdb/node-api": "^1.4.4-r.1",
+    "@duckdb/node-api": "^1.5.5-r.4",
     "@homebridge/ciao": "^1.3.4",
     "@jitl/quickjs-wasmfile-release-asyncify": "^0.31.0",
     "@lydell/node-pty": "1.1.0",
@@ -69,10 +70,11 @@
     "@mozilla/readability": "^0.6.0",
     "@novnc/novnc": "^1.6.0",
     "@openrouter/ai-sdk-provider": "^3.0.0",
-    "@orpc/client": "^1.11.3",
-    "@orpc/openapi": "^1.12.2",
-    "@orpc/server": "^1.11.3",
-    "@orpc/zod": "^1.11.3",
+    "@orpc/client": "1.14.11",
+    "@orpc/experimental-effect": "1.14.11",
+    "@orpc/openapi": "1.14.11",
+    "@orpc/server": "1.14.11",
+    "@orpc/zod": "1.14.11",
     "@radix-ui/react-checkbox": "^1.3.3",
     "@radix-ui/react-context-menu": "^2.2.16",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -101,13 +103,14 @@
     "crc-32": "^1.2.2",
     "diff": "^8.0.2",
     "disposablestack": "^1.1.7",
+    "effect": "4.0.0-rc.112",
     "electron-updater": "^6.6.2",
     "electron-window-state": "^5.0.3",
     "express": "^5.1.0",
     "fix-path": "5.0.0",
     "ghostty-web": "^0.4.0-next.7.g03ead6e",
+    "happy-dom": "^20.0.10",
     "ignore": "^7.0.5",
-    "jsdom": "^27.2.0",
     "json-schema-to-typescript": "^15.0.4",
     "jsonc-parser": "^3.3.1",
     "lottie-react": "^2.4.1",
@@ -172,7 +175,6 @@
     "@types/escape-html": "^1.0.4",
     "@types/express": "^5.0.3",
     "@types/jest": "^30.0.0",
-    "@types/jsdom": "^27.0.0",
     "@types/katex": "^0.16.7",
     "@types/markdown-it": "^14.1.2",
     "@types/minimist": "^1.2.5",
@@ -207,7 +209,6 @@
     "eslint-plugin-storybook": "10.0.0",
     "eslint-plugin-tailwindcss": "4.0.0-beta.0",
     "geist": "^1.5.1",
-    "happy-dom": "^20.0.10",
     "jest": "^30.1.3",
     "mermaid": "^11.12.0",
     "nodemon": "^3.1.10",
@@ -260,11 +261,13 @@
   ],
   "build": {
     "appId": "com.mux.app",
-    "productName": "mux",
+    "productName": "Xum",
+    "executableName": "xum",
     "protocols": [
       {
-        "name": "Mux",
+        "name": "Xum",
         "schemes": [
+          "xum",
           "mux"
         ]
       }
@@ -294,7 +297,7 @@
         "zip"
       ],
       "icon": "build/icon.icns",
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
@@ -305,12 +308,15 @@
       "target": "AppImage",
       "category": "Development",
       "icon": "build/icons",
-      "artifactName": "${productName}-${version}-${arch}.${ext}"
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
+      "desktop": {
+        "StartupWMClass": "xum"
+      }
     },
     "win": {
       "target": "nsis",
       "icon": "build/icon.png",
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
       "sign": "scripts/sign-windows.js",
       "signingHashAlgorithms": [
         "sha256"
@@ -334,6 +340,7 @@
     "unrs-resolver"
   ],
   "patchedDependencies": {
-    "@ai-sdk/xai@4.0.28": "patches/@ai-sdk%2Fxai@4.0.28.patch"
+    "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
+    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch"
   }
 }

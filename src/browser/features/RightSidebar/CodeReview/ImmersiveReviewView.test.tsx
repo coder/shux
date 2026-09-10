@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { useEffect, useState, type ComponentProps } from "react";
 
@@ -15,12 +15,14 @@ interface MockApiClient {
         success: boolean;
         output: string;
         exitCode: number;
+        truncated?: { reason: string; totalLines: number };
       };
     }>;
   };
 }
 
 let mockApi: MockApiClient;
+let clipboardWrites: string[] = [];
 
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({
@@ -30,6 +32,13 @@ void mock.module("@/browser/contexts/API", () => ({
     authenticate: () => undefined,
     retry: () => undefined,
   }),
+}));
+
+void mock.module("@/browser/utils/clipboard", () => ({
+  copyToClipboard: (text: string) => {
+    clipboardWrites.push(text);
+    return Promise.resolve();
+  },
 }));
 
 import { ImmersiveReviewView, shouldPreserveImmersiveContextCursor } from "./ImmersiveReviewView";
@@ -120,6 +129,7 @@ describe("ImmersiveReviewView", () => {
   let originalNavigator: typeof globalThis.navigator;
   let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame;
   let originalCancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
+  let originalHTMLElement: typeof globalThis.HTMLElement;
 
   beforeEach(() => {
     originalWindow = globalThis.window;
@@ -127,11 +137,15 @@ describe("ImmersiveReviewView", () => {
     originalNavigator = globalThis.navigator;
     originalRequestAnimationFrame = globalThis.requestAnimationFrame;
     originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+    originalHTMLElement = globalThis.HTMLElement;
 
     const dom = new GlobalWindow({ url: "http://localhost" });
     globalThis.window = dom as unknown as Window & typeof globalThis;
     globalThis.document = dom.document as unknown as Document;
     globalThis.navigator = dom.navigator as unknown as Navigator;
+    // Keyboard handlers guard with `target instanceof HTMLElement`; expose the active
+    // dom's constructor so the guard sees this window's elements instead of throwing.
+    globalThis.HTMLElement = dom.HTMLElement as unknown as typeof globalThis.HTMLElement;
     globalThis.requestAnimationFrame = dom.requestAnimationFrame.bind(
       dom
     ) as unknown as typeof globalThis.requestAnimationFrame;
@@ -141,6 +155,7 @@ describe("ImmersiveReviewView", () => {
 
     globalThis.window.api = { platform: "linux", versions: {} };
 
+    clipboardWrites = [];
     mockApi = {
       workspace: {
         executeBash: mock(() =>
@@ -165,6 +180,7 @@ describe("ImmersiveReviewView", () => {
     globalThis.navigator = originalNavigator;
     globalThis.requestAnimationFrame = originalRequestAnimationFrame;
     globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+    globalThis.HTMLElement = originalHTMLElement;
   });
 
   test("only preserves context cursors while overlay content is unchanged", () => {
@@ -244,6 +260,24 @@ describe("ImmersiveReviewView", () => {
     const badge = on.getByTestId("immersive-assisted-mode-badge");
     expect(badge.textContent ?? "").toContain("Assisted");
     expect(badge.textContent ?? "").toContain("2/3");
+  });
+
+  test("guest Escape and Tab cannot exit or change host immersive review", () => {
+    const onExit = mock(() => undefined);
+    const view = renderImmersiveReview({ isTouchImmersive: false, onExit });
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    for (const key of ["Escape", "Tab"]) {
+      const event = new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      fireEvent(canvas, event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(onExit).not.toHaveBeenCalled();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExit).toHaveBeenCalledTimes(1);
   });
 
   test("reserves the assisted banner slot while iterating through hunks in one file", () => {
@@ -963,5 +997,639 @@ describe("ImmersiveReviewView", () => {
     // the parent panel must NOT have reset the selection back to the first
     // visible hunk.
     expect(view.container.textContent ?? "").toContain(reviewedHunk.filePath);
+  });
+
+  test("copy button copies the entire on-disk file even when the display read is line-budgeted", async () => {
+    const fullContent = `first line\n${Array.from({ length: 60 }, (_, i) => `line ${i + 2}`).join("\n")}\nlast line`;
+
+    // The full-file display read carries an awk line budget; the copy read must not,
+    // so it still yields the whole file when the display falls back to compact hunks.
+    const copyReadCalls: Array<{ script: string; options?: { cwdMode?: string } }> = [];
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const input = args[0] as { script: string; options?: { cwdMode?: string } };
+      if (input.script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      copyReadCalls.push(input);
+      return Promise.resolve({
+        success: true as const,
+        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
+      });
+    });
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() => expect(clipboardWrites).toHaveLength(1));
+    expect(clipboardWrites[0]).toBe(fullContent);
+    // Single-project hunk paths are repo-root-relative, so the copy read must run
+    // from the repo root (default mode would run from a subproject cwd).
+    expect(copyReadCalls[0]?.options).toEqual({ cwdMode: "repo-root" });
+  });
+
+  test("pressing the copy-file key copies the file, but not while typing", async () => {
+    const fullContent = "first line\nmiddle\nlast line";
+    let executeBashCalls = 0;
+    mockApi.workspace.executeBash = mock(() => {
+      executeBashCalls += 1;
+      return Promise.resolve({
+        success: true as const,
+        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
+      });
+    });
+
+    const view = renderImmersiveReview({ isTouchImmersive: false });
+
+    fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y" });
+    await waitFor(() => expect(clipboardWrites).toHaveLength(1));
+    expect(clipboardWrites[0]).toBe(fullContent);
+
+    // Typing "y" in an editable element must not trigger the copy. The guard is
+    // synchronous, so the read-call count must not move.
+    const callsAfterCopy = executeBashCalls;
+    const input = document.createElement("input");
+    view.container.appendChild(input);
+    fireEvent.keyDown(input, { key: "y" });
+    expect(executeBashCalls).toBe(callsAfterCopy);
+    expect(clipboardWrites).toHaveLength(1);
+  });
+
+  test("discards a copy that completes after navigating to another file", async () => {
+    const fileAHunk = createHunk({ id: "hunk-a", filePath: "src/a.ts" });
+    const fileBHunk = createHunk({ id: "hunk-b", filePath: "src/b.ts" });
+
+    let resolveRead: ((value: unknown) => void) | undefined;
+    mockApi.workspace.executeBash = mock(
+      () =>
+        new Promise((resolve) => {
+          resolveRead = resolve as (value: unknown) => void;
+        })
+    ) as unknown as MockApiClient["workspace"]["executeBash"];
+
+    function NavigationHarness() {
+      const [selectedHunkId, setSelectedHunkId] = useState<string | null>(fileAHunk.id);
+      return (
+        <ThemeProvider forcedTheme="dark">
+          <ImmersiveReviewView
+            workspaceId="workspace-1"
+            fileTree={createFileTreeForPaths([fileAHunk.filePath, fileBHunk.filePath])}
+            hunks={[fileAHunk, fileBHunk]}
+            allHunks={[fileAHunk, fileBHunk]}
+            isRead={() => false}
+            onToggleRead={mock(() => undefined)}
+            onMarkFileAsRead={mock(() => undefined)}
+            selectedHunkId={selectedHunkId}
+            onSelectHunk={setSelectedHunkId}
+            onExit={mock(() => undefined)}
+            isTouchImmersive={true}
+            reviewsByFilePath={new Map()}
+            firstSeenMap={{}}
+          />
+        </ThemeProvider>
+      );
+    }
+
+    const view = render(<NavigationHarness />);
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+    await waitFor(() => expect(resolveRead).toBeTruthy());
+
+    // Navigate to file B while the read for file A is still in flight.
+    const nextFileButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Next file"]'
+    );
+    expect(nextFileButton).toBeTruthy();
+    fireEvent.click(nextFileButton!);
+    await waitFor(() => expect(view.container.textContent ?? "").toContain("b.ts"));
+
+    resolveRead!({
+      success: true as const,
+      data: { success: true, output: encodeFileReadOutput("file A contents"), exitCode: 0 },
+    });
+
+    // The stale completion must not reach the clipboard. The handler continuation
+    // (including any would-be clipboard write) is a bounded microtask chain after the
+    // resolved read, so drain microtasks deterministically instead of sleeping.
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+    });
+    expect(clipboardWrites).toHaveLength(0);
+  });
+
+  test("discards a copy when the file changes in place while the read is pending", async () => {
+    const hunkV1 = createHunk({ content: "-old line\n+new line" });
+
+    // Copy reads carry no awk line budget; overlay full-file reads do.
+    const pendingReads: Array<(value: unknown) => void> = [];
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const { script } = args[0] as { script: string };
+      if (script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      return new Promise((resolve) => {
+        pendingReads.push(resolve as (value: unknown) => void);
+      });
+    }) as unknown as MockApiClient["workspace"]["executeBash"];
+
+    function InPlaceEditHarness() {
+      const [hunks, setHunks] = useState([hunkV1]);
+      return (
+        <ThemeProvider forcedTheme="dark">
+          <button
+            type="button"
+            data-testid="edit-file"
+            onClick={() => setHunks([createHunk({ content: "-old line\n+edited line" })])}
+          >
+            edit
+          </button>
+          <ImmersiveReviewView
+            workspaceId="workspace-1"
+            fileTree={createFileTree(hunkV1.filePath)}
+            hunks={hunks}
+            allHunks={hunks}
+            isRead={() => false}
+            onToggleRead={mock(() => undefined)}
+            onMarkFileAsRead={mock(() => undefined)}
+            selectedHunkId={hunkV1.id}
+            onSelectHunk={mock(() => undefined)}
+            onExit={mock(() => undefined)}
+            isTouchImmersive={true}
+            reviewsByFilePath={new Map()}
+            firstSeenMap={{}}
+          />
+        </ThemeProvider>
+      );
+    }
+
+    const view = render(<InPlaceEditHarness />);
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+    await waitFor(() => expect(pendingReads).toHaveLength(1));
+
+    // An edit changes the same file's diff content while the read is pending.
+    fireEvent.click(view.getByTestId("edit-file"));
+
+    pendingReads[0]({
+      success: true as const,
+      data: { success: true, output: encodeFileReadOutput("pre-edit contents"), exitCode: 0 },
+    });
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+    });
+    // The pre-edit payload must not reach the clipboard or report success.
+    expect(clipboardWrites).toHaveLength(0);
+    expect(
+      view.container
+        .querySelector('button[aria-label="Copy file contents"]')
+        ?.getAttribute("data-copy-file-feedback")
+    ).toBeNull();
+  });
+
+  test("discards a copy that completes after navigating away and back (ABA)", async () => {
+    const fileAHunk = createHunk({ id: "hunk-a", filePath: "src/a.ts" });
+    const fileBHunk = createHunk({ id: "hunk-b", filePath: "src/b.ts" });
+
+    // Copy reads carry no awk line budget; overlay full-file reads do.
+    const pendingReads: Array<(value: unknown) => void> = [];
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const { script } = args[0] as { script: string };
+      if (script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      return new Promise((resolve) => {
+        pendingReads.push(resolve as (value: unknown) => void);
+      });
+    }) as unknown as MockApiClient["workspace"]["executeBash"];
+
+    function NavigationHarness() {
+      const [selectedHunkId, setSelectedHunkId] = useState<string | null>(fileAHunk.id);
+      return (
+        <ThemeProvider forcedTheme="dark">
+          <ImmersiveReviewView
+            workspaceId="workspace-1"
+            fileTree={createFileTreeForPaths([fileAHunk.filePath, fileBHunk.filePath])}
+            hunks={[fileAHunk, fileBHunk]}
+            allHunks={[fileAHunk, fileBHunk]}
+            isRead={() => false}
+            onToggleRead={mock(() => undefined)}
+            onMarkFileAsRead={mock(() => undefined)}
+            selectedHunkId={selectedHunkId}
+            onSelectHunk={setSelectedHunkId}
+            onExit={mock(() => undefined)}
+            isTouchImmersive={true}
+            reviewsByFilePath={new Map()}
+            firstSeenMap={{}}
+          />
+        </ThemeProvider>
+      );
+    }
+
+    const view = render(<NavigationHarness />);
+
+    const clickCopy = () => {
+      const button = view.container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Copy file contents"]'
+      );
+      expect(button).toBeTruthy();
+      fireEvent.click(button!);
+    };
+    const navigate = (label: "Next file" | "Previous file", expectText: string) => {
+      const button = view.container.querySelector<HTMLButtonElement>(
+        `button[aria-label="${label}"]`
+      );
+      expect(button).toBeTruthy();
+      fireEvent.click(button!);
+      return waitFor(() => expect(view.container.textContent ?? "").toContain(expectText));
+    };
+
+    clickCopy();
+    await waitFor(() => expect(pendingReads).toHaveLength(1));
+
+    // A -> B -> A while the read for A is still pending.
+    await navigate("Next file", "b.ts");
+    await navigate("Previous file", "a.ts");
+
+    // The stale read for A resolves after returning to A: it must be discarded even
+    // though the active path matches again.
+    pendingReads[0]({
+      success: true as const,
+      data: { success: true, output: encodeFileReadOutput("stale A contents"), exitCode: 0 },
+    });
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+    });
+    expect(clipboardWrites).toHaveLength(0);
+
+    // Navigation freed the pending slot, so a replacement copy of A can start.
+    clickCopy();
+    await waitFor(() => expect(pendingReads).toHaveLength(2));
+  });
+
+  test("rejects truncated reads instead of copying a partial file", async () => {
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: {
+          success: true,
+          output: encodeFileReadOutput("partial contents"),
+          exitCode: 0,
+          truncated: { reason: "too big", totalLines: 1 },
+        },
+      })
+    );
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    // The rejection must be user-visible, not just a console log.
+    await waitFor(() =>
+      expect(
+        view.container
+          .querySelector('button[aria-label="Copy file contents"]')
+          ?.getAttribute("data-copy-file-feedback")
+      ).toBe("failed")
+    );
+    expect(clipboardWrites).toHaveLength(0);
+  });
+
+  test("multi-project copies anchor containment to the project symlink", async () => {
+    const fullContent = "multi project contents";
+    const copyReadCalls: Array<{ script: string; options?: { cwdMode?: string } }> = [];
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const input = args[0] as { script: string; options?: { cwdMode?: string } };
+      copyReadCalls.push(input);
+      return Promise.resolve({
+        success: true as const,
+        data: { success: true, output: encodeFileReadOutput(fullContent), exitCode: 0 },
+      });
+    });
+
+    const view = renderImmersiveReview({ isMultiProjectWorkspace: true });
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() => expect(clipboardWrites).toHaveLength(1));
+    expect(clipboardWrites[0]).toBe(fullContent);
+    const copyRead = copyReadCalls.find((call) => !call.script.includes("awk 'NR >"));
+    expect(copyRead).toBeTruthy();
+    // Multi-project hunk paths are container-root-relative, so the read must run in
+    // default (container-root) mode; the project-symlink containment invariant itself
+    // is covered behaviorally by the real-bash tests in fileRead.test.ts.
+    expect(copyRead!.options).toBeUndefined();
+  });
+
+  test("serializes same-file copies and ignores key repeat", async () => {
+    // Copy reads carry no awk line budget; overlay full-file reads do.
+    let executeBashCalls = 0;
+    let resolveRead: ((value: unknown) => void) | undefined;
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const { script } = args[0] as { script: string };
+      if (script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      executeBashCalls += 1;
+      return new Promise((resolve) => {
+        resolveRead = resolve as (value: unknown) => void;
+      });
+    }) as unknown as MockApiClient["workspace"]["executeBash"];
+
+    renderImmersiveReview({ isTouchImmersive: false });
+
+    fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y" });
+    await waitFor(() => expect(executeBashCalls).toBe(1));
+
+    // OS key repeat and a second same-file request while the read is pending
+    // must not fan out more backend reads.
+    fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y", repeat: true });
+    fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y" });
+    expect(executeBashCalls).toBe(1);
+
+    resolveRead!({
+      success: true as const,
+      data: { success: true, output: encodeFileReadOutput("contents"), exitCode: 0 },
+    });
+    await waitFor(() => expect(clipboardWrites).toHaveLength(1));
+
+    // After completion the same file can be copied again.
+    fireEvent.keyDown(globalThis.window as unknown as Element, { key: "y" });
+    await waitFor(() => expect(executeBashCalls).toBe(2));
+  });
+
+  test("clears prior feedback while a new copy is pending", async () => {
+    // Copy reads carry no awk line budget; overlay full-file reads do.
+    let resolveRead: ((value: unknown) => void) | undefined;
+    let copyReadCount = 0;
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const { script } = args[0] as { script: string };
+      if (script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      copyReadCount += 1;
+      if (copyReadCount === 1) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: true, output: encodeFileReadOutput("contents"), exitCode: 0 },
+        });
+      }
+      return new Promise((resolve) => {
+        resolveRead = resolve as (value: unknown) => void;
+      });
+    }) as unknown as MockApiClient["workspace"]["executeBash"];
+
+    const view = renderImmersiveReview();
+
+    const findCopyButton = () =>
+      view.container.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]');
+    fireEvent.click(findCopyButton()!);
+    await waitFor(() =>
+      expect(findCopyButton()?.getAttribute("data-copy-file-feedback")).toBe("copied")
+    );
+
+    // Starting a second copy must clear the stale success while the read hangs.
+    fireEvent.click(findCopyButton()!);
+    await waitFor(() =>
+      expect(findCopyButton()?.getAttribute("data-copy-file-feedback")).toBeNull()
+    );
+    expect(resolveRead).toBeTruthy();
+  });
+
+  test("reports a size-specific failure for oversized files", async () => {
+    // Copy reads carry no awk line budget; overlay full-file reads do. The copy read
+    // budget itself is exercised behaviorally in fileRead.test.ts; here the backend
+    // returns the deterministic too-large exit it produces for oversized files.
+    mockApi.workspace.executeBash = mock((...args: unknown[]) => {
+      const { script } = args[0] as { script: string };
+      if (script.includes("awk 'NR >")) {
+        return Promise.resolve({
+          success: true as const,
+          data: { success: false, output: "", exitCode: 43 },
+        });
+      }
+      return Promise.resolve({
+        success: true as const,
+        data: { success: false, output: "", exitCode: 42 },
+      });
+    });
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() =>
+      expect(
+        view.container
+          .querySelector('button[aria-label="Copy file contents"]')
+          ?.getAttribute("data-copy-file-feedback")
+      ).toBe("failed")
+    );
+    expect(clipboardWrites).toHaveLength(0);
+    // The failure must tell the user it is a size problem, not a generic error.
+    expect(view.container.textContent ?? "").toContain("file is larger than 750 KB");
+  });
+
+  test("shows a visible failure when the API is unavailable", async () => {
+    // APIContext supplies api: null while connecting/reconnecting/errored.
+    mockApi = null as unknown as MockApiClient;
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() =>
+      expect(
+        view.container
+          .querySelector('button[aria-label="Copy file contents"]')
+          ?.getAttribute("data-copy-file-feedback")
+      ).toBe("failed")
+    );
+    expect(view.container.textContent ?? "").toContain("backend connection unavailable");
+    expect(clipboardWrites).toHaveLength(0);
+  });
+
+  test("rejects partial payloads from unsuccessful script exits", async () => {
+    // Simulates base64 dying after stat emitted the size: the script exits nonzero
+    // but leaves parseable output that would decode to empty text.
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { success: false, output: "19\n", exitCode: 1 },
+      })
+    );
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() =>
+      expect(
+        view.container
+          .querySelector('button[aria-label="Copy file contents"]')
+          ?.getAttribute("data-copy-file-feedback")
+      ).toBe("failed")
+    );
+    expect(clipboardWrites).toHaveLength(0);
+  });
+
+  test("shows a visible failure when copying a binary file", async () => {
+    // NUL bytes make processFileContents classify the payload as binary.
+    const binaryOutput = `4\n${Buffer.from([0x00, 0x01, 0x02, 0x03]).toString("base64")}`;
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { success: true, output: binaryOutput, exitCode: 0 },
+      })
+    );
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() =>
+      expect(
+        view.container
+          .querySelector('button[aria-label="Copy file contents"]')
+          ?.getAttribute("data-copy-file-feedback")
+      ).toBe("failed")
+    );
+    expect(clipboardWrites).toHaveLength(0);
+  });
+
+  test("no copy affordance for a deleted file", () => {
+    const deletedHunk = createHunk({ changeType: "deleted" });
+
+    const view = renderImmersiveReview({
+      hunks: [deletedHunk],
+      allHunks: [deletedHunk],
+    });
+
+    expect(view.container.querySelector('button[aria-label="Copy file contents"]')).toBeNull();
+  });
+
+  test("no copy affordance for a hunk-less deleted file known only to the file tree", () => {
+    // Deleting an empty or binary file yields no hunks; the active file then comes
+    // from the file tree, whose numstat entry still carries the deletion status.
+    const tree = createFileTree("src/gone.bin");
+    const leaf = tree.children[0]?.children[0];
+    expect(leaf?.path).toBe("src/gone.bin");
+    leaf.stats = { filePath: "src/gone.bin", additions: 0, deletions: 0, changeType: "deleted" };
+
+    const view = renderImmersiveReview({
+      fileTree: tree,
+      hunks: [],
+      allHunks: [],
+      selectedHunkId: null,
+    });
+
+    expect(view.container.textContent ?? "").toContain("gone.bin");
+    expect(view.container.querySelector('button[aria-label="Copy file contents"]')).toBeNull();
+  });
+
+  test("no copy affordance for a deleted file whose hunks are all filtered out", () => {
+    const deletedHunk = createHunk({ changeType: "deleted" });
+
+    // Filters (search/assisted/read) can empty the visible hunk list while the
+    // active file still resolves to the deleted file via the unfiltered set.
+    const view = renderImmersiveReview({
+      hunks: [],
+      allHunks: [deletedHunk],
+      selectedHunkId: deletedHunk.id,
+    });
+
+    expect(view.container.textContent ?? "").toContain(deletedHunk.filePath);
+    expect(view.container.querySelector('button[aria-label="Copy file contents"]')).toBeNull();
+  });
+
+  test("copies SVG markup as text instead of rejecting it as an image", async () => {
+    const svgSource = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>';
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { success: true, output: encodeFileReadOutput(svgSource), exitCode: 0 },
+      })
+    );
+
+    const view = renderImmersiveReview();
+
+    const copyButton = view.container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Copy file contents"]'
+    );
+    expect(copyButton).toBeTruthy();
+    fireEvent.click(copyButton!);
+
+    await waitFor(() => expect(clipboardWrites).toHaveLength(1));
+    expect(clipboardWrites[0]).toBe(svgSource);
+  });
+
+  test("no copy affordance when the review is complete", () => {
+    const hunk = createHunk();
+
+    const view = renderImmersiveReview({
+      hunks: [],
+      allHunks: [hunk],
+      isRead: () => true,
+      selectedHunkId: null,
+    });
+
+    expect(view.container.textContent ?? "").toContain("Review complete");
+    expect(view.container.querySelector('button[aria-label="Copy file contents"]')).toBeNull();
   });
 });

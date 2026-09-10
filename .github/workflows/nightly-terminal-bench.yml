@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: 'Models to test (comma-separated, or "all" for opus-5 + gpt-5.6-sol + google/gemini-3-pro-preview + google/gemini-3-flash-preview + google/gemini-3.6-flash)'
+        description: 'Models to test (comma-separated, or "all" for opus-5 + gpt-5.6-sol + google/gemini-3-pro-preview + google/gemini-3-flash-preview + google/gemini-3.8-flash)'
         required: false
         default: "all"
         type: string
@@ -129,7 +129,7 @@ jobs:
           INPUT_MODELS: ${{ inputs.models }}
         run: |
           if [ "$INPUT_MODELS" = "all" ] || [ -z "$INPUT_MODELS" ]; then
-            echo 'models=["anthropic/claude-opus-5","openai/gpt-5.6-sol","google/gemini-3-pro-preview","google/gemini-3-flash-preview","google/gemini-3.6-flash"]' >> "$GITHUB_OUTPUT"
+            echo 'models=["anthropic/claude-opus-5","openai/gpt-5.6-sol","google/gemini-3-pro-preview","google/gemini-3-flash-preview","google/gemini-3.8-flash"]' >> "$GITHUB_OUTPUT"
           else
             # Convert comma-separated to JSON array
             models_json=$(echo "$INPUT_MODELS" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')

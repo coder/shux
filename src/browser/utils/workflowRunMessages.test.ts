@@ -10,6 +10,14 @@ import {
 import type { MuxMessage } from "@/common/types/message";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 
+function parseWorkflowResultPayload(message: string): Record<string, unknown> {
+  const match = /<mux_workflow_result>\n([\s\S]*)\n<\/mux_workflow_result>/.exec(message);
+  if (match?.[1] == null) {
+    throw new Error(`message does not contain a workflow result payload: ${message}`);
+  }
+  return JSON.parse(match[1]) as Record<string, unknown>;
+}
+
 describe("buildWorkflowRunCardMessage", () => {
   test("builds a stable workflow_run card message with the current durable run", () => {
     const run: WorkflowRunRecord = {
@@ -115,6 +123,53 @@ describe("buildWorkflowRunCardMessage", () => {
     expect(message).toContain("retried successfully");
     expect(message).toContain('"status": "completed"');
     expect(message).not.toContain("Execution interrupted");
+  });
+
+  test("deduplicates hoisted report fields out of the result payload", () => {
+    const message = buildWorkflowResultContextMessage({
+      rawCommand: "workflow_run ./workflows/demo.js",
+      name: "./workflows/demo.js",
+      runId: "wfr_dedup",
+      status: "completed",
+      result: { reportMarkdown: "report body", structuredOutput: { gate: "go" } },
+      run: null,
+    });
+
+    const payload = parseWorkflowResultPayload(message);
+    expect(payload.reportMarkdown).toBe("report body");
+    expect(payload.structuredOutput).toEqual({ gate: "go" });
+    // Hoisted fields must not be repeated under `result` (doubles token cost).
+    expect(payload).not.toHaveProperty("result");
+  });
+
+  test("keeps only non-hoisted residual fields under result", () => {
+    const message = buildWorkflowResultContextMessage({
+      rawCommand: "workflow_run ./workflows/demo.js",
+      name: "./workflows/demo.js",
+      runId: "wfr_residual",
+      status: "completed",
+      result: { reportMarkdown: "report body", extra: "kept" },
+      run: null,
+    });
+
+    const payload = parseWorkflowResultPayload(message);
+    expect(payload.reportMarkdown).toBe("report body");
+    expect(payload.result).toEqual({ extra: "kept" });
+  });
+
+  test("keeps non-object results verbatim when nothing is hoisted", () => {
+    const message = buildWorkflowResultContextMessage({
+      rawCommand: "workflow_run ./workflows/demo.js",
+      name: "./workflows/demo.js",
+      runId: "wfr_scalar",
+      status: "completed",
+      result: "plain string result",
+      run: null,
+    });
+
+    const payload = parseWorkflowResultPayload(message);
+    expect(payload).not.toHaveProperty("reportMarkdown");
+    expect(payload.result).toBe("plain string result");
   });
 
   test("filters durable workflow UI-only rows while preserving workflow results", () => {

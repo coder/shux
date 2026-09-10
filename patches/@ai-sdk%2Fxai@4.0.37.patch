@@ -1,0 +1,30 @@
+diff --git a/dist/index.js b/dist/index.js
+index 0c3addd1069ebb39d852b2a14653d58230fd192c..f6b8762d46c6400a48ab3734ef5fe8c0e13d8dad 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -2150,8 +2150,8 @@ import { z as z13 } from "zod/v4";
+ var xSearchArgsSchema = lazySchema5(
+   () => zodSchema5(
+     z13.object({
+-      allowedXHandles: z13.array(z13.string()).max(10).optional(),
+-      excludedXHandles: z13.array(z13.string()).max(10).optional(),
++      allowedXHandles: z13.array(z13.string()).max(20).optional(),
++      excludedXHandles: z13.array(z13.string()).max(20).optional(),
+       fromDate: z13.string().optional(),
+       toDate: z13.string().optional(),
+       enableImageUnderstanding: z13.boolean().optional(),
+diff --git a/src/tool/x-search.ts b/src/tool/x-search.ts
+index 5566aa9c391f67cab60fe50ff2a2b55ca71b0b73..6d0dd586f07c5ea9d2bd2dcbed4be211be2e3c8a 100644
+--- a/src/tool/x-search.ts
++++ b/src/tool/x-search.ts
+@@ -8,8 +8,8 @@ import { z } from 'zod/v4';
+ export const xSearchArgsSchema = lazySchema(() =>
+   zodSchema(
+     z.object({
+-      allowedXHandles: z.array(z.string()).max(10).optional(),
+-      excludedXHandles: z.array(z.string()).max(10).optional(),
++      allowedXHandles: z.array(z.string()).max(20).optional(),
++      excludedXHandles: z.array(z.string()).max(20).optional(),
+       fromDate: z.string().optional(),
+       toDate: z.string().optional(),
+       enableImageUnderstanding: z.boolean().optional(),

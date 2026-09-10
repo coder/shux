@@ -70,6 +70,69 @@ function createSyntheticSkillSnapshotMessage(args: {
 }
 
 describe("extractLoadedSkillSnapshotsFromMessages", () => {
+  it("extracts snapshots from nested agent_skill_read records inside code_execution", () => {
+    // Exclusive PTC: skill reads happen as nested xum.agent_skill_read calls,
+    // so the snapshot must be recovered from the code_execution record.
+    const nestedMessage: MuxMessage = {
+      id: "nested",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "tool-nested",
+          toolName: "code_execution",
+          state: "output-available",
+          input: { code: "..." },
+          output: {
+            success: true,
+            toolCalls: [
+              {
+                toolName: "agent_skill_read",
+                args: { name: "nested-skill" },
+                result: {
+                  success: true,
+                  skill: {
+                    scope: "project",
+                    directoryName: "nested-skill",
+                    frontmatter: { name: "nested-skill", description: "nested description" },
+                    body: "Nested body",
+                  },
+                },
+              },
+              // Failed and kernel-compacted records (no full result) yield nothing.
+              { toolName: "agent_skill_read", args: { name: "failed-skill" }, error: "denied" },
+              { toolName: "agent_skill_read", args: { name: "kernel-skill" }, ok: true, bytes: 9 },
+              // Contradictory untrusted row: explicit ok:false is authoritative
+              // failure even when a schema-valid result rides alongside (r18).
+              {
+                toolName: "agent_skill_read",
+                args: { name: "contradictory-skill" },
+                ok: false,
+                result: {
+                  success: true,
+                  skill: {
+                    scope: "project",
+                    directoryName: "contradictory-skill",
+                    frontmatter: {
+                      name: "contradictory-skill",
+                      description: "contradictory description",
+                    },
+                    body: "Contradictory body",
+                  },
+                },
+              },
+              { toolName: "bash", args: { script: "true" }, result: { success: true } },
+            ],
+          },
+        },
+      ],
+    };
+
+    const snapshots = extractLoadedSkillSnapshotsFromMessages([nestedMessage]);
+    expect(snapshots.map((snapshot) => snapshot.name)).toEqual(["nested-skill"]);
+    expect(snapshots[0].body).toContain("Nested body");
+  });
+
   it("dedupes by scope/name and keeps the latest read order", () => {
     const snapshots = extractLoadedSkillSnapshotsFromMessages([
       createAgentSkillReadToolMessage({

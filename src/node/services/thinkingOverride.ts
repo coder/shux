@@ -12,6 +12,7 @@
  * Node-runtime-local: carries a callback, so it does not belong in
  * src/common/types (never crosses IPC).
  */
+import type { ModelMessage } from "ai";
 import type { ThinkingLevel } from "@/common/types/thinking";
 
 export interface ActiveTurnThinkingOverride {
@@ -38,3 +39,17 @@ export interface RebuiltThinkingProviderOptions {
 export type RebuildProviderOptionsForThinkingLevel = (
   level: ThinkingLevel
 ) => RebuiltThinkingProviderOptions | null;
+
+/**
+ * Step-0 message rebuild for a thinking override consumed after stream
+ * construction (a slider write can race startStream's awaits, landing after
+ * the pre-construction quiescence fold). Message preparation is
+ * thinking-level-dependent, so an options-only rebuild would send messages
+ * transformed for the wrong mode. Returns the fully prepared first-step
+ * messages; implementations also emit a superseding turn envelope so replay
+ * matches the wire request.
+ */
+export type RebuildFirstStepForThinkingLevel = (
+  effectiveLevel: ThinkingLevel,
+  providerOptions: Record<string, unknown>
+) => Promise<ModelMessage[]>;

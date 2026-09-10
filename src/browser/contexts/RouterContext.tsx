@@ -249,7 +249,7 @@ function useUrlSync(): void {
   useEffect(() => {
     const url = location.pathname + location.search + location.hash;
 
-    // The dedicated Mux home page is gone. Keep "/" as a transient compatibility
+    // The dedicated Xum home page is gone. Keep "/" as a transient compatibility
     // entrypoint, but only persist real restorable routes so desktop relaunches reopen
     // the last meaningful page instead of getting stuck on root.
     if (isRestorableRoute(url)) {

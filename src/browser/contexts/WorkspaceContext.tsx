@@ -11,12 +11,12 @@ import {
   type SetStateAction,
 } from "react";
 import { useLocation } from "react-router-dom";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
-import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
+import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
   deleteWorkspaceStorage,
   getAgentIdKey,
@@ -51,6 +51,8 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   readPersistedState,
   readPersistedString,
+  subscribePersistedStateWrites,
+  syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
@@ -64,8 +66,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { reassignPinnedTimestamps } from "@/common/utils/pin";
-import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
+import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -77,17 +78,18 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
- * One-time best-effort migration: if the backend doesn't have model preferences yet,
- * persist explicit localStorage values so future port/origin changes keep them.
- * Called once on startup after backend config is fetched.
- *
+ * Preserve legacy local model choices across port/origin changes.
  * Exported for focused migration tests.
  */
 export function migrateLocalModelPrefsToBackend(
   api: APIClient,
-  cfg: { defaultModel?: string; hiddenModels?: string[] }
-): void {
-  if (!api.config.updateModelPreferences) return;
+  cfg: Pick<
+    Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
+    "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
+  >,
+  dirtyKeys: ReadonlySet<string> = new Set()
+) {
+  if (!api.config.updateModelPreferences) return cfg;
 
   const localDefaultModelRaw = readPersistedString(DEFAULT_MODEL_KEY);
   const localDefaultModel =
@@ -104,23 +106,31 @@ export function migrateLocalModelPrefsToBackend(
   // localStorage presence implies explicit user choice (usePersistedState never
   // writes fallback defaults). Always migrate to backend so the preference
   // survives future changes to the built-in default constant.
-  if (cfg.defaultModel === undefined && localDefaultModel) {
+  if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && cfg.defaultModel === undefined && localDefaultModel) {
     patch.defaultModel = localDefaultModel;
   }
 
   if (
-    cfg.hiddenModels === undefined &&
-    Array.isArray(localHiddenModels) &&
-    localHiddenModels.length > 0
+    !dirtyKeys.has(HIDDEN_MODELS_KEY) &&
+    (cfg.hiddenModelsInitialized === false ||
+      (cfg.hiddenModels === undefined &&
+        Array.isArray(localHiddenModels) &&
+        localHiddenModels.length > 0))
   ) {
-    patch.hiddenModels = localHiddenModels;
+    // Backend defaults are not evidence that legacy local preferences were imported.
+    patch.hiddenModels = [
+      ...new Set([
+        ...(cfg.hiddenModels ?? []),
+        ...(Array.isArray(localHiddenModels) ? localHiddenModels : []),
+      ]),
+    ];
   }
 
   if (Object.keys(patch).length > 0) {
-    api.config.updateModelPreferences(patch).catch(() => {
-      // Best-effort only.
-    });
+    // Migration persistence must not delay hydration of unrelated settings.
+    api.config.updateModelPreferences(patch).catch(() => undefined);
   }
+  return { ...cfg, ...patch };
 }
 
 /**
@@ -161,18 +171,20 @@ function migrateLocalGatewayPrefsToBackend(
   }
 }
 
-function shouldSeedWorkspaceAgentIdFromBackend(metadata: FrontendWorkspaceMetadata): boolean {
-  // Main workspaces own their live agent selection in localStorage. Child/task
-  // workspaces are backend-defined and locked, so they must re-seed from metadata.
-  return metadata.parentWorkspaceId != null;
-}
-
 /**
  * Seed per-workspace localStorage from backend workspace metadata.
  *
  * This keeps a workspace's model/thinking consistent across devices/browsers.
  */
-function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadata): void {
+function seedWorkspaceLocalStorageFromBackend(
+  metadata: FrontendWorkspaceMetadata,
+  previous?: FrontendWorkspaceMetadata
+): void {
+  // Snapshot all main-workspace choices on client load, not on navigation.
+  // Later metadata must not overwrite unsent choices; reload to restore backend settings.
+  if (metadata.parentWorkspaceId == null && previous != null) {
+    return;
+  }
   // Cache keyed by agentId (string) - includes exec, plan, and custom agents
   type WorkspaceAISettingsByAgentCache = Partial<
     Record<
@@ -184,7 +196,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   const workspaceId = metadata.id;
 
   const metadataAgentId = resolvePersistedAgentId(metadata, "");
-  if (shouldSeedWorkspaceAgentIdFromBackend(metadata) && metadataAgentId.length > 0) {
+  if (metadataAgentId.length > 0) {
     const key = getAgentIdKey(workspaceId);
     const normalized = normalizeAgentId(metadataAgentId);
     const existing = readPersistedState<string | undefined>(key, undefined);
@@ -214,17 +226,6 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   for (const [agentKey, entry] of Object.entries(aiByAgent)) {
     if (!entry) continue;
     if (typeof entry.model !== "string" || entry.model.length === 0) continue;
-
-    // Protect newer local preferences from stale metadata updates (e.g., rapid thinking toggles).
-    if (
-      !shouldApplyWorkspaceAiSettingsFromBackend(workspaceId, agentKey, {
-        model: entry.model,
-        thinkingLevel: entry.thinkingLevel,
-        reasoningMode: entry.reasoningMode,
-      })
-    ) {
-      continue;
-    }
 
     nextByAgent[agentKey] = {
       model: entry.model,
@@ -261,9 +262,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
 
   // Absent reasoningMode means "standard": seed it explicitly so switching to
   // an agent whose settings never carried the field cannot inherit another
-  // agent's "pro" from the shared workspace-scoped key. Newer local choices
-  // are already protected by the pending-settings guard above
-  // (shouldApplyWorkspaceAiSettingsFromBackend).
+  // agent's "pro" from the shared workspace-scoped key.
   const reasoningKey = getReasoningModeKey(workspaceId);
   const nextReasoning = active.reasoningMode ?? "standard";
   const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
@@ -376,7 +375,6 @@ function createWorkspaceDraftId(): string {
 function isDraftEmpty(projectPath: string, draftId: string): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
 
-  // Check for input text
   const inputText = readPersistedState<string>(getInputKey(scopeId), "");
   if (inputText.trim().length > 0) {
     return false;
@@ -464,8 +462,8 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
   }>;
   removeWorkspace: (
     workspaceId: string,
-    options?: { force?: boolean }
-  ) => Promise<{ success: boolean; error?: string }>;
+    options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+  ) => Promise<WorkspaceRemoveResult>;
   updateWorkspaceTitle: (
     workspaceId: string,
     newTitle: string
@@ -485,6 +483,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     options?: { acknowledgedUntrackedPaths?: string[] }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /**
+   * Workspaces with an archive preflight or archive request in flight. Archive can take tens
+   * of seconds server-side (snapshot + worktree removal), so this lives here rather than in
+   * the component that started it: the sidebar row and the menu bar both show "Archiving..."
+   * no matter which one the user clicked.
+   */
+  archivingWorkspaceIds: ReadonlySet<string>;
   refreshWorkspaceMetadata: () => Promise<void>;
   setWorkspaceMetadata: React.Dispatch<
     React.SetStateAction<Map<string, FrontendWorkspaceMetadata>>
@@ -545,6 +550,38 @@ export const WorkspaceContext = {
 
 interface WorkspaceProviderProps {
   children: ReactNode;
+}
+
+/**
+ * Keeps `workspaceId` in the archiving set while `run` is outstanding. Requests for one
+ * workspace can overlap (the sidebar shortcut fires while a header-started archive is still
+ * in flight), so the id is reference-counted and only removed when the last one settles.
+ */
+async function trackArchivingRequest<T>(
+  counts: Map<string, number>,
+  setArchivingWorkspaceIds: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>,
+  workspaceId: string,
+  run: () => Promise<T>
+): Promise<T> {
+  counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+  setArchivingWorkspaceIds((prev) =>
+    prev.has(workspaceId) ? prev : new Set(prev).add(workspaceId)
+  );
+  try {
+    return await run();
+  } finally {
+    const remaining = (counts.get(workspaceId) ?? 1) - 1;
+    if (remaining > 0) {
+      counts.set(workspaceId, remaining);
+    } else {
+      counts.delete(workspaceId);
+      setArchivingWorkspaceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(workspaceId);
+        return next;
+      });
+    }
+  }
 }
 
 /**
@@ -618,20 +655,53 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   useEffect(() => {
     if (!api?.config?.getConfig) return;
 
-    void api.config
+    let active = true;
+    // Track writes, not just equality: toggling twice is still local intent.
+    const dirtyKeys = new Set<string>();
+    const initialPreferences = [DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY].map((key) => ({
+      key,
+      value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
+    }));
+    const markDirty = (key: string | null) => {
+      for (const preference of initialPreferences) {
+        if (key === null || key === preference.key) dirtyKeys.add(preference.key);
+      }
+    };
+    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
+      if (source === "local") markDirty(key);
+    });
+    const storageWindow = window;
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === storageWindow.localStorage) markDirty(event.key);
+    };
+    storageWindow.addEventListener("storage", onStorage);
+    const stopTrackingWrites = () => {
+      unsubscribeWrites();
+      storageWindow.removeEventListener("storage", onStorage);
+    };
+
+    api.config
       .getConfig()
       .then((cfg) => {
+        if (!active) return;
+        // Cross-tab writes can land before their queued storage events arrive.
+        for (const { key, value } of initialPreferences) {
+          if (JSON.stringify(readPersistedState<unknown>(key, undefined)) !== value)
+            dirtyKeys.add(key);
+        }
+        // Read legacy local preferences before backend hydration can overwrite them.
+        const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
         updatePersistedState(
           AGENT_AI_DEFAULTS_KEY,
           normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
         );
 
         // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (cfg.defaultModel !== undefined) {
-          updatePersistedState(DEFAULT_MODEL_KEY, cfg.defaultModel);
+        if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && modelPrefs.defaultModel !== undefined) {
+          syncPersistedStateFromBackend(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
         }
-        if (cfg.hiddenModels !== undefined) {
-          updatePersistedState(HIDDEN_MODELS_KEY, cfg.hiddenModels);
+        if (!dirtyKeys.has(HIDDEN_MODELS_KEY) && modelPrefs.hiddenModels !== undefined) {
+          syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
         }
 
         // Seed runtime enablement from backend so switching ports doesn't reset the UI.
@@ -644,10 +714,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
         }
 
-        // One-time best-effort migration: if the backend doesn't have model prefs yet,
-        // persist explicit localStorage values so future port changes keep them.
-        migrateLocalModelPrefsToBackend(api, cfg);
-
         // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
         // check if the user had non-default values in the old localStorage keys.
         // This covers users upgrading from builds that only stored gateway state locally.
@@ -655,7 +721,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       })
       .catch(() => {
         // Best-effort only.
-      });
+      })
+      .finally(stopTrackingWrites);
+
+    return () => {
+      active = false;
+      stopTrackingWrites();
+    };
   }, [api]);
   // Get project refresh function from ProjectContext
   const {
@@ -732,10 +804,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [workspaceDraftsByProjectState]
   );
 
-  const pendingDeepLinksRef = useRef<MuxDeepLinkPayload[]>([]);
+  const pendingDeepLinksRef = useRef<DeepLinkPayload[]>([]);
 
   const handleDeepLink = useCallback(
-    (payload: MuxDeepLinkPayload) => {
+    (payload: DeepLinkPayload) => {
       if (payload.type !== "new_chat") {
         return;
       }
@@ -1051,7 +1123,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         ensureCreatedAt(metadata);
         // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          metadata,
+          workspaceMetadataRef.current.get(metadata.id)
+        );
         metadataMap.set(metadata.id, metadata);
       }
 
@@ -1220,7 +1295,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // 1. ALWAYS normalize incoming metadata first - this is the critical data update.
           if (meta !== null) {
             ensureCreatedAt(meta);
-            seedWorkspaceLocalStorageFromBackend(meta);
+            seedWorkspaceLocalStorageFromBackend(meta, workspaceMetadataRef.current.get(meta.id));
           }
 
           const isNowArchived =
@@ -1271,24 +1346,17 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               updated.set(event.workspaceId, meta);
             }
 
-            // Reload projects when archive state changes so that
-            // getProjectWorkspaceCounts (used for removal eligibility) sees
-            // up-to-date archivedAt timestamps in the project config.
+            // Reload projects when archive state changes so the sidebar's
+            // embedded workspace arrays stay in sync (projects.list excludes
+            // archived workspaces, so archiving/unarchiving changes them).
             const wasInActiveMap = prev.has(event.workspaceId);
             const archiveStateChanged = isNowArchived
               ? wasInActiveMap // was active, now archived
               : !wasInActiveMap && meta !== null; // was absent (archived), now active (unarchived)
 
-            // Also reload when:
-            // 1. Workspace is deleted in another session
-            // 2. New workspace appears (e.g., from fork)
-            // 3. Workspace transitions from initializing to ready (init completed)
-            if (
-              meta === null ||
-              isNewWorkspace ||
-              (wasInitializing && isNowReady) ||
-              archiveStateChanged
-            ) {
+            // Config notifications refresh deleted workspace lists once after a cascade.
+            // Keep metadata refreshes for new workspaces and completed initialization.
+            if (isNewWorkspace || (wasInitializing && isNowReady) || archiveStateChanged) {
               void refreshProjects();
             }
 
@@ -1378,7 +1446,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         // Update metadata immediately to avoid race condition with validation effect
         ensureCreatedAt(result.metadata);
-        seedWorkspaceLocalStorageFromBackend(result.metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          result.metadata,
+          workspaceMetadataRef.current.get(result.metadata.id)
+        );
         setWorkspaceMetadata((prev) => {
           const updated = new Map(prev);
           updated.set(result.metadata.id, result.metadata);
@@ -1402,8 +1473,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const removeWorkspace = useCallback(
     async (
       workspaceId: string,
-      options?: { force?: boolean }
-    ): Promise<{ success: boolean; error?: string }> => {
+      options?: Parameters<APIClient["workspace"]["remove"]>[0]["options"]
+    ): Promise<WorkspaceRemoveResult> => {
       if (!api) return { success: false, error: "API not connected" };
 
       // Capture state before the async operation.
@@ -1445,7 +1516,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           return { success: true };
         } else {
           console.error("Failed to remove workspace:", result.error);
-          return { success: false, error: result.error };
+          return result;
         }
       } catch (error) {
         const errorMessage = getErrorMessage(error);
@@ -1509,36 +1580,44 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
       if (!api) return { success: false, error: "API not connected" };
 
-      let previousPinnedAt: string | undefined;
-      let applied = false;
+      let previousPinnedAtById: Map<string, string | undefined> | null = null;
       setWorkspaceMetadata((prev) => {
         const meta = prev.get(workspaceId);
         if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
-        previousPinnedAt = meta.pinnedAt;
-        applied = true;
-        // Mirror the server's append-only ordering: strictly greater than every
-        // existing pin in the same project so rapid pins stay in click order.
+        const touched = new Map<string, string | undefined>([[workspaceId, meta.pinnedAt]]);
+        const next = new Map(prev);
+        // Mirror the server's global append-only ordering (all projects, not
+        // just this one), including its write-path healing of corrupted pin
+        // timestamps, so every row sits where authoritative metadata will
+        // keep it.
         let optimisticPinnedAt: string | undefined;
         if (pinned) {
-          let pinnedAtMs = Date.now();
-          for (const other of prev.values()) {
-            if (other.projectPath !== meta.projectPath || !other.pinnedAt) continue;
-            const otherMs = new Date(other.pinnedAt).getTime();
-            if (Number.isFinite(otherMs) && otherMs >= pinnedAtMs) pinnedAtMs = otherMs + 1;
+          const { changed, pinnedAt } = appendPinnedTimestamp(
+            [...prev.values()]
+              .filter((other) => other.pinnedAt)
+              .map((other) => ({ id: other.id, pinnedAt: other.pinnedAt }))
+          );
+          for (const [id, healedPinnedAt] of changed) {
+            const other = next.get(id);
+            if (!other) continue;
+            touched.set(id, other.pinnedAt);
+            next.set(id, { ...other, pinnedAt: healedPinnedAt });
           }
-          optimisticPinnedAt = new Date(pinnedAtMs).toISOString();
+          optimisticPinnedAt = pinnedAt;
         }
-        const next = new Map(prev);
         next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });
+        previousPinnedAtById = touched;
         return next;
       });
       const revert = () => {
-        if (!applied) return;
+        const touched: Map<string, string | undefined> | null = previousPinnedAtById;
+        if (!touched) return;
         setWorkspaceMetadata((prev) => {
-          const meta = prev.get(workspaceId);
-          if (!meta) return prev;
           const next = new Map(prev);
-          next.set(workspaceId, { ...meta, pinnedAt: previousPinnedAt });
+          for (const [id, priorPinnedAt] of touched) {
+            const meta = next.get(id);
+            if (meta) next.set(id, { ...meta, pinnedAt: priorPinnedAt });
+          }
           return next;
         });
       };
@@ -1637,6 +1716,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api, setWorkspaceMetadata]
   );
 
+  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
+  const archivingRequestCounts = useRef(new Map<string, number>());
+
   const preflightArchiveWorkspace = useCallback(
     async (
       workspaceId: string
@@ -1644,7 +1728,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.preflightArchive({ workspaceId });
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
+          workspaceId,
+          () => api.workspace.preflightArchive({ workspaceId })
+        );
         if (result.success) {
           return { success: true, data: result.data };
         }
@@ -1664,10 +1753,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.archive({
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
           workspaceId,
-          acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-        });
+          () =>
+            api.workspace.archive({
+              workspaceId,
+              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+            })
+        );
         if (result.success) {
           // Older mocks/story fixtures may still return `{ success: true }` without the newer
           // typed archive payload. Treat that legacy success shape as an ordinary archive so
@@ -1742,7 +1837,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const metadata = await api.workspace.getInfo({ workspaceId });
       if (metadata) {
         ensureCreatedAt(metadata);
-        seedWorkspaceLocalStorageFromBackend(metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          metadata,
+          workspaceMetadataRef.current.get(metadata.id)
+        );
       }
       return metadata;
     },
@@ -2030,6 +2128,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,
@@ -2056,6 +2155,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,

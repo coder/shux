@@ -1,3 +1,7 @@
+import {
+  CONTEXT_NOTES_RESERVED_BYTES,
+  CONTEXT_NOTES_RESERVED_TOKENS,
+} from "@/common/constants/contextBudget";
 import { describe, it, expect } from "bun:test";
 
 import {
@@ -73,6 +77,180 @@ describe("rankHotSetCandidates", () => {
       "/memories/global/often.md",
       "/memories/global/once.md",
     ]);
+  });
+});
+
+describe("additive context notes", () => {
+  const notesPath = "/memories/workspace/context-notes.md";
+  const countTokens = (text: string) => Promise.resolve(Math.ceil(text.length / 3.5));
+
+  it("keeps the ordinary eight pins unchanged and adds notes only in token-budget mode", async () => {
+    const pins = Array.from({ length: 10 }, (_, index) =>
+      candidate({ path: `/memories/global/pin-${index}.md`, pinned: true })
+    );
+    const candidates = [...pins, candidate({ path: notesPath })];
+    const original = structuredClone(candidates);
+    const args = { readFile: () => Promise.resolve("facts"), countTokens, now: NOW };
+    const ordinary = await selectHotMemories({ ...args, candidates: pins });
+    expect(ordinary).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS);
+    expect(await selectHotMemories({ ...args, candidates })).toEqual(ordinary);
+    const augmented = await selectHotMemories({ ...args, candidates, tokenBudgetActive: true });
+    expect(augmented.slice(0, ordinary.length)).toEqual(ordinary);
+    expect(augmented).toHaveLength(MEMORY_HOT_SET_MAX_ITEMS + 1);
+    expect(augmented.at(-1)).toMatchObject({ path: notesPath, pinned: false, content: "facts" });
+    expect(candidates).toEqual(original);
+  });
+
+  it("unused notes stay cold when off, while explicitly pinned notes retain ordinary order", async () => {
+    const reads: string[] = [];
+    const args = {
+      readFile: (path: string) => {
+        reads.push(path);
+        return Promise.resolve("facts");
+      },
+      countTokens,
+    };
+    expect(
+      await selectHotMemories({ ...args, candidates: [candidate({ path: notesPath })] })
+    ).toEqual([]);
+    expect(reads).toEqual([]);
+    const candidates = [
+      candidate({ path: notesPath, pinned: true }),
+      candidate({
+        path: "/memories/global/a.md",
+        pinned: true,
+        accessCount: 1,
+        lastAccessedAt: NOW,
+      }),
+    ];
+    const ordinary = await selectHotMemories({ ...args, candidates, now: NOW });
+    expect(ordinary.map((item) => item.path)).toEqual(["/memories/global/a.md", notesPath]);
+    // Already selected normally: no duplicate, extra truncation, or priority boost.
+    expect(
+      await selectHotMemories({ ...args, candidates, now: NOW, tokenBudgetActive: true })
+    ).toEqual(ordinary);
+    const used = await selectHotMemories({
+      ...args,
+      candidates: [candidate({ path: notesPath, accessCount: 1, lastAccessedAt: NOW })],
+      now: NOW,
+    });
+    expect(used.map((item) => item.path)).toEqual([notesPath]);
+  });
+
+  it.each(["x".repeat(30_000), "界😀".repeat(8_000)])(
+    "bounds the entire extra block when there are no ordinary hot memories",
+    async (content) => {
+      const items = await selectHotMemories({
+        candidates: [candidate({ path: notesPath })],
+        readFile: () => Promise.resolve(content),
+        countTokens,
+        tokenBudgetActive: true,
+      });
+      expect(items).toHaveLength(1);
+      expect(items[0].truncated).toBe(true);
+      expect(content.startsWith(items[0].content)).toBe(true);
+      expect(items[0].content).not.toContain("\uFFFD");
+      const rendered = formatHotMemoriesBlock(items);
+      expect(rendered).toContain("[truncated:");
+      expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
+      expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
+    }
+  );
+
+  it("onlyContextNotes re-fits even a pinned notes file to the notes caps and drops the rest", async () => {
+    const content = "x".repeat(12_000);
+    const candidates = [
+      candidate({ path: notesPath, pinned: true }),
+      candidate({ path: "/memories/global/a.md", pinned: true }),
+    ];
+    const args = { candidates, readFile: () => Promise.resolve(content), countTokens, now: NOW };
+    // Ordinary pass: the pinned notes ride the larger per-item budget untruncated.
+    const ordinary = await selectHotMemories({ ...args, tokenBudgetActive: true });
+    expect(ordinary.find((item) => item.path === notesPath)).toMatchObject({
+      truncated: false,
+      content,
+    });
+    const flush = await selectHotMemories({ ...args, onlyContextNotes: true });
+    expect(flush.map((item) => item.path)).toEqual([notesPath]);
+    expect(flush[0].truncated).toBe(true);
+    const rendered = formatHotMemoriesBlock(flush, { flushPreload: true });
+    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_BYTES);
+    expect(await countTokens(rendered)).toBeLessThanOrEqual(CONTEXT_NOTES_RESERVED_TOKENS);
+    // The flush rendering variant differs only in how a truncated item is annotated (the pinned
+    // tool has no `view` to point at); untruncated items render identically in both variants.
+    expect(rendered).not.toBe(formatHotMemoriesBlock(flush));
+    const untruncated = [{ ...flush[0], truncated: false }];
+    expect(formatHotMemoriesBlock(untruncated, { flushPreload: true })).toBe(
+      formatHotMemoriesBlock(untruncated)
+    );
+  });
+
+  it("does not take any of the base byte/token allowance, including wrapper costs", async () => {
+    const baseCandidate = candidate({ path: "/memories/global/pin.md", pinned: true });
+    const readFile = (path: string) =>
+      Promise.resolve(path === notesPath ? "x".repeat(30_000) : "base facts");
+    const base = await selectHotMemories({ candidates: [baseCandidate], readFile, countTokens });
+    const baseBlock = formatHotMemoriesBlock(base);
+    const baseTokens = await countTokens(baseBlock);
+    const augmented = await selectHotMemories({
+      candidates: [candidate({ path: notesPath }), baseCandidate],
+      readFile,
+      countTokens,
+      maxItemBytes: 10,
+      maxTotalBytes: 10,
+      maxTotalTokens: baseTokens,
+      tokenBudgetActive: true,
+    });
+    expect(augmented.slice(0, base.length)).toEqual(base);
+    expect(augmented).toHaveLength(2);
+    expect(augmented[1].content.length).toBeGreaterThan(10);
+    const combined = formatHotMemoriesBlock(augmented);
+    expect(Buffer.byteLength(combined) - Buffer.byteLength(baseBlock)).toBeLessThanOrEqual(
+      CONTEXT_NOTES_RESERVED_BYTES
+    );
+    expect((await countTokens(combined)) - baseTokens).toBeLessThanOrEqual(
+      CONTEXT_NOTES_RESERVED_TOKENS
+    );
+  });
+
+  it.each(["unreadable", "binary", "tokenizer"])(
+    "retains normal selections when the extra is %s",
+    async (failure) => {
+      const items = await selectHotMemories({
+        candidates: [
+          candidate({ path: notesPath }),
+          candidate({ path: "/memories/global/pin.md", pinned: true }),
+        ],
+        tokenBudgetActive: true,
+        readFile: (path) => {
+          if (path !== notesPath) return Promise.resolve("base facts");
+          if (failure === "unreadable") throw new Error("unreadable");
+          return Promise.resolve(failure === "binary" ? "\u0000" : "notes facts");
+        },
+        countTokens: (text) => {
+          if (failure === "tokenizer" && text.includes(notesPath))
+            throw new Error("tokenizer unavailable");
+          return countTokens(text);
+        },
+      });
+      expect(items.map((item) => item.path)).toEqual(["/memories/global/pin.md"]);
+      expect(items[0].content).toBe("base facts");
+    }
+  );
+
+  it("does not read or create an absent workspace notebook", async () => {
+    const reads: string[] = [];
+    const items = await selectHotMemories({
+      candidates: [candidate({ path: "/memories/global/context-notes.md" })],
+      readFile: (path) => {
+        reads.push(path);
+        return Promise.resolve("facts");
+      },
+      countTokens,
+      tokenBudgetActive: true,
+    });
+    expect(items).toEqual([]);
+    expect(reads).toEqual([]);
   });
 });
 

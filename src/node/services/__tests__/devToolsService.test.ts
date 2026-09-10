@@ -36,10 +36,7 @@ function makeStep(overrides: Partial<DevToolsStep> & { id: string; runId: string
 }
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
-  const config = new Config(opts.sessionsDir);
-  spyOn(config, "getSessionDir").mockImplementation((workspaceId: string) =>
-    path.join(opts.sessionsDir, workspaceId)
-  );
+  const config = new Config(path.dirname(opts.sessionsDir));
   spyOn(config, "getLlmDebugLogsEnabled").mockImplementation(() => opts.enabled ?? true);
   return config;
 }

@@ -503,7 +503,7 @@ describe("availableRoutes", () => {
     expect(routes).toEqual([
       {
         route: "mux-gateway",
-        displayName: "Mux Gateway",
+        displayName: "Xum Gateway",
         isConfigured: false,
       },
       {
@@ -515,6 +515,11 @@ describe("availableRoutes", () => {
         route: "github-copilot",
         displayName: "GitHub Copilot",
         isConfigured: true,
+      },
+      {
+        route: "coder",
+        displayName: "Coder",
+        isConfigured: false,
       },
       {
         route: "direct",
@@ -564,7 +569,7 @@ describe("availableRoutes", () => {
     expect(routes).toEqual([
       {
         route: "mux-gateway",
-        displayName: "Mux Gateway",
+        displayName: "Xum Gateway",
         isConfigured: false,
       },
       {
@@ -575,6 +580,11 @@ describe("availableRoutes", () => {
       {
         route: "github-copilot",
         displayName: "GitHub Copilot",
+        isConfigured: false,
+      },
+      {
+        route: "coder",
+        displayName: "Coder",
         isConfigured: false,
       },
       {
@@ -604,13 +614,18 @@ describe("availableRoutes", () => {
     const routes = availableRoutes(
       OPENAI_MODEL,
       createIsConfigured(["github-copilot"]),
-      createIsGatewayModelAccessible([["github-copilot", "gpt-5.5"]])
+      // Coder is excluded via its own catalog entry to prove the gate applies
+      // to every gateway, not just Copilot.
+      createIsGatewayModelAccessible([
+        ["github-copilot", "gpt-5.5"],
+        ["coder", "openai/gpt-5.5"],
+      ])
     );
 
     expect(routes).toEqual([
       {
         route: "mux-gateway",
-        displayName: "Mux Gateway",
+        displayName: "Xum Gateway",
         isConfigured: false,
       },
       {

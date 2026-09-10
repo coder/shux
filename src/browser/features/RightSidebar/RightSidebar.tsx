@@ -46,18 +46,23 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import { TerminalTab } from "@/browser/features/RightSidebar/TerminalTab";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import {
-  RIGHT_SIDEBAR_TABS,
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceActivityAuthoritative,
+} from "@/browser/stores/WorkspaceStore";
+import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
+import {
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
+  getTerminalTabFallbackName,
   makeTerminalTabType,
   type TabType,
 } from "@/browser/types/rightSidebar";
@@ -113,9 +118,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
-
-// Re-export for consumers
-export type { ReviewStats };
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -195,9 +197,6 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
     </div>
   );
 };
-
-export { RIGHT_SIDEBAR_TABS, isTabType };
-export type { TabType };
 
 function getGoalSetErrorMessage(error: GoalSetError): string {
   if (error.type === "goal_conflict") {
@@ -286,6 +285,8 @@ interface RightSidebarTabsetNodeProps {
   onTerminalExit: (tab: TabType) => void;
   /** Map of terminal tab types to their current titles (from OSC sequences) */
   terminalTitles: Map<TabType, string>;
+  /** Workspace-wide 0-based ordering of terminal tabs across all splits */
+  terminalTabOrder: Map<TabType, number>;
   /** Handler to update a terminal's title */
   onTerminalTitleChange: (tab: TabType, title: string) => void;
   /** Map of tab → global position index (0-based) for keybind tooltips */
@@ -411,7 +412,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       const Label = TAB_REGISTRY[tab].Label;
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
-      const terminalIndex = terminalTabs.indexOf(tab);
+      const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
       label = (
         <TerminalTabLabel
           dynamicTitle={props.terminalTitles.get(tab)}
@@ -555,6 +556,9 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           // Check if this terminal should be auto-focused (was just opened via keybind)
           const terminalSessionId = getTerminalSessionId(terminalTab);
           const shouldAutoFocus = isActive && terminalSessionId === props.autoFocusTerminalSession;
+          const terminalIndex = props.terminalTabOrder.get(terminalTab) ?? 0;
+          const tabName =
+            props.terminalTitles.get(terminalTab) ?? getTerminalTabFallbackName(terminalIndex);
 
           return (
             <div
@@ -569,6 +573,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
                 workspaceId={props.workspaceId}
                 tabType={terminalTab}
                 visible={isActive}
+                tabName={tabName}
+                tabIndex={terminalIndex}
                 onTitleChange={(title) => props.onTerminalTitleChange(terminalTab, title)}
                 autoFocus={shouldAutoFocus}
                 onAutoFocusConsumed={shouldAutoFocus ? props.onAutoFocusConsumed : undefined}
@@ -1054,7 +1060,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
 
-    if (apiState.status !== "connected" || !api) {
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    if (!api) {
       setDesktopAvailable(null);
       return;
     }
@@ -1077,7 +1084,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [api, apiState.status, desktopExperimentEnabled, workspaceId]);
+  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {
@@ -1174,6 +1181,36 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
+
+  // Auto-surface the Workflows tab when a run starts: the tab is the primary
+  // run-detail surface (the chat card stays collapsed while it exists), but a
+  // background-added tab with a small badge is easy to miss. Only a mounted
+  // 0 → >0 transition activates — opening a workspace mid-run keeps the user's
+  // persisted tab, and switching away afterwards is respected. Does not
+  // un-collapse a collapsed sidebar.
+  const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
+  const activityAuthoritative = useWorkspaceActivityAuthoritative();
+  const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
+    // workspace — both pre-hydration and after a failure-path self-heal (which marks
+    // hydrated with an empty map). Recording that 0 as the baseline would misread the
+    // eventual real snapshot of a pre-existing active run as a fresh 0 → >0 start and
+    // steal the persisted tab. Keep the baseline unknown until authoritative data; the
+    // first authoritative observation counts as "first observation" and never activates.
+    if (!activityAuthoritative) {
+      return;
+    }
+    const previous = previousActiveWorkflowRunCountRef.current;
+    previousActiveWorkflowRunCountRef.current = activeWorkflowRunCount;
+    if (
+      !workflowsExperimentEnabled ||
+      !shouldAutoActivateWorkflowsTab(previous, activeWorkflowRunCount)
+    ) {
+      return;
+    }
+    setLayout((prev) => selectOrAddTab(prev, "workflows"));
+  }, [activityAuthoritative, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
 
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {
@@ -1318,6 +1355,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return positions;
   }, [layout.root]);
 
+  // Workspace-wide terminal ordering. Numbering per tabset would restart at
+  // "Terminal"/#1 in every split, defeating the badge's per-tab identity.
+  const terminalTabOrder = new Map<TabType, number>();
+  collectAllTabs(layout.root)
+    .filter(isTerminalTab)
+    .forEach((tab, index) => terminalTabOrder.set(tab, index));
+
   // @dnd-kit state for tracking active drag
   const [activeDragData, setActiveDragData] = React.useState<TabDragData | null>(null);
 
@@ -1349,6 +1393,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
@@ -1525,10 +1570,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // an unhandled promise rejection. We surface it via the same PopoverError used by
       // handleAddTerminal — the user already paid the cost of removing the tab below, so
       // they need to know if the pop-out itself failed.
-      void openTerminalPopout(api, workspaceId, sessionId).catch((err: unknown) => {
-        console.error("[RightSidebar] Failed to open terminal pop-out:", err);
-        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
-      });
+      // Carry the known OSC title into the pop-out; it is deleted from the
+      // sidebar map below and the new window only sees future title changes.
+      void openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab)).catch(
+        (err: unknown) => {
+          console.error("[RightSidebar] Failed to open terminal pop-out:", err);
+          terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+        }
+      );
 
       // Remove the tab from the sidebar (terminal now lives in its own window)
       // Don't close the session - the pop-out window takes over
@@ -1542,7 +1591,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return next;
       });
     },
-    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError]
+    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError, terminalTitles]
   );
 
   // Configure sensors with distance threshold for click vs drag disambiguation
@@ -1695,6 +1744,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onCloseTerminal={handleCloseTerminal}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}
+        terminalTabOrder={terminalTabOrder}
         onTerminalTitleChange={handleTerminalTitleChange}
         tabPositions={tabPositions}
         onRequestTerminalFocus={setAutoFocusTerminalSession}
@@ -1739,6 +1789,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
                   "w-0.5 flex-shrink-0 z-10 transition-[background] duration-150 cursor-col-resize",
                   isResizing ? "bg-accent" : "bg-border-light hover:bg-accent"
                 )}
+                // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
                 onMouseDown={(e) => onStartResize(e as unknown as React.MouseEvent)}
               />
             )}

@@ -1,5 +1,5 @@
 /**
- * E2E tests for the CLI layer (mux api commands).
+ * E2E tests for the CLI layer (xum api commands).
  *
  * These tests verify that:
  * 1. CLI commands work correctly via HTTP to a real server
@@ -19,7 +19,7 @@ import { createCli, FailedToExitError } from "trpc-cli";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 import type { ORPCContext } from "@/node/orpc/context";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 
@@ -38,7 +38,7 @@ interface TestServerHandle {
 async function createTestServer(authToken?: string): Promise<TestServerHandle> {
   // Create temp dir for config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-cli-test-"));
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
 
   // Mock BrowserWindow
   const mockWindow: BrowserWindow = {
@@ -51,7 +51,7 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
   } as unknown as BrowserWindow;
 
   // Initialize services
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   await services.initialize();
   services.windowService.setMainWindow(mockWindow);
 

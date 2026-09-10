@@ -8,15 +8,10 @@
 
 import type { TabType } from "@/browser/types/rightSidebar";
 import { getTabConfig, isBaseTabId } from "./tabConfig";
-import type {
-  ReviewStats as RegistryReviewStats,
-  TabLabelContext,
-  TabPanelContext,
-} from "./tabRegistry";
+import type { ReviewStats as RegistryReviewStats } from "./tabRegistry";
 
 /** Re-exported review stats type (used by RightSidebar wrapper props). */
 export type ReviewStats = RegistryReviewStats;
-export type { TabPanelContext, TabLabelContext };
 
 /** Configuration for a terminal tab (still special-cased outside the registry). */
 const TERMINAL_TAB_CONTENT_CLASS_NAME = "overflow-hidden p-0";

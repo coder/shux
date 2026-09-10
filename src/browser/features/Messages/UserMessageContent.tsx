@@ -14,6 +14,7 @@ import {
   HoverCardTrigger,
 } from "@/browser/components/HoverCard/HoverCard";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { downloadBlob } from "@/browser/utils/downloadFile";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { AgentSkillBadge } from "./AgentSkillBadge";
 import { buildAgentSkillSnapshotMarkdown } from "./agentSkillSnapshotMarkdown";
@@ -242,24 +243,19 @@ export const UserMessageContent: React.FC<UserMessageContentProps> = (props) => 
 
                   event.preventDefault();
 
-                  const blobUrl = URL.createObjectURL(blob);
-
                   if (isDesktopMode()) {
                     // In desktop mode, new windows are routed via shell.openExternal.
                     // blob: URLs are tied to this renderer and won't resolve externally,
                     // so download the file in-app instead.
-                    const link = document.createElement("a");
-                    link.href = blobUrl;
-                    link.download =
+                    void downloadBlob(
+                      blob,
                       part.filename ??
-                      (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment");
-                    document.body.appendChild(link);
-                    link.click();
-                    link.remove();
-                    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                        (baseMediaType === "application/pdf" ? "attachment.pdf" : "attachment")
+                    );
                     return;
                   }
 
+                  const blobUrl = URL.createObjectURL(blob);
                   window.open(blobUrl, "_blank", "noopener,noreferrer");
 
                   // Keep the blob URL alive long enough for the new tab to load.

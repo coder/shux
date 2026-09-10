@@ -167,15 +167,52 @@ function extractLoadedSkillSnapshotFromSyntheticMessage(
   });
 }
 
+/**
+ * Nested agent_skill_read calls inside a code_execution part (exclusive PTC):
+ * skill reads happen as nested xum.agent_skill_read calls, so the outer part
+ * is named "code_execution" and the results live in its output's toolCalls
+ * records. Classic PTC records retain the full result (snapshot recoverable);
+ * kernel-compacted records drop result contents, so nothing survives there —
+ * extractLoadedSkillSnapshotFromToolOutput rejects those records naturally.
+ */
+function extractLoadedSkillSnapshotsFromCodeExecutionOutput(
+  output: unknown
+): LoadedSkillSnapshot[] {
+  if (typeof output !== "object" || output === null) return [];
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+
+  const snapshots: LoadedSkillSnapshot[] = [];
+  for (const record of toolCalls as Array<Record<string, unknown>>) {
+    if (typeof record !== "object" || record === null) continue;
+    if (record.toolName !== "agent_skill_read" || record.error !== undefined) continue;
+    // Nested history is untrusted: an explicit ok:false marks the call failed
+    // even when a schema-valid result rides alongside (r18). Other nested
+    // extractors treat ok:false as authoritative failure — do the same here so
+    // contradictory rows cannot inject a skill snapshot into later requests.
+    if (record.ok === false) continue;
+    const snapshot = extractLoadedSkillSnapshotFromToolOutput(record.result);
+    if (snapshot) {
+      snapshots.push(snapshot);
+    }
+  }
+  return snapshots;
+}
+
 function extractLoadedSkillSnapshotsFromMessage(message: MuxMessage): LoadedSkillSnapshot[] {
   const snapshots: LoadedSkillSnapshot[] = [];
 
   for (const part of message.parts) {
-    if (
-      part.type !== "dynamic-tool" ||
-      part.toolName !== "agent_skill_read" ||
-      part.state !== "output-available"
-    ) {
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") {
+      continue;
+    }
+
+    if (part.toolName === "code_execution") {
+      snapshots.push(...extractLoadedSkillSnapshotsFromCodeExecutionOutput(part.output));
+      continue;
+    }
+
+    if (part.toolName !== "agent_skill_read") {
       continue;
     }
 

@@ -190,3 +190,18 @@ describe("worker budget sizing", () => {
     ).toBe(1);
   });
 });
+
+describe("eslint profile", () => {
+  const eslintWorkersAt = (limitGib: number) =>
+    workerBudget.computeWorkers({
+      ...workerBudget.PROFILES.eslint,
+      cpuCount: 8,
+      limitBytes: limitGib * GIB,
+      inUseBytes: 10 * GIB,
+    });
+
+  it("leaves room for a second cold lint on a 32GiB cgroup while large hosts keep 4 lanes", () => {
+    expect(eslintWorkersAt(32)).toBe(2);
+    expect(eslintWorkersAt(64)).toBe(4);
+  });
+});

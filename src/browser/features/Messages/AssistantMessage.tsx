@@ -200,8 +200,9 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
     const isCompacted = message.isCompacted;
     const isIdleCompacted = message.isIdleCompacted;
 
+    // Keep compaction badges visible beside long model names on narrow transcripts.
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
         {modelName && (
           <ModelDisplay
             modelString={modelName}

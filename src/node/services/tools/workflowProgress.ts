@@ -4,6 +4,7 @@ import type {
   WorkflowStepStatus,
 } from "@/common/types/workflow";
 import assert from "@/common/utils/assert";
+import { resolveWorkflowPhaseManifest } from "@/node/services/workflows/workflowPhaseManifest";
 
 type WorkflowProgressEvent = Exclude<WorkflowRunEvent, { type: "status" | "result" }>;
 
@@ -31,6 +32,26 @@ function getLatestPhaseEvent(run: WorkflowRunRecord) {
   return run.events.findLast((event) => event.type === "phase");
 }
 
+// "phase i/N" position within the DECLARED manifest, or null when the run's
+// script declares no phases or the latest phase is dynamic/undeclared. Inferred
+// manifests never drive a fraction: their source order may not match runtime
+// order, so a "2/5" would mislead. task_list/task_await hand this builder raw
+// (non-hydrated) run records, so resolve from run.source directly (memoized).
+function getDeclaredPhasePosition(
+  run: WorkflowRunRecord,
+  latestPhaseName: string
+): { phaseIndex: number; declaredPhaseCount: number } | null {
+  const outcome = resolveWorkflowPhaseManifest(run.source, run.sourceHash);
+  if (outcome.kind !== "manifest" || outcome.manifest.provenance !== "declared") {
+    return null;
+  }
+  const index = outcome.manifest.phases.findIndex((phase) => phase.name === latestPhaseName);
+  if (index < 0) {
+    return null;
+  }
+  return { phaseIndex: index + 1, declaredPhaseCount: outcome.manifest.phases.length };
+}
+
 export function buildWorkflowProgressSummary(run: WorkflowRunRecord) {
   assert(run.workflow.name.length > 0, "buildWorkflowProgressSummary: workflow name is required");
 
@@ -49,6 +70,7 @@ export function buildWorkflowProgressSummary(run: WorkflowRunRecord) {
           latestPhase: {
             name: latestPhase.name,
             at: latestPhase.at,
+            ...getDeclaredPhasePosition(run, latestPhase.name),
           },
         }
       : {}),
@@ -64,5 +86,8 @@ export function formatWorkflowProgressNote(baseNote: string, run: WorkflowRunRec
   if (latestPhase == null) {
     return baseNote;
   }
-  return `${baseNote} Latest phase: ${latestPhase.name}.`;
+  const position = getDeclaredPhasePosition(run, latestPhase.name);
+  const positionSuffix =
+    position != null ? ` (${position.phaseIndex}/${position.declaredPhaseCount})` : "";
+  return `${baseNote} Latest phase: ${latestPhase.name}${positionSuffix}.`;
 }

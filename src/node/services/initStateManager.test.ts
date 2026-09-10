@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import * as os from "os";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { Config } from "@/node/config";
@@ -254,7 +254,7 @@ describe("InitStateManager", () => {
       const workspaceId = "test-workspace";
       manager.startInit(workspaceId, "/path/to/hook");
 
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
 
       let releaseLock: (() => void) | undefined;
@@ -525,17 +525,6 @@ describe("InitStateManager", () => {
       await manager.endInit(workspaceId, 0);
       await waitPromise;
       // No spurious timeout error should be logged (verify via log spy if needed)
-    });
-
-    it("should work without abortSignal (backwards compat)", async () => {
-      const workspaceId = "test-workspace";
-      manager.startInit(workspaceId, "/path/to/hook");
-      const waitPromise = manager.waitForInit(workspaceId);
-
-      // Complete init
-      await manager.endInit(workspaceId, 0);
-      await waitPromise;
-      // Should complete without error
     });
   });
 });

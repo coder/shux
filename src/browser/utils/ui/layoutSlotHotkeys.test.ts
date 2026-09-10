@@ -107,29 +107,32 @@ describe("handleLayoutSlotHotkeys", () => {
     expect(applySlotToWorkspace.mock.calls.length).toBe(0);
   });
 
-  test("does not handle slot hotkey when a browser viewport is focused", () => {
-    const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());
+  test.each(["data-browser-viewport", "data-desktop-viewport"])(
+    "does not handle slot hotkey inside %s",
+    (viewportAttribute) => {
+      const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());
 
-    const browserViewport = document.createElement("div");
-    browserViewport.setAttribute("data-browser-viewport", "true");
+      const browserViewport = document.createElement("div");
+      browserViewport.setAttribute(viewportAttribute, "true");
 
-    const textarea = document.createElement("textarea");
-    browserViewport.appendChild(textarea);
+      const textarea = document.createElement("textarea");
+      browserViewport.appendChild(textarea);
 
-    const handled = handleLayoutSlotHotkeys(
-      createEvent({ key: "1", ctrlKey: true, altKey: true, target: textarea }),
-      {
-        isCommandPaletteOpen: false,
-        isSettingsOpen: false,
-        selectedWorkspaceId: "ws",
-        layoutPresets: createLayoutPresetsWithSlot1(),
-        applySlotToWorkspace,
-      }
-    );
+      const handled = handleLayoutSlotHotkeys(
+        createEvent({ key: "1", ctrlKey: true, altKey: true, target: textarea }),
+        {
+          isCommandPaletteOpen: false,
+          isSettingsOpen: false,
+          selectedWorkspaceId: "ws",
+          layoutPresets: createLayoutPresetsWithSlot1(),
+          applySlotToWorkspace,
+        }
+      );
 
-    expect(handled).toBe(false);
-    expect(applySlotToWorkspace.mock.calls.length).toBe(0);
-  });
+      expect(handled).toBe(false);
+      expect(applySlotToWorkspace.mock.calls.length).toBe(0);
+    }
+  );
 
   test("does not handle slot hotkey when AltGr is active", () => {
     const applySlotToWorkspace = mock((_workspaceId: string, _slot: number) => Promise.resolve());

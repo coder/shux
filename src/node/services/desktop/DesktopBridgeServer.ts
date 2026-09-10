@@ -2,6 +2,7 @@ import * as net from "node:net";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
+import { DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS } from "@/common/constants/desktop";
 import { assert } from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 import type { DesktopSessionManager } from "./DesktopSessionManager";
@@ -15,12 +16,24 @@ const VNC_HOST = "127.0.0.1";
 
 interface BridgePair {
   ws: WebSocket;
-  tcp: net.Socket;
+  tcp: net.Socket | null;
+  requesterWorkspaceId: string;
+  ownerWorkspaceId: string;
+  /** The requesting pane's viewer registration, when it bootstrapped with one. */
+  viewerId: string | null;
+  sessionId: string;
+  vncPort: number;
+  connectAbort: AbortController;
+  unsubscribeClose?: () => void;
   closed: boolean;
 }
 
 export interface DesktopBridgeServerOptions {
-  desktopSessionManager: Pick<DesktopSessionManager, "getLiveSessionConnection">;
+  desktopSessionManager: Pick<
+    DesktopSessionManager,
+    "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   desktopTokenManager: Pick<DesktopTokenManager, "validate">;
 }
 
@@ -92,10 +105,16 @@ async function waitForWebSocketClose(ws: WebSocket, timeoutMs = 250): Promise<vo
 }
 
 export class DesktopBridgeServer {
-  private readonly desktopSessionManager: Pick<DesktopSessionManager, "getLiveSessionConnection">;
+  private readonly desktopSessionManager: Pick<
+    DesktopSessionManager,
+    "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
+  > &
+    Partial<Pick<DesktopSessionManager, "noteDetached">>;
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
+  private readonly drainingSockets = new Map<net.Socket, Promise<void>>();
+  private stopConfigWatch: (() => void) | undefined;
   // Keep upgrade rejection aligned with stop() so httpServer.close() cannot hang on sockets
   // that reconnect after shutdown snapshots the current bridge clients.
   private isStopping = false;
@@ -112,6 +131,37 @@ export class DesktopBridgeServer {
 
   public ensureReady(): void {
     assert(this.wss, "DesktopBridgeServer WebSocketServer must be initialized");
+  }
+
+  /**
+   * Whether a VNC bridge WebSocket is attached for this workspace, as requester or as owner of
+   * a shared desktop. Every viewer surface (inline browser pane, inline Electron pane, popout
+   * windows) reaches the desktop through this bridge, so it is the ground truth that someone is
+   * watching; the browser viewer registry alone misses the inline Electron pane, which skips
+   * watchViewer. Pairs are registered synchronously with their admission lookup (which honors
+   * the archive guard), so an archive gate observing no pair cannot be beaten by a connection
+   * admitted earlier.
+   */
+  hasActiveBridge(
+    workspaceId: string,
+    // The owner captured at admission goes stale when a borrower is rebound before the config
+    // watcher revalidates the pair; the manager re-resolves it so the new owner counts as
+    // attached (and the old one no longer does) from the moment the binding changes.
+    resolveOwner: (requesterWorkspaceId: string, capturedOwnerWorkspaceId: string) => string = (
+      _requester,
+      capturedOwner
+    ) => capturedOwner
+  ): boolean {
+    assert(workspaceId.length > 0, "hasActiveBridge requires a workspaceId");
+    for (const pair of this.activePairs) {
+      if (
+        pair.requesterWorkspaceId === workspaceId ||
+        resolveOwner(pair.requesterWorkspaceId, pair.ownerWorkspaceId) === workspaceId
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -164,6 +214,8 @@ export class DesktopBridgeServer {
         }
       }
 
+      await Promise.allSettled(this.drainingSockets.values());
+
       this.activePairs.clear();
 
       if (activePairs.length > 0 || orphanClientClosePromises.length > 0) {
@@ -212,11 +264,86 @@ export class DesktopBridgeServer {
       return;
     }
 
+    // Subscribe before connecting: cleanup must revoke both established viewers and connections
+    // still awaiting TCP, even when a borrower has no owned desktop session to close.
+    const pair: BridgePair = {
+      ws,
+      tcp: null,
+      requesterWorkspaceId: payload.workspaceId,
+      ownerWorkspaceId: liveSession.ownerWorkspaceId,
+      viewerId: payload.viewerId,
+      sessionId: liveSession.sessionId,
+      vncPort: liveSession.vncPort,
+      connectAbort: new AbortController(),
+      closed: false,
+    };
+    pair.unsubscribeClose = this.desktopSessionManager.onWorkspaceClose((workspaceId) => {
+      if (
+        workspaceId === null ||
+        workspaceId === pair.requesterWorkspaceId ||
+        workspaceId === pair.ownerWorkspaceId
+      ) {
+        this.cleanupPair(pair, {
+          closeCode: MISSING_SESSION_CLOSE_CODE,
+          closeReason: "session unavailable",
+          // Renderer acknowledgment can beat the server's final WS close callback. If its
+          // handshake already started, preserve accepted release frames on this path too.
+          flushTcp:
+            pair.ws.readyState === WebSocket.CLOSING || pair.ws.readyState === WebSocket.CLOSED,
+        });
+      }
+    });
+    this.activePairs.add(pair);
+    ws.once("close", () =>
+      this.cleanupPair(pair, { closeReason: "websocket closed", flushTcp: true })
+    );
+    ws.on("error", (error) => {
+      log.error("DesktopBridgeServer: WebSocket bridge failed", {
+        workspaceId: payload.workspaceId,
+        error,
+      });
+      this.cleanupPair(pair, { closeReason: "websocket error" });
+    });
+
     try {
-      const tcp = await this.connectToVnc(liveSession.vncPort);
-      const pair: BridgePair = { ws, tcp, closed: false };
+      if (!this.stopConfigWatch) {
+        try {
+          this.stopConfigWatch = this.desktopSessionManager.watchWorkspaceConfig(
+            () => this.revalidateConnections(),
+            (error) => this.revokeForConfigWatchFailure(error)
+          );
+          // Catch a persisted change between the initial lookup and watcher installation,
+          // even if the TCP connection would never finish to perform its later recheck.
+          this.revalidateConnections();
+          if (pair.closed) return;
+        } catch (error) {
+          this.revokeForConfigWatchFailure(error);
+          return;
+        }
+      }
+      const tcp = await this.connectToVnc(liveSession.vncPort, pair.connectAbort.signal);
+      if (pair.closed) {
+        tcp.destroy();
+        return;
+      }
+      pair.tcp = tcp;
+      // Tokens name the requester, not the owner: revalidate the current relationship after
+      // connecting too, so an archive/removal during TCP setup cannot attach a stale borrower.
+      const currentSession = this.desktopSessionManager.getLiveSessionConnection(
+        payload.workspaceId
+      );
+      if (
+        currentSession?.sessionId !== payload.sessionId ||
+        currentSession.ownerWorkspaceId !== pair.ownerWorkspaceId ||
+        currentSession.vncPort !== liveSession.vncPort
+      ) {
+        this.cleanupPair(pair, {
+          closeCode: MISSING_SESSION_CLOSE_CODE,
+          closeReason: "session unavailable",
+        });
+        return;
+      }
       this.attachBridgeListeners(pair, payload.workspaceId, liveSession.sessionId);
-      this.activePairs.add(pair);
       log.debug("DesktopBridgeServer: bridged desktop session", {
         workspaceId: payload.workspaceId,
         sessionId: liveSession.sessionId,
@@ -227,17 +354,63 @@ export class DesktopBridgeServer {
         this.cleanupPair(pair, { closeReason: "websocket closed before bridge finished" });
       }
     } catch (error) {
+      if (pair.closed) return;
       log.warn("DesktopBridgeServer: failed to connect to VNC endpoint", {
         workspaceId: payload.workspaceId,
         sessionId: payload.sessionId,
         vncPort: liveSession.vncPort,
         error,
       });
-      closeWebSocket(ws, VNC_CONNECT_FAILURE_CLOSE_CODE, "vnc connect failed");
+      this.cleanupPair(pair, {
+        closeCode: VNC_CONNECT_FAILURE_CLOSE_CODE,
+        closeReason: "vnc connect failed",
+      });
     }
   }
 
-  private async connectToVnc(port: number): Promise<net.Socket> {
+  private revalidateConnections(): void {
+    try {
+      const connections = new Map<
+        string,
+        ReturnType<DesktopSessionManager["getLiveSessionConnection"]>
+      >();
+      for (const pair of this.activePairs) {
+        const mode = pair.tcp ? "established" : "admission";
+        const key = `${mode}:${pair.requesterWorkspaceId}`;
+        if (!connections.has(key)) {
+          connections.set(
+            key,
+            this.desktopSessionManager.getLiveSessionConnection(pair.requesterWorkspaceId, mode)
+          );
+        }
+        const current = connections.get(key);
+        if (
+          current?.ownerWorkspaceId !== pair.ownerWorkspaceId ||
+          current.sessionId !== pair.sessionId ||
+          current.vncPort !== pair.vncPort
+        ) {
+          this.cleanupPair(pair, {
+            closeCode: MISSING_SESSION_CLOSE_CODE,
+            closeReason: "session unavailable",
+          });
+        }
+      }
+    } catch (error) {
+      this.revokeForConfigWatchFailure(error);
+    }
+  }
+
+  private revokeForConfigWatchFailure(error: unknown): void {
+    log.warn("DesktopBridgeServer: config watching failed; revoking viewers", { error });
+    for (const pair of this.activePairs) {
+      this.cleanupPair(pair, {
+        closeCode: MISSING_SESSION_CLOSE_CODE,
+        closeReason: "session unavailable",
+      });
+    }
+  }
+
+  private async connectToVnc(port: number, signal: AbortSignal): Promise<net.Socket> {
     assert(Number.isInteger(port), "DesktopBridgeServer VNC port must be an integer");
     assert(port > 0, "DesktopBridgeServer VNC port must be positive");
 
@@ -249,6 +422,14 @@ export class DesktopBridgeServer {
         tcp.off("connect", onConnect);
         tcp.off("error", onError);
         tcp.off("close", onCloseBeforeConnect);
+        signal.removeEventListener("abort", onAbort);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        tcp.destroy();
+        reject(new Error("VNC connection cancelled"));
       };
 
       const onConnect = () => {
@@ -282,10 +463,14 @@ export class DesktopBridgeServer {
       tcp.once("connect", onConnect);
       tcp.once("error", onError);
       tcp.once("close", onCloseBeforeConnect);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
     });
   }
 
   private attachBridgeListeners(pair: BridgePair, workspaceId: string, sessionId: string): void {
+    const tcp = pair.tcp;
+    assert(tcp, "Desktop bridge listeners require a connected TCP socket");
     pair.ws.on("message", (data, isBinary) => {
       if (pair.closed) {
         return;
@@ -300,7 +485,7 @@ export class DesktopBridgeServer {
       }
 
       try {
-        pair.tcp.write(normalizeBinaryMessage(data));
+        tcp.write(normalizeBinaryMessage(data));
       } catch (error) {
         log.error("DesktopBridgeServer: failed to forward client frame to VNC", {
           workspaceId,
@@ -311,24 +496,14 @@ export class DesktopBridgeServer {
       }
     });
 
-    pair.ws.on("close", () => {
-      this.cleanupPair(pair, { closeReason: "websocket closed" });
-    });
-
-    pair.ws.on("error", (error) => {
-      log.error("DesktopBridgeServer: WebSocket bridge failed", { workspaceId, sessionId, error });
-      this.cleanupPair(pair, { closeReason: "websocket error" });
-    });
-
-    pair.tcp.on("data", (chunk) => {
+    tcp.on("data", (chunk) => {
       if (pair.closed) {
         return;
       }
 
-      if (pair.ws.readyState !== WebSocket.OPEN) {
-        this.cleanupPair(pair, { closeReason: "websocket unavailable for tcp data" });
-        return;
-      }
+      // A client close may race the last screen update. Let its close event drain pending
+      // client→VNC key/button releases instead of destroying the socket from this read path.
+      if (pair.ws.readyState !== WebSocket.OPEN) return;
 
       try {
         pair.ws.send(chunk, { binary: true });
@@ -342,23 +517,38 @@ export class DesktopBridgeServer {
       }
     });
 
-    pair.tcp.on("end", () => {
+    tcp.on("end", () => {
       this.cleanupPair(pair, { closeReason: "tcp ended" });
     });
 
-    pair.tcp.on("close", () => {
+    tcp.on("close", () => {
       this.cleanupPair(pair, { closeReason: "tcp closed" });
     });
 
-    pair.tcp.on("error", (error) => {
+    tcp.on("error", (error) => {
       log.error("DesktopBridgeServer: TCP bridge failed", { workspaceId, sessionId, error });
       this.cleanupPair(pair, { closeReason: "tcp error" });
     });
   }
 
+  private drainTcp(tcp: net.Socket): void {
+    const drained = new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => tcp.destroy(), DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS);
+      timeout.unref?.();
+      tcp.once("close", () => {
+        clearTimeout(timeout);
+        this.drainingSockets.delete(tcp);
+        resolve();
+      });
+    });
+    this.drainingSockets.set(tcp, drained);
+    // end() preserves buffered release frames; destroy() would discard unwritten bytes.
+    tcp.end();
+  }
+
   private cleanupPair(
     pair: BridgePair,
-    options: { closeCode?: number; closeReason?: string } = {}
+    options: { closeCode?: number; closeReason?: string; flushTcp?: boolean } = {}
   ): void {
     if (pair.closed) {
       return;
@@ -366,11 +556,32 @@ export class DesktopBridgeServer {
 
     pair.closed = true;
     this.activePairs.delete(pair);
+    // An established bridge was a known attachment: let the manager's archive gate keep the
+    // requester and owner attached for the bounded grace while the client reconnects or hands
+    // off. A pair that never reached VNC (admission/TCP/revalidation failure) never showed a
+    // desktop, so its loss is not evidence of a viewer. Attributed to the pane's viewer
+    // registration so a pane that gives that registration up definitively retracts this too.
+    if (pair.tcp !== null) {
+      this.desktopSessionManager.noteDetached?.(
+        pair.requesterWorkspaceId,
+        pair.ownerWorkspaceId,
+        pair.viewerId ?? undefined
+      );
+    }
+    if (this.activePairs.size === 0) {
+      const stopConfigWatch = this.stopConfigWatch;
+      this.stopConfigWatch = undefined;
+      stopConfigWatch?.();
+    }
+    pair.unsubscribeClose?.();
+    pair.connectAbort.abort();
 
-    if (!pair.tcp.destroyed) {
+    if (pair.tcp && !pair.tcp.destroyed) {
       try {
-        pair.tcp.destroy();
+        if (options.flushTcp) this.drainTcp(pair.tcp);
+        else pair.tcp.destroy();
       } catch (error) {
+        pair.tcp.destroy();
         log.debug("DesktopBridgeServer: TCP cleanup failed", {
           error,
           reason: options.closeReason,

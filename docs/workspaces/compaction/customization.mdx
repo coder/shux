@@ -3,11 +3,11 @@ title: Customization
 description: Customize the compaction system prompt
 ---
 
-You can customize how Mux summarizes conversations during compaction by overriding the `compact` agent.
+You can customize how Xum summarizes conversations during compaction by overriding the `compact` agent.
 
 ## Override the `compact` agent
 
-Create `.mux/agents/compact.md` in your project (or `~/.mux/agents/compact.md` for global):
+Create `.xum/agents/compact.md` in your project (or `~/.xum/agents/compact.md` for global):
 
 ```md
 ---
@@ -89,4 +89,4 @@ Write in a factual, dense style. Every sentence should convey essential context.
 
 - Custom `compact` agents apply to both manual `/compact` and auto-compaction.
 - Tools are always disabled during compaction.
-- `-t` sets `maxOutputTokens`; Mux converts this into an approximate word target for the instruction message.
+- `-t` sets `maxOutputTokens`; Xum converts this into an approximate word target for the instruction message.

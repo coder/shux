@@ -9,7 +9,7 @@
 import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 import type { DisplayedMessage } from "@/common/types/message";
 import { getPreferredCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getExplicitCompactionSuggestion, type CompactionRouteOptions } from "./suggestion";
 
@@ -99,7 +99,11 @@ export function checkContextSwitch(
   if (
     !opts?.allowSameModel &&
     previousModel &&
-    normalizeToCanonical(targetModel) === normalizeToCanonical(previousModel)
+    // Coder-aware equality: a cross-typed Coder route and the direct provider
+    // can have different effective limits (e.g. 1M on the Anthropic-typed
+    // gateway route), so switching between them must still be evaluated
+    // rather than suppressed as a same-model change.
+    modelSelectionEqualityKey(targetModel) === modelSelectionEqualityKey(previousModel)
   ) {
     return null;
   }

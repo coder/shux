@@ -13,7 +13,7 @@ import {
 
 function createSessionDirProvider(root: string) {
   return {
-    getSessionDir: (workspaceId: string) => path.join(root, workspaceId),
+    sessionsDir: root,
   };
 }
 

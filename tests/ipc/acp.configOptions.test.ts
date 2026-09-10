@@ -1,4 +1,5 @@
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "../../src/common/constants/knownModels";
 import {
   AGENT_MODE_CONFIG_ID,
   buildConfigOptions,
@@ -9,6 +10,7 @@ import type { ORPCClient } from "../../src/node/acp/serverConnection";
 interface WorkspaceAiSettings {
   model: string;
   thinkingLevel: "off" | "low" | "medium" | "high" | "xhigh" | "max";
+  reasoningMode?: "standard" | "pro";
 }
 
 interface WorkspaceState {
@@ -52,10 +54,12 @@ function createHarness(
   initial: WorkspaceState,
   options?: {
     agents?: AgentDescriptor[];
+    hiddenModels?: string[];
   }
 ): {
   client: ORPCClient;
   getWorkspaceState: () => WorkspaceState;
+  onAgentModeChanged: jest.Mock<void, [string, WorkspaceAiSettings]>;
   updateModeCalls: Array<{
     workspaceId: string;
     mode: "exec" | "plan";
@@ -67,7 +71,7 @@ function createHarness(
     aiSettings: WorkspaceAiSettings;
   }>;
 } {
-  let workspaceState: WorkspaceState = {
+  const workspaceState: WorkspaceState = {
     agentId: initial.agentId,
     aiSettings: { ...initial.aiSettings },
     aiSettingsByAgent: { ...initial.aiSettingsByAgent },
@@ -87,6 +91,7 @@ function createHarness(
   const availableAgents = options?.agents ?? DEFAULT_AGENT_DESCRIPTORS;
 
   const client = {
+    config: { getConfig: async () => ({ hiddenModels: options?.hiddenModels }) },
     workspace: {
       getInfo: async (): Promise<WorkspaceInfo> => ({
         id: "ws-1",
@@ -107,16 +112,6 @@ function createHarness(
       }) => {
         updateModeCalls.push(input);
 
-        workspaceState = {
-          ...workspaceState,
-          agentId: input.mode,
-          aiSettings: { ...input.aiSettings },
-          aiSettingsByAgent: {
-            ...workspaceState.aiSettingsByAgent,
-            [input.mode]: { ...input.aiSettings },
-          },
-        };
-
         return { success: true as const, data: undefined };
       },
       updateAgentAISettings: async (input: {
@@ -125,16 +120,6 @@ function createHarness(
         aiSettings: WorkspaceAiSettings;
       }) => {
         updateAgentCalls.push(input);
-
-        workspaceState = {
-          ...workspaceState,
-          agentId: input.agentId,
-          aiSettings: { ...input.aiSettings },
-          aiSettingsByAgent: {
-            ...workspaceState.aiSettingsByAgent,
-            [input.agentId]: { ...input.aiSettings },
-          },
-        };
 
         return { success: true as const, data: undefined };
       },
@@ -147,6 +132,7 @@ function createHarness(
   return {
     client,
     getWorkspaceState: () => workspaceState,
+    onAgentModeChanged: jest.fn<void, [string, WorkspaceAiSettings]>(),
     updateModeCalls,
     updateAgentCalls,
   };
@@ -170,6 +156,51 @@ function flattenSelectOptions(
 }
 
 describe("ACP config options", () => {
+  it.each([
+    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, blue: false, red: false },
+    {
+      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
+      current: KNOWN_MODELS.GPT.id,
+      blue: false,
+      red: false,
+    },
+    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, blue: true, red: true },
+    {
+      hiddenModels: [KNOWN_MODELS.DAYBREAK_BLUE.id],
+      current: KNOWN_MODELS.GPT.id,
+      blue: false,
+      red: true,
+    },
+    {
+      hiddenModels: [KNOWN_MODELS.DAYBREAK_RED.id],
+      current: KNOWN_MODELS.GPT.id,
+      blue: true,
+      red: false,
+    },
+    {
+      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
+      current: KNOWN_MODELS.DAYBREAK_BLUE.id,
+      blue: true,
+      red: false,
+    },
+  ])("respects model visibility while retaining the current selection: %j", async (scenario) => {
+    const harness = createHarness(
+      {
+        agentId: "exec",
+        aiSettings: { model: scenario.current, thinkingLevel: "high" },
+        aiSettingsByAgent: {},
+      },
+      { hiddenModels: scenario.hiddenModels }
+    );
+    const option = getSelectConfigOption(await buildConfigOptions(harness.client, "ws-1"), "model");
+    const values = flattenSelectOptions(option).map((entry) => entry.value);
+    expect(values.includes(KNOWN_MODELS.DAYBREAK_BLUE.id)).toBe(scenario.blue);
+    expect(values.includes(KNOWN_MODELS.DAYBREAK_RED.id)).toBe(scenario.red);
+    expect(values).toContain(scenario.current);
+    expect(new Set(values).size).toBe(values.length);
+    expect(option.currentValue).toBe(scenario.current);
+  });
+
   it("includes agent mode descriptions and model-aware thinking labels for Opus 4.6", async () => {
     const harness = createHarness({
       agentId: "exec",
@@ -248,7 +279,72 @@ describe("ACP config options", () => {
     ]);
   });
 
-  it("clamps persisted thinking level when model changes", async () => {
+  it("preserves pro reasoning mode across agent mode switches", async () => {
+    const harness = createHarness({
+      agentId: "plan",
+      aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      },
+    });
+
+    await handleSetConfigOption(harness.client, "ws-1", AGENT_MODE_CONFIG_ID, "exec", {
+      activeAgentId: "plan",
+      onAgentModeChanged: harness.onAgentModeChanged,
+    });
+
+    expect(harness.updateModeCalls).toHaveLength(0);
+    expect(harness.onAgentModeChanged.mock.calls[0]?.[1].reasoningMode).toBe("pro");
+  });
+
+  it("preserves pro reasoning mode across model and thinking level changes", async () => {
+    const harness = createHarness({
+      agentId: "exec",
+      aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      aiSettingsByAgent: {
+        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      },
+    });
+
+    await handleSetConfigOption(harness.client, "ws-1", "model", "anthropic:claude-opus-4-6", {
+      activeAgentId: "exec",
+      onAgentModeChanged: harness.onAgentModeChanged,
+    });
+    expect(harness.onAgentModeChanged.mock.calls[0]?.[1].reasoningMode).toBe("pro");
+
+    await handleSetConfigOption(harness.client, "ws-1", "thinkingLevel", "medium", {
+      activeAgentId: "exec",
+      aiSettings: harness.onAgentModeChanged.mock.calls[0]?.[1],
+      onAgentModeChanged: harness.onAgentModeChanged,
+    });
+    expect(harness.onAgentModeChanged.mock.calls[1]?.[1]).toEqual({
+      model: "anthropic:claude-opus-4-6",
+      thinkingLevel: "medium",
+      reasoningMode: "pro",
+    });
+    expect(harness.updateModeCalls).toHaveLength(0);
+    expect(harness.updateAgentCalls).toHaveLength(0);
+  });
+
+  it.each(["bogus", "openai:", ":gpt-5.2"])(
+    "rejects malformed local model choices (%s)",
+    async (model) => {
+      const harness = createHarness({
+        agentId: "exec",
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "off" },
+        aiSettingsByAgent: {},
+      });
+      await expect(
+        handleSetConfigOption(harness.client, "ws-1", "model", model, {
+          onAgentModeChanged: harness.onAgentModeChanged,
+        })
+      ).rejects.toThrow();
+      expect(harness.onAgentModeChanged).not.toHaveBeenCalled();
+    }
+  );
+
+  it("clamps local thinking level when model changes", async () => {
     const harness = createHarness({
       agentId: "exec",
       aiSettings: {
@@ -268,11 +364,11 @@ describe("ACP config options", () => {
       "ws-1",
       "model",
       "openai:gpt-5-pro",
-      { activeAgentId: "exec" }
+      { activeAgentId: "exec", onAgentModeChanged: harness.onAgentModeChanged }
     );
 
-    expect(harness.updateModeCalls).toHaveLength(1);
-    expect(harness.updateModeCalls[0]?.aiSettings).toEqual({
+    expect(harness.updateModeCalls).toHaveLength(0);
+    expect(harness.onAgentModeChanged.mock.calls[0]?.[1]).toEqual({
       model: "openai:gpt-5-pro",
       thinkingLevel: "high",
     });
@@ -283,8 +379,8 @@ describe("ACP config options", () => {
     expect(thinkingOption.currentValue).toBe("high");
     expect(thinkingEntries.map((entry) => entry.value)).toEqual(["high"]);
     expect(harness.getWorkspaceState().aiSettingsByAgent.exec).toEqual({
-      model: "openai:gpt-5-pro",
-      thinkingLevel: "high",
+      model: "anthropic:claude-opus-4-6",
+      thinkingLevel: "xhigh",
     });
   });
 
@@ -307,10 +403,12 @@ describe("ACP config options", () => {
     const agentModeOption = getSelectConfigOption(options, AGENT_MODE_CONFIG_ID);
     expect(agentModeOption.currentValue).toBe("exec");
 
-    const updated = await handleSetConfigOption(harness.client, "ws-1", "thinkingLevel", "off");
+    const updated = await handleSetConfigOption(harness.client, "ws-1", "thinkingLevel", "off", {
+      onAgentModeChanged: harness.onAgentModeChanged,
+    });
 
-    expect(harness.updateModeCalls).toHaveLength(1);
-    expect(harness.updateModeCalls[0]?.mode).toBe("exec");
+    expect(harness.updateModeCalls).toHaveLength(0);
+    expect(harness.onAgentModeChanged.mock.calls[0]?.[0]).toBe("exec");
 
     const updatedThinkingOption = getSelectConfigOption(updated, "thinkingLevel");
     expect(updatedThinkingOption.currentValue).toBe("off");
@@ -350,10 +448,12 @@ describe("ACP config options", () => {
     const agentModeOption = getSelectConfigOption(options, AGENT_MODE_CONFIG_ID);
     expect(agentModeOption.currentValue).toBe("ask");
 
-    const updated = await handleSetConfigOption(harness.client, "ws-1", "thinkingLevel", "off");
+    const updated = await handleSetConfigOption(harness.client, "ws-1", "thinkingLevel", "off", {
+      onAgentModeChanged: harness.onAgentModeChanged,
+    });
 
-    expect(harness.updateAgentCalls).toHaveLength(1);
-    expect(harness.updateAgentCalls[0]?.agentId).toBe("ask");
+    expect(harness.updateAgentCalls).toHaveLength(0);
+    expect(harness.onAgentModeChanged.mock.calls[0]?.[0]).toBe("ask");
 
     const updatedThinkingOption = getSelectConfigOption(updated, "thinkingLevel");
     expect(updatedThinkingOption.currentValue).toBe("off");

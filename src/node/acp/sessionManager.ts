@@ -68,12 +68,6 @@ export class SessionManager {
     return this.getRouting(sessionId).workspaceId;
   }
 
-  getSessionId(workspaceId: string): string {
-    const sessionId = this.workspaceToSession.get(workspaceId);
-    assert(sessionId, `[SessionManager] missing sessionId for workspaceId "${workspaceId}"`);
-    return sessionId;
-  }
-
   removeSession(sessionId: string): void {
     const routing = this.sessions.get(sessionId);
     if (!routing) {

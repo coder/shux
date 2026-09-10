@@ -1,12 +1,18 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
   MuxMessage,
   MuxMetadata,
   DisplayedMessage,
   CompactionRequestData,
   InlineSkillSnapshotMap,
-  AgentSkillReference,
 } from "@/common/types/message";
-import { createMuxMessage, isCompactionSummaryMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  getMcpPromptReferenceKey,
+  isCompactionSummaryMetadata,
+  sanitizeAgentSkillRefs,
+  sanitizeMcpPromptRefs,
+} from "@/common/types/message";
 
 import {
   copyStreamLifecycleSnapshot,
@@ -43,12 +49,12 @@ import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
-import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
 import type {
   WorkspaceChatMessage,
   StreamErrorMessage,
   DeleteMessage,
   OnChatCursor,
+  OnChatHistoryCursor,
 } from "@/common/orpc/types";
 import { isInitStart, isInitOutput, isInitEnd, isMuxMessage } from "@/common/orpc/types";
 import {
@@ -236,6 +242,13 @@ interface StreamingContext {
   suppressNotification: boolean;
   isReplay: boolean;
   model: string;
+  /**
+   * Request-pinned pricing/metadata identity stamped by the backend at
+   * stream start. Live pricing must prefer it over re-resolving the raw
+   * model: a Coder catalog refresh can remove/retag the instance while the
+   * stream is active.
+   */
+  metadataModel?: string;
   routedThroughGateway?: boolean;
   routeProvider?: string;
 
@@ -339,6 +352,27 @@ interface AgentSkillSnapshotContent {
   body?: string;
 }
 
+interface MCPPromptSnapshotContent {
+  serverName: string;
+  promptName: string;
+  commandKey: string;
+  invokingMessageId?: string;
+  description?: string;
+  body: string;
+}
+
+function maybeCollectMcpPromptSnapshot(
+  message: MuxMessage,
+  snapshots: Map<string, MCPPromptSnapshotContent>
+): void {
+  const metadata = message.metadata?.mcpPromptSnapshot;
+  if (!metadata) return;
+  snapshots.set(getMcpPromptReferenceKey(metadata.serverName, metadata.promptName), {
+    ...metadata,
+    body: getTextPartContent(message.parts),
+  });
+}
+
 interface InlineSkillSnapshotDisplayState {
   snapshots?: InlineSkillSnapshotMap;
   cacheKey?: string;
@@ -385,61 +419,52 @@ function maybeCollectAgentSkillSnapshot(
   });
 }
 
-function isAgentSkillReferenceArray(
-  refs: readonly AgentSkillReference[] | undefined
-): refs is readonly AgentSkillReference[] {
-  return Array.isArray(refs);
-}
-
 function deriveInlineSkillSnapshotDisplayState(
-  refs: readonly AgentSkillReference[] | undefined,
-  latestAgentSkillSnapshotByKey: ReadonlyMap<string, AgentSkillSnapshotContent>
+  messageId: string,
+  rawRefs: unknown,
+  latestAgentSkillSnapshotByKey: ReadonlyMap<string, AgentSkillSnapshotContent>,
+  rawMcpRefs: unknown,
+  latestMcpPromptSnapshotByKey: ReadonlyMap<string, MCPPromptSnapshotContent>
 ): InlineSkillSnapshotDisplayState {
-  if (!isAgentSkillReferenceArray(refs) || refs.length === 0) {
-    return {};
-  }
-
   const snapshotsBySkillName: InlineSkillSnapshotMap = {};
   const cacheEntryBySkillName = new Map<string, string>();
 
-  for (const ref of refs) {
-    if (ref.source !== "inline") {
-      continue;
-    }
-
+  for (const ref of sanitizeAgentSkillRefs(rawRefs)) {
+    if (ref.source !== "inline") continue;
     const snapshot = latestAgentSkillSnapshotByKey.get(
       getAgentSkillSnapshotKey(ref.scope, ref.skillName)
     );
     if (!snapshot || (snapshot.frontmatterYaml === undefined && snapshot.body === undefined)) {
       continue;
     }
-
     snapshotsBySkillName[ref.skillName] = {
       skillName: ref.skillName,
       scope: ref.scope,
-      snapshot: {
-        frontmatterYaml: snapshot.frontmatterYaml,
-        body: snapshot.body,
-      },
+      snapshot: { frontmatterYaml: snapshot.frontmatterYaml, body: snapshot.body },
     };
-    cacheEntryBySkillName.set(
-      ref.skillName,
-      JSON.stringify({
-        scope: ref.scope,
-        skillName: ref.skillName,
-        snapshot: getAgentSkillSnapshotDisplayCacheKey(snapshot),
-      })
+    cacheEntryBySkillName.set(ref.skillName, getAgentSkillSnapshotDisplayCacheKey(snapshot));
+  }
+
+  for (const ref of sanitizeMcpPromptRefs(rawMcpRefs)) {
+    if (ref.source !== "inline") continue;
+    const snapshot = latestMcpPromptSnapshotByKey.get(
+      getMcpPromptReferenceKey(ref.serverName, ref.promptName)
     );
+    // Same exact-correlation rule as the slash surface (crash orphans).
+    if (snapshot?.invokingMessageId !== messageId) continue;
+    snapshotsBySkillName[ref.commandKey] = {
+      skillName: ref.commandKey,
+      scope: "built-in",
+      snapshot: { body: snapshot.body },
+    };
+    cacheEntryBySkillName.set(ref.commandKey, snapshot.body);
   }
 
-  if (cacheEntryBySkillName.size === 0) {
-    return {};
-  }
-
+  if (cacheEntryBySkillName.size === 0) return {};
   return {
     snapshots: snapshotsBySkillName,
     cacheKey: Array.from(cacheEntryBySkillName.entries())
-      .sort(([leftSkillName], [rightSkillName]) => leftSkillName.localeCompare(rightSkillName))
+      .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
       .map(([, cacheEntry]) => cacheEntry)
       .join("\n"),
   };
@@ -496,6 +521,13 @@ export class StreamingMessageAggregator {
    *  Used for reconnect cursors instead of the absolute minimum (which
    *  includes user-loaded older pages via loadOlderHistory). */
   private establishedOldestHistorySequence: number | null = null;
+
+  /** Server-issued history cursor from the last caught-up, reused verbatim on reconnect.
+   *  The client's in-memory representation intentionally diverges from persisted rows
+   *  (compact-on-append parts, adopted tool outputs, client timestamps), so recomputing
+   *  cursor fingerprints locally would mismatch and silently downgrade every since
+   *  reconnect to a full replay. */
+  private lastServerHistoryCursor: OnChatHistoryCursor | null = null;
 
   // Delta history for token counting and TPS calculation
   private deltaHistory = new Map<string, DeltaRecordStorage>();
@@ -613,20 +645,6 @@ export class StreamingMessageAggregator {
   // either the real user message or a terminal stream event.
   private optimisticPendingStreamStart = false;
   private optimisticPendingStreamStartIdleCaughtUpCount = 0;
-
-  // Last completed stream timing stats (preserved after stream ends for display)
-  // Unlike activeStreams, this persists until the next stream starts
-  private lastCompletedStreamStats: {
-    startTime: number;
-    endTime: number;
-    firstTokenTime: number | null;
-    toolExecutionMs: number;
-    model: string;
-    outputTokens: number;
-    reasoningTokens: number;
-    streamingMs: number; // Time from first token to end (for accurate tok/s)
-    mode?: string; // Mode in which this response occurred
-  } | null = null;
 
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
@@ -759,7 +777,6 @@ export class StreamingMessageAggregator {
   /** Clear all session timing stats (in-memory only). */
   clearSessionTimingStats(): void {
     this.sessionTimingStats = {};
-    this.lastCompletedStreamStats = null;
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
@@ -933,20 +950,6 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Extract compaction summary text from a completed assistant message.
-   * Used when a compaction stream completes to get the summary for history replacement.
-   * @param messageId The ID of the assistant message to extract text from
-   * @returns The concatenated text from all text parts, or undefined if message not found
-   */
-  getCompactionSummary(messageId: string): string | undefined {
-    const message = this.messages.get(messageId);
-    if (!message) return undefined;
-
-    // Concatenate all text parts (ignore tool calls and reasoning)
-    return getTextPartContent(message.parts);
-  }
-
-  /**
    * Clean up stream-scoped state when stream ends (normally or abnormally).
    * Called by handleStreamEnd, handleStreamAbort, and handleStreamError.
    *
@@ -956,7 +959,6 @@ export class StreamingMessageAggregator {
    *
    * Preserves:
    * - currentTodos (incomplete lists stay visible; handleStreamEnd may clear fully completed lists)
-   * - lastCompletedStreamStats - timing stats from this stream for display after completion
    */
   private cleanupStreamState(messageId: string): void {
     // Clear optimistic interrupt flag if this stream was being interrupted.
@@ -1014,21 +1016,6 @@ export class StreamingMessageAggregator {
       const streamingMs = Math.max(0, durationMs - (ttftMs ?? 0) - totalToolExecutionMs);
 
       const mode = message?.metadata?.mode ?? context.mode;
-
-      // Store last completed stream stats (include durations anchored in the renderer clock)
-      const startTime = endTime - durationMs;
-      const firstTokenTime = ttftMs !== null ? startTime + ttftMs : null;
-      this.lastCompletedStreamStats = {
-        startTime,
-        endTime,
-        firstTokenTime,
-        toolExecutionMs: totalToolExecutionMs,
-        model: context.model,
-        outputTokens,
-        reasoningTokens,
-        streamingMs,
-        mode,
-      };
 
       // Use composite key model:mode for per-model+mode stats
       // Old data (no mode) will just use model as key, maintaining backward compat
@@ -1094,8 +1081,12 @@ export class StreamingMessageAggregator {
         ? normalizedMessage.parts.length
         : 0;
 
-      // Prefer richer content when duplicates arrive (e.g., placeholder vs completed message)
-      if (incomingParts < existingParts) {
+      // Rejection capsules are authoritative despite having no parts; stale payloads cannot revive them.
+      // Otherwise prefer richer content (e.g., placeholder vs completed message).
+      if (
+        !normalizedMessage.metadata?.contextBudgetRejected &&
+        (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+      ) {
         return;
       }
     }
@@ -1174,7 +1165,10 @@ export class StreamingMessageAggregator {
         // Since-replay can include a stale boundary row for an active stream message while
         // richer in-memory parts already exist. Keep the richer message to avoid dropping
         // in-flight tool/text parts that filtered replay deltas may not resend.
-        if (incomingParts < existingParts) {
+        if (
+          !normalizedMessage.metadata?.contextBudgetRejected &&
+          (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+        ) {
           continue;
         }
 
@@ -1199,6 +1193,23 @@ export class StreamingMessageAggregator {
       (a, b) => (a.metadata?.historySequence ?? 0) - (b.metadata?.historySequence ?? 0)
     );
 
+    this.replayDerivedState(chronologicalMessages, hasActiveStream, opts);
+  }
+
+  /**
+   * Replay message-derived state (skills, todos, agent status, review pins) from rows
+   * in chronological order, then run the shared post-replay normalization: persisted
+   * agent-status fallback, completed-todo cleanup on idle replays, cache invalidation,
+   * and pending-stream settle detection.
+   *
+   * Shared by loadHistoricalMessages and reconcileSinceReplay so batch loads and
+   * since-replay reconciliation keep identical derived-state semantics.
+   */
+  private replayDerivedState(
+    chronologicalMessages: readonly MuxMessage[],
+    hasActiveStream: boolean,
+    opts?: { skipDerivedState?: boolean }
+  ): void {
     let shouldClearCompletedTodosOnIdleReplay = false;
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
@@ -1216,9 +1227,10 @@ export class StreamingMessageAggregator {
           let assistantUpdatedTodos = false;
           for (const part of message.parts) {
             if (isDynamicToolPart(part) && part.state === "output-available") {
-              // Replay deliberately omits the timestamp so historical
-              // assisted-review pins don't all light up as "new" on initial
-              // load; only live updates get a fresh addedAt.
+              // Replay deliberately omits the live context so historical
+              // events don't re-fire user-visible side effects: assisted-review
+              // pins don't light up as "new" and notify results don't re-send
+              // browser notifications on every hydration.
               this.processToolResult(part.toolName, part.input, part.output);
               if (
                 part.toolName === "todo_write" &&
@@ -1276,6 +1288,167 @@ export class StreamingMessageAggregator {
     }
   }
 
+  /** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
+  private static readonly DERIVED_STATE_TOOL_NAMES = new Set([
+    "todo_write",
+    "propose_plan",
+    "status_set",
+    "agent_skill_read",
+    "review_pane_update",
+  ]);
+
+  private messageContributesDerivedState(message: MuxMessage): boolean {
+    if (message.metadata?.agentSkillSnapshot != null) {
+      return true;
+    }
+    return message.parts.some(
+      (part) =>
+        isDynamicToolPart(part) &&
+        part.state === "output-available" &&
+        StreamingMessageAggregator.DERIVED_STATE_TOOL_NAMES.has(part.toolName)
+    );
+  }
+
+  /**
+   * Reconcile a since-mode replay: the replayed rows are the authoritative suffix for
+   * historySequence >= requestedAnchorSequence.
+   *
+   * The server-issued cursor anchor can be older than the client's cached transcript
+   * (rows streamed live since the last caught-up sit above it), and server-side cursor
+   * validation only protects rows below the anchor. Rows in [anchor, client-max] can be
+   * deleted or rewritten server-side while the client is unsubscribed, so plain append
+   * semantics would retain them as stale ghosts. Here the replayed set wins: stale rows
+   * are removed, rewritten rows are replaced by their persisted forms, and the client
+   * converges exactly to persisted state.
+   */
+  reconcileSinceReplay(args: {
+    requestedAnchorSequence: number;
+    messages: MuxMessage[];
+    /**
+     * Server-confirmed active stream that matches the local stream context from when
+     * this reconnect's cursor was built. Kept as the richer local assembly: its
+     * persisted placeholder row has empty/partial parts and stream replay only
+     * re-sends deltas after the stream cursor, so hard-replacing it would lose
+     * already-rendered content.
+     */
+    preservedActiveStreamMessageId?: string;
+    hasActiveStream: boolean;
+  }): void {
+    const { requestedAnchorSequence, preservedActiveStreamMessageId, hasActiveStream } = args;
+    assert(
+      Number.isFinite(requestedAnchorSequence) && requestedAnchorSequence >= 0,
+      `reconcileSinceReplay requires a non-negative anchor, got ${requestedAnchorSequence}`
+    );
+
+    const replayed = args.messages.map(normalizeMessageRouteProvider);
+    const replayedIds = new Set(replayed.map((message) => message.id));
+
+    // Incremental derived-state replay cannot "unapply" a discarded todo_write /
+    // status_set / review pin, so track whether any discarded local row could have
+    // fed derived state and rebuild from the full window when one did.
+    let removedDerivedStateSource = false;
+    let deletedRows = false;
+
+    // 1) Delete stale suffix rows: any local row at/above the anchor that the server
+    // did not re-send was deleted or rewritten while the client was unsubscribed.
+    // Rows without a historySequence (optimistic sends awaiting ack) are never
+    // touched, nor is the preserved active-stream row.
+    for (const [messageId, existing] of Array.from(this.messages.entries())) {
+      const historySequence = existing.metadata?.historySequence;
+      if (historySequence === undefined || historySequence < requestedAnchorSequence) {
+        continue;
+      }
+      if (messageId === preservedActiveStreamMessageId || replayedIds.has(messageId)) {
+        continue;
+      }
+      removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
+      this.deleteMessage(messageId);
+      deletedRows = true;
+    }
+
+    // 2) Apply replayed rows with replace-by-id semantics: persisted rows are
+    // authoritative for finalized turns, including rewrites with FEWER parts than the
+    // local compacted copy (so these must not go through addMessage's "prefer richer
+    // content" guard). Exceptions that keep the richer local copy:
+    // - the preserved active-stream row (see preservedActiveStreamMessageId doc), and
+    // - defensive: rows below the anchor (e.g. a stale disk partial), which have no
+    //   suffix authority and follow append-mode update semantics instead.
+    const applied: MuxMessage[] = [];
+    for (const incoming of replayed) {
+      const incomingSequence = incoming.metadata?.historySequence;
+      const belowAnchor =
+        incomingSequence === undefined || incomingSequence < requestedAnchorSequence;
+      const existing = this.messages.get(incoming.id);
+
+      if (existing && (incoming.id === preservedActiveStreamMessageId || belowAnchor)) {
+        const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
+        const incomingParts = Array.isArray(incoming.parts) ? incoming.parts.length : 0;
+        if (
+          !incoming.metadata?.contextBudgetRejected &&
+          (existing.metadata?.contextBudgetRejected || incomingParts < existingParts)
+        ) {
+          continue;
+        }
+      }
+
+      if (existing) {
+        removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
+      }
+      this.messages.set(incoming.id, incoming);
+      this.bumpMessageVersion(incoming.id);
+      this.displayedMessageCache.delete(incoming.id);
+      applied.push(incoming);
+    }
+
+    // Flush the whole-transcript cache before the derived rebuild: deleteMessage only
+    // evicts per-message caches, and rebuildDerivedStateFromWindow must see the
+    // post-mutation message set, not a stale getAllMessages() array.
+    this.invalidateCache();
+
+    // 3) Rebuild derived state deterministically from the post-reconcile message set
+    // when a discarded row could have contributed to it; otherwise replay just the
+    // applied rows incrementally (same semantics as append-mode loads).
+    if (removedDerivedStateSource) {
+      this.rebuildDerivedStateFromWindow(hasActiveStream);
+    } else {
+      const chronologicalApplied = [...applied].sort(
+        (a, b) => (a.metadata?.historySequence ?? 0) - (b.metadata?.historySequence ?? 0)
+      );
+      this.replayDerivedState(chronologicalApplied, hasActiveStream);
+    }
+
+    if (deletedRows) {
+      // Match handleDeleteMessage: deletions invalidate async last-user-prompt fallbacks.
+      this.historyEpoch++;
+    }
+  }
+
+  /**
+   * Deterministically rebuild message-derived state from the current replay window
+   * (rows at/above the server replay-window floor). Resets the derived stores first
+   * because incremental replay cannot "unapply" contributions from rows that
+   * reconciliation discarded. Scoped to the established window so
+   * loadOlderHistory-paginated rows (loaded with skipDerivedState) stay excluded,
+   * matching full-replay semantics.
+   */
+  private rebuildDerivedStateFromWindow(hasActiveStream: boolean): void {
+    this.loadedSkills.clear();
+    this.loadedSkillsCache = [];
+    this.skillLoadErrors.clear();
+    this.skillLoadErrorsCache = [];
+    this.currentTodos = [];
+    this.assistedReviewHunks = [];
+    this.agentStatus = undefined;
+    this.lastStatusUrl = undefined;
+
+    const windowFloor = this.establishedOldestHistorySequence ?? Number.NEGATIVE_INFINITY;
+    const windowRows = this.getAllMessages().filter((message) => {
+      const historySequence = message.metadata?.historySequence;
+      return historySequence !== undefined && historySequence >= windowFloor;
+    });
+    this.replayDerivedState(windowRows, hasActiveStream);
+  }
+
   setEstablishedOldestHistorySequence(sequence: number | null): void {
     this.establishedOldestHistorySequence = sequence;
   }
@@ -1292,69 +1465,33 @@ export class StreamingMessageAggregator {
   }
 
   /**
+   * Record the server-issued history cursor from a caught-up payload. Pass null when
+   * the server did not advertise a trustworthy cursor (e.g. replay failure), which
+   * forces the next reconnect to request a full replay.
+   */
+  setServerHistoryCursor(cursor: OnChatHistoryCursor | null): void {
+    this.lastServerHistoryCursor = cursor;
+  }
+
+  /**
    * Build a cursor for incremental onChat reconnection.
    * Returns undefined when we cannot safely represent the current state,
    * forcing a full replay.
+   *
+   * The history segment is the server-issued cursor reused verbatim (see
+   * lastServerHistoryCursor); the client-computed stream segment is advisory and
+   * clamped server-side.
    */
   getOnChatCursor(): OnChatCursor | undefined {
-    let maxHistorySequence = -1;
-    let maxHistoryMessageId: string | undefined;
-    let minHistorySequence = Number.POSITIVE_INFINITY;
-
-    for (const message of this.messages.values()) {
-      const historySequence = message.metadata?.historySequence;
-      if (historySequence === undefined) {
-        continue;
-      }
-
-      if (historySequence > maxHistorySequence) {
-        maxHistorySequence = historySequence;
-        maxHistoryMessageId = message.id;
-      }
-
-      if (historySequence < minHistorySequence) {
-        minHistorySequence = historySequence;
-      }
-    }
-
-    if (!maxHistoryMessageId || !Number.isFinite(minHistorySequence)) {
-      return undefined;
-    }
-
     if (this.activeStreams.size > 1) {
       // Defensive fallback: multiple active streams is anomalous, so force a full replay.
       return undefined;
     }
 
-    const allMessages = this.getAllMessages();
-    const establishedOldestHistorySequence = this.establishedOldestHistorySequence;
-    const fingerprintMessages =
-      establishedOldestHistorySequence != null
-        ? allMessages.filter(
-            (message) =>
-              (message.metadata?.historySequence ?? Number.POSITIVE_INFINITY) >=
-              establishedOldestHistorySequence
-          )
-        : allMessages;
-
-    // Scope fingerprint input to the established replay window. The server computes
-    // priorHistoryFingerprint from getHistoryFromLatestBoundary(skip=0), so client-
-    // paginated rows from older compaction epochs must be excluded to avoid false
-    // mismatches that force unnecessary full replay on reconnect.
-    const priorHistoryFingerprint = computePriorHistoryFingerprint(
-      fingerprintMessages,
-      maxHistorySequence
-    );
-    const oldestHistorySequence = establishedOldestHistorySequence ?? minHistorySequence;
-
-    const cursor: OnChatCursor = {
-      history: {
-        messageId: maxHistoryMessageId,
-        historySequence: maxHistorySequence,
-        oldestHistorySequence,
-        ...(priorHistoryFingerprint !== undefined ? { priorHistoryFingerprint } : {}),
-      },
-    };
+    const cursor: OnChatCursor = {};
+    if (this.lastServerHistoryCursor) {
+      cursor.history = this.lastServerHistoryCursor;
+    }
 
     if (this.activeStreams.size === 1) {
       const activeStreamEntry = this.activeStreams.entries().next().value;
@@ -1366,11 +1503,11 @@ export class StreamingMessageAggregator {
       };
     }
 
+    if (!cursor.history && !cursor.stream) {
+      return undefined;
+    }
+
     return cursor;
-  }
-  // Efficient methods to check message state without creating arrays
-  getMessageCount(): number {
-    return this.messages.size;
   }
 
   hasMessages(): boolean {
@@ -1604,25 +1741,6 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Get timing statistics from the last completed stream.
-   * Returns null if no stream has completed yet in this session.
-   * Unlike getActiveStreamTimingStats, this includes endTime and token counts.
-   */
-  getLastCompletedStreamStats(): {
-    startTime: number;
-    endTime: number;
-    firstTokenTime: number | null;
-    toolExecutionMs: number;
-    model: string;
-    outputTokens: number;
-    reasoningTokens: number;
-    streamingMs: number;
-    mode?: string;
-  } | null {
-    return this.lastCompletedStreamStats;
-  }
-
-  /**
    * Get aggregate timing statistics across all completed streams in this session.
    * Totals are computed on-the-fly from per-model data.
    * Returns null if no streams have completed yet.
@@ -1760,8 +1878,16 @@ export class StreamingMessageAggregator {
    * Get the active main-agent stream id (for interrupt, live usage, and token tracking).
    * Returns undefined when no interruptible stream is active.
    */
+  getMessagePartCount(messageId: string): number {
+    return this.messages.get(messageId)?.parts.length ?? 0;
+  }
+
   getActiveStreamMessageId(): string | undefined {
     return this.getActiveStreamEntry()?.[0];
+  }
+
+  isStreamActive(messageId: string): boolean {
+    return this.activeStreams.has(messageId);
   }
 
   /**
@@ -1775,13 +1901,6 @@ export class StreamingMessageAggregator {
       this.interruptingMessageId = activeMessageId;
       this.invalidateCache();
     }
-  }
-
-  /**
-   * Check if a message is in the "interrupting" transient state.
-   */
-  isInterrupting(messageId: string): boolean {
-    return this.interruptingMessageId === messageId;
   }
 
   /**
@@ -1803,6 +1922,15 @@ export class StreamingMessageAggregator {
   /** Active streams that can be interrupted via the backend StreamManager. */
   hasInterruptibleActiveStream(): boolean {
     return this.getActiveStreamEntry() !== undefined;
+  }
+
+  /**
+   * Request-pinned metadata identity of the ACTIVE stream (see
+   * StreamingContext.metadataModel). undefined when no stream is active or
+   * the backend did not stamp one.
+   */
+  getActiveStreamMetadataModel(): string | undefined {
+    return this.getActiveStreamEntry()?.[1].metadataModel;
   }
 
   getCurrentModel(): string | undefined {
@@ -1880,6 +2008,10 @@ export class StreamingMessageAggregator {
     this.setPendingStreamStartTime(null);
   }
 
+  isOptimisticPendingStreamStart(): boolean {
+    return this.optimisticPendingStreamStart;
+  }
+
   resetForReplay(): void {
     const pendingStreamSnapshot =
       this.pendingStreamStartTime === null
@@ -1918,6 +2050,9 @@ export class StreamingMessageAggregator {
     this.lastAbortReason = null;
     this.lastResponseCompletedAt = null;
     this.establishedOldestHistorySequence = null;
+    // A since cursor is only safe while rows below its anchor are present locally.
+    // Clearing the transcript invalidates that premise, so force a full reconnect.
+    this.lastServerHistoryCursor = null;
     this.invalidateCache();
   }
 
@@ -1973,6 +2108,7 @@ export class StreamingMessageAggregator {
       suppressNotification,
       isReplay: data.replay === true,
       model: data.model,
+      metadataModel: data.metadataModel,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
       serverFirstTokenTime: null,
@@ -2312,19 +2448,30 @@ export class StreamingMessageAggregator {
         (part): part is DynamicToolPart =>
           part.type === "dynamic-tool" && part.toolCallId === data.parentToolCallId
       );
-      if (parentPart) {
-        // Initialize nestedCalls array if needed
-        parentPart.nestedCalls ??= [];
-        parentPart.nestedCalls.push({
-          toolCallId: data.toolCallId,
-          toolName: data.toolName,
-          state: "input-available",
-          input: data.args,
-          timestamp: data.timestamp,
-        });
-        this.markMessageDirty(data.messageId);
+      if (!parentPart) {
+        // execute() can emit nested events before the parent part streams in.
+        // Never fall through to creating a ghost top-level row: streamManager
+        // buffers the nested record and re-emits its events (start, workflow
+        // attachment, end) right after the parent part lands.
         return;
       }
+      // Initialize nestedCalls array if needed
+      parentPart.nestedCalls ??= [];
+      // Buffered-merge and reconnect replays re-deliver nested starts the
+      // renderer may already have; skip duplicates like the top-level path
+      // below does.
+      if (parentPart.nestedCalls.some((nc) => nc.toolCallId === data.toolCallId)) {
+        return;
+      }
+      parentPart.nestedCalls.push({
+        toolCallId: data.toolCallId,
+        toolName: data.toolName,
+        state: "input-available",
+        input: data.args,
+        timestamp: data.timestamp,
+      });
+      this.markMessageDirty(data.messageId);
+      return;
     }
 
     // Check if this tool call already exists to prevent duplicates
@@ -2549,7 +2696,10 @@ export class StreamingMessageAggregator {
     toolName: string,
     input: unknown,
     output: unknown,
-    messageContext?: { timestamp?: number }
+    // Present only for live (non-replay) tool results. History hydration and reconnect
+    // replay omit it so user-visible side effects (browser notifications, assisted-review
+    // "new" badges) never re-fire for events the user already saw.
+    liveContext?: { timestamp: number }
   ): void {
     // Update TODO state if this was a successful todo_write.
     // We still reconstruct from history so interrupted/incomplete plans survive reloads;
@@ -2606,14 +2756,14 @@ export class StreamingMessageAggregator {
             // Carry forward addedAt for `add` ops only so a refined
             // comment doesn't reset the "new" badge.
             candidate.addedAt = previous.addedAt;
-          } else if (messageContext?.timestamp !== undefined) {
+          } else if (liveContext !== undefined) {
             // `replace` op (or first time we've seen this key under any op):
             // stamp with the current message's timestamp. `replace` is an
             // explicit republish, so reuse of an old key should still
             // re-arm the "new" badge. Replay deliberately omits the
             // timestamp so historical pins don't all light up as "new"
             // on initial load.
-            candidate.addedAt = messageContext.timestamp;
+            candidate.addedAt = liveContext.timestamp;
           }
           next.push(candidate);
         }
@@ -2649,8 +2799,11 @@ export class StreamingMessageAggregator {
       }
     }
 
-    // Handle browser notifications when Electron wasn't available
-    if (toolName === "notify") {
+    // Handle browser notifications when Electron wasn't available.
+    // Live results only: notify outputs are persisted in history with their routing
+    // metadata, so history hydration and reconnect replay would otherwise re-fire
+    // OS notifications for past events on every workspace switch or reload (#2547).
+    if (toolName === "notify" && liveContext !== undefined) {
       const result = parseNotifySuccessResult(output);
       if (result) {
         const uiOnlyNotify = getToolOutputUiOnly(output)?.notify;
@@ -2748,11 +2901,15 @@ export class StreamingMessageAggregator {
 
         // Process tool result to update derived state (todos, agentStatus, etc.)
         // Live updates stamp a fresh `Date.now()` so the Assisted-review "new"
-        // badge can highlight just-introduced pins (the replay path
-        // intentionally omits this so historical pins don't flash on load).
-        this.processToolResult(data.toolName, toolPart.input, data.result, {
-          timestamp: Date.now(),
-        });
+        // badge can highlight just-introduced pins. Reconnect replay re-emits
+        // tool-call-end for already-completed calls, so treat those like the
+        // history-hydration path: no fresh timestamp and no notification re-fire.
+        this.processToolResult(
+          data.toolName,
+          toolPart.input,
+          data.result,
+          data.replay === true ? undefined : { timestamp: Date.now() }
+        );
 
         // Tool output is now stable - invalidate all caches.
         this.markMessageDirty(data.messageId);
@@ -3495,7 +3652,7 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Transform MuxMessages into DisplayedMessages for UI consumption
+   * Transform XumMessages into DisplayedMessages for UI consumption
    * This splits complex messages with multiple parts into separate UI blocks
    * while preserving temporal ordering through sequence numbers
    *
@@ -3505,7 +3662,8 @@ export class StreamingMessageAggregator {
   getDisplayedMessages(): DisplayedMessage[] {
     if (!this.cache.displayedMessages) {
       const displayedMessages: DisplayedMessage[] = [];
-      const allMessages = this.getAllMessages();
+      // Reconstruct rejected content only in this display projection; the stored history remains inert.
+      const allMessages = this.getAllMessages().map(restoreContextBudgetRejectedMessageForDisplay);
       const showSyntheticMessages =
         typeof window !== "undefined" && window.api?.debugLlmRequest === true;
 
@@ -3514,11 +3672,18 @@ export class StreamingMessageAggregator {
         ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
           isWorkflowResultMessage(message));
 
-      // Synthetic agent-skill snapshot messages are hidden from the transcript unless
-      // debugLlmRequest is enabled. We still want to surface their content in the UI by
-      // attaching the resolved snapshot (frontmatterYaml + body) to subsequent user
-      // messages that reference skills via /{skillName} or inline $skillName tokens.
+      // Retain hidden snapshots so referenced user messages can display their resolved content.
       const latestAgentSkillSnapshotByKey = new Map<string, AgentSkillSnapshotContent>();
+      // MCP prompt snapshots are re-materialized per turn and may fail, so a user
+      // row only sees the contiguous snapshot block directly before it; a
+      // history-wide map would falsely attach an older turn's expansion.
+      const blockMcpPromptSnapshotByKey = new Map<string, MCPPromptSnapshotContent>();
+      const isSyntheticSnapshotRow = (message: MuxMessage): boolean =>
+        message.metadata?.synthetic === true &&
+        (message.metadata.mcpPromptSnapshot !== undefined ||
+          message.metadata.agentSkillSnapshot !== undefined ||
+          message.metadata.fileAtMentionSnapshot !== undefined);
+      let previousWasSnapshotRow = true;
 
       // Pair completed subagent cards with the assistant response to their prior progress turn.
       // Persisted anchors improve within-response precision, but historical correctness must not
@@ -3529,7 +3694,10 @@ export class StreamingMessageAggregator {
       );
 
       for (const message of allMessages) {
+        if (!previousWasSnapshotRow) blockMcpPromptSnapshotByKey.clear();
+        previousWasSnapshotRow = isSyntheticSnapshotRow(message);
         maybeCollectAgentSkillSnapshot(message, latestAgentSkillSnapshotByKey);
+        maybeCollectMcpPromptSnapshot(message, blockMcpPromptSnapshotByKey);
         // Synthetic messages are typically for model context only.
         // Show them only in debug mode, or when explicitly marked as UI-visible.
         if (shouldHideMessageFromTranscript(message)) {
@@ -3545,20 +3713,40 @@ export class StreamingMessageAggregator {
         const agentSkillSnapshot = agentSkillSnapshotKey
           ? latestAgentSkillSnapshotByKey.get(agentSkillSnapshotKey)
           : undefined;
+        const slashMcpPromptRef =
+          message.role === "user"
+            ? sanitizeMcpPromptRefs(muxMeta?.mcpPromptRefs).find((ref) => ref.source === "slash")
+            : undefined;
+        const mcpPromptSnapshotCandidate = slashMcpPromptRef
+          ? blockMcpPromptSnapshotByKey.get(
+              getMcpPromptReferenceKey(slashMcpPromptRef.serverName, slashMcpPromptRef.promptName)
+            )
+          : undefined;
+        // Prompt identity alone can attach a crash-orphaned expansion to a
+        // later same-prompt turn; require the exact invoking row.
+        const mcpPromptSnapshot =
+          mcpPromptSnapshotCandidate?.invokingMessageId === message.id
+            ? mcpPromptSnapshotCandidate
+            : undefined;
 
         const agentSkillSnapshotForDisplay = agentSkillSnapshot
           ? { frontmatterYaml: agentSkillSnapshot.frontmatterYaml, body: agentSkillSnapshot.body }
-          : undefined;
+          : mcpPromptSnapshot
+            ? { body: mcpPromptSnapshot.body }
+            : undefined;
 
         const agentSkillSnapshotCacheKey = agentSkillSnapshot
           ? getAgentSkillSnapshotDisplayCacheKey(agentSkillSnapshot)
-          : undefined;
+          : mcpPromptSnapshot?.body;
 
         const inlineSkillSnapshotState =
           message.role === "user"
             ? deriveInlineSkillSnapshotDisplayState(
+                message.id,
                 muxMeta?.agentSkillRefs,
-                latestAgentSkillSnapshotByKey
+                latestAgentSkillSnapshotByKey,
+                muxMeta?.mcpPromptRefs,
+                blockMcpPromptSnapshotByKey
               )
             : undefined;
         const inlineSkillSnapshotsCacheKey = inlineSkillSnapshotState?.cacheKey;

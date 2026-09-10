@@ -85,4 +85,42 @@ describe("checkContextSwitch", () => {
     expect(warning?.targetModel).toBe(targetModel);
     expect(warning?.targetLimit).toBe(100_000);
   });
+
+  test("evaluates switches between a Coder gateway route and the direct model", () => {
+    // coder:openai/<model> (instance type decides the upstream) and the
+    // direct openai:<model> are distinct selections with potentially
+    // different effective limits (e.g. 1M on an Anthropic-typed route), so
+    // the switch must be evaluated, not suppressed as same-model.
+    const targetModel = "openai:gpt-5.2-codex";
+    const limit = getEffectiveContextLimit(targetModel, false);
+    expect(limit).not.toBeNull();
+    if (!limit) return;
+
+    const warning = checkContextSwitch(
+      Math.floor(limit * 0.95),
+      targetModel,
+      "coder:openai/gpt-5.2-codex",
+      false,
+      OPTIONS
+    );
+    expect(warning).not.toBeNull();
+    expect(warning?.targetModel).toBe(targetModel);
+  });
+
+  test("still suppresses passthrough gateway aliases of the same model", () => {
+    const targetModel = "mux-gateway:openai/gpt-5.2-codex";
+    const canonical = "openai:gpt-5.2-codex";
+    const limit = getEffectiveContextLimit(canonical, false);
+    expect(limit).not.toBeNull();
+    if (!limit) return;
+
+    const warning = checkContextSwitch(
+      Math.floor(limit * 0.95),
+      targetModel,
+      canonical,
+      false,
+      OPTIONS
+    );
+    expect(warning).toBeNull();
+  });
 });

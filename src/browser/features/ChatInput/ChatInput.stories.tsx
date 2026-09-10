@@ -12,6 +12,7 @@ import {
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
 import { within, userEvent, waitFor } from "@storybook/test";
+import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
 
 // Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
 const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
@@ -283,6 +284,81 @@ export const FocusedComposer: AppStory = {
   },
 };
 
+export const SendingMessage: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        const workspaceId = "ws-sending-message";
+        setWorkspaceInput(
+          workspaceId,
+          "Please double-check the retry path before we ship the connection fix."
+        );
+        return setupSimpleChatStory({
+          workspaceId,
+          messages: [
+            createUserMessage("msg-1", "Can you look at the reconnect logic?", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 120_000,
+            }),
+            createAssistantMessage("msg-2", "Sure, I found the handler that owns reconnects.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 60_000,
+            }),
+          ],
+          // Never resolves: the send stays in flight so the pending row remains visible.
+          onSendMessage: () => new Promise(() => undefined),
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone", "laptop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "A sent message stays visible in the transcript tail with a sending indicator until the backend acknowledges it; the composer is disabled meanwhile.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+
+    const sendButton = await within(storyRoot).findByLabelText("Send message");
+    await userEvent.click(sendButton);
+
+    await waitFor(() => {
+      const row = storyRoot.querySelector<HTMLElement>('[data-component="PendingSendMessage"]');
+      const status = storyRoot.querySelector<HTMLElement>('[data-component="PendingSendStatus"]');
+      if (!row || !status) {
+        throw new Error("Pending send row not rendered");
+      }
+      if (!row.textContent?.includes("Please double-check the retry path")) {
+        throw new Error("Pending send row does not show the sent text");
+      }
+      if (row.scrollWidth > row.clientWidth) {
+        throw new Error(
+          `Pending send row overflows horizontally (${row.scrollWidth}px > ${row.clientWidth}px)`
+        );
+      }
+      const textarea = storyRoot.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Message Claude"]'
+      );
+      if (!textarea?.disabled) {
+        throw new Error("Composer should be disabled while the send is in flight");
+      }
+    });
+    blurActiveElement();
+  },
+};
+
 export const ThinkingSelectorOpen: AppStory = {
   tags: ["thinking-selector"],
   globals: {
@@ -349,7 +425,7 @@ export const ThinkingSelectorOpen: AppStory = {
  */
 export const NarrowControlRowCollapse: AppStory = {
   render: () => (
-    <div data-testid="composer-width-wrapper" style={{ width: 900, height: 700 }}>
+    <div data-testid="composer-width-wrapper" style={{ width: "min(900px, 100%)", height: 700 }}>
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();
@@ -423,6 +499,7 @@ export const NarrowControlRowCollapse: AppStory = {
     }
 
     const assertNoOverflow = (stage: string) => {
+      assertComposerPillGeometry(storyRoot);
       const row = storyRoot.querySelector<HTMLElement>('[data-component="ComposerControlRow"]');
       if (!row) throw new Error("Composer control row not rendered");
       if (row.scrollWidth > row.clientWidth) {
@@ -550,6 +627,81 @@ export const NarrowControlRowCollapse: AppStory = {
         );
       }
     });
+  },
+};
+
+function assertComposerPillGeometry(
+  storyRoot: HTMLElement,
+  touch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches
+) {
+  const row = storyRoot.querySelector<HTMLElement>('[data-component="ComposerControlRow"]');
+  const group = storyRoot.querySelector<HTMLElement>('[data-component="ModelSelectorGroup"]');
+  if (!row || !group) throw new Error("Composer controls not rendered");
+  const groupBounds = group.getBoundingClientRect();
+  const rowBounds = row.getBoundingClientRect();
+  const pills = [
+    within(row).getByLabelText("Select agent"),
+    within(row).getByRole("button", { name: /^Context usage/ }),
+    group,
+  ];
+  for (const pill of pills) {
+    const bounds = pill.getBoundingClientRect();
+    if (bounds.width === 0) continue;
+    for (const edge of ["height", "top", "bottom"] as const) {
+      if (Math.abs(bounds[edge] - groupBounds[edge]) > 0.5) {
+        throw new Error(
+          `Composer pill ${edge} is ${bounds[edge]}px; model/thinking pill is ${groupBounds[edge]}px`
+        );
+      }
+    }
+    if (bounds.left < rowBounds.left - 0.5 || bounds.right > rowBounds.right + 0.5) {
+      throw new Error("Composer pill extends outside its row");
+    }
+  }
+  for (const button of row.querySelectorAll("button")) {
+    const bounds = button.getBoundingClientRect();
+    if (bounds.width === 0) continue;
+    if (
+      touch &&
+      (bounds.height < MOBILE_TOUCH_TARGET_PX || bounds.width < MOBILE_TOUCH_TARGET_PX)
+    ) {
+      throw new Error("Composer button lost its minimum touch target");
+    }
+    if (
+      group.contains(button) &&
+      (bounds.top < groupBounds.top - 0.5 || bounds.bottom > groupBounds.bottom + 0.5)
+    ) {
+      throw new Error("Model/thinking button extends outside its pill");
+    }
+  }
+}
+
+export const ComposerPillHeights: AppStory = {
+  render: NarrowControlRowCollapse.render,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { viewports: ["phone", "laptop"] } },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+    await waitFor(() => assertComposerPillGeometry(storyRoot));
+
+    // Pixel and the test-runner do not emulate coarse pointers.
+    const wrapper = within(storyRoot).getByTestId("composer-width-wrapper");
+    const originalWidth = wrapper.style.width;
+    const touchFloor = document.createElement("style");
+    touchFloor.textContent = `[data-component="ComposerControlRow"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; min-width: ${MOBILE_TOUCH_TARGET_PX}px; }`;
+    document.head.append(touchFloor);
+    wrapper.style.width = "390px";
+    try {
+      await waitFor(() => assertComposerPillGeometry(storyRoot, true));
+    } finally {
+      touchFloor.remove();
+      wrapper.style.width = originalWidth;
+    }
   },
 };
 

@@ -31,8 +31,14 @@ function getTokenizer(modelName: ModelName): Tokenizer {
 
 export function countTokens({ modelName, input }: CountTokensInput): number {
   const tokenizer = getTokenizer(modelName);
-  const count = tokenizer.count(input);
-  return count;
+  // Token counting is measurement, not a safety boundary: ordinary user/repo
+  // text can legitimately contain special-token strings like "<|endoftext|>"
+  // (e.g. GPT-2/BPE tasks), and count() -> encode() throws on them by
+  // default, which fatally breaks counting for the whole message. Empty
+  // allowed + disallowed sets disable the rejection without interpreting the
+  // spelling as one reserved token: the literal characters tokenize as
+  // ordinary text, keeping counts faithful to what providers see.
+  return tokenizer.encode(input, [], []).length;
 }
 
 export function encodingName(modelName: ModelName): string {

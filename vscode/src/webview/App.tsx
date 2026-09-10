@@ -2,23 +2,28 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 import { Pencil } from "lucide-react";
 
-import type { WorkspaceChatMessage } from "mux/common/orpc/types";
-import type { DisplayedMessage } from "mux/common/types/message";
-import { createClient } from "mux/common/orpc/client";
+import type { WorkspaceChatMessage } from "xum/common/orpc/types";
+import type { DisplayedMessage } from "xum/common/types/message";
+import { createClient } from "xum/common/orpc/client";
 
-import { ProviderOptionsProvider } from "mux/browser/contexts/ProviderOptionsContext";
-import { SettingsProvider } from "mux/browser/contexts/SettingsContext";
-import { APIProvider } from "mux/browser/contexts/API";
-import { ThemeProvider } from "mux/browser/contexts/ThemeContext";
-import { ChatHostContextProvider } from "mux/browser/contexts/ChatHostContext";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "mux/browser/components/Tooltip/Tooltip";
-import { Button } from "mux/browser/components/Button/Button";
-import { matchesKeybind, KEYBINDS } from "mux/browser/utils/ui/keybinds";
-import { readPersistedState } from "mux/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "mux/common/constants/storage";
-import { useAutoScroll } from "mux/browser/hooks/useAutoScroll";
-import { applyWorkspaceChatEventToAggregator } from "mux/browser/utils/messages/applyWorkspaceChatEventToAggregator";
-import { StreamingMessageAggregator } from "mux/browser/utils/messages/StreamingMessageAggregator";
+import { ProviderOptionsProvider } from "xum/browser/contexts/ProviderOptionsContext";
+import { SettingsProvider } from "xum/browser/contexts/SettingsContext";
+import { APIProvider } from "xum/browser/contexts/API";
+import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
+import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "xum/browser/components/Tooltip/Tooltip";
+import { Button } from "xum/browser/components/Button/Button";
+import { matchesKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
+import { readPersistedState } from "xum/browser/hooks/usePersistedState";
+import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
+import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
+import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
+import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 
 import type { ExtensionToWebviewMessage, UiConnectionStatus, UiWorkspace } from "./protocol";
 import { WorkspacePicker } from "./WorkspacePicker";
@@ -35,7 +40,6 @@ interface Notice {
   level: "info" | "error";
   message: string;
 }
-
 
 const VSCODE_CHAT_HOST_CONTEXT_VALUE = {
   uiSupport: VSCODE_CHAT_UI_SUPPORT,
@@ -144,7 +148,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     setDisplayedMessages(aggregator.getDisplayedMessages());
   };
 
-
   const flushDisplayedMessagesRef = useRef(flushDisplayedMessages);
   flushDisplayedMessagesRef.current = flushDisplayedMessages;
   const scheduleDisplayedMessages = () => {
@@ -181,7 +184,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const jumpToBottomRef = useRef(jumpToBottom);
   jumpToBottomRef.current = jumpToBottom;
 
-
   // Keep a stable monotonic counter for notice IDs.
   const noticeSeqRef = useRef(0);
 
@@ -190,7 +192,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     const id = `notice-${noticeSeqRef.current}`;
     setNotices((prev) => [...prev, { id, level: notice.level, message: notice.message }]);
   };
-
 
   const pushNoticeRef = useRef(pushNotice);
   pushNoticeRef.current = pushNotice;
@@ -226,7 +227,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           // switching workspaces (avoids showing stale messages for a new selection).
           cancelScheduledRender();
           aggregatorRef.current = null;
-          chatReplayStateRef.current = msg.workspaceId ? createChatReplayState(msg.workspaceId) : null;
+          chatReplayStateRef.current = msg.workspaceId
+            ? createChatReplayState(msg.workspaceId)
+            : null;
           setDisplayedMessages([]);
           setNotices([]);
 
@@ -242,7 +245,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           cancelScheduledRender();
           const workspace = workspacesRef.current.find((w) => w.id === msg.workspaceId);
           const createdAt = pickWorkspaceCreatedAt(workspace);
-          aggregatorRef.current = new StreamingMessageAggregator(createdAt, msg.workspaceId, workspace?.unarchivedAt);
+          aggregatorRef.current = new StreamingMessageAggregator(
+            createdAt,
+            msg.workspaceId,
+            workspace?.unarchivedAt
+          );
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
           setDisplayedMessages([]);
           setNotices([]);
@@ -317,7 +324,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                 pushNotice({
                   level: "error",
                   message:
-                    "Mux chat did not finish loading (missing caught-up). Showing a partial transcript; try Refresh if messages look incomplete.",
+                    "Xum chat did not finish loading (missing caught-up). Showing a partial transcript; try Refresh if messages look incomplete.",
                 });
               }
 
@@ -358,7 +365,10 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             flushDisplayedMessages();
           } catch (error) {
             const message = `Chat event handling error: ${error instanceof Error ? error.message : String(error)}`;
-            bridge.debugLog("chatEvent processing failed", { error: String(error), event: msg.event });
+            bridge.debugLog("chatEvent processing failed", {
+              error: String(error),
+              event: msg.event,
+            });
             pushNotice({ level: "error", message });
           }
 
@@ -397,7 +407,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bridge]);
 
-
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!canChat || !selectedWorkspaceId) {
@@ -410,7 +419,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       }
 
       const vimEnabled = readPersistedState(VIM_ENABLED_KEY, false);
-      const interruptKeybind = vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL;
+      const interruptKeybind = vimEnabled
+        ? KEYBINDS.INTERRUPT_STREAM_VIM
+        : KEYBINDS.INTERRUPT_STREAM_NORMAL;
 
       if (!matchesKeybind(e, interruptKeybind)) {
         return;
@@ -457,120 +468,127 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     bridge.postMessage({ type: "openWorkspace", workspaceId: selectedWorkspaceId });
   };
 
-
   return (
     <ChatHostContextProvider value={VSCODE_CHAT_HOST_CONTEXT_VALUE}>
       <APIProvider client={apiClient}>
-      <SettingsProvider>
-        <ProviderOptionsProvider>
-          <ThemeProvider forcedTheme="dark">
-            <TooltipProvider>
-          <div className="flex h-screen flex-col">
-            <div className="border-b border-border bg-background-secondary p-3">
-              <div className="flex items-center gap-2">
-                <WorkspacePicker
-                  workspaces={workspaces}
-                  selectedWorkspaceId={selectedWorkspaceId}
-                  onSelectWorkspace={(workspaceId) => {
-                    bridge.postMessage({ type: "selectWorkspace", workspaceId });
-                  }}
-                  onRequestRefresh={requestRefreshWorkspaces}
-                />
+        <SettingsProvider>
+          <ProviderOptionsProvider>
+            <ThemeProvider forcedTheme="dark">
+              <TooltipProvider>
+                <div className="flex h-screen flex-col">
+                  <div className="border-b border-border bg-background-secondary p-3">
+                    <div className="flex items-center gap-2">
+                      <WorkspacePicker
+                        workspaces={workspaces}
+                        selectedWorkspaceId={selectedWorkspaceId}
+                        onSelectWorkspace={(workspaceId) => {
+                          bridge.postMessage({ type: "selectWorkspace", workspaceId });
+                        }}
+                        onRequestRefresh={requestRefreshWorkspaces}
+                      />
 
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span
-                      className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
-                      aria-label="Preview feature"
-                    >
-                      Preview
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent align="center">
-                    Preview feature — under active development; may contain bugs.
-                  </TooltipContent>
-                </Tooltip>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span
+                            className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
+                            aria-label="Preview feature"
+                          >
+                            Preview
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent align="center">
+                          Preview feature — under active development; may contain bugs.
+                        </TooltipContent>
+                      </Tooltip>
 
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={onOpenWorkspace}
-                      disabled={!selectedWorkspaceId}
-                      aria-label="Open workspace"
-                      className="text-muted hover:text-foreground h-8 w-8 shrink-0"
-                    >
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent align="center">Open workspace</TooltipContent>
-                </Tooltip>
-              </div>
-            </div>
-
-            <div
-              ref={contentRef}
-              className="flex-1 overflow-y-auto p-3"
-              onScroll={handleScroll}
-              onWheel={markUserInteraction}
-              onMouseDown={markUserInteraction}
-              onTouchStart={markUserInteraction}
-            >
-              <div ref={innerRef}>
-                {selectedWorkspaceId ? (
-                  <>
-                    {displayedMessages.map((msg) => (
-                      <DisplayedMessageRenderer key={msg.id} message={msg} workspaceId={selectedWorkspaceId} />
-                    ))}
-                    <VscodeStreamingBarrier
-                      workspaceId={selectedWorkspaceId}
-                      aggregator={aggregatorRef.current}
-                      className="mt-3"
-                    />
-                  </>
-                ) : null}
-
-                {notices.map((notice) => (
-                  <div
-                    key={notice.id}
-                    className={
-                      notice.level === "error"
-                        ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
-                        : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
-                    }
-                  >
-                    {notice.message}
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            onClick={onOpenWorkspace}
+                            disabled={!selectedWorkspaceId}
+                            aria-label="Open workspace"
+                            className="text-muted hover:text-foreground h-8 w-8 shrink-0"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent align="center">Open workspace</TooltipContent>
+                      </Tooltip>
+                    </div>
                   </div>
-                ))}
 
-                {!selectedWorkspaceId && notices.length === 0 ? (
-                  <div className="text-muted text-sm">Select a mux workspace to view messages.</div>
-                ) : null}
-              </div>
-            </div>
+                  <div
+                    ref={contentRef}
+                    className="flex-1 overflow-y-auto p-3"
+                    onScroll={handleScroll}
+                    onWheel={markUserInteraction}
+                    onMouseDown={markUserInteraction}
+                    onTouchStart={markUserInteraction}
+                  >
+                    <div ref={innerRef}>
+                      {selectedWorkspaceId ? (
+                        <>
+                          {displayedMessages.map((msg) => (
+                            <DisplayedMessageRenderer
+                              key={msg.id}
+                              message={msg}
+                              workspaceId={selectedWorkspaceId}
+                            />
+                          ))}
+                          <VscodeStreamingBarrier
+                            workspaceId={selectedWorkspaceId}
+                            aggregator={aggregatorRef.current}
+                            className="mt-3"
+                          />
+                        </>
+                      ) : null}
 
-            <div className="border-t border-border bg-background-secondary p-3">
-              {selectedWorkspaceId ? (
-                <ChatComposer
-                  key={selectedWorkspaceId}
-                  workspaceId={selectedWorkspaceId}
-                  disabled={!canChat}
-                  disabledReason={canChat ? undefined : "Chat requires mux server connection."}
-                  aggregator={aggregatorRef.current}
-                  onSendComplete={jumpToBottom}
-                  onNotice={pushNotice}
-                />
-              ) : (
-                <div className="text-muted text-sm">Select a mux workspace to chat.</div>
-              )}
-            </div>
-          </div>
-            </TooltipProvider>
-          </ThemeProvider>
-        </ProviderOptionsProvider>
-      </SettingsProvider>
+                      {notices.map((notice) => (
+                        <div
+                          key={notice.id}
+                          className={
+                            notice.level === "error"
+                              ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
+                              : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
+                          }
+                        >
+                          {notice.message}
+                        </div>
+                      ))}
+
+                      {!selectedWorkspaceId && notices.length === 0 ? (
+                        <div className="text-muted text-sm">
+                          Select a Xum workspace to view messages.
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="border-t border-border bg-background-secondary p-3">
+                    {selectedWorkspaceId ? (
+                      <ChatComposer
+                        key={selectedWorkspaceId}
+                        workspaceId={selectedWorkspaceId}
+                        disabled={!canChat}
+                        disabledReason={
+                          canChat ? undefined : "Chat requires Xum server connection."
+                        }
+                        aggregator={aggregatorRef.current}
+                        onSendComplete={jumpToBottom}
+                        onNotice={pushNotice}
+                      />
+                    ) : (
+                      <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
+                    )}
+                  </div>
+                </div>
+              </TooltipProvider>
+            </ThemeProvider>
+          </ProviderOptionsProvider>
+        </SettingsProvider>
       </APIProvider>
     </ChatHostContextProvider>
   );

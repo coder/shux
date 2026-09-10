@@ -6,6 +6,7 @@ import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import { WORKFLOW_CHECKPOINT_RETRY_ERROR_MESSAGE } from "@/common/utils/workflowRetryEligibility";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+import type { TaskService } from "@/node/services/taskService";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -168,7 +169,19 @@ describe("workflow_resume tool", () => {
 
   test("resumes in background and records an agent workflow run reference", async () => {
     using tempDir = new TestTempDir("test-workflow-resume-bg");
-    const workflowService = buildWorkflowService();
+    // The reference must NOT be durable before the dispatch: the run still sits in its old
+    // terminal state until the dispatch restarts it, and a pre-dispatch reference would let a
+    // crash in that window replay the stale failure/interruption as a current wake.
+    let referenceDurableAtDispatch = false;
+    const workflowService = buildWorkflowService({
+      resumeRunInBackground: mock(async () => {
+        const references = await readAgentWorkflowRunReferences(tempDir.path);
+        referenceDurableAtDispatch = references.some(
+          (reference) => reference.runId === "wfr_resume_me"
+        );
+        return { runId: "wfr_resume_me", status: "running" as const, result: null };
+      }),
+    });
     const tool = createWorkflowResumeTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
       trusted: false,
@@ -186,6 +199,7 @@ describe("workflow_resume tool", () => {
       projectTrusted: false,
     });
     expect(workflowService.resumeRun).not.toHaveBeenCalled();
+    expect(referenceDurableAtDispatch).toBe(false);
     const references = await readAgentWorkflowRunReferences(tempDir.path);
     expect(references.map((reference) => reference.runId)).toContain("wfr_resume_me");
     expect(result).toMatchObject({ status: "running", runId: "wfr_resume_me", mode: "resume" });
@@ -227,6 +241,144 @@ describe("workflow_resume tool", () => {
       mode: "resume",
       note: expect.stringContaining("already completed"),
     });
+  });
+
+  test("marks terminal attention settled when returning an already-completed run's result", async () => {
+    using tempDir = new TestTempDir("test-workflow-resume-consumed");
+    const completedRun = buildRun({
+      status: "completed",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:00.000Z", status: "running" },
+        {
+          sequence: 2,
+          type: "result",
+          at: "2026-05-29T00:00:01.000Z",
+          result: { reportMarkdown: "already done" },
+        },
+        { sequence: 3, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+    });
+    const workflowService = buildWorkflowService({ getRun: mock(async () => completedRun) });
+    const markWorkflowRunTerminalAttentionSettled = mock(() => Promise.resolve());
+    const tool = createWorkflowResumeTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService,
+      taskService: { markWorkflowRunTerminalAttentionSettled } as unknown as TaskService,
+    });
+
+    await tool.execute!(
+      { run_id: "wfr_resume_me", run_in_background: false, mode: null },
+      mockToolCallOptions
+    );
+
+    expect(markWorkflowRunTerminalAttentionSettled).toHaveBeenCalledWith({
+      ownerWorkspaceId: "workspace-1",
+      runId: "wfr_resume_me",
+      status: "completed",
+      runUpdatedAt: completedRun.updatedAt,
+      settledAs: "delivered",
+    });
+  });
+
+  test("does not mark terminal attention settled for background dispatches", async () => {
+    using tempDir = new TestTempDir("test-workflow-resume-background-no-consume");
+    // The refresh after a background dispatch can still observe the stale pre-dispatch failed
+    // status; settling it would absorb the retried run's future terminal wake.
+    const workflowService = buildWorkflowService({ getRun: mock(async () => buildFailedRun()) });
+    const markWorkflowRunTerminalAttentionSettled = mock(() => Promise.resolve());
+    const tool = createWorkflowResumeTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService,
+      taskService: { markWorkflowRunTerminalAttentionSettled } as unknown as TaskService,
+    });
+
+    await tool.execute!(
+      { run_id: "wfr_resume_me", run_in_background: true, mode: "retry_from_checkpoint" },
+      mockToolCallOptions
+    );
+
+    expect(markWorkflowRunTerminalAttentionSettled).not.toHaveBeenCalled();
+  });
+
+  test("marks terminal attention settled when a foreground retry finishes terminal", async () => {
+    using tempDir = new TestTempDir("test-workflow-resume-foreground-consume");
+    const failedRun = buildFailedRun();
+    const completedRun = buildRun({
+      status: "completed",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:00.000Z", status: "running" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:02.000Z", status: "completed" },
+      ],
+    });
+    let getRunCalls = 0;
+    const workflowService = buildWorkflowService({
+      getRun: mock(async () => {
+        getRunCalls += 1;
+        return getRunCalls === 1 ? failedRun : completedRun;
+      }),
+      retryRunFromCheckpoint: mock(async () => ({
+        runId: "wfr_resume_me",
+        status: "completed" as const,
+        result: { reportMarkdown: "retried" },
+      })),
+    });
+    const markWorkflowRunTerminalAttentionSettled = mock(() => Promise.resolve());
+    const tool = createWorkflowResumeTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService,
+      taskService: { markWorkflowRunTerminalAttentionSettled } as unknown as TaskService,
+    });
+
+    await tool.execute!(
+      { run_id: "wfr_resume_me", run_in_background: false, mode: "retry_from_checkpoint" },
+      mockToolCallOptions
+    );
+
+    expect(markWorkflowRunTerminalAttentionSettled).toHaveBeenCalledWith({
+      ownerWorkspaceId: "workspace-1",
+      runId: "wfr_resume_me",
+      status: "completed",
+      runUpdatedAt: completedRun.updatedAt,
+      settledAs: "delivered",
+    });
+  });
+
+  test("skips the settled marker when the refresh read fails but still returns the result", async () => {
+    using tempDir = new TestTempDir("test-workflow-resume-refresh-failure-consume");
+    // WorkflowService.getRun collapses transient read failures to null. The marker binds to the
+    // run's terminal generation (updatedAt), which is unknowable without the refreshed record:
+    // the terminal result still returns to the model, and the wake settles as consumed from
+    // history evidence on the next scan instead of being marked here.
+    let getRunCalls = 0;
+    const workflowService = buildWorkflowService({
+      getRun: mock(async () => {
+        getRunCalls += 1;
+        return getRunCalls === 1 ? buildRun() : null;
+      }),
+      resumeRun: mock(async () => ({
+        runId: "wfr_resume_me",
+        status: "completed" as const,
+        result: { reportMarkdown: "resumed" },
+      })),
+    });
+    const markWorkflowRunTerminalAttentionSettled = mock(() => Promise.resolve());
+    const tool = createWorkflowResumeTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService,
+      taskService: { markWorkflowRunTerminalAttentionSettled } as unknown as TaskService,
+    });
+
+    const result = await tool.execute!(
+      { run_id: "wfr_resume_me", run_in_background: false, mode: null },
+      mockToolCallOptions
+    );
+
+    expect(markWorkflowRunTerminalAttentionSettled).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: "completed", runId: "wfr_resume_me", mode: "resume" });
   });
 
   test("rejects default resume of a failed run with checkpoint retry guidance", async () => {

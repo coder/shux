@@ -1,3 +1,4 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
@@ -7,8 +8,18 @@ import type {
   MuxMessage,
   MuxMessageMetadata,
 } from "@/common/types/message";
-import { getCompactionFollowUpContent } from "@/common/types/message";
+import {
+  getCompactionFollowUpContent,
+  isRolloverBoundary,
+  sanitizeAgentSkillRefs,
+  sanitizeMcpPromptRefs,
+} from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
+import {
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
+  parseAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -160,7 +171,12 @@ function createCompactionBoundaryRow(
     historySequence,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
+    contextWindowRollover: isRolloverBoundary(message) ? true : undefined,
     compactionEpoch,
+    ...(message.metadata?.muxMetadata?.type === "compaction-summary" &&
+    message.metadata.muxMetadata.strategy === "continuous"
+      ? { strategy: "continuous" }
+      : {}),
   };
 }
 
@@ -216,7 +232,60 @@ function getValidBashMonitorWakeRecords(
     typeof record.displayName === "string" &&
     typeof record.filter === "string" &&
     typeof record.filterExclude === "boolean";
-  return records.every(isValidRecord) ? records : undefined;
+  if (!records.every(isValidRecord)) return undefined;
+  // Self-healing for the optional settlement fields: an invalid terminal or staleTerminal shape
+  // drops that field, not the record, so the wake still renders with its base summary.
+  const isValidTerminal = (
+    terminal: unknown
+  ): terminal is NonNullable<BashMonitorWakeDisplayRecord["terminal"]> =>
+    isPlainObject(terminal) &&
+    (terminal.status === "exited" ||
+      terminal.status === "killed" ||
+      terminal.status === "failed" ||
+      terminal.status === "unknown") &&
+    (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
+  return records.map((record) => {
+    const terminalValid = record.terminal === undefined || isValidTerminal(record.terminal);
+    const staleValid = record.staleTerminal === undefined || isValidTerminal(record.staleTerminal);
+    if (terminalValid && staleValid) return record;
+    const { terminal, staleTerminal, ...rest } = record;
+    return {
+      ...rest,
+      ...(terminalValid && terminal !== undefined ? { terminal } : {}),
+      ...(staleValid && staleTerminal !== undefined ? { staleTerminal } : {}),
+    };
+  });
+}
+
+/**
+ * Same self-healing contract as getValidBashMonitorWakeRecords: peer metadata is persisted
+ * black-box data, so a corrupted row (e.g. object-valued fromTitle rendered as a React child)
+ * must fall back to normal user-message rendering instead of bricking the transcript.
+ *
+ * Authenticity mirrors the provider sanitizer: the row must carry synthetic provenance and its
+ * text must be a well-formed envelope whose sender fields MATCH the metadata. A partially
+ * corrupted row (valid-looking metadata on ordinary model output, or a metadata/envelope sender
+ * mismatch) renders as an ordinary assistant message instead of collapsing under another
+ * sender's attribution.
+ */
+function getValidAgentPeerMessage(
+  message: { metadata?: { muxMetadata?: MuxMessageMetadata; synthetic?: boolean } },
+  partText: string
+): NonNullable<Extract<DisplayedMessage, { type: "assistant" }>["agentPeerMessage"]> | undefined {
+  const meta = getValidAgentPeerMessageMeta(message.metadata?.muxMetadata);
+  if (meta == null || message.metadata?.synthetic !== true) {
+    return undefined;
+  }
+  const parsed = parseAgentMessageEnvelope(partText);
+  if (
+    parsed == null ||
+    parsed.from !== meta.fromWorkspaceId ||
+    parsed.relationship !== meta.relationship ||
+    parsed.fromTitle !== meta.fromTitle
+  ) {
+    return undefined;
+  }
+  return meta;
 }
 
 function getRawCommand(muxMetadata: unknown): string | undefined {
@@ -259,6 +328,11 @@ function buildUserDisplayedMessages(options: {
     }));
 
   let rawCommand = getRawCommand(muxMeta);
+  const sanitizedMcpPromptRefs = sanitizeMcpPromptRefs(muxMeta?.mcpPromptRefs);
+  const mcpPromptRefs = sanitizedMcpPromptRefs.length > 0 ? sanitizedMcpPromptRefs : undefined;
+  const sanitizedAgentSkillRefs = sanitizeAgentSkillRefs(muxMeta?.agentSkillRefs);
+  const agentSkillRefs = sanitizedAgentSkillRefs.length > 0 ? sanitizedAgentSkillRefs : undefined;
+  const slashMcpPromptRef = mcpPromptRefs?.find((ref) => ref.source === "slash");
   const agentSkill =
     muxMeta?.type === "agent-skill"
       ? {
@@ -267,7 +341,13 @@ function buildUserDisplayedMessages(options: {
           arguments: muxMeta.arguments,
           snapshot: agentSkillSnapshot,
         }
-      : undefined;
+      : slashMcpPromptRef
+        ? {
+            skillName: slashMcpPromptRef.commandKey,
+            scope: "built-in" as const,
+            snapshot: agentSkillSnapshot,
+          }
+        : undefined;
 
   const bashMonitorWakeRecords = getValidBashMonitorWakeRecords(muxMeta);
 
@@ -302,14 +382,46 @@ function buildUserDisplayedMessages(options: {
       historySequence,
       isSynthetic: message.metadata?.synthetic === true ? true : undefined,
       isUiVisible: message.metadata?.uiVisible === true ? true : undefined,
+      contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
+      mcpPromptRefs,
+      agentSkillRefs,
       inlineSkillSnapshots,
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
+      contextBudgetWarning:
+        message.metadata?.synthetic === true &&
+        muxMeta?.type === "context-budget-warning" &&
+        Number.isFinite(muxMeta.contextTokens) &&
+        muxMeta.contextTokens >= 0 &&
+        Number.isFinite(muxMeta.maxTokens) &&
+        muxMeta.maxTokens > 0
+          ? {
+              contextTokens: muxMeta.contextTokens,
+              maxTokens: muxMeta.maxTokens,
+              final: muxMeta.final === true,
+            }
+          : undefined,
+      // The peer-message wake trigger is a synthetic machine row: mark it so prompt
+      // navigation skips it (the envelope payload itself is a separate assistant row). When the
+      // recipient is executing a delegated workspace turn, the trigger carries that turn's
+      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
+      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
+      // human user row wearing peer metadata must fall back to ordinary rendering, not be
+      // disguised as a machine notification hidden from prompt navigation.
+      agentPeerMessageTrigger:
+        message.metadata?.synthetic === true &&
+        (muxMeta?.type === "agent-peer-message"
+          ? getValidAgentPeerMessageMeta(muxMeta) != null
+          : muxMeta?.type === "workspace-turn-task" &&
+            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
+          ? true
+          : undefined,
     },
   ];
 }
@@ -416,6 +528,9 @@ function appendAssistantTextRow(
     streamPresentation: options.isStreaming
       ? { source: options.streamIsReplay ? "replay" : "live" }
       : undefined,
+    // Backend-attached metadata (never model-authored text) gates the peer-message card, so a
+    // model-emitted lookalike envelope still renders as an ordinary assistant message.
+    agentPeerMessage: getValidAgentPeerMessage(message, part.text),
   });
 }
 
@@ -462,12 +577,28 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       continue;
     }
 
+    const output =
+      record.result ??
+      (typeof record.error === "string"
+        ? // success:false matches the failure shape tool cards and
+          // isFailedToolOutput already understand, so the error stays
+          // visible (e.g. bash's ErrorBox) after reload.
+          { success: false, error: record.error }
+        : undefined);
+    // RLM kernel-mode compact record (r12): the full nested result never
+    // persists in the tool output, so degraded detail after reload is expected
+    // (live streaming keeps full detail via part.nestedCalls, which takes
+    // precedence). Failure travels out-of-band via `failed` instead of a
+    // synthetic output shape, so a real tool result can never be mistaken
+    // for a reconstruction stand-in.
+    const kernelFailure = output === undefined && record.ok === false;
+
     nestedCalls.push({
       toolCallId: `${part.toolCallId}-nested-${idx}`,
       toolName: record.toolName,
       input: record.args,
-      output:
-        record.result ?? (typeof record.error === "string" ? { error: record.error } : undefined),
+      output,
+      ...(kernelFailure ? { failed: true } : {}),
       state: "output-available",
       timestamp: part.timestamp,
     });
@@ -687,7 +818,8 @@ function buildAssistantDisplayedMessages(options: {
 export function buildDisplayedMessagesForMessage(
   options: BuildDisplayedMessagesForMessageOptions
 ): DisplayedMessage[] {
-  const { message, agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const { agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const message = restoreContextBudgetRejectedMessageForDisplay(options.message);
   const baseTimestamp = message.metadata?.timestamp;
   const historySequence = message.metadata?.historySequence ?? 0;
   const planRows = buildPlanDisplayMessages(message, historySequence);

@@ -19,6 +19,7 @@ import {
   formatNumberedKeybind,
   KEYBINDS,
   matchNumberedKeybind,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -246,6 +247,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     if (!isPickerVisible) return;
 
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       const index = matchNumberedKeybind(e);
       if (index < 0) return;
 

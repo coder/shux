@@ -13,7 +13,7 @@ const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_API_URL = "https://api.github.com/user";
 
-// Mux-owned OAuth app client ID used for server-mode owner login.
+// Xum-owned OAuth app client ID used for server-mode owner login.
 const MUX_SERVER_GITHUB_CLIENT_ID = "Ov23liCVKFN3jOo9R7HS";
 const GITHUB_DEVICE_FLOW_SCOPE = "read:user";
 
@@ -763,7 +763,9 @@ export class ServerAuthService {
       headers: {
         Accept: "application/vnd.github+json",
         Authorization: `Bearer ${accessToken}`,
-        "User-Agent": "mux-server-auth",
+        // Display/product attribution only; GitHub requires a UA but does not
+        // parse this string as a mux wire contract.
+        "User-Agent": "xum-server-auth",
       },
     });
 

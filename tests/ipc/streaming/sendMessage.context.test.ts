@@ -306,7 +306,7 @@ describeIntegration("sendMessage context handling tests", () => {
         const maxAttempts = 20;
         while (attempts < maxAttempts) {
           const activity = await env.orpc.workspace.activity.list();
-          const workspaceActivity = activity[workspaceId];
+          const workspaceActivity = activity?.[workspaceId];
           if (!workspaceActivity?.streaming) {
             break;
           }

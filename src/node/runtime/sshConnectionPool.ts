@@ -514,7 +514,7 @@ export class SSHConnectionPool {
     // Set up SSH_ASKPASS for interactive host-key verification.
     // The askpass helper exchanges prompt/response text through temp files.
     // Non-host-key prompts (passphrase, password) return empty to fail fast —
-    // passphrase-protected keys must be agent-unlocked before Mux can use them.
+    // passphrase-protected keys must be agent-unlocked before Xum can use them.
     const askpass =
       canPromptInteractively && promptService
         ? await createMediatedAskpassSession({

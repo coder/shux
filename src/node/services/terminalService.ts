@@ -1,8 +1,14 @@
+import * as path from "path";
 import { EventEmitter } from "events";
+import * as fs from "fs";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isErrnoWithCode } from "@/node/utils/fs";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { spawn } from "child_process";
-import { secretsToRecord, type ExternalSecretResolver } from "@/common/types/secrets";
-import type { Config } from "@/node/config";
-import { getMuxEnv, getRuntimeType } from "@/node/runtime/initHook";
+import { secretsToRecord } from "@/common/types/secrets";
+import { SecretsStore, type Config } from "@/node/config";
+import { getXumEnv, getRuntimeType } from "@/node/runtime/initHook";
 import type { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type {
@@ -17,8 +23,10 @@ import {
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
-import { sanitizeMuxChildEnv } from "@/node/runtime/childProcessEnv";
+import { resolveContainerCli } from "@/node/runtime/containerCli";
+import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { Terminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { NO_OSC_IDLE_FALLBACK_MS } from "@/constants/terminalActivity";
@@ -61,9 +69,123 @@ export class TerminalService {
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
+  private shuttingDown = false;
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
+  // In-flight create() reservations per workspace (see create): counted before any await so
+  // archive admission gates observe startups that have not yet registered a session.
+  private readonly pendingSessionCreations = new Map<string, number>();
+  // Injected by WorkspaceService: true while an archive admission gate is active for the
+  // workspace. Checked synchronously with the startup reservation (see create) so a terminal
+  // startup and an archive always observe each other.
+  private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
+
+  /**
+   * Workspaces a native terminal was opened for. Native emulators are spawned detached and
+   * typically daemonize, so neither spawn success nor closure is observable — entries are
+   * recorded at open time (even for failed attempts, failing safe) and never removed.
+   * Model-facing snapshot archives consult this because removing a checkout under a user's
+   * live native shell/editor is unrecoverable. Detached emulators can also outlive Xum
+   * itself, so opens are additionally persisted as a durable per-workspace marker that
+   * survives app restarts (see nativeTerminalMarkerPath); this Set doubles as a read cache.
+   */
+  private readonly nativeTerminalWorkspaces = new Set<string>();
+
+  /**
+   * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
+   * marker exist before this batch wrote one?) and collects one launch-evidence token per
+   * admitted open; tokens are removed only by failed launches. When the last token of a
+   * batch is removed, every open in the batch failed, so the batch's marker is deleted
+   * unless it predated the batch (an earlier session's shell may still be running behind
+   * it). Successful opens retain their token forever, pinning the marker. Probing per batch
+   * — not per call — prevents a marker written by an earlier in-flight open of the same
+   * batch from masquerading as pre-existing evidence when every open in the batch fails.
+   */
+  private readonly nativeTerminalMarkerBatches = new Map<
+    string,
+    { markerPreexisted: boolean; tokens: Set<symbol> }
+  >();
+
+  /**
+   * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
+   * rollback's unlink could interleave with a concurrent open's write and delete the marker
+   * protecting that open's live shell.
+   */
+  private readonly nativeTerminalMarkerLocks = new MutexMap<string>();
+
+  /**
+   * openNative calls currently in flight per workspace, counted synchronously at entry
+   * (before the archive guard check) and released when the call settles. An in-flight open
+   * has already passed the archive guard and will launch after its awaits without
+   * rechecking, so hasOpenedNativeTerminal counts these alongside durable evidence — a
+   * concurrent failed open's rollback may collapse the shared marker and cache entry, and
+   * without this count that collapse would make a still-launching sibling invisible to an
+   * archive that then removes the environment beneath its shell.
+   */
+  private readonly pendingNativeTerminalOpens = new Map<string, number>();
+
+  private nativeTerminalMarkerPath(workspaceId: string): string {
+    return path.join(this.config.sessionsDir, workspaceId, "native-terminal-opened");
+  }
+
+  /**
+   * Disk probe for the durable marker. "unknown" means the probe failed in a way that cannot
+   * prove absence (EACCES, EIO, ...).
+   */
+  private async probeNativeTerminalMarkerOnDisk(
+    workspaceId: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      await fs.promises.access(this.nativeTerminalMarkerPath(workspaceId));
+      return "present";
+    } catch (error) {
+      return isErrnoWithCode(error, "ENOENT") ? "absent" : "unknown";
+    }
+  }
+
+  /**
+   * Synchronous slice of hasOpenedNativeTerminal: whether an open is still in flight
+   * (admitted but its durable marker not yet persisted). The pre-interruption archive hold
+   * checks this in its synchronous validation block, where the async marker probe cannot
+   * run and is unnecessary — established opens are refused by the caller's earlier
+   * untrackable-app gate.
+   */
+  hasPendingNativeTerminalOpen(workspaceId: string): boolean {
+    return (this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) > 0;
+  }
+
+  /** Whether a native terminal was ever opened for this workspace (survives app restarts). */
+  async hasOpenedNativeTerminal(workspaceId: string): Promise<boolean> {
+    // Opens still in flight count as opened: see pendingNativeTerminalOpens.
+    if ((this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) > 0) {
+      return true;
+    }
+    if (this.nativeTerminalWorkspaces.has(workspaceId)) {
+      return true;
+    }
+    const probe = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+    if (probe === "present") {
+      this.nativeTerminalWorkspaces.add(workspaceId);
+      return true;
+    }
+    // An "unknown" probe (EACCES, EIO, ...) cannot prove the marker is absent, and a false
+    // "absent" would let a snapshot archive remove the checkout under a surviving terminal —
+    // fail closed without caching (the marker may still prove readable later).
+    return probe !== "absent";
+  }
+
+  setWorkspaceArchiveGuard(guard: (workspaceId: string) => boolean): void {
+    this.workspaceArchiveGuard = guard;
+  }
+
+  /** Synchronous persisted-archived check for terminal admission (see create). */
+  private isArchivedNow(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return (
+      entry != null && isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    );
+  }
   // Tracks sessions that have received at least one OSC signal (0, 2, or 133).
   // OSC-driven sessions rely on shell-provided idle/running signals and skip the fallback timer.
   private readonly sessionsWithOscActivity = new Set<string>();
@@ -74,7 +196,9 @@ export class TerminalService {
   constructor(
     config: Config,
     ptyService: PTYService,
-    private readonly opResolver?: ExternalSecretResolver
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    )
   ) {
     this.config = config;
     this.ptyService = ptyService;
@@ -92,23 +216,58 @@ export class TerminalService {
   }
 
   private getProxyUriEnv(): Record<string, string> {
-    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: empty/whitespace-only env vars should be treated as unset
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- empty/whitespace-only env vars should be treated as unset
     const vscodeProxyUri = process.env.VSCODE_PROXY_URI?.trim() || undefined;
-    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: empty/whitespace-only env vars should be treated as unset
-    const muxProxyUri = process.env.MUX_PROXY_URI?.trim() || vscodeProxyUri;
+    const xumProxyUri = resolveXumEnvironmentValue("PROXY_URI", process.env)?.trim();
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- empty/whitespace-only env vars should be treated as unset
+    const muxProxyUri = xumProxyUri || vscodeProxyUri;
 
     const proxyUriEnv: Record<string, string> = {};
     if (vscodeProxyUri != null) {
       proxyUriEnv.VSCODE_PROXY_URI = vscodeProxyUri;
     }
     if (muxProxyUri != null) {
+      proxyUriEnv.XUM_PROXY_URI = muxProxyUri;
       proxyUriEnv.MUX_PROXY_URI = muxProxyUri;
     }
 
     return proxyUriEnv;
   }
 
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
+    // Reserve the startup synchronously: a creation that has passed its archived check but is
+    // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
+    // reservation an archive's live-activity gate could pass and the pending creation would
+    // then publish a PTY into the archived workspace. The archive-guard check shares this
+    // synchronous block: an archive gate armed first refuses this startup here; a reservation
+    // counted first is observed by that gate via hasWorkspaceSessions.
+    this.pendingSessionCreations.set(
+      params.workspaceId,
+      (this.pendingSessionCreations.get(params.workspaceId) ?? 0) + 1
+    );
+    try {
+      if (this.workspaceArchiveGuard?.(params.workspaceId) === true) {
+        throw new Error(
+          `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
+      return await this.createUnreserved(params);
+    } finally {
+      const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingSessionCreations.delete(params.workspaceId);
+      } else {
+        this.pendingSessionCreations.set(params.workspaceId, remaining);
+      }
+    }
+  }
+
+  private async createUnreserved(params: TerminalCreateParams): Promise<TerminalSession> {
     try {
       // 1. Resolve workspace
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -116,6 +275,15 @@ export class TerminalService {
 
       if (!workspaceMetadata) {
         throw new Error(`Workspace not found: ${params.workspaceId}`);
+      }
+
+      // Archived workspaces must not accrue hidden live activity: archive stops terminal
+      // sessions, so admitting a new one afterwards would leave a PTY running in a workspace
+      // the UI no longer surfaces. Unarchive first.
+      if (isWorkspaceArchived(workspaceMetadata.archivedAt, workspaceMetadata.unarchivedAt)) {
+        throw new Error(
+          `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
       }
 
       // Validate required fields before proceeding - projectPath is required for project-dir runtimes
@@ -144,8 +312,8 @@ export class TerminalService {
       // We intentionally skip dynamic values (like cost/model) because long-lived shells would go stale.
       const runtimeType = getRuntimeType(workspaceMetadata.runtimeConfig);
       const shouldInjectLocalEnv = runtimeType === "local" || runtimeType === "worktree";
-      const muxEnv = shouldInjectLocalEnv
-        ? getMuxEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
+      const xumEnv = shouldInjectLocalEnv
+        ? getXumEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
             workspaceId: workspaceMetadata.id,
           })
         : undefined;
@@ -154,15 +322,14 @@ export class TerminalService {
       // unless we add a dedicated secure propagation path.
       const secrets = shouldInjectLocalEnv
         ? await secretsToRecord(
-            this.config.getEffectiveSecrets(workspaceMetadata.projectPath),
-            this.opResolver
+            this.secretsStore.getEffectiveSecrets(workspaceMetadata.projectPath)
           )
         : {};
 
       // Any process launched from this terminal inherits these variables.
       // Proxy URI propagation allows terminal tools to construct externally reachable links.
       // MUX_PROXY_URI explicitly overrides VSCODE_PROXY_URI, and falls back to it when unset.
-      const terminalEnv = muxEnv ? { ...muxEnv, ...this.getProxyUriEnv(), ...secrets } : undefined;
+      const terminalEnv = xumEnv ? { ...xumEnv, ...this.getProxyUriEnv(), ...secrets } : undefined;
 
       // 4. Setup emitters and buffer
       // We don't know the sessionId yet (PTYService generates it), but PTYService uses a callback.
@@ -198,6 +365,17 @@ export class TerminalService {
 
       // 5. Create session
       const projectsConfig = this.config.loadConfigOrDefault();
+      // Recheck archived/archiving state after the awaits above: a user-driven archive (which
+      // force-closes rather than refuses) may have completed since the entry check, and a PTY
+      // spawned now would run hidden in the archived workspace.
+      if (
+        this.workspaceArchiveGuard?.(params.workspaceId) === true ||
+        this.isArchivedNow(params.workspaceId)
+      ) {
+        throw new Error(
+          `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
       const session = await this.ptyService.createSession(
         params,
         runtime,
@@ -209,6 +387,24 @@ export class TerminalService {
       );
 
       tempSessionId = session.sessionId;
+
+      // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
+      // have run closeWorkspaceSessions while createSession was awaiting — that close only
+      // terminates tracked sessions, so an unchecked publish here would leave a hidden PTY in
+      // the archived workspace. Kill the just-spawned PTY instead of registering it.
+      if (
+        this.workspaceArchiveGuard?.(params.workspaceId) === true ||
+        this.isArchivedNow(params.workspaceId)
+      ) {
+        try {
+          this.ptyService.closeSession(session.sessionId);
+        } finally {
+          this.cleanup(session.sessionId);
+        }
+        throw new Error(
+          `Workspace was archived while the terminal was starting: ${params.workspaceId}.`
+        );
+      }
 
       // Initialize emitters and headless terminal for state tracking
       this.outputEmitters.set(session.sessionId, new EventEmitter());
@@ -348,7 +544,7 @@ export class TerminalService {
     }
   }
 
-  async openWindow(workspaceId: string, sessionId?: string): Promise<void> {
+  async openWindow(workspaceId: string, sessionId?: string, initialTitle?: string): Promise<void> {
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
@@ -365,7 +561,7 @@ export class TerminalService {
         log.info(
           `Opening terminal window for workspace: ${workspaceId}${sessionId ? ` (session: ${sessionId})` : ""}`
         );
-        await this.terminalWindowManager!.openTerminalWindow(workspaceId, sessionId);
+        await this.terminalWindowManager!.openTerminalWindow(workspaceId, sessionId, initialTitle);
       } else {
         log.info(
           `Browser mode: terminal UI handled by browser for ${isSSH ? "SSH" : "local"} workspace: ${workspaceId}`
@@ -398,12 +594,122 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
+    // Pending-open admission pairing (same synchronous block as the archive guard check
+    // below, mirroring create()): the count is registered before any await so archive gates
+    // observe the intent immediately, and it keeps hasOpenedNativeTerminal true for the
+    // whole in-flight window — including the pre-marker awaits, where a concurrent failed
+    // open's rollback may collapse the shared marker and cache entry. Failed opens launch
+    // no shell (see the catch below), so the count simply releases in the finally; durable
+    // recording happens at marker-write time.
+    this.pendingNativeTerminalOpens.set(
+      workspaceId,
+      (this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      // Archive admission pairing: an archive gate armed first refuses this open, while an
+      // open counted first is observed by the sink's native-terminal check before snapshot
+      // capture. Without this, an open entering after that check could launch a native shell
+      // in a checkout the same archive is about to remove.
+      if (this.workspaceArchiveGuard?.(workspaceId) === true) {
+        throw new Error(
+          `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
+      await this.openNativeAdmitted(workspaceId);
+    } finally {
+      const remaining = (this.pendingNativeTerminalOpens.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingNativeTerminalOpens.delete(workspaceId);
+      } else {
+        this.pendingNativeTerminalOpens.set(workspaceId, remaining);
+      }
+    }
+  }
+
+  /** Body of openNative after pending-open admission; see openNative. */
+  private async openNativeAdmitted(workspaceId: string): Promise<void> {
+    let admissionToken: symbol | null = null;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
 
       if (!workspace) {
         throw new Error(`Workspace not found: ${workspaceId}`);
+      }
+
+      // Persisted archived state (not just an in-progress archive): a stale renderer can
+      // request a terminal for an already-archived workspace whose checkout may already be
+      // snapshot and removed. Mirrors create()'s admission — unarchive first. Checked before
+      // the durable marker write so a refused open cannot permanently gate future snapshot
+      // archives of this workspace.
+      if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+        throw new Error(
+          `Workspace is archived: ${workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
+
+      // Durable marker: the detached emulator can outlive Xum, so a restart must not forget
+      // the open (the in-memory Set resets, and both archive checks would otherwise let a
+      // model-driven snapshot archive remove the checkout under the still-live shell).
+      // Persistence failure is fatal to the launch: a terminal opened without the marker
+      // would be invisible to archive gating after a restart, so failing the open here is the
+      // only fail-closed option (the in-memory Set covers just this app session).
+      try {
+        admissionToken = await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
+          // Batch-scoped ancestry (see nativeTerminalMarkerBatches): the pre-existence probe
+          // runs once per batch, before the batch's first write, so a marker written by an
+          // earlier in-flight open of this same batch cannot masquerade as evidence of a
+          // real prior launch. "unknown" probes count as pre-existing (fail closed).
+          let batch = this.nativeTerminalMarkerBatches.get(workspaceId);
+          const createdBatch = batch == null;
+          if (batch == null) {
+            const preexisting = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+            batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
+            this.nativeTerminalMarkerBatches.set(workspaceId, batch);
+          }
+          const markerPath = this.nativeTerminalMarkerPath(workspaceId);
+          try {
+            await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
+            await fs.promises.writeFile(markerPath, new Date().toISOString());
+          } catch (error) {
+            // A newly created, still-empty batch must not outlive a failed persistence
+            // attempt: its probe (possibly a fail-closed "unknown" during the same
+            // filesystem hiccup) would become stale ancestry for a later retry, permanently
+            // preserving a marker that retry writes even when its launch fails. Discarding
+            // it makes the next attempt re-probe the recovered disk. A joined batch keeps
+            // its live tokens.
+            if (createdBatch && batch.tokens.size === 0) {
+              this.nativeTerminalMarkerBatches.delete(workspaceId);
+              // The failed write may still have created (or truncated) the marker file —
+              // ENOSPC and I/O errors can reject after the open. When this batch's probe
+              // proved absence, that artifact is ours and no launch backs it: left behind,
+              // it reads as durable launch evidence across restarts and classifies as
+              // pre-existing on retry. An "unknown" probe stays fail closed (never unlink
+              // what might predate us); unlink failure only over-refuses archives.
+              if (!batch.markerPreexisted) {
+                try {
+                  await fs.promises.unlink(markerPath);
+                } catch {
+                  // Best-effort (fail closed).
+                }
+              }
+            }
+            throw error;
+          }
+          // The sticky in-memory record is a cache of the just-written marker; before this
+          // point the pending-open count already keeps archive gates closed.
+          this.nativeTerminalWorkspaces.add(workspaceId);
+          // Launch evidence is registered under the same lock as the write so a concurrent
+          // failed launch's rollback can never observe the marker without the token.
+          const token = Symbol("native-terminal-launch");
+          batch.tokens.add(token);
+          return token;
+        });
+      } catch (error) {
+        log.error("Failed to persist native terminal marker", { workspaceId, error });
+        throw new Error(
+          `Cannot open a native terminal for ${workspaceId}: persisting the terminal-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the terminal after a restart.`
+        );
       }
 
       const runtimeConfig = workspace.runtimeConfig;
@@ -421,10 +727,11 @@ export class TerminalService {
         if (!containerName) {
           throw new Error("Docker container not initialized");
         }
+        const containerCli = quoteForNativeTerminalCommandArg(await resolveContainerCli());
         await this.openNativeTerminal({
           type: "local",
           workspacePath: process.cwd(), // cwd doesn't matter, we're running docker exec
-          command: `docker exec -it ${containerName} /bin/sh -c "cd ${workspace.namedWorkspacePath} && exec /bin/sh"`,
+          command: `${containerCli} exec -it ${containerName} /bin/sh -c "cd ${workspace.namedWorkspacePath} && exec /bin/sh"`,
         });
       } else if (isDevcontainerRuntime(runtimeConfig)) {
         // These arguments are executed via `sh -c` in terminal launchers, so they
@@ -446,6 +753,16 @@ export class TerminalService {
         });
       }
     } catch (err) {
+      // No failure path in openNative launches a shell: pre-marker failures (unknown/archived
+      // workspace, marker persistence) never reach a launcher and recorded nothing durable
+      // (the pending-open count covers that window and releases in openNative's finally). A
+      // marker this call created is a false positive that would permanently refuse future
+      // model-driven snapshot/Coder-stop archives, so it rolls back unless other launch
+      // evidence remains; launcher errors propagate only from before their detached spawn
+      // (nothing after spawn()/unref() throws).
+      if (admissionToken != null) {
+        await this.rollbackNativeTerminalMarkerAfterFailedLaunch(workspaceId, admissionToken);
+      }
       const message = getErrorMessage(err);
       log.error(`Failed to open native terminal: ${message}`);
       throw err;
@@ -453,16 +770,44 @@ export class TerminalService {
   }
 
   /**
-   * Open a native terminal and run a command.
-   * Used for opening $EDITOR in a terminal when editing files.
-   * @param command The command to run
-   * @param workspacePath Optional directory to run the command in (defaults to cwd)
+   * Undo a failed openNative's durable marker. The marker is deleted only when its whole
+   * ancestry batch failed (no launch-evidence token remains, so no shell launched or can
+   * still launch under it) and it did not predate the batch (an earlier session's shell may
+   * still be running behind it). Serialized with marker writes so the unlink can never race
+   * a concurrent open's write; deletion failure keeps the sticky marker (fail closed).
    */
-  async openNativeWithCommand(command: string, workspacePath?: string): Promise<void> {
-    await this.openNativeTerminal({
-      type: "local",
-      workspacePath: workspacePath ?? process.cwd(),
-      command,
+  private async rollbackNativeTerminalMarkerAfterFailedLaunch(
+    workspaceId: string,
+    token: symbol
+  ): Promise<void> {
+    await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
+      const batch = this.nativeTerminalMarkerBatches.get(workspaceId);
+      if (batch == null) {
+        // Unknown batch (cannot happen: batches are only closed here): keep everything.
+        return;
+      }
+      batch.tokens.delete(token);
+      if (batch.tokens.size > 0) {
+        return;
+      }
+      // Every open in the batch failed: close it so the next open starts a fresh probe.
+      this.nativeTerminalMarkerBatches.delete(workspaceId);
+      if (batch.markerPreexisted) {
+        return;
+      }
+      try {
+        await fs.promises.unlink(this.nativeTerminalMarkerPath(workspaceId));
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ENOENT")) {
+          // The marker may still exist, so the in-memory cache entry must stay to match it.
+          log.error("Failed to roll back native terminal marker after a failed launch", {
+            workspaceId,
+            error,
+          });
+          return;
+        }
+      }
+      this.nativeTerminalWorkspaces.delete(workspaceId);
     });
   }
 
@@ -677,10 +1022,10 @@ export class TerminalService {
         cwd: availableTerminal.cwd,
         detached: true,
         stdio: "ignore",
-        // Strip mux-internal vars (e.g. CHROME_DESKTOP, our Linux desktop
+        // Strip xum-internal vars (e.g. CHROME_DESKTOP, our Linux desktop
         // identity) so apps launched from this shell don't inherit them.
-        // sanitizeMuxChildEnv copies its input, so pass process.env directly.
-        env: sanitizeMuxChildEnv(process.env),
+        // sanitizeXumChildEnv copies its input, so pass process.env directly.
+        env: sanitizeXumChildEnv(process.env),
       });
       child.unref();
     } else {
@@ -926,6 +1271,26 @@ export class TerminalService {
         this.cleanup(sessionId);
       }
     }
+  }
+
+  getOpenSessionCount(): number {
+    return (
+      this.sessionActivity.size +
+      Array.from(this.pendingSessionCreations.values()).reduce((sum, count) => sum + count, 0)
+    );
+  }
+
+  /**
+   * Whether any live terminal PTY sessions are tracked for a workspace. Model-facing
+   * lifecycle paths consult this to refuse archiving instead of silently killing PTYs.
+   */
+  hasWorkspaceSessions(workspaceId: string): boolean {
+    return (
+      this.getTrackedSessionIdsForWorkspace(workspaceId).length > 0 ||
+      // Startups reserved in create() but not yet tracked in sessionActivity count as live:
+      // archive refusal gates must see them before their PTY publishes.
+      (this.pendingSessionCreations.get(workspaceId) ?? 0) > 0
+    );
   }
 
   /**

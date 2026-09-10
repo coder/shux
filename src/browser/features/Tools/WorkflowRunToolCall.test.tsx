@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/require-await */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
@@ -17,7 +17,7 @@ import {
 } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
+import type { WorkflowRunRecord, WorkflowRunStreamEvent } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   CommandRegistryProvider,
@@ -108,12 +108,10 @@ void mock.module("@/browser/components/Dialog/Dialog", () => ({
   ),
 }));
 
-// WorkflowRunToolCall reads the dynamic-workflows experiment to decide whether to auto-collapse.
-// Force it off so these tests are hermetic: in the full bun-test suite, cross-file experiment
-// state (shared happy-dom localStorage) can otherwise flip the card to collapsed and hide the
-// expanded content these tests assert.
+// Keep experiment state local to this suite so cross-file happy-dom storage cannot affect cards.
+let dynamicWorkflowsEnabled = false;
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
-  useExperimentValue: () => false,
+  useExperimentValue: () => dynamicWorkflowsEnabled,
 }));
 
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "./WorkflowRunToolCall";
@@ -213,6 +211,95 @@ function createWorkflowRunForExpansionTest(input: {
   };
 }
 
+function createTimelineRun(input: {
+  id: string;
+  status?: "running" | "backgrounded" | "completed";
+  stepTitle?: string;
+  updatedAt?: string;
+}): WorkflowRunRecord {
+  const status = input.status ?? "running";
+  const stepTitle = input.stepTitle ?? "Collect sources";
+  const completed = status === "completed";
+  const base = createWorkflowRunForExpansionTest({
+    id: input.id,
+    status: completed ? "completed" : "running",
+  });
+  const updatedAt =
+    input.updatedAt ?? (completed ? "2026-05-29T00:00:03.000Z" : "2026-05-29T00:00:02.000Z");
+  return {
+    ...base,
+    status,
+    updatedAt,
+    events: [
+      { sequence: 1, type: "status", at: "2026-05-29T00:00:01.000Z", status },
+      { sequence: 2, type: "phase", at: "2026-05-29T00:00:01.000Z", name: "Research" },
+      {
+        sequence: 3,
+        type: "task",
+        at: "2026-05-29T00:00:01.000Z",
+        stepId: "collect",
+        taskId: "task_collect",
+        status: completed ? "completed" : "started",
+        title: stepTitle,
+      },
+      ...(completed
+        ? [{ sequence: 4, type: "status" as const, at: updatedAt, status: "completed" as const }]
+        : []),
+    ],
+    steps: [
+      {
+        stepId: "collect",
+        inputHash: "sha256:collect",
+        status: completed ? "completed" : "started",
+        taskId: "task_collect",
+        startedAt: "2026-05-29T00:00:01.000Z",
+        ...(completed ? { completedAt: updatedAt } : {}),
+      },
+    ],
+  };
+}
+
+function createWorkflowSubscription() {
+  const queued: WorkflowRunStreamEvent[] = [];
+  let resolveNext: ((result: IteratorResult<WorkflowRunStreamEvent>) => void) | null = null;
+  let closed = false;
+  const iterator: AsyncIterableIterator<WorkflowRunStreamEvent> = {
+    next: () => {
+      const event = queued.shift();
+      if (event != null) {
+        return Promise.resolve({ value: event, done: false });
+      }
+      if (closed) {
+        return Promise.resolve({ value: undefined, done: true });
+      }
+      return new Promise((resolve) => {
+        resolveNext = resolve;
+      });
+    },
+    return: () => {
+      closed = true;
+      resolveNext?.({ value: undefined, done: true });
+      resolveNext = null;
+      return Promise.resolve({ value: undefined, done: true });
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+  return {
+    iterator,
+    emit(event: WorkflowRunStreamEvent) {
+      if (resolveNext != null) {
+        const resolve = resolveNext;
+        resolveNext = null;
+        resolve({ value: event, done: false });
+        return;
+      }
+      queued.push(event);
+    },
+  };
+}
+
 function CommandActionCapture(props: { onActions: (actions: CommandAction[]) => void }) {
   const registry = useCommandRegistry();
   useEffect(() => {
@@ -230,6 +317,13 @@ function getWorkflowHeader(view: ReturnType<typeof render>): HTMLElement {
   return header as HTMLElement;
 }
 
+function openEventLog(view: ReturnType<typeof render>): void {
+  const disclosure = view.queryByText("Event log");
+  if (disclosure != null) {
+    fireEvent.click(disclosure);
+  }
+}
+
 describe("WorkflowRunToolCall", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
@@ -242,6 +336,7 @@ describe("WorkflowRunToolCall", () => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
+    dynamicWorkflowsEnabled = false;
   });
 
   afterEach(() => {
@@ -298,6 +393,79 @@ describe("WorkflowRunToolCall", () => {
     expect(getStoredPrefs()).toBeNull();
   });
 
+  test("keeps active workflow runs expanded with the workflows experiment enabled", () => {
+    dynamicWorkflowsEnabled = true;
+
+    for (const status of ["running", "backgrounded"] as const) {
+      const run = createTimelineRun({ id: `wfr_active_${status}`, status });
+      const view = renderWithStickyToolProviders(
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+          status={status === "backgrounded" ? "backgrounded" : "executing"}
+          result={{ status, runId: run.id, result: null, run }}
+        />
+      );
+
+      expect(view.getByText(run.id)).toBeTruthy();
+      expect(view.getByText("Research")).toBeTruthy();
+      view.unmount();
+    }
+
+    const completedRun = createTimelineRun({ id: "wfr_dynamic_completed", status: "completed" });
+    const completedView = renderWithStickyToolProviders(
+      <WorkflowRunToolCall
+        args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: false }}
+        status="completed"
+        result={{ status: "completed", runId: completedRun.id, result: null, run: completedRun }}
+      />
+    );
+    expect(completedView.queryByText(completedRun.id)).toBeNull();
+  });
+
+  test("auto-collapses a non-interacted card when its run becomes terminal", () => {
+    dynamicWorkflowsEnabled = true;
+    const runningRun = createTimelineRun({ id: "wfr_transition" });
+    const completedRun = createTimelineRun({ id: runningRun.id, status: "completed" });
+    const renderCard = (run: WorkflowRunRecord) =>
+      withStickyToolProviders(
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+          status={run.status === "completed" ? "completed" : "executing"}
+          result={{ status: run.status, runId: run.id, result: null, run }}
+        />
+      );
+    const view = render(renderCard(runningRun));
+
+    expect(view.getByText(runningRun.id)).toBeTruthy();
+    view.rerender(renderCard(completedRun));
+    expect(view.queryByText(completedRun.id)).toBeNull();
+  });
+
+  test("manual collapse sticks while the live header summary updates", () => {
+    dynamicWorkflowsEnabled = true;
+    const runningRun = createTimelineRun({ id: "wfr_manual_live" });
+    const updatedRun = createTimelineRun({
+      id: runningRun.id,
+      stepTitle: "Verify claims",
+      updatedAt: "2026-05-29T00:00:03.000Z",
+    });
+    const renderCard = (run: WorkflowRunRecord) =>
+      withStickyToolProviders(
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+          status="executing"
+          result={{ status: "running", runId: run.id, result: null, run }}
+        />
+      );
+    const view = render(renderCard(runningRun));
+
+    fireEvent.click(getWorkflowHeader(view));
+    expect(view.queryByText(runningRun.id)).toBeNull();
+    view.rerender(renderCard(updatedRun));
+
+    expect(view.queryByText(updatedRun.id)).toBeNull();
+    expect(getWorkflowHeader(view).textContent).toContain("0/1 steps · Verify claims");
+  });
   test("resets completed workflow auto-collapse interaction for a new run id", () => {
     const firstRun = createWorkflowRunForExpansionTest({ id: "wfr_first", status: "completed" });
     const secondRun = createWorkflowRunForExpansionTest({ id: "wfr_second", status: "completed" });
@@ -469,6 +637,7 @@ describe("WorkflowRunToolCall", () => {
     expect(view.queryByText("wfr_123")).toBeNull();
 
     fireEvent.click(workflowHeader);
+    openEventLog(view);
 
     expect(view.getByText("wfr_123")).toBeTruthy();
     const getDisclosureForTitle = (title: string) => view.getByText(title).closest("details");
@@ -486,11 +655,15 @@ describe("WorkflowRunToolCall", () => {
     expect(firstEventIndex).toBeTruthy();
     expect(firstEventIndex.getAttribute("title")).toBeNull();
     expect(firstEventIndex.getAttribute("aria-label")).toBe("Raw event #2");
-    expect(view.getByText("scope").closest("div")?.className).toContain("bg-plan-mode-alpha");
+    expect(
+      view
+        .getAllByText("scope")
+        .some((element) => element.closest("div")?.className.includes("bg-plan-mode-alpha"))
+    ).toBe(true);
     expect(view.getByText("Scoped topic").closest("div")?.className).not.toContain(
       "bg-plan-mode-alpha"
     );
-    expect(view.getByText("Workflow events (6)")).toBeTruthy();
+    expect(view.getByText("Event log")).toBeTruthy();
     const taskEventRow = view.getByText("scope-topic / task_scope / completed");
     const taskEventIndex = view.getByText("#3");
     expect(taskEventIndex.className).toContain("cursor-help");
@@ -615,11 +788,153 @@ describe("WorkflowRunToolCall", () => {
       </APIHarness>
     );
 
+    openEventLog(view);
     await waitFor(() => {
       expect(view.getByText("child-phase")).toBeTruthy();
     });
     expect(requestedRunIds).toContain("wfr_child01");
     expect(view.container.textContent).toContain("running · 0/0 steps · child-phase");
+  });
+
+  test("shows live step progress in the header while the run is active", () => {
+    const timestamp = "2026-05-29T00:00:00.000Z";
+    const laterTimestamp = "2026-05-29T00:00:05.000Z";
+    const run: WorkflowRunRecord = {
+      id: "wfr_progress01",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "deep-research",
+        description: "Deep research",
+        scope: "built-in",
+        requestedScriptPath: TEST_WORKFLOW_SCRIPT_PATH,
+        canonicalScriptPath: TEST_WORKFLOW_SCRIPT_PATH,
+        sourceKind: "skill",
+        sourceHash: "sha256:progress",
+        executable: true,
+      },
+      source: "export default function workflow() { return null; }",
+      sourceHash: "sha256:progress",
+      args: {},
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: laterTimestamp,
+      events: [
+        { sequence: 1, type: "status", at: timestamp, status: "running" },
+        { sequence: 2, type: "phase", at: timestamp, name: "research" },
+        {
+          sequence: 3,
+          type: "task",
+          at: timestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "started",
+          title: "Survey prior art",
+        },
+        {
+          sequence: 4,
+          type: "task",
+          at: laterTimestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "completed",
+          title: "Survey prior art",
+        },
+        {
+          sequence: 5,
+          type: "task",
+          at: laterTimestamp,
+          stepId: "step-2",
+          taskId: "task-2",
+          status: "started",
+          title: "Draft report",
+        },
+      ],
+      steps: [
+        {
+          stepId: "step-1",
+          inputHash: "hash-1",
+          status: "completed",
+          taskId: "task-1",
+          startedAt: timestamp,
+          completedAt: laterTimestamp,
+        },
+        {
+          stepId: "step-2",
+          inputHash: "hash-2",
+          status: "started",
+          taskId: "task-2",
+          startedAt: laterTimestamp,
+        },
+      ],
+    };
+    const client = {
+      workflows: {
+        getRun: async () => run,
+      },
+    };
+
+    const view = renderWithStickyToolProviders(
+      <APIHarness client={client}>
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, args: {}, run_in_background: false }}
+          status="executing"
+          result={{ status: "running", runId: run.id, result: null, run }}
+        />
+      </APIHarness>
+    );
+
+    // Progress is a collapsed-header affordance; the expanded body already shows events.
+    const header = getWorkflowHeader(view);
+    expect(header.textContent).not.toContain("1/2 steps");
+    fireEvent.click(header);
+    expect(header.textContent).toContain("1/2 steps · Draft report");
+  });
+
+  test("omits header progress once the run completes", () => {
+    const timestamp = "2026-05-29T00:00:00.000Z";
+    const run: WorkflowRunRecord = {
+      ...createWorkflowRunForExpansionTest({ id: "wfr_progress02", status: "completed" }),
+      events: [
+        { sequence: 1, type: "phase", at: timestamp, name: "research" },
+        {
+          sequence: 2,
+          type: "task",
+          at: timestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "completed",
+          title: "Survey prior art",
+        },
+        { sequence: 3, type: "status", at: timestamp, status: "completed" },
+      ],
+      steps: [
+        {
+          stepId: "step-1",
+          inputHash: "hash-1",
+          status: "completed",
+          taskId: "task-1",
+          startedAt: timestamp,
+          completedAt: timestamp,
+        },
+      ],
+    };
+    const client = {
+      workflows: {
+        getRun: async () => null,
+      },
+    };
+
+    const view = renderWithStickyToolProviders(
+      <APIHarness client={client}>
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, args: {}, run_in_background: false }}
+          status="completed"
+          result={{ status: "completed", runId: run.id, result: null, run }}
+        />
+      </APIHarness>
+    );
+
+    expect(getWorkflowHeader(view).textContent).not.toContain("steps");
   });
 
   test("does not fetch collapsed terminal child rows after the parent run is terminal", async () => {
@@ -655,6 +970,8 @@ describe("WorkflowRunToolCall", () => {
                 sourceKind: "skill",
                 sourceHash: "sha256:parent",
                 executable: true,
+                // Server-shaped record: already hydrated (none derivable).
+                phaseManifest: null,
               },
               source: "export default function workflow() { return null; }",
               sourceHash: "sha256:parent",
@@ -835,6 +1152,7 @@ describe("WorkflowRunToolCall", () => {
       </APIHarness>
     );
 
+    openEventLog(view);
     await waitFor(() => {
       expect(view.getByText("Nested workflow run is not available.")).toBeTruthy();
     });
@@ -949,6 +1267,7 @@ describe("WorkflowRunToolCall", () => {
       </ThemeProvider>
     );
 
+    openEventLog(view);
     expect(view.getAllByText("implement / task_live / completed")).toHaveLength(1);
     expect(view.queryByText("implement / task_live / started")).toBeNull();
     expect(view.getByText("implement / task_retry / started")).toBeTruthy();
@@ -1086,6 +1405,7 @@ describe("WorkflowRunToolCall", () => {
       </ThemeProvider>
     );
 
+    openEventLog(view);
     expect(view.queryByLabelText("Open report for task_structured_only")).toBeNull();
     expect(view.container.textContent).not.toContain(
       STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN
@@ -1576,6 +1896,7 @@ describe("WorkflowRunToolCall", () => {
       </ThemeProvider>
     );
 
+    openEventLog(view);
     expect(view.queryByLabelText("Open task workspace for task_deleted_report")).toBeNull();
     expect(view.queryByText("Open")).toBeNull();
     expect(
@@ -1590,6 +1911,28 @@ describe("WorkflowRunToolCall", () => {
     });
   });
 
+  test("renders the projected timeline with the raw event log collapsed", () => {
+    const run = createTimelineRun({ id: "wfr_projected_timeline" });
+    const view = renderWithStickyToolProviders(
+      <WorkflowRunToolCall
+        args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+        status="executing"
+        result={{ status: "running", runId: run.id, result: null, run }}
+      />
+    );
+
+    expect(view.getByText("0/1 steps")).toBeTruthy();
+    // Without a usage overlay the stats row omits the token/cost cells entirely
+    // (mirroring WorkflowRunHeader) instead of rendering dash placeholders.
+    expect(view.queryByText(/tokens/)).toBeNull();
+    fireEvent.click(view.getByText("Research"));
+    expect(view.getByText("Collect sources")).toBeTruthy();
+    expect(view.getByText("Event log")).toBeTruthy();
+    expect(view.queryByLabelText("Raw event #3")).toBeNull();
+
+    fireEvent.click(view.getByText("Event log"));
+    expect(view.getByLabelText("Raw event #3")).toBeTruthy();
+  });
   test("shows invocation arguments and script source before workflow events", () => {
     const runningRun = {
       id: "wfr_event_priority",
@@ -1641,6 +1984,7 @@ describe("WorkflowRunToolCall", () => {
     const argumentsTitle = view.getByText("Arguments");
     const sourceTitle = view.getByText("Script source");
     const eventsTitle = view.getByText("Workflow events (1)");
+    expect(view.queryByText("Event log")).toBeNull();
     expect(Boolean(argumentsTitle.compareDocumentPosition(eventsTitle) & 4)).toBe(true);
     expect(Boolean(sourceTitle.compareDocumentPosition(eventsTitle) & 4)).toBe(true);
     expect(view.getByText("collect-sources / github.issue.get / completed")).toBeTruthy();
@@ -1736,6 +2080,196 @@ describe("WorkflowRunToolCall", () => {
     expect(view.getByText(/Inline workflow received ok/)).toBeTruthy();
   });
 
+  test("hydrates the phase rail once for pre-upgrade snapshots that embed source without a manifest", async () => {
+    // Persisted by a build before phase manifests existed: terminal, has `source`,
+    // no `workflow.phaseManifest`. Terminal cards never subscribe, so without a
+    // one-shot fetch the declared rail would never appear after upgrading.
+    const source =
+      'export const meta = { phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }] };\n' +
+      'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n';
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source,
+      sourceHash: "sha256:pre-upgrade",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "never-visited", label: "Never visited" }],
+        },
+      },
+    };
+    const getRun = mock(async () => hydrated);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: legacySnapshot.id,
+                result: { reportMarkdown: "ok" },
+                run: legacySnapshot,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        runId: legacySnapshot.id,
+      })
+    );
+    // The declared-but-unvisited phase exists only on the hydrated rail.
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+
+    // Collapsing and re-expanding must not refetch: hydration is attempted once per run.
+    fireEvent.click(getWorkflowHeader(view));
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Never visited")).toBeTruthy());
+    expect(getRun).toHaveBeenCalledTimes(1);
+  });
+
+  test("retries pre-upgrade manifest hydration on the next expand after a failed fetch", async () => {
+    const legacySnapshot: WorkflowRunRecord = {
+      id: "wfr_pre_upgrade_retry",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: { name: "phased", description: "Phased", scope: "project", executable: true },
+      source:
+        'export const meta = { phases: [{ name: "scope" }, { name: "later", label: "Later phase" }] };\n' +
+        'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:pre-upgrade-retry",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-05-29T00:00:00.000Z", name: "scope" },
+        { sequence: 2, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const hydrated: WorkflowRunRecord = {
+      ...legacySnapshot,
+      workflow: {
+        ...legacySnapshot.workflow,
+        phaseManifest: {
+          provenance: "declared",
+          phases: [{ name: "scope" }, { name: "later", label: "Later phase" }],
+        },
+      },
+    };
+    let calls = 0;
+    const getRun = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("transient");
+      }
+      return hydrated;
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const view = render(
+        <APIHarness client={{ workflows: { getRun } }}>
+          <ThemeProvider forcedTheme="dark">
+            <TooltipProvider>
+              <WorkflowRunToolCall
+                args={{ script_path: "./workflows/phased.js", args: {}, run_in_background: false }}
+                status="completed"
+                result={{
+                  status: "completed",
+                  runId: legacySnapshot.id,
+                  result: { reportMarkdown: "ok" },
+                  run: legacySnapshot,
+                }}
+                workspaceId={TEST_WORKSPACE_ID}
+              />
+            </TooltipProvider>
+          </ThemeProvider>
+        </APIHarness>
+      );
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(calls).toBe(1));
+      expect(view.queryByText("Later phase")).toBeNull();
+      // A failed attempt must not retire the fetch: collapsing and re-expanding retries.
+      fireEvent.click(getWorkflowHeader(view));
+      fireEvent.click(getWorkflowHeader(view));
+      await waitFor(() => expect(view.getByText("Later phase")).toBeTruthy());
+      expect(calls).toBe(2);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("does not fetch for snapshots already hydrated to an explicit null manifest", async () => {
+    const hydratedNone: WorkflowRunRecord = {
+      id: "wfr_hydrated_none",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: {
+        name: "plain",
+        description: "Plain",
+        scope: "project",
+        executable: true,
+        phaseManifest: null,
+      },
+      source: 'export default function workflow() { return { reportMarkdown: "ok" }; }\n',
+      sourceHash: "sha256:hydrated-none",
+      args: {},
+      status: "completed",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "status", at: "2026-05-29T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const getRun = mock(async () => hydratedNone);
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ script_path: "./workflows/plain.js", args: {}, run_in_background: false }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: hydratedNone.id,
+                result: { reportMarkdown: "ok" },
+                run: hydratedNone,
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() => expect(view.getByText("Script source")).toBeTruthy());
+    expect(getRun).not.toHaveBeenCalled();
+  });
+
   test("renders attached foreground workflow runs without heuristic discovery", async () => {
     const attachedRun = {
       id: "wfr_attached",
@@ -1792,6 +2326,84 @@ describe("WorkflowRunToolCall", () => {
     await waitFor(() =>
       expect(getRun).toHaveBeenCalledWith({ workspaceId: "workspace-1", runId: "wfr_attached" })
     );
+  });
+
+  test("renders a workflow card from kernel-bounded args via the attached run hint", async () => {
+    // A kernel-nested workflow_run whose launch args were replaced by a
+    // __kernelBounded marker must still render the live card: identity comes
+    // from the attached run hint, and the marker offers nothing for the
+    // heuristic name+args discovery to match (listRuns must stay untouched).
+    const attachedRun = createWorkflowRunForExpansionTest({ id: "wfr_kernel", status: "running" });
+    const listRuns = mock(async () => []);
+    const getRun = mock(async () => attachedRun);
+
+    const view = render(
+      <APIHarness client={{ workflows: { listRuns, getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ __kernelBounded: true, bytes: 18_457, preview: "{…}" }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              toolCallId="nested-workflow-1"
+              workflowRunHint={{ runId: "wfr_kernel", run: attachedRun }}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    // The workflow name renders in both the header and the script card.
+    expect(view.getAllByText("deep-research").length).toBeGreaterThan(0);
+    expect(view.getByText("wfr_kernel")).toBeTruthy();
+    expect(listRuns).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({ workspaceId: TEST_WORKSPACE_ID, runId: "wfr_kernel" })
+    );
+  });
+
+  test("recovers run identity from a kernel-bounded result marker", async () => {
+    // With both args and result bounded, the retained runId on the result
+    // marker is the only identity; expanding the card must refetch the
+    // durable run by that id.
+    const completedRun = createWorkflowRunForExpansionTest({
+      id: "wfr_bounded_result",
+      status: "completed",
+    });
+    const getRun = mock(async () => completedRun);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ __kernelBounded: true, bytes: 18_457, preview: "{…}" }}
+              result={
+                {
+                  __kernelBounded: true,
+                  bytes: 40_000,
+                  preview: "{…}",
+                  runId: "wfr_bounded_result",
+                  status: "completed",
+                } as never
+              }
+              status="completed"
+              workspaceId={TEST_WORKSPACE_ID}
+              toolCallId="nested-workflow-2"
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        runId: "wfr_bounded_result",
+      })
+    );
+    await waitFor(() => expect(view.getAllByText("deep-research").length).toBeGreaterThan(0));
   });
 
   test("uses resume result status when the attachment run snapshot is stale", async () => {
@@ -1945,7 +2557,7 @@ describe("WorkflowRunToolCall", () => {
     expect(view.queryByText("wfr_stale")).toBeNull();
     expect(view.queryByText("stale")).toBeNull();
     expect(view.getAllByText("built-in").length).toBeGreaterThan(0);
-    expect(view.getByText("Workflow events (1)")).toBeTruthy();
+    expect(view.getByText("Event log")).toBeTruthy();
     expect(view.getByText("scope")).toBeTruthy();
     expect(listRuns).toHaveBeenCalledWith({ workspaceId: "workspace-1" });
 
@@ -2167,7 +2779,7 @@ describe("WorkflowRunToolCall", () => {
     expect(getWorkflowHeader(view).textContent).toContain("executing");
     expect(view.getByText("wfr_known")).toBeTruthy();
     expect(view.getAllByText("built-in").length).toBeGreaterThan(0);
-    expect(view.getByText("Workflow events (1)")).toBeTruthy();
+    expect(view.getByText("Event log")).toBeTruthy();
     expect(view.getByText("scope")).toBeTruthy();
     // The fetched snapshot matches the args' run id and this workspace, so the run is
     // actionable before the blocking tool call returns a result.
@@ -2307,6 +2919,188 @@ describe("WorkflowRunToolCall", () => {
     expect(view.queryByRole("button", { name: "Resume workflow" })).toBeNull();
   });
 
+  test("applies matching workflow subscription updates without polling", async () => {
+    const initialRun = createTimelineRun({ id: "wfr_subscribed", stepTitle: "Collect sources" });
+    const updatedRun = createTimelineRun({
+      id: initialRun.id,
+      stepTitle: "Verify sources",
+      updatedAt: "2026-05-29T00:00:03.000Z",
+    });
+    const otherRun = createTimelineRun({ id: "wfr_other", stepTitle: "Ignore me" });
+    const stream = createWorkflowSubscription();
+    const subscribe = mock(async () => stream.iterator);
+    const getRun = mock(async () => initialRun);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe, getRun } }}>
+        {withStickyToolProviders(
+          <WorkflowRunToolCall
+            args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+            status="executing"
+            workspaceId={TEST_WORKSPACE_ID}
+            result={{ status: "running", runId: initialRun.id, result: null, run: initialRun }}
+          />
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(subscribe).toHaveBeenCalledTimes(1));
+    fireEvent.click(view.getByText("Research"));
+    expect(view.getByText("Collect sources")).toBeTruthy();
+    stream.emit({ type: "run-changed", run: otherRun });
+    stream.emit({ type: "run-changed", run: updatedRun });
+
+    await waitFor(() => expect(view.getByText("Verify sources")).toBeTruthy());
+    expect(view.queryByText("Ignore me")).toBeNull();
+    expect(getRun).not.toHaveBeenCalled();
+  });
+
+  test("falls back to workflow polling when the live subscription fails", async () => {
+    const initialRun = createTimelineRun({ id: "wfr_subscription_fallback" });
+    const completedRun = createTimelineRun({ id: initialRun.id, status: "completed" });
+    const subscribe = mock(async () => {
+      throw new Error("stream unavailable");
+    });
+    const getRun = mock(async () => completedRun);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe, getRun } }}>
+        {withStickyToolProviders(
+          <WorkflowRunToolCall
+            args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+            status="executing"
+            workspaceId={TEST_WORKSPACE_ID}
+            result={{ status: "running", runId: initialRun.id, result: null, run: initialRun }}
+          />
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(getRun).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(getWorkflowHeader(view).textContent).toContain("completed"));
+  });
+
+  test("does not subscribe terminal workflow cards", async () => {
+    const completedRun = createTimelineRun({
+      id: "wfr_terminal_no_subscription",
+      status: "completed",
+    });
+    const subscribe = mock(async () => createWorkflowSubscription().iterator);
+    render(
+      <APIHarness client={{ workflows: { subscribe } }}>
+        {withStickyToolProviders(
+          <WorkflowRunToolCall
+            args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: false }}
+            status="completed"
+            workspaceId={TEST_WORKSPACE_ID}
+            result={{
+              status: "completed",
+              runId: completedRun.id,
+              result: null,
+              run: completedRun,
+            }}
+          />
+        )}
+      </APIHarness>
+    );
+
+    await Promise.resolve();
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  test("keeps polling nested runs the subscription feed omits", async () => {
+    const parentWorkflow = {
+      runId: "wfr_parent",
+      stepId: "spawn-child",
+      inputHash: "sha256:child",
+      depth: 1,
+    };
+    const nestedRun = {
+      ...createTimelineRun({ id: "wfr_nested_child" }),
+      parentWorkflow,
+    };
+    const updatedNestedRun = {
+      ...createTimelineRun({
+        id: nestedRun.id,
+        stepTitle: "Verify sources",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+      parentWorkflow,
+    };
+    const subscribe = mock(async () => createWorkflowSubscription().iterator);
+    const getRun = mock(async () => updatedNestedRun);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe, getRun } }}>
+        {withStickyToolProviders(
+          <WorkflowRunToolCall
+            args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+            status="executing"
+            workspaceId={TEST_WORKSPACE_ID}
+            result={{ status: "running", runId: nestedRun.id, result: null, run: nestedRun }}
+          />
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(getRun).toHaveBeenCalled());
+    fireEvent.click(view.getByText("Research"));
+    await waitFor(() => expect(view.getByText("Verify sources")).toBeTruthy());
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  test("shares one workspace subscription across concurrent workflow cards", async () => {
+    const firstRun = createTimelineRun({ id: "wfr_shared_first", stepTitle: "First initial" });
+    const secondRun = createTimelineRun({ id: "wfr_shared_second", stepTitle: "Second initial" });
+    const stream = createWorkflowSubscription();
+    const subscribe = mock(async () => stream.iterator);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe } }}>
+        {withStickyToolProviders(
+          <>
+            <WorkflowRunToolCall
+              args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              result={{ status: "running", runId: firstRun.id, result: null, run: firstRun }}
+            />
+            <WorkflowRunToolCall
+              args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              result={{ status: "running", runId: secondRun.id, result: null, run: secondRun }}
+            />
+          </>
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(subscribe).toHaveBeenCalled());
+    for (const phase of view.getAllByText("Research")) {
+      fireEvent.click(phase);
+    }
+    expect(view.getByText("First initial")).toBeTruthy();
+    expect(view.getByText("Second initial")).toBeTruthy();
+
+    stream.emit({
+      type: "run-changed",
+      run: createTimelineRun({
+        id: firstRun.id,
+        stepTitle: "First updated",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+    });
+    stream.emit({
+      type: "run-changed",
+      run: createTimelineRun({
+        id: secondRun.id,
+        stepTitle: "Second updated",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+    });
+
+    await waitFor(() => expect(view.getByText("First updated")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Second updated")).toBeTruthy());
+    expect(subscribe).toHaveBeenCalledTimes(1);
+  });
+
   test("keeps the newest workflow refresh snapshot when polls resolve out of order", async () => {
     const originalSetInterval = globalThis.window.setInterval;
     const originalClearInterval = globalThis.window.clearInterval;
@@ -2408,6 +3202,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:action-ordered",
@@ -2773,6 +3569,7 @@ describe("WorkflowRunToolCall", () => {
     );
 
     await waitFor(() => expect(pendingRefresh.resolve).toBeDefined());
+    openEventLog(view);
     fireEvent.click(view.getByLabelText("Open report for task_report"));
     await waitFor(() => {
       expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
@@ -2893,6 +3690,7 @@ describe("WorkflowRunToolCall", () => {
     );
 
     await waitFor(() => expect(pendingRefresh.resolve).toBeDefined());
+    openEventLog(view);
     fireEvent.click(
       view.getByRole("button", {
         name: "Expand structured output for workflow task task_structured",
@@ -3352,6 +4150,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -3472,6 +4272,8 @@ describe("WorkflowRunToolCall", () => {
           description: "Deep research",
           scope: "built-in" as const,
           executable: true,
+          // Server-shaped record: already hydrated (none derivable).
+          phaseManifest: null,
         },
         source: "export default function workflow() { return null; }",
         sourceHash: "sha256:test",
@@ -3797,6 +4599,8 @@ describe("WorkflowRunToolCall", () => {
         description: "Deep research",
         scope: "built-in" as const,
         executable: true,
+        // Server-shaped record: already hydrated (none derivable).
+        phaseManifest: null,
       },
       source: "export default function workflow() { return null; }",
       sourceHash: "sha256:test",
@@ -3855,6 +4659,8 @@ describe("WorkflowRunToolCall", () => {
                     description: "Deep research",
                     scope: "built-in",
                     executable: true,
+                    // Server-shaped record: already hydrated (none derivable).
+                    phaseManifest: null,
                   },
                   source: "export default function workflow() { return null; }",
                   sourceHash: "sha256:test",

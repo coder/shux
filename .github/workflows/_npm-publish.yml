@@ -4,12 +4,15 @@ name: NPM Publish (Reusable)
 # Called by publish-npm.yml (the OIDC-trusted caller).
 #
 # OIDC TRUSTED PUBLISHING SETUP (on npmjs.com):
-#   For each package (mux, @coder/mux-chat-components):
+#   New packages must be published manually once before npm allows trusted publisher setup.
+#   Repository renames do not update npm settings; reconfigure every existing package.
+#   For each package (@coder/xum, mux, @coder/mux-chat-components):
 #   1. Go to package settings → Trusted Publisher → GitHub Actions
 #   2. Configure:
 #      - Owner: coder
-#      - Repository: mux
+#      - Repository: xum
 #      - Workflow filename: publish-npm.yml  (the caller, NOT this reusable)
+#      - Allowed action: npm publish
 #      - Environment: (leave blank)
 
 on:
@@ -48,7 +51,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       # Setup Node.js 24+ for npm v11+ required by OIDC trusted publishing.
       # Node 22 ships with npm 10.x which does NOT support OIDC.
@@ -56,6 +59,32 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Verify npm provenance repository metadata
+        env:
+          EXPECTED_REPOSITORY_URL: git+${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const manifests = [
+            "package.json",
+            "packages/mux-compat/package.json",
+            "packages/chat-components/package.json",
+          ];
+          const expected = process.env.EXPECTED_REPOSITORY_URL;
+          let valid = true;
+
+          // npm validates repository.url against the OIDC repository claim, so fail before building.
+          for (const manifest of manifests) {
+            const packageJson = JSON.parse(fs.readFileSync(manifest, "utf8"));
+            if (packageJson.repository?.url !== expected) {
+              console.error(`${manifest}: repository.url is ${JSON.stringify(packageJson.repository?.url)}, expected ${JSON.stringify(expected)}`);
+              valid = false;
+            }
+          }
+
+          if (!valid) process.exit(1);
+          NODE
 
       - name: Generate unique version from git
         id: version
@@ -91,10 +120,10 @@ jobs:
           echo "version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
 
-          # Update package.json with the new version
-          node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json')); pkg.version = '${NPM_VERSION}'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');"
+          # Keep the canonical @coder/xum package and legacy mux forwarding package in lockstep.
+          node ./scripts/set-package-version.js "$NPM_VERSION"
 
-          echo "Updated package.json to version ${NPM_VERSION}"
+          echo "Updated package versions to ${NPM_VERSION}"
 
       - name: Generate version file
         run: ./scripts/generate-version.sh
@@ -106,24 +135,25 @@ jobs:
         run: make build
 
       - name: Pack npm package for smoke test
-        run: npm pack
-
-      - name: Find package tarball
-        id: find-tarball
+        id: pack
         run: |
-          # shellcheck disable=SC2012 # ls is fine here - known filename pattern in controlled directory
-          TARBALL=$(ls mux-*.tgz | head -1)
+          TARBALL=$(./scripts/pack-npm-package.sh)
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "Found package: $TARBALL"
 
       - name: Run smoke test
         env:
-          PACKAGE_TARBALL: ${{ steps.find-tarball.outputs.tarball }}
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           SERVER_PORT: 3000
           SERVER_HOST: localhost
           STARTUP_TIMEOUT: 30
         run: |
           ./scripts/smoke-test.sh
+
+      - name: Run legacy mux forwarding package smoke test
+        env:
+          CANONICAL_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: ./scripts/smoke-test-mux-compat.sh
 
       - name: Upload server logs on smoke test failure
         if: failure()
@@ -140,7 +170,7 @@ jobs:
       # don't respect shrinkwrap. Uses a different port to avoid conflicts.
       - name: Run smoke test (without shrinkwrap)
         env:
-          PACKAGE_TARBALL: ${{ steps.find-tarball.outputs.tarball }}
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           SERVER_PORT: 3001
           SERVER_HOST: localhost
           STARTUP_TIMEOUT: 30
@@ -160,7 +190,12 @@ jobs:
 
       - name: Clean up tarball
         if: always()
-        run: rm -f mux-*.tgz
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          if [ -n "$PACKAGE_TARBALL" ]; then
+            rm -f "$PACKAGE_TARBALL"
+          fi
 
       - name: Check if version exists
         id: check-exists
@@ -190,6 +225,32 @@ jobs:
           echo "Version ${STEPS_VERSION_OUTPUTS_VERSION} already exists on npm; skipping publish."
         env:
           STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Verify legacy mux compatibility package
+        working-directory: packages/mux-compat
+        run: npm pack --dry-run
+
+      - name: Check if legacy mux version exists
+        id: mux-compat-check-exists
+        working-directory: packages/mux-compat
+        run: |
+          VERSION="${STEPS_VERSION_OUTPUTS_VERSION}"
+          if npm view "mux@${VERSION}" version &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Legacy mux version ${VERSION} already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Legacy mux version ${VERSION} will be published"
+          fi
+        env:
+          STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Publish legacy mux compatibility package
+        if: steps.mux-compat-check-exists.outputs.exists == 'false'
+        working-directory: packages/mux-compat
+        run: npm publish --tag "$STEPS_VERSION_OUTPUTS_TAG"
+        env:
+          STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
 
       - name: Generate chat-components version
         id: chat-components-version

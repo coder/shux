@@ -1,4 +1,17 @@
+/**
+ * Codex (ChatGPT) OAuth service.
+ *
+ * Internals are Effect-native (see muxGatewayOauthService.ts for the shape):
+ * fallible pipelines are `Effect.gen` programs whose error channel carries a
+ * single reason-carrying tagged error, and the public Promise methods are
+ * thin `Effect.runPromise` facades folding back into the wire
+ * `Result<_, string>` shape, so pre-Effect callers keep working unchanged.
+ * Device-flow cancellation stays on the AbortController seam (the polling
+ * loop is a forked fiber, but its lifecycle is controlled through
+ * `finishDeviceFlow`'s abort, not fiber interruption).
+ */
 import * as crypto from "crypto";
+import { Duration, Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -12,7 +25,7 @@ import {
   CODEX_OAUTH_DEVICE_VERIFY_URL,
   CODEX_OAUTH_TOKEN_URL,
 } from "@/common/constants/codexOAuth";
-import type { Config } from "@/node/config";
+import type { ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
@@ -24,7 +37,7 @@ import {
   parseCodexOauthAuth,
   type CodexOauthAuth,
 } from "@/node/utils/codexOauthAuth";
-import { createDeferred } from "@/node/utils/oauthUtils";
+import { createDeferred, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -96,6 +109,15 @@ function isInvalidGrantError(errorText: string): boolean {
   return lower.includes("invalid_grant") || lower.includes("revoked");
 }
 
+/**
+ * Typed failure for Codex OAuth errors. `reason` carries the exact
+ * user-facing string the wire `Result` contract expects, so facades map it
+ * 1:1 onto `Err(reason)` without reformatting.
+ */
+export class CodexOauthError extends Schema.TaggedError<CodexOauthError>()("CodexOauthError", {
+  reason: Schema.String,
+}) {}
+
 export class CodexOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
   private readonly deviceFlows = new Map<string, DeviceFlow>();
@@ -107,109 +129,213 @@ export class CodexOauthService {
   private cachedAuth: CodexOauthAuth | null = null;
 
   constructor(
-    private readonly config: Config,
+    private readonly providersConfigStore: ProvidersConfigStore,
     private readonly providerService: ProviderService,
     private readonly windowService?: WindowService
   ) {}
 
   async disconnect(): Promise<Result<void, string>> {
-    // Clear stored ChatGPT OAuth tokens so Codex-only models are hidden again.
-    this.cachedAuth = null;
-    return await this.providerService.setConfigValue("openai", ["codexOauth"], undefined);
+    return Effect.runPromise(this.disconnectEffect());
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors asAtomicMutation in providerService.ts): a client abort must not
+   * skip the persisted-credential clear after the in-memory cache was already
+   * invalidated.
+   */
+  disconnectEffect(): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        // Clear stored ChatGPT OAuth tokens so Codex-only models are hidden again.
+        self.cachedAuth = null;
+        // setConfigValue resolves with a wire Result; a rejection stays a
+        // defect, matching the previously un-caught await.
+        return yield* Effect.promise(() =>
+          self.providerService.setConfigValue("openai", ["codexOauth"], undefined)
+        );
+      })
+    );
   }
 
   async startDesktopFlow(): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
-    const flowId = randomBase64Url();
+    return Effect.runPromise(this.startDesktopFlowEffect());
+  }
 
-    const codeVerifier = randomBase64Url();
-    const codeChallenge = sha256Base64Url(codeVerifier);
-    const redirectUri = CODEX_OAUTH_BROWSER_REDIRECT_URI;
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
+   * abort between the loopback-server acquisition and `desktopFlows.register`
+   * would leak the server with nothing left to close it. Flow startup is quick
+   * and local, so running it to completion on abort is cheap; an abandoned
+   * flow still self-cleans via the registered timeout.
+   */
+  startDesktopFlowEffect(): Effect.Effect<
+    Result<{ flowId: string; authorizeUrl: string }, string>
+  > {
+    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect()));
+  }
 
-    let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
-    try {
-      loopback = await startLoopbackServer({
-        port: 1455,
-        host: "localhost",
-        callbackPath: "/auth/callback",
-        validateLoopback: true,
-        expectedState: flowId,
-        deferSuccessResponse: true,
+  private launchDesktopFlowEffect(): Effect.Effect<
+    { flowId: string; authorizeUrl: string },
+    CodexOauthError
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const flowId = randomBase64Url();
+
+      const codeVerifier = randomBase64Url();
+      const codeChallenge = sha256Base64Url(codeVerifier);
+      const redirectUri = CODEX_OAUTH_BROWSER_REDIRECT_URI;
+
+      const loopback = yield* Effect.tryPromise({
+        try: () =>
+          startLoopbackServer({
+            port: 1455,
+            host: "localhost",
+            callbackPath: "/auth/callback",
+            validateLoopback: true,
+            expectedState: flowId,
+            deferSuccessResponse: true,
+          }),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
+          }),
       });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Failed to start OAuth callback listener: ${message}`);
-    }
 
-    const resultDeferred = createDeferred<Result<void, string>>();
+      const resultDeferred = createDeferred<Result<void, string>>();
 
-    this.desktopFlows.register(flowId, {
-      server: loopback.server,
-      resultDeferred,
-      // Keep server-side timeout tied to flow lifetime so abandoned flows
-      // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
-      timeoutHandle: setTimeout(() => {
-        void this.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
-      }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      self.desktopFlows.register(flowId, {
+        server: loopback.server,
+        resultDeferred,
+        // Keep server-side timeout tied to flow lifetime so abandoned flows
+        // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
+        timeoutHandle: setTimeout(() => {
+          Effect.runFork(
+            self.desktopFlows.finishEffect(flowId, Err("Timed out waiting for OAuth callback"))
+          );
+        }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      });
+
+      const authorizeUrl = buildCodexAuthorizeUrl({
+        redirectUri,
+        state: flowId,
+        codeChallenge,
+      });
+
+      // Background fiber: wait for the loopback callback, exchange code for
+      // tokens, then finish the flow. Races against resultDeferred (which
+      // resolves on cancel/timeout) so the fiber exits cleanly if the flow is
+      // cancelled.
+      Effect.runFork(
+        self.desktopCallbackPipeline({
+          flowId,
+          redirectUri,
+          codeVerifier,
+          loopback,
+          resultDeferred,
+        })
+      );
+
+      log.debug(`[Codex OAuth] Desktop flow started (flowId=${flowId})`);
+
+      return { flowId, authorizeUrl };
     });
+  }
 
-    const authorizeUrl = buildCodexAuthorizeUrl({
-      redirectUri,
-      state: flowId,
-      codeChallenge,
-    });
-
-    // Background task: wait for the loopback callback, exchange code for tokens,
-    // then finish the flow. Races against resultDeferred (which resolves on
-    // cancel/timeout) so the task exits cleanly if the flow is cancelled.
-    void (async () => {
-      const callbackResult = await Promise.race([
-        loopback.result,
-        resultDeferred.promise.then(() => null),
-      ]);
+  /**
+   * Desktop-flow completion pipeline, forked from `startDesktopFlowEffect`.
+   * Races the loopback callback against resultDeferred so that if the flow is
+   * cancelled/timed out externally, this fiber exits cleanly instead of
+   * dangling on loopback.result.
+   */
+  private desktopCallbackPipeline(args: {
+    flowId: string;
+    redirectUri: string;
+    codeVerifier: string;
+    loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
+    resultDeferred: ReturnType<typeof createDeferred<Result<void, string>>>;
+  }): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const callbackResult = yield* Effect.promise(() =>
+        Promise.race([args.loopback.result, args.resultDeferred.promise.then((): null => null)])
+      );
 
       // null means the flow was finished externally (cancel/timeout).
       if (!callbackResult) return;
 
       if (!callbackResult.success) {
-        await this.desktopFlows.finish(flowId, Err(callbackResult.error));
+        yield* self.desktopFlows.finishEffect(args.flowId, Err(callbackResult.error));
         return;
       }
 
-      const exchangeResult = await this.handleDesktopCallbackAndExchange({
-        flowId,
-        redirectUri,
-        codeVerifier,
-        code: callbackResult.data.code,
-        error: null,
-        errorDescription: undefined,
-      });
+      const exchangeResult: Result<void, string> = yield* toWireResult(
+        self.handleDesktopCallbackAndExchange({
+          flowId: args.flowId,
+          redirectUri: args.redirectUri,
+          codeVerifier: args.codeVerifier,
+          code: callbackResult.data.code,
+          error: null,
+          errorDescription: undefined,
+        })
+      );
 
       if (exchangeResult.success) {
-        loopback.sendSuccessResponse();
+        args.loopback.sendSuccessResponse();
       } else {
-        loopback.sendFailureResponse(exchangeResult.error);
+        args.loopback.sendFailureResponse(exchangeResult.error);
       }
 
-      await this.desktopFlows.finish(flowId, exchangeResult);
-    })();
-
-    log.debug(`[Codex OAuth] Desktop flow started (flowId=${flowId})`);
-
-    return Ok({ flowId, authorizeUrl });
+      yield* self.desktopFlows.finishEffect(args.flowId, exchangeResult);
+    });
   }
 
   async waitForDesktopFlow(
     flowId: string,
     opts?: { timeoutMs?: number }
   ): Promise<Result<void, string>> {
-    return this.desktopFlows.waitFor(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
+    return Effect.runPromise(this.waitForDesktopFlowEffect(flowId, opts));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: abandoning the wait does not affect the flow itself (the
+   * shared deferred and registered timeout keep the flow's lifecycle intact).
+   */
+  waitForDesktopFlowEffect(
+    flowId: string,
+    opts?: { timeoutMs?: number }
+  ): Effect.Effect<Result<void, string>> {
+    return this.desktopFlows.waitForEffect(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
   }
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
-    if (this.desktopFlows.has(flowId)) {
-      log.debug(`[Codex OAuth] Desktop flow cancelled (flowId=${flowId})`);
-    }
-    await this.desktopFlows.cancel(flowId);
+    return Effect.runPromise(this.cancelDesktopFlowEffect(flowId));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel).
+   */
+  cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (self.desktopFlows.has(flowId)) {
+          log.debug(`[Codex OAuth] Desktop flow cancelled (flowId=${flowId})`);
+        }
+        yield* self.desktopFlows.cancelEffect(flowId);
+      })
+    );
   }
 
   async startDeviceFlow(): Promise<
@@ -223,133 +349,208 @@ export class CodexOauthService {
       string
     >
   > {
-    const flowId = randomBase64Url();
+    return Effect.runPromise(this.startDeviceFlowEffect());
+  }
 
-    const deviceAuthResult = await this.requestDeviceUserCode();
-    if (!deviceAuthResult.success) {
-      return Err(deviceAuthResult.error);
-    }
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible:
+   * preserves the pre-handlerGen run-to-completion semantics — a client abort
+   * must not allocate a device code upstream without registering the local
+   * flow record (and its expiry timeout) that lets callers re-attach or the
+   * flow self-clean.
+   */
+  startDeviceFlowEffect(): Effect.Effect<
+    Result<{ flowId: string; userCode: string; verifyUrl: string; intervalSeconds: number }, string>
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      toWireResult(
+        Effect.gen(function* () {
+          const flowId = randomBase64Url();
 
-    const { deviceAuthId, userCode, intervalSeconds, expiresAtMs } = deviceAuthResult.data;
-    const verifyUrl = CODEX_OAUTH_DEVICE_VERIFY_URL;
+          const { deviceAuthId, userCode, intervalSeconds, expiresAtMs } =
+            yield* self.requestDeviceUserCode();
+          const verifyUrl = CODEX_OAUTH_DEVICE_VERIFY_URL;
 
-    const { promise: resultPromise, resolve: resolveResult } =
-      createDeferred<Result<void, string>>();
+          const { promise: resultPromise, resolve: resolveResult } =
+            createDeferred<Result<void, string>>();
 
-    const abortController = new AbortController();
+          const abortController = new AbortController();
 
-    const timeoutMs = Math.min(DEFAULT_DEVICE_TIMEOUT_MS, Math.max(0, expiresAtMs - Date.now()));
-    const timeout = setTimeout(() => {
-      void this.finishDeviceFlow(flowId, Err("Device code expired"));
-    }, timeoutMs);
+          const timeoutMs = Math.min(
+            DEFAULT_DEVICE_TIMEOUT_MS,
+            Math.max(0, expiresAtMs - Date.now())
+          );
+          const timeout = setTimeout(() => {
+            Effect.runFork(self.finishDeviceFlowEffect(flowId, Err("Device code expired")));
+          }, timeoutMs);
 
-    this.deviceFlows.set(flowId, {
-      flowId,
-      deviceAuthId,
-      userCode,
-      verifyUrl,
-      intervalSeconds,
-      expiresAtMs,
-      abortController,
-      pollingStarted: false,
-      timeout,
-      cleanupTimeout: null,
-      resultPromise,
-      resolveResult,
-      settled: false,
-    });
+          self.deviceFlows.set(flowId, {
+            flowId,
+            deviceAuthId,
+            userCode,
+            verifyUrl,
+            intervalSeconds,
+            expiresAtMs,
+            abortController,
+            pollingStarted: false,
+            timeout,
+            cleanupTimeout: null,
+            resultPromise,
+            resolveResult,
+            settled: false,
+          });
 
-    log.debug(`[Codex OAuth] Device flow started (flowId=${flowId})`);
+          log.debug(`[Codex OAuth] Device flow started (flowId=${flowId})`);
 
-    return Ok({ flowId, userCode, verifyUrl, intervalSeconds });
+          return { flowId, userCode, verifyUrl, intervalSeconds };
+        })
+      )
+    );
   }
 
   async waitForDeviceFlow(
     flowId: string,
     opts?: { timeoutMs?: number }
   ): Promise<Result<void, string>> {
-    const flow = this.deviceFlows.get(flowId);
-    if (!flow) {
-      return Err("OAuth flow not found");
-    }
+    return Effect.runPromise(this.waitForDeviceFlowEffect(flowId, opts));
+  }
 
-    if (!flow.pollingStarted) {
-      flow.pollingStarted = true;
-      this.pollDeviceFlow(flowId).catch((error) => {
-        // The polling loop is responsible for resolving the flow; if we reach
-        // here something unexpected happened.
-        const message = getErrorMessage(error);
-        log.warn(`[Codex OAuth] Device polling crashed (flowId=${flowId}): ${message}`);
-        void this.finishDeviceFlow(flowId, Err(`Device polling crashed: ${message}`));
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: the polling fiber is forked inside a single sync step (so
+   * an interrupt cannot mark polling started without launching it), and
+   * abandoning the wait leaves the shared deferred and flow timeouts intact.
+   */
+  waitForDeviceFlowEffect(
+    flowId: string,
+    opts?: { timeoutMs?: number }
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const flow = self.deviceFlows.get(flowId);
+      if (!flow) {
+        return Err("OAuth flow not found");
+      }
+
+      yield* Effect.sync(() => {
+        if (flow.pollingStarted) return;
+        flow.pollingStarted = true;
+        Effect.runFork(
+          self.pollDeviceFlowEffect(flowId).pipe(
+            Effect.catchDefect((defect) =>
+              Effect.gen(function* () {
+                // The polling loop is responsible for resolving the flow; if we
+                // reach here something unexpected happened.
+                const message = getErrorMessage(defect);
+                log.warn(`[Codex OAuth] Device polling crashed (flowId=${flowId}): ${message}`);
+                yield* self.finishDeviceFlowEffect(
+                  flowId,
+                  Err(`Device polling crashed: ${message}`)
+                );
+              })
+            )
+          )
+        );
       });
-    }
 
-    const timeoutMs = opts?.timeoutMs ?? DEFAULT_DEVICE_TIMEOUT_MS;
+      const timeoutMs = opts?.timeoutMs ?? DEFAULT_DEVICE_TIMEOUT_MS;
 
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    const timeoutPromise = new Promise<Result<void, string>>((resolve) => {
-      timeoutHandle = setTimeout(() => {
-        resolve(Err("Timed out waiting for device authorization"));
-      }, timeoutMs);
+      // Effect.timeout bounds this wait call only: on timeout it interrupts
+      // the promise-wait fiber (the shared deferred is unaffected for other
+      // waiters), and its timer is cleared when the deferred wins.
+      const result: Result<void, string> = yield* Effect.promise(
+        async () => flow.resultPromise
+      ).pipe(
+        Effect.timeout(Duration.millis(timeoutMs)),
+        Effect.catch(() =>
+          Effect.succeed<Result<void, string>>(Err("Timed out waiting for device authorization"))
+        )
+      );
+
+      if (!result.success) {
+        // Ensure polling is cancelled on timeout/errors.
+        yield* self.finishDeviceFlowEffect(flowId, result);
+      }
+
+      return result;
     });
-
-    const result = await Promise.race([flow.resultPromise, timeoutPromise]);
-
-    if (timeoutHandle !== null) {
-      clearTimeout(timeoutHandle);
-    }
-
-    if (!result.success) {
-      // Ensure polling is cancelled on timeout/errors.
-      void this.finishDeviceFlow(flowId, result);
-    }
-
-    return result;
   }
 
   async cancelDeviceFlow(flowId: string): Promise<void> {
-    const flow = this.deviceFlows.get(flowId);
-    if (!flow) return;
+    return Effect.runPromise(this.cancelDeviceFlowEffect(flowId));
+  }
 
-    log.debug(`[Codex OAuth] Device flow cancelled (flowId=${flowId})`);
-    await this.finishDeviceFlow(flowId, Err("OAuth flow cancelled"));
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the finish bookkeeping must
+   * complete — a client abort mid-cancel must not leave the flow polling (it
+   * could still persist credentials after the user asked to cancel).
+   */
+  cancelDeviceFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        const flow = self.deviceFlows.get(flowId);
+        if (!flow) return;
+
+        log.debug(`[Codex OAuth] Device flow cancelled (flowId=${flowId})`);
+        yield* self.finishDeviceFlowEffect(flowId, Err("OAuth flow cancelled"));
+      })
+    );
   }
 
   async getValidAuth(): Promise<Result<CodexOauthAuth, string>> {
-    const stored = this.readStoredAuth();
-    if (!stored) {
-      return Err("Codex OAuth is not configured");
-    }
+    return Effect.runPromise(this.getValidAuthEffect());
+  }
 
-    if (!isCodexOauthAuthExpired(stored)) {
-      return Ok(stored);
-    }
+  getValidAuthEffect(): Effect.Effect<Result<CodexOauthAuth, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const stored = self.readStoredAuth();
+      if (!stored) {
+        return Err("Codex OAuth is not configured");
+      }
 
-    await using _lock = await this.refreshMutex.acquire();
+      if (!isCodexOauthAuthExpired(stored)) {
+        return Ok(stored);
+      }
 
-    // Re-read after acquiring lock in case another caller refreshed first.
-    const latest = this.readStoredAuth();
-    if (!latest) {
-      return Err("Codex OAuth is not configured");
-    }
+      // acquireUseRelease guarantees the mutex is released on every exit path
+      // (refresh success/failure, defects, interruption) — the Effect
+      // equivalent of the pre-Effect `await using` lock.
+      return yield* Effect.acquireUseRelease(
+        Effect.promise(() => self.refreshMutex.acquire()),
+        () =>
+          Effect.gen(function* () {
+            // Re-read after acquiring lock in case another caller refreshed first.
+            const latest = self.readStoredAuth();
+            if (!latest) {
+              return Err("Codex OAuth is not configured");
+            }
 
-    if (!isCodexOauthAuthExpired(latest)) {
-      return Ok(latest);
-    }
+            if (!isCodexOauthAuthExpired(latest)) {
+              return Ok(latest);
+            }
 
-    const refreshed = await this.refreshTokens(latest);
-    if (!refreshed.success) {
-      return Err(refreshed.error);
-    }
-
-    return Ok(refreshed.data);
+            return yield* toWireResult(self.refreshTokens(latest));
+          }),
+        (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+      );
+    });
   }
 
   async dispose(): Promise<void> {
     await this.desktopFlows.shutdownAll();
 
     const deviceIds = [...this.deviceFlows.keys()];
-    await Promise.all(deviceIds.map((id) => this.finishDeviceFlow(id, Err("App shutting down"))));
+    for (const id of deviceIds) {
+      Effect.runSync(this.finishDeviceFlowEffect(id, Err("App shutting down")));
+    }
 
     for (const flow of this.deviceFlows.values()) {
       clearTimeout(flow.timeout);
@@ -365,87 +566,114 @@ export class CodexOauthService {
     if (this.cachedAuth) {
       return this.cachedAuth;
     }
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const openaiConfig = providersConfig.openai as Record<string, unknown> | undefined;
     const auth = parseCodexOauthAuth(openaiConfig?.codexOauth);
     this.cachedAuth = auth;
     return auth;
   }
 
-  private async persistAuth(auth: CodexOauthAuth): Promise<Result<void, string>> {
-    const result = await this.providerService.setConfigValue("openai", ["codexOauth"], auth);
-    // Invalidate cache so the next readStoredAuth() picks up the persisted value from disk.
-    // We clear rather than set because setConfigValue may have side-effects (e.g. file-write
-    // failures) and we want the next read to be authoritative.
-    this.cachedAuth = null;
-    return result;
+  private persistAuth(auth: CodexOauthAuth): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // setConfigValue resolves with a wire Result; a rejection stays a
+      // defect, matching the previously un-caught await.
+      const result = yield* Effect.promise(() =>
+        self.providerService.setConfigValue("openai", ["codexOauth"], auth)
+      );
+      // Invalidate cache so the next readStoredAuth() picks up the persisted value from disk.
+      // We clear rather than set because setConfigValue may have side-effects (e.g. file-write
+      // failures) and we want the next read to be authoritative.
+      self.cachedAuth = null;
+      return result;
+    });
   }
 
-  private async handleDesktopCallbackAndExchange(input: {
+  private handleDesktopCallbackAndExchange(input: {
     flowId: string;
     redirectUri: string;
     codeVerifier: string;
     code: string | null;
     error: string | null;
     errorDescription?: string;
-  }): Promise<Result<void, string>> {
-    if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`Codex OAuth error: ${message}`);
-    }
+  }): Effect.Effect<void, CodexOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (input.error) {
+        const message = input.errorDescription
+          ? `${input.error}: ${input.errorDescription}`
+          : input.error;
+        return yield* Effect.fail(new CodexOauthError({ reason: `Codex OAuth error: ${message}` }));
+      }
 
-    if (!input.code) {
-      return Err("Missing OAuth code");
-    }
+      if (!input.code) {
+        return yield* Effect.fail(new CodexOauthError({ reason: "Missing OAuth code" }));
+      }
 
-    const tokenResult = await this.exchangeCodeForTokens({
-      code: input.code,
-      redirectUri: input.redirectUri,
-      codeVerifier: input.codeVerifier,
+      const auth = yield* self.exchangeCodeForTokens({
+        code: input.code,
+        redirectUri: input.redirectUri,
+        codeVerifier: input.codeVerifier,
+      });
+
+      const persistResult = yield* self.persistAuth(auth);
+      if (!persistResult.success) {
+        return yield* Effect.fail(new CodexOauthError({ reason: persistResult.error }));
+      }
+
+      log.debug(`[Codex OAuth] Desktop exchange completed (flowId=${input.flowId})`);
+
+      self.windowService?.focusMainWindow();
     });
-    if (!tokenResult.success) {
-      return Err(tokenResult.error);
-    }
-
-    const persistResult = await this.persistAuth(tokenResult.data);
-    if (!persistResult.success) {
-      return Err(persistResult.error);
-    }
-
-    log.debug(`[Codex OAuth] Desktop exchange completed (flowId=${input.flowId})`);
-
-    this.windowService?.focusMainWindow();
-
-    return Ok(undefined);
   }
 
-  private async exchangeCodeForTokens(input: {
+  private exchangeCodeForTokens(input: {
     code: string;
     redirectUri: string;
     codeVerifier: string;
-  }): Promise<Result<CodexOauthAuth, string>> {
-    try {
-      const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: buildCodexTokenExchangeBody({
-          code: input.code,
-          redirectUri: input.redirectUri,
-          codeVerifier: input.codeVerifier,
-        }),
+  }): Effect.Effect<CodexOauthAuth, CodexOauthError> {
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)`, which coerces
+        // non-Promise returns (e.g. a test's synchronous fetch mock).
+        try: async () =>
+          fetch(CODEX_OAUTH_TOKEN_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: buildCodexTokenExchangeBody({
+              code: input.code,
+              redirectUri: input.redirectUri,
+              codeVerifier: input.codeVerifier,
+            }),
+          }),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth exchange failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        // Preserve the HTTP status fallback when the response body is unreadable.
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Codex OAuth exchange failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth exchange failed: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json)) {
-        return Err("Codex OAuth exchange returned an invalid JSON payload");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth exchange returned an invalid JSON payload" })
+        );
       }
 
       const accessToken = typeof json.access_token === "string" ? json.access_token : null;
@@ -454,48 +682,63 @@ export class CodexOauthService {
       const idToken = typeof json.id_token === "string" ? json.id_token : undefined;
 
       if (!accessToken) {
-        return Err("Codex OAuth exchange response missing access_token");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth exchange response missing access_token" })
+        );
       }
 
       if (!refreshToken) {
-        return Err("Codex OAuth exchange response missing refresh_token");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth exchange response missing refresh_token" })
+        );
       }
 
       if (expiresIn === null) {
-        return Err("Codex OAuth exchange response missing expires_in");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth exchange response missing expires_in" })
+        );
       }
 
       const accountId = extractAccountIdFromTokens({ accessToken, idToken }) ?? undefined;
 
-      return Ok({
+      const auth: CodexOauthAuth = {
         type: "oauth",
         access: accessToken,
         refresh: refreshToken,
         expires: Date.now() + Math.max(0, Math.floor(expiresIn * 1000)),
         accountId,
-      });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Codex OAuth exchange failed: ${message}`);
-    }
+      };
+      return auth;
+    });
   }
 
-  private async refreshTokens(current: CodexOauthAuth): Promise<Result<CodexOauthAuth, string>> {
-    try {
-      const response = await fetch(CODEX_OAUTH_TOKEN_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: buildCodexRefreshBody({ refreshToken: current.refresh }),
+  private refreshTokens(current: CodexOauthAuth): Effect.Effect<CodexOauthAuth, CodexOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)`, which coerces
+        // non-Promise returns (e.g. a test's synchronous fetch mock).
+        try: async () =>
+          fetch(CODEX_OAUTH_TOKEN_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: buildCodexRefreshBody({ refreshToken: current.refresh }),
+          }),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth refresh failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
 
         // When the refresh token is invalid/revoked, clear persisted auth so subsequent
         // requests fall back to the existing "not connected" behavior.
         if (isInvalidGrantError(errorText)) {
           log.debug("[Codex OAuth] Refresh token rejected; clearing stored auth");
-          const disconnectResult = await this.disconnect();
+          const disconnectResult = yield* self.disconnectEffect();
           if (!disconnectResult.success) {
             log.warn(
               `[Codex OAuth] Failed to clear stored auth after refresh failure: ${disconnectResult.error}`
@@ -504,12 +747,22 @@ export class CodexOauthService {
         }
 
         const prefix = `Codex OAuth refresh failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth refresh failed: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json)) {
-        return Err("Codex OAuth refresh returned an invalid JSON payload");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth refresh returned an invalid JSON payload" })
+        );
       }
 
       const accessToken = typeof json.access_token === "string" ? json.access_token : null;
@@ -518,11 +771,15 @@ export class CodexOauthService {
       const idToken = typeof json.id_token === "string" ? json.id_token : undefined;
 
       if (!accessToken) {
-        return Err("Codex OAuth refresh response missing access_token");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth refresh response missing access_token" })
+        );
       }
 
       if (expiresIn === null) {
-        return Err("Codex OAuth refresh response missing expires_in");
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth refresh response missing expires_in" })
+        );
       }
 
       const accountId = extractAccountIdFromTokens({ accessToken, idToken }) ?? current.accountId;
@@ -535,45 +792,70 @@ export class CodexOauthService {
         accountId,
       };
 
-      const persistResult = await this.persistAuth(next);
+      const persistResult = yield* self.persistAuth(next);
       if (!persistResult.success) {
-        return Err(persistResult.error);
+        return yield* Effect.fail(new CodexOauthError({ reason: persistResult.error }));
       }
 
-      return Ok(next);
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Codex OAuth refresh failed: ${message}`);
-    }
+      return next;
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: an unexpected throw —
+      // e.g. a rejected persistAuth/disconnect config write, which
+      // Effect.promise surfaces as a defect — must fold into the wire error
+      // so getValidAuth() keeps returning Err(...) instead of rejecting.
+      Effect.catchDefect((defect) =>
+        Effect.fail(
+          new CodexOauthError({ reason: `Codex OAuth refresh failed: ${getErrorMessage(defect)}` })
+        )
+      )
+    );
   }
 
-  private async requestDeviceUserCode(): Promise<
-    Result<
-      {
-        deviceAuthId: string;
-        userCode: string;
-        intervalSeconds: number;
-        expiresAtMs: number;
-      },
-      string
-    >
+  private requestDeviceUserCode(): Effect.Effect<
+    {
+      deviceAuthId: string;
+      userCode: string;
+      intervalSeconds: number;
+      expiresAtMs: number;
+    },
+    CodexOauthError
   > {
-    try {
-      const response = await fetch(CODEX_OAUTH_DEVICE_USERCODE_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_id: CODEX_OAUTH_CLIENT_ID }),
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(CODEX_OAUTH_DEVICE_USERCODE_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ client_id: CODEX_OAUTH_CLIENT_ID }),
+          }),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth device auth request failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Codex OAuth device auth request failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CodexOauthError({
+            reason: `Codex OAuth device auth request failed: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json)) {
-        return Err("Codex OAuth device auth response returned an invalid JSON payload");
+        return yield* Effect.fail(
+          new CodexOauthError({
+            reason: "Codex OAuth device auth response returned an invalid JSON payload",
+          })
+        );
       }
 
       const deviceAuthId = typeof json.device_auth_id === "string" ? json.device_auth_id : null;
@@ -582,7 +864,11 @@ export class CodexOauthService {
       const expiresIn = parseOptionalNumber(json.expires_in);
 
       if (!deviceAuthId || !userCode) {
-        return Err("Codex OAuth device auth response missing required fields");
+        return yield* Effect.fail(
+          new CodexOauthError({
+            reason: "Codex OAuth device auth response missing required fields",
+          })
+        );
       }
 
       const intervalSeconds = interval !== null ? Math.max(1, Math.floor(interval)) : 5;
@@ -591,86 +877,119 @@ export class CodexOauthService {
           ? Date.now() + Math.max(0, Math.floor(expiresIn * 1000))
           : Date.now() + DEFAULT_DEVICE_TIMEOUT_MS;
 
-      return Ok({ deviceAuthId, userCode, intervalSeconds, expiresAtMs });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Codex OAuth device auth request failed: ${message}`);
-    }
+      return { deviceAuthId, userCode, intervalSeconds, expiresAtMs };
+    });
   }
 
-  private async pollDeviceFlow(flowId: string): Promise<void> {
-    const flow = this.deviceFlows.get(flowId);
-    if (!flow || flow.settled) {
-      return;
-    }
-
-    const intervalSeconds = flow.intervalSeconds;
-
-    while (Date.now() < flow.expiresAtMs) {
-      if (flow.abortController.signal.aborted) {
-        await this.finishDeviceFlow(flowId, Err("OAuth flow cancelled"));
+  /**
+   * Device-token polling loop, forked from `waitForDeviceFlowEffect`.
+   * Cancellation flows through the flow's AbortController (aborted by
+   * `finishDeviceFlow`), not fiber interruption, so the loop always exits via
+   * its own checks.
+   */
+  private pollDeviceFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const flow = self.deviceFlows.get(flowId);
+      if (!flow || flow.settled) {
         return;
       }
 
-      const attempt = await this.pollDeviceTokenOnce(flow);
-      if (attempt.kind === "success") {
-        const persistResult = await this.persistAuth(attempt.auth);
-        if (!persistResult.success) {
-          await this.finishDeviceFlow(flowId, Err(persistResult.error));
+      const intervalSeconds = flow.intervalSeconds;
+
+      while (Date.now() < flow.expiresAtMs) {
+        if (flow.abortController.signal.aborted) {
+          yield* self.finishDeviceFlowEffect(flowId, Err("OAuth flow cancelled"));
           return;
         }
 
-        log.debug(`[Codex OAuth] Device authorization completed (flowId=${flowId})`);
-        this.windowService?.focusMainWindow();
-        await this.finishDeviceFlow(flowId, Ok(undefined));
-        return;
+        const attempt = yield* self.pollDeviceTokenOnce(flow);
+        if (attempt.kind === "success") {
+          const persistResult = yield* self.persistAuth(attempt.auth);
+          if (!persistResult.success) {
+            yield* self.finishDeviceFlowEffect(flowId, Err(persistResult.error));
+            return;
+          }
+
+          log.debug(`[Codex OAuth] Device authorization completed (flowId=${flowId})`);
+          self.windowService?.focusMainWindow();
+          yield* self.finishDeviceFlowEffect(flowId, Ok(undefined));
+          return;
+        }
+
+        if (attempt.kind === "fatal") {
+          yield* self.finishDeviceFlowEffect(flowId, Err(attempt.message));
+          return;
+        }
+
+        // OpenCode guide: intervalSeconds * 1000 + 3000. sleepWithAbort keeps
+        // cancellation on the AbortController seam; an abort rejection exits
+        // the loop like the pre-Effect try/catch did.
+        const slept = yield* Effect.promise(() =>
+          sleepWithAbort(intervalSeconds * 1000 + 3000, flow.abortController.signal).then(
+            () => true,
+            () => false
+          )
+        );
+        if (!slept) {
+          // Abort is handled via cancelDeviceFlow()/finishDeviceFlow().
+          return;
+        }
       }
 
-      if (attempt.kind === "fatal") {
-        await this.finishDeviceFlow(flowId, Err(attempt.message));
-        return;
-      }
-
-      try {
-        // OpenCode guide: intervalSeconds * 1000 + 3000
-        await sleepWithAbort(intervalSeconds * 1000 + 3000, flow.abortController.signal);
-      } catch {
-        // Abort is handled via cancelDeviceFlow()/finishDeviceFlow().
-        return;
-      }
-    }
-
-    await this.finishDeviceFlow(flowId, Err("Device code expired"));
+      yield* self.finishDeviceFlowEffect(flowId, Err("Device code expired"));
+    });
   }
 
-  private async pollDeviceTokenOnce(
+  private pollDeviceTokenOnce(
     flow: DeviceFlow
-  ): Promise<
+  ): Effect.Effect<
     | { kind: "success"; auth: CodexOauthAuth }
     | { kind: "pending" }
     | { kind: "fatal"; message: string }
   > {
-    try {
-      const response = await fetch(CODEX_OAUTH_DEVICE_TOKEN_POLL_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_auth_id: flow.deviceAuthId, user_code: flow.userCode }),
-        signal: flow.abortController.signal,
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        try: async () =>
+          fetch(CODEX_OAUTH_DEVICE_TOKEN_POLL_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ device_auth_id: flow.deviceAuthId, user_code: flow.userCode }),
+            signal: flow.abortController.signal,
+          }),
+        catch: (error) =>
+          new CodexOauthError({
+            // Abort is treated as cancellation.
+            reason: flow.abortController.signal.aborted
+              ? "OAuth flow cancelled"
+              : `Device authorization failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (response.status === 403 || response.status === 404) {
-        return { kind: "pending" };
+        return { kind: "pending" as const };
       }
 
       if (response.status !== 200) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Codex OAuth device token poll failed (${response.status})`;
-        return { kind: "fatal", message: errorText ? `${prefix}: ${errorText}` : prefix };
+        return {
+          kind: "fatal" as const,
+          message: errorText ? `${prefix}: ${errorText}` : prefix,
+        };
       }
 
-      const json = (await response.json().catch(() => null)) as unknown;
+      const json = yield* Effect.promise(
+        async (): Promise<unknown> => response.json().catch(() => null)
+      );
       if (!isPlainObject(json)) {
-        return { kind: "fatal", message: "Codex OAuth device token poll returned invalid JSON" };
+        return {
+          kind: "fatal" as const,
+          message: "Codex OAuth device token poll returned invalid JSON",
+        };
       }
 
       const authorizationCode =
@@ -679,54 +998,52 @@ export class CodexOauthService {
 
       if (!authorizationCode || !codeVerifier) {
         return {
-          kind: "fatal",
+          kind: "fatal" as const,
           message: "Codex OAuth device token poll response missing required fields",
         };
       }
 
-      const tokenResult = await this.exchangeCodeForTokens({
+      const auth = yield* self.exchangeCodeForTokens({
         code: authorizationCode,
         redirectUri: "https://auth.openai.com/deviceauth/callback",
         codeVerifier,
       });
 
-      if (!tokenResult.success) {
-        return { kind: "fatal", message: tokenResult.error };
-      }
-
-      return { kind: "success", auth: tokenResult.data };
-    } catch (error) {
-      // Abort is treated as cancellation.
-      if (flow.abortController.signal.aborted) {
-        return { kind: "fatal", message: "OAuth flow cancelled" };
-      }
-
-      const message = getErrorMessage(error);
-      return { kind: "fatal", message: `Device authorization failed: ${message}` };
-    }
+      return { kind: "success" as const, auth };
+    }).pipe(
+      // Fold exchange/poll failures into the fatal branch (message is the
+      // exact wire error string, matching the pre-Effect returns).
+      Effect.catchTag("CodexOauthError", (error) =>
+        Effect.succeed({ kind: "fatal" as const, message: error.reason })
+      )
+    );
   }
 
-  private finishDeviceFlow(flowId: string, result: Result<void, string>): Promise<void> {
-    const flow = this.deviceFlows.get(flowId);
-    if (!flow || flow.settled) {
-      return Promise.resolve();
-    }
-
-    flow.settled = true;
-    clearTimeout(flow.timeout);
-    flow.abortController.abort();
-
-    try {
-      flow.resolveResult(result);
-    } finally {
-      if (flow.cleanupTimeout !== null) {
-        clearTimeout(flow.cleanupTimeout);
+  /** Idempotent device-flow finish: all-sync bookkeeping + deferred resolve. */
+  private finishDeviceFlowEffect(
+    flowId: string,
+    result: Result<void, string>
+  ): Effect.Effect<void> {
+    return Effect.sync(() => {
+      const flow = this.deviceFlows.get(flowId);
+      if (!flow || flow.settled) {
+        return;
       }
-      flow.cleanupTimeout = setTimeout(() => {
-        this.deviceFlows.delete(flowId);
-      }, COMPLETED_FLOW_TTL_MS);
-    }
 
-    return Promise.resolve();
+      flow.settled = true;
+      clearTimeout(flow.timeout);
+      flow.abortController.abort();
+
+      try {
+        flow.resolveResult(result);
+      } finally {
+        if (flow.cleanupTimeout !== null) {
+          clearTimeout(flow.cleanupTimeout);
+        }
+        flow.cleanupTimeout = setTimeout(() => {
+          this.deviceFlows.delete(flowId);
+        }, COMPLETED_FLOW_TTL_MS);
+      }
+    });
   }
 }

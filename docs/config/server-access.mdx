@@ -1,9 +1,9 @@
 ---
 title: Server Access
-description: Configure authentication and session controls for mux server/browser mode
+description: Configure authentication and session controls for xum server/browser mode
 ---
 
-`mux server` can be accessed from browsers, mobile devices, and other machines on your network. This page covers how access control works, including the GitHub owner login allowlist.
+`xum server` can be accessed from browsers, mobile devices, and other machines on your network. This page covers how access control works, including the GitHub owner login allowlist.
 
 ## Authentication modes
 
@@ -13,7 +13,7 @@ Token resolution order:
 
 1. `--no-auth` (disables auth entirely)
 2. `--auth-token <token>`
-3. `MUX_SERVER_AUTH_TOKEN`
+3. `XUM_SERVER_AUTH_TOKEN`
 4. Auto-generated token at startup
 
 <Warning>
@@ -23,12 +23,12 @@ Token resolution order:
 
 ## Configure GitHub owner login
 
-Mux can optionally allow GitHub Device Flow login for exactly one GitHub account.
+Xum can optionally allow GitHub Device Flow login for exactly one GitHub account.
 
 Set the allowed account with either:
 
-- Environment variable: `MUX_SERVER_AUTH_GITHUB_OWNER`
-- Config file key: `serverAuthGithubOwner` in `~/.mux/config.json`
+- Environment variable: `XUM_SERVER_AUTH_GITHUB_OWNER`
+- Config file key: `serverAuthGithubOwner` in `~/.xum/config.json`
 
 There is currently no UI control for this setting; configure it via env/config.
 
@@ -40,9 +40,9 @@ Example:
 }
 ```
 
-If both are set, `MUX_SERVER_AUTH_GITHUB_OWNER` takes precedence.
+If both are set, `XUM_SERVER_AUTH_GITHUB_OWNER` takes precedence.
 
-When enabled, the auth modal shows **Login with GitHub**. Mux verifies the GitHub `login` value against the configured owner (case-insensitive). Non-matching users are rejected.
+When enabled, the auth modal shows **Login with GitHub**. Xum verifies the GitHub `login` value against the configured owner (case-insensitive). Non-matching users are rejected.
 
 <Note>
   This allowlist currently supports a single GitHub username. It does not support multiple users or
@@ -64,11 +64,11 @@ This page manages cookie-backed browser sessions. Token-based access remains val
 
 ## Network exposure and bind settings
 
-To expose Mux beyond localhost and configure bind host/port in the UI:
+To expose Xum beyond localhost and configure bind host/port in the UI:
 
 1. Open **Settings → Experiments**
 2. Enable **Expose API server on LAN/VPN**
-3. Configure bind host, port, and **Serve mux web UI**
+3. Configure bind host, port, and **Serve xum web UI**
 4. Click **Apply**
 
 Equivalent CLI options:
@@ -77,6 +77,22 @@ Equivalent CLI options:
 - `--port <port>`
 - `--ssh-host <host>`
 - `--add-project <path>`
+
+## Updating the server
+
+Open **About** (or use the **Check for Updates**, **Download Update**, **Install Update and Restart**, and **Update Channel** command palette actions) to check for updates, download, then choose **Install & restart**. The server uses the saved update channel, or infers Nightly from an installed `-next.` version when no channel is saved. Stable follows the npm `latest` tag; Nightly follows `next`. **Newest npm** in the About dialog selects the most recently published package, including pre-releases, regardless of tags. Switching channels can install an older version. Checks and restarts are manual. The registry must be reachable over HTTPS without credentials (`XUM_UPDATE_REGISTRY_URL` or `npm_config_registry` override the default) and must answer metadata and tarball requests itself: redirects are refused, and registries that require authentication for metadata report the registry error at check time. The server downloads the release tarball and verifies it against the registry's published sha512 digest before the package manager installs it and its dependencies. After the install, every dependency recorded in the staged lockfile is checked against the digest the registry publishes for that exact version, so a dependency the package manager fetched through a redirect or from a tampered mirror is refused. Every request validates the registry certificate, ignoring `strict-ssl=false` and `NODE_TLS_REJECT_UNAUTHORIZED`; trust a private CA by starting the server with `NODE_EXTRA_CA_CERTS`, which the server and the package manager both honor (`cafile` is not consulted).
+
+Self-update requires a supervisor that restarts the server after it exits, an external launcher symlink pointing to an installed `@coder/xum` CLI with a bun, npm, or pnpm lockfile, and a stable auth token (`MUX_SERVER_AUTH_TOKEN`, `--auth-token`, or `--no-auth`). A generated token dies with the process, so the relaunched server would lock every browser session out. Set `XUM_BINARY` to that symlink and `XUM_SERVER_SUPERVISED=true` only when a supervisor is configured. The `coder/mux` registry module with `restart_on_kill=true` already declares these through its launcher environment. Unsupported installations show a reason instead of offering an update.
+
+Downloads install an exact package version in a sibling staging directory without changing the running installation. Restart is blocked by active streams, pending turns, workspaces still initializing or being archived, removed, renamed, forked, or staged, workflow runs, project clones and creations, any other request still in flight, queued messages, pending auto-retries, open or starting terminals, live desktop sessions, and running processes without recoverable monitors. Armed background watchers with verified, persisted monitor registrations do not block restart. After restart, their workspaces receive a lost-monitor wake and can relaunch them as needed; shell commands are not replayed automatically. Finish or stop any blocking work and retry, or choose **Restart anyway** (also the **Install Update and Restart Anyway** palette action) to skip the check: the server shuts down the same way it does under a supervisor restart, so in-flight streams stop with their partial output kept, and terminals and background processes are closed. There is no automatic restart-when-idle in this version.
+
+After activation, the server exits gracefully and the supervisor relaunches it. Browser clients reconnect and reload when the server build changes. If reconnection takes longer than about 45 seconds, use **Retry**.
+
+<Warning>
+  The registry module counts self-updates toward `max_restart_attempts`, just like other exits. The
+  server cannot read the remaining restart budget. Ensure the supervisor has restarts available, or
+  configure unlimited restarts (`max_restart_attempts=0`) before relying on self-update.
+</Warning>
 
 ## Related
 

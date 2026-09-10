@@ -5,7 +5,14 @@ import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinki
 import type { ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 import { UserMessage, type UserMessageNavigation } from "./UserMessage";
+import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
+import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
+import { AlertTriangle, MessageSquare } from "lucide-react";
+import {
+  BackgroundWorkWakeMessage,
+  getBackgroundWorkWakeSummary,
+} from "./BackgroundWorkWakeMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { ToolMessage } from "./ToolMessage";
 import { ReasoningMessage } from "./ReasoningMessage";
@@ -14,7 +21,7 @@ import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
 import { InitMessage } from "./InitMessage";
 import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
-import { removeEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
 interface MessageRendererProps {
@@ -83,14 +90,46 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     taskReportLinking,
     userMessageNavigation,
   }) => {
+    message = useStreamingMessageDelta(workspaceId, message);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type
     switch (message.type) {
-      case "user":
+      case "user": {
+        const backgroundWorkWakeSummary =
+          message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
         renderedMessage =
-          message.bashMonitorWake != null ? (
+          message.contextBudgetWarning != null ? (
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                message.contextBudgetWarning.final
+                  ? "Context window ending: notes flush"
+                  : "Context budget warning"
+              }
+              icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="context-budget-warning"
+              className={className}
+            />
+          ) : message.bashMonitorWake != null ? (
             <BashMonitorWakeMessage message={message} className={className} />
+          ) : message.agentPeerMessageTrigger != null ? (
+            // The wake trigger is backend-generated control text: a full user bubble would
+            // falsely present it as human input (the payload renders separately as the
+            // assistant-side agent-message card).
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Agent message notification"
+              icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="agent-peer-message-trigger"
+              className={className}
+            />
+          ) : backgroundWorkWakeSummary != null ? (
+            <BackgroundWorkWakeMessage
+              message={message}
+              summary={backgroundWorkWakeSummary}
+              className={className}
+            />
           ) : (
             <UserMessage
               message={message}
@@ -101,15 +140,21 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
             />
           );
         break;
+      }
       case "assistant":
-        renderedMessage = (
-          <AssistantMessage
-            message={message}
-            className={className}
-            workspaceId={workspaceId}
-            isCompacting={isCompacting}
-          />
-        );
+        // Peer message payloads are assistant-role synthetic rows (peer bytes never gain
+        // user-role authority); backend-attached metadata gates the card presentation.
+        renderedMessage =
+          message.agentPeerMessage != null ? (
+            <AgentPeerMessage message={message} className={className} />
+          ) : (
+            <AssistantMessage
+              message={message}
+              className={className}
+              workspaceId={workspaceId}
+              isCompacting={isCompacting}
+            />
+          );
         break;
       case "tool":
         renderedMessage = (

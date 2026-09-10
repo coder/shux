@@ -78,9 +78,60 @@ export function setupSubagentReportStory() {
   });
 }
 
+export function setupSubagentFailureStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-subagent-failure-presentation",
+    workspaceName: "subagent-failures",
+    projectName: "mux",
+    messages: [
+      createUserMessage("failure-user", "Have the agents review the changes and run the tests.", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 180_000,
+      }),
+      ...[
+        {
+          taskId: "94f98c6165",
+          agentType: "exec",
+          errorType: "workspace_turn_superseded",
+          errorMessage:
+            "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+        },
+        {
+          taskId: "28a75e1b09",
+          agentType: "explore",
+          errorType: "process_exit",
+          errorMessage: "The agent process exited unexpectedly before it could finish the review.",
+        },
+      ].map((failure, index) =>
+        createUserMessage(
+          `failure-${index}`,
+          `<mux_subagent_failure>
+<task_id>${failure.taskId}</task_id>
+<execution_version>wst_f804f6a7a6:interrupted:2026-09-04T12:04:40.370Z</execution_version>
+<execution_id>wst_f804f6a7a6</execution_id>
+<agent_type>${failure.agentType}</agent_type>
+<error_type>${failure.errorType}</error_type>
+<error_message>
+${failure.errorMessage}
+</error_message>
+This sub-agent task failed terminally and will not produce a report. Do not re-await it.
+</mux_subagent_failure>`,
+          {
+            historySequence: index + 2,
+            timestamp: STABLE_TIMESTAMP - 120_000 + index * 60_000,
+            synthetic: true,
+          }
+        )
+      ),
+    ],
+  });
+}
+
 export function PhoneSubagentReportDecorator(Story: ComponentType) {
   return (
-    <div style={{ width: 390, height: 844, overflow: "hidden" }}>
+    <div style={{ width: 390, maxWidth: "100%", height: 844, overflow: "hidden" }}>
       <Story />
     </div>
   );

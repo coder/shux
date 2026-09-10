@@ -30,6 +30,27 @@ export class AsyncMutex {
     return new AsyncMutexLock(this);
   }
 
+  /** True while some caller holds the lock (for defensive assertions only —
+   * it cannot tell WHO holds it, so never use it as a locking substitute). */
+  get isLocked(): boolean {
+    return this.locked;
+  }
+
+  /**
+   * Take the lock only if it is free RIGHT NOW; returns null when another
+   * holder has it. Synchronous check-and-take — atomic in single-threaded
+   * JS (no await between check and set). For callers whose work is optional
+   * under contention and must never queue behind a long-lived lease (r70:
+   * task-terminal delivery must not wait behind a running guest eval).
+   */
+  tryAcquire(): AsyncMutexLock | null {
+    if (this.locked) {
+      return null;
+    }
+    this.locked = true;
+    return new AsyncMutexLock(this);
+  }
+
   /**
    * Release the lock and wake up next waiter in queue
    * @internal - Should only be called by AsyncMutexLock
@@ -49,7 +70,7 @@ export class AsyncMutex {
  * Implements AsyncDisposable to ensure lock is released when scope exits.
  * This provides static compile-time guarantees against lock leaks.
  */
-class AsyncMutexLock implements AsyncDisposable {
+export class AsyncMutexLock implements AsyncDisposable {
   constructor(private readonly mutex: AsyncMutex) {}
 
   /**

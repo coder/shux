@@ -46,6 +46,7 @@ import {
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
 } from "@/constants/layout";
+import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
 
 import {
@@ -74,20 +75,18 @@ import {
   EXPANDED_PROJECTS_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-  resolveEffectiveComposerModel,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
@@ -97,7 +96,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
-import { AboutDialogProvider } from "./contexts/AboutDialogContext";
+import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
@@ -182,6 +181,7 @@ function AppInner() {
   } = useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
+  const { open: openAboutDialog } = useAboutDialog();
   const { confirm: confirmDialog } = useConfirmDialog();
   const setThemePreference = useCallback(
     (nextTheme: ThemePreference) => {
@@ -192,6 +192,23 @@ function AppInner() {
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
+
+  useEffect(() => {
+    setSupportedUpdateChannels([]);
+    if (!api) return;
+
+    let active = true;
+    api.update
+      .getChannel()
+      .then(({ supportedChannels }) => {
+        if (active) setSupportedUpdateChannels(supportedChannels);
+      })
+      .catch(console.error);
+    return () => {
+      active = false;
+    };
+  }, [api]);
 
   const {
     userProjects,
@@ -216,6 +233,7 @@ function AppInner() {
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -339,14 +357,14 @@ function AppInner() {
       // Update window title with workspace title (or name for legacy workspaces)
       const metadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
       const workspaceTitle = metadata?.title ?? metadata?.name ?? selectedWorkspace.workspaceId;
-      const title = `${workspaceTitle} - ${selectedWorkspace.projectName} - mux`;
+      const title = `${workspaceTitle} - ${selectedWorkspace.projectName} - ${XUM_PRODUCT_SLUG}`;
       // Set document.title locally for browser mode, call backend for Electron
       document.title = title;
       void api?.window.setTitle({ title });
     } else {
       // Set document.title locally for browser mode, call backend for Electron
-      document.title = "mux";
-      void api?.window.setTitle({ title: "mux" });
+      document.title = XUM_PRODUCT_SLUG;
+      void api?.window.setTitle({ title: XUM_PRODUCT_SLUG });
     }
   }, [selectedWorkspace, workspaceMetadata, api]);
 
@@ -537,8 +555,6 @@ function AppInner() {
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
       const model = getModelForWorkspace(workspaceId);
       const key = getThinkingLevelKey(workspaceId);
-      // Carry the current pro-mode choice: the backend replaces the agent's
-      // settings wholesale, so omitting reasoningMode would wipe it.
       const reasoningMode = getReasoningModeForWorkspace(workspaceId);
 
       // Use the utility function which handles localStorage and event dispatch
@@ -570,30 +586,7 @@ function AppInner() {
         {}
       );
 
-      // Persist to backend so the palette change follows the workspace across devices.
       if (api) {
-        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-          model,
-          thinkingLevel: normalized,
-          reasoningMode,
-        });
-
-        api.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel: normalized, reasoningMode },
-          })
-          .then((result) => {
-            if (!result.success) {
-              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            }
-          })
-          .catch(() => {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            // Best-effort only.
-          });
-
         // Mid-turn change: also apply to the active turn's next model step so
         // the palette/keybind path behaves like the selector (ThinkingProvider).
         requestActiveTurnThinkingLevel(api, workspaceId, normalized);
@@ -611,9 +604,7 @@ function AppInner() {
     [api, getModelForWorkspace, getReasoningModeForWorkspace]
   );
 
-  // Palette toggle for the OpenAI pro reasoning mode. Persists like the
-  // thinking-level palette action: localStorage first (ThinkingProvider listens),
-  // then best-effort backend sync with the full settings payload.
+  // Keep palette choices local until a user message sends the full settings.
   const toggleReasoningModeFromPalette = useCallback(
     (workspaceId: string) => {
       if (!workspaceId) {
@@ -651,32 +642,8 @@ function AppInner() {
         },
         {}
       );
-
-      if (api) {
-        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-          model,
-          thinkingLevel,
-          reasoningMode: next,
-        });
-
-        api.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel, reasoningMode: next },
-          })
-          .then((result) => {
-            if (!result.success) {
-              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            }
-          })
-          .catch(() => {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-            // Best-effort only.
-          });
-      }
     },
-    [api, getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
+    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
   );
 
   const getFastModeActive = useCallback(() => {
@@ -959,7 +926,10 @@ function AppInner() {
         meta,
         direction,
         sortedWorkspacesByProject,
-        userProjects
+        userProjects,
+        readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+          ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
+          : false
       );
       if (order) void reorderPinnedWorkspaces(order);
     },
@@ -968,6 +938,7 @@ function AppInner() {
       workspaceMetadata,
       sortedWorkspacesByProject,
       userProjects,
+      multiProjectWorkspacesEnabled,
       reorderPinnedWorkspaces,
     ]
   );
@@ -987,11 +958,13 @@ function AppInner() {
     getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,
+    getEffectiveRouteForModel: (modelString) => routing.resolveEffectiveRoute(modelString),
     getMinThinkingOverride,
     onStartScratchCreation: openNewScratchFromPalette,
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
+    agentPluginsEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
@@ -1011,6 +984,8 @@ function AppInner() {
     onToggleTheme: toggleTheme,
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
+    onOpenAbout: openAboutDialog,
+    supportedUpdateChannels,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
       void applySlotToWorkspace(workspaceId, slot).catch(() => {
@@ -1456,7 +1431,7 @@ function AppInner() {
                 onWorkspaceCreated={handleWorkspaceCreated}
               />
             ) : (
-              // The dedicated Mux home page was removed. Keep `/` as a minimal shell so
+              // The dedicated Xum home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,
               // without reintroducing a sticky dashboard screen.
               <RootRouteShell

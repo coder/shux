@@ -861,6 +861,8 @@ describe("useCreationWorkspace", () => {
       trunkBranch: "dev",
     });
     const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
+    const beginPendingSendSpy = spyOn(workspaceStore, "beginPendingSend");
+    const markPendingSendAcceptedSpy = spyOn(workspaceStore, "markPendingSendAccepted");
 
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
@@ -880,6 +882,16 @@ describe("useCreationWorkspace", () => {
 
     expect(handleSendResult).toEqual({ success: true });
 
+    // The initial message is shown as pending in the new workspace and marked accepted on success.
+    expect(beginPendingSendSpy.mock.calls.length).toBe(1);
+    expect(beginPendingSendSpy.mock.calls[0][0]).toBe(TEST_WORKSPACE_ID);
+    expect(beginPendingSendSpy.mock.calls[0][1]).toMatchObject({ content: "launch workspace" });
+    expect(markPendingSendAcceptedSpy.mock.calls).toEqual([
+      [TEST_WORKSPACE_ID, beginPendingSendSpy.mock.calls[0][1].id],
+    ]);
+    beginPendingSendSpy.mockRestore();
+    markPendingSendAcceptedSpy.mockRestore();
+
     // workspace.create should be called with the generated name
     expect(workspaceApi.create.mock.calls.length).toBe(1);
     const createCall = workspaceApi.create.mock.calls[0];
@@ -892,6 +904,7 @@ describe("useCreationWorkspace", () => {
     expect(createRequest?.runtimeConfig).toEqual({
       type: "ssh",
       host: "example.com",
+      // SSH remotes keep the stable ~/mux layout; local Xum home is separate.
       srcBaseDir: "~/mux",
     });
 
@@ -1116,7 +1129,9 @@ describe("useCreationWorkspace", () => {
     // barrier is cleared once staging fails.
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({ markPendingInitialSend: true });
-    expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
+    expect(clearPendingInitialSendSpy.mock.calls.map(([workspaceId]) => workspaceId)).toContain(
+      TEST_WORKSPACE_ID
+    );
     clearPendingInitialSendSpy.mockRestore();
 
     const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);

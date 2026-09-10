@@ -5,23 +5,30 @@
  * Each workspace can have multiple terminal windows open simultaneously.
  */
 
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from "electron";
 import * as path from "path";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { normalizeAndValidateExternalUrl } from "@/desktop/utils/normalizeAndValidateExternalUrl";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
 
-// MUX_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
+// XUM_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
+const xumProxyUri = resolveXumEnvironmentValue("PROXY_URI", process.env)?.trim();
 const localhostProxyTemplate =
-  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: empty/whitespace-only env vars should be treated as unset
-  process.env.MUX_PROXY_URI?.trim() || process.env.VSCODE_PROXY_URI?.trim() || undefined;
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- empty/whitespace-only env vars should be treated as unset
+  xumProxyUri || process.env.VSCODE_PROXY_URI?.trim() || undefined;
 
 export class TerminalWindowManager {
   private windows = new Map<string, Set<BrowserWindow>>(); // workspaceId -> Set of windows
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
 
-  constructor(config: Config) {
+  constructor(
+    config: Config,
+    private readonly createWindow: (options: BrowserWindowConstructorOptions) => BrowserWindow = (
+      options
+    ) => new BrowserWindow(options)
+  ) {
     this.config = config;
   }
 
@@ -30,7 +37,11 @@ export class TerminalWindowManager {
    * Multiple windows can be open for the same workspace
    * @param sessionId Optional session ID to reattach to (for pop-out handoff from embedded terminal)
    */
-  async openTerminalWindow(workspaceId: string, sessionId?: string): Promise<void> {
+  async openTerminalWindow(
+    workspaceId: string,
+    sessionId?: string,
+    initialTitle?: string
+  ): Promise<void> {
     this.windowCount++;
     const windowId = this.windowCount;
 
@@ -46,7 +57,7 @@ export class TerminalWindowManager {
       title = `Terminal ${windowId} — ${workspaceId}`;
     }
 
-    const terminalWindow = new BrowserWindow({
+    const terminalWindow = this.createWindow({
       width: 1000,
       height: 600,
       title,
@@ -106,14 +117,17 @@ export class TerminalWindowManager {
     });
 
     // Load the terminal page
-    // Match main window logic: use dev server unless packaged or MUX_E2E_LOAD_DIST=1
-    const forceDistLoad = process.env.MUX_E2E_LOAD_DIST === "1";
+    // Match main window logic: use dev server unless packaged or XUM_E2E_LOAD_DIST=1
+    const forceDistLoad = resolveXumEnvironmentValue("E2E_LOAD_DIST", process.env) === "1";
     const useDevServer = !app.isPackaged && !forceDistLoad;
 
     // Build query params including optional sessionId for session handoff
     const queryParams: Record<string, string> = { workspaceId };
     if (sessionId) {
       queryParams.sessionId = sessionId;
+    }
+    if (initialTitle) {
+      queryParams.title = initialTitle;
     }
 
     if (useDevServer) {
@@ -158,21 +172,5 @@ export class TerminalWindowManager {
       }
       this.windows.delete(workspaceId);
     }
-  }
-
-  /**
-   * Get all windows for a workspace
-   */
-  getWindows(workspaceId: string): BrowserWindow[] {
-    const windowSet = this.windows.get(workspaceId);
-    if (!windowSet) return [];
-    return Array.from(windowSet).filter((w) => !w.isDestroyed());
-  }
-
-  /**
-   * Get count of open terminal windows for a workspace
-   */
-  getWindowCount(workspaceId: string): number {
-    return this.getWindows(workspaceId).length;
   }
 }

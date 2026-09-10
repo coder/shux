@@ -13,6 +13,7 @@ import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { selectWorkspace } from "@/browser/stories/helpers/uiState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import {
   getExperimentKey,
@@ -22,6 +23,7 @@ import {
 import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
   UI_THEME_KEY,
 } from "@/common/constants/storage";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
@@ -53,6 +55,10 @@ export function resetStorybookPersistedStateForStory(): void {
     // Sidebar stories can write sidebarAgeGrouping=false into the shared
     // origin; clear it so the GeneralSection switch snapshots its default.
     localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
+
+    // Terminal badge stories seed an enabled badge config; clear it so the
+    // default GeneralSection story snapshots the disabled (collapsed) rows.
+    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
 }
 
@@ -97,6 +103,8 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
   if (wiredProvidersClientRef.current !== clientRef.current) {
     wiredProvidersClientRef.current = clientRef.current;
     getProvidersConfigStore().setClient(clientRef.current);
+    // useRouting/useMinThinkingLevels consumers read the shared AppConfigStore.
+    getAppConfigStore().setClient(clientRef.current);
   }
 
   return (

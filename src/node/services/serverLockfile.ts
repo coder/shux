@@ -19,16 +19,16 @@ export const ServerLockDataSchema = z.object({
 export type ServerLockData = z.infer<typeof ServerLockDataSchema>;
 
 /**
- * Manages the server lockfile at ~/.mux/server.lock
+ * Manages the server lockfile at ~/.xum/server.lock
  *
- * The lockfile enables CLI tools to discover a running mux server
- * (either Electron app or standalone mux server) and connect to it.
+ * The lockfile enables CLI tools to discover a running xum server
+ * (either Electron app or standalone xum server) and connect to it.
  */
 export class ServerLockfile {
   private readonly lockPath: string;
 
-  constructor(muxHome: string) {
-    this.lockPath = path.join(muxHome, "server.lock");
+  constructor(xumHome: string) {
+    this.lockPath = path.join(xumHome, "server.lock");
   }
 
   /**

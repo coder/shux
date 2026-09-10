@@ -1,6 +1,7 @@
 import type { Tool } from "ai";
 import type { z } from "zod";
 import type { ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import { CONTEXT_FLUSH_TOOL_POLICY_RULE } from "@/common/constants/contextBudget";
 
 /**
  * Tool policy - array of filters applied in order
@@ -76,4 +77,18 @@ export function applyToolPolicy(
   return Object.fromEntries(
     Object.entries(tools).filter(([toolName]) => enabledToolNames.has(toolName))
   );
+}
+
+/** Rollover must honor the same last-match regex policy as tool assembly. */
+export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
+  return applyToolPolicyToNames(["session_history"], policy).length === 0;
+}
+
+/**
+ * Caller policy for a context-budget final-flush turn: the memory-only ceiling is appended
+ * last so it wins regardless of the caller's or agent's own rules, while `memory` keeps
+ * whatever verdict the inherited policy gave it.
+ */
+export function withContextBudgetFlushToolPolicy(policy?: ToolPolicy): ToolPolicy {
+  return [...(policy ?? []), CONTEXT_FLUSH_TOOL_POLICY_RULE];
 }

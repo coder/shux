@@ -3,11 +3,11 @@ title: Coder Runtime
 description: Run agents on Coder workspaces
 ---
 
-Mux can use [Coder Workspaces](https://coder.com/docs) as SSH hosts. When enabled, Mux talks to the Coder CLI on your local machine to list templates/presets/workspaces and connects over SSH. Connecting to an existing Coder workspace lets multiple Mux workspaces share the same Coder host, which avoids per-workspace provisioning overhead.
+Xum can use [Coder Workspaces](https://coder.com/docs) as SSH hosts. When enabled, Xum talks to the Coder CLI on your local machine to list templates/presets/workspaces and connects over SSH. Connecting to an existing Coder workspace lets multiple Xum workspaces share the same Coder host, which avoids per-workspace provisioning overhead.
 
 ## Requirements
 
-- Coder CLI **v2.25.0+** installed on the machine running Mux and logged in to your deployment
+- Coder CLI **v2.25.0+** installed on the machine running Xum and logged in to your deployment
 - Access to a Coder template (for new workspaces) or an existing workspace
 - A workspace image with git and your toolchain
 
@@ -16,22 +16,22 @@ Mux can use [Coder Workspaces](https://coder.com/docs) as SSH hosts. When enable
 1. Choose **SSH** as the runtime and enable **Use Coder Workspace**.
 2. Select **New**.
 3. Pick a template and (if available) a preset.
-4. Mux creates a Coder workspace named `mux-<workspace-name>` (derived from your Mux workspace name), waits for startup scripts, then connects over SSH.
+4. Xum creates a Coder workspace named `mux-<workspace-name>` (derived from your Xum workspace name), waits for startup scripts, then connects over SSH.
 
-If multiple organizations have templates with the same name, Mux shows the organization name so you can pick the right one.
+If multiple organizations have templates with the same name, Xum shows the organization name so you can pick the right one.
 
 ## Use an existing Coder workspace
 
 1. Choose **Existing**.
 2. Select a workspace from the list (status is shown).
-3. Mux will start the workspace if it is stopped, then connect to `<workspace-name>.mux--coder`.
+3. Xum will start the workspace if it is stopped, then connect to `<workspace-name>.mux--coder`.
 
 ## SSH setup
 
-Mux writes and maintains a mux-owned SSH config block before connecting, creating aliases like `<workspace-name>.mux--coder` in `~/.ssh/config`.
+Xum writes and maintains a Xum-owned SSH config block before connecting, creating aliases like `<workspace-name>.mux--coder` in `~/.ssh/config`.
 
 ## Notes
 
 - If the **Use Coder Workspace** checkbox is missing, verify that the Coder CLI is found on the PATH.
-- Each Mux workspace still lives in its own directory on the remote machine, even when sharing a single Coder workspace.
-- By default, archiving a **New** (mux-created) Coder-backed workspace will also stop the underlying Coder workspace, and unarchiving will attempt to start it again. This does **not** apply when using an **Existing** Coder workspace. To disable this behavior, set `stopCoderWorkspaceOnArchive` to `false` in `~/.mux/config.json`.
+- Each Xum workspace still lives in its own directory on the remote machine, even when sharing a single Coder workspace.
+- By default, archiving a **New** (Xum-created) Coder-backed workspace will also stop the underlying Coder workspace, and unarchiving will attempt to start it again. This does **not** apply when using an **Existing** Coder workspace. To disable this behavior, set `stopCoderWorkspaceOnArchive` to `false` in `~/.xum/config.json`.

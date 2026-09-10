@@ -95,4 +95,18 @@ describe("executeBash repo-root helpers", () => {
       "src/example.ts"
     );
   });
+
+  test("preserves edge whitespace in git file paths through reprojection", () => {
+    // A file may literally be named ".env " (trailing space); trimming it here would
+    // point downstream reads (copy, overlay) at a different file such as an ignored
+    // ".env". Single-project reprojection must return the exact path.
+    expect(reprojectRepoRootFilePath(null, ".env ")).toBe(".env ");
+    // Multi-project: the repo-relative remainder keeps its edge whitespace too.
+    expect(reprojectRepoRootFilePath(workspaceMetadata, ".env ", "/tmp/project-b")).toBe(
+      "project-b/.env "
+    );
+    expect(normalizeRepoRootFilePath(workspaceMetadata, "project-b/.env ", "/tmp/project-b")).toBe(
+      ".env "
+    );
+  });
 });

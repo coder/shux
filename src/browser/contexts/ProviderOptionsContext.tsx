@@ -6,6 +6,7 @@ import {
 } from "@/common/constants/storage";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { supports1MContext } from "@/common/utils/ai/models";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 
 interface ProviderOptionsContextType {
@@ -54,6 +55,7 @@ function migrateGlobalToPerModel(
 }
 
 export function ProviderOptionsProvider({ children }: { children: React.ReactNode }) {
+  const { config: providersConfig } = useProvidersConfig();
   const [anthropicOptions, setAnthropicOptions] = usePersistedState<
     MuxProviderOptions["anthropic"]
   >(PROVIDER_OPTIONS_ANTHROPIC_KEY, {}, { listener: true });
@@ -81,7 +83,7 @@ export function ProviderOptionsProvider({ children }: { children: React.ReactNod
       return true;
     }
 
-    return supports1MContext(modelId) && anthropicOptions?.use1MContext === true;
+    return supports1MContext(modelId, providersConfig) && anthropicOptions?.use1MContext === true;
   };
 
   const toggle1MContext = (modelId: string): void => {

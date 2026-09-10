@@ -9,6 +9,7 @@ function makeInput(overrides: Partial<SyncPlanInput> = {}): SyncPlanInput {
     watermarkWorkspaceIds: new Set(),
     hasAnyWatermarkAtOrAboveZero: false,
     pricingFingerprintChanged: false,
+    semanticsVersionChanged: false,
     changedSignalWorkspaceIds: new Set(),
     ...overrides,
   };
@@ -264,6 +265,43 @@ describe("decideSyncPlan", () => {
             knownWorkspaceIds: new Set(["ws-1"]),
             watermarkWorkspaceIds: new Set(["ws-1"]),
             pricingFingerprintChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "noop",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("returns full_rebuild to backfill existing events when ETL semantics changed", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 10,
+            watermarkCount: 2,
+            knownWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            watermarkWorkspaceIds: new Set(["ws-1", "ws-2"]),
+            hasAnyWatermarkAtOrAboveZero: true,
+            semanticsVersionChanged: true,
+          })
+        )
+      ).toEqual({
+        action: "full_rebuild",
+        workspaceIdsToIngest: [],
+        workspaceIdsToPurge: [],
+      });
+    });
+
+    test("does not rebuild for a semantics change when no events exist", () => {
+      expect(
+        decideSyncPlan(
+          makeInput({
+            eventCount: 0,
+            watermarkCount: 1,
+            knownWorkspaceIds: new Set(["ws-1"]),
+            watermarkWorkspaceIds: new Set(["ws-1"]),
+            semanticsVersionChanged: true,
           })
         )
       ).toEqual({

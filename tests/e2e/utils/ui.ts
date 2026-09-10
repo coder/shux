@@ -30,6 +30,7 @@ export interface WorkspaceUI {
     setThinkingLevel(value: number): Promise<void>;
     sendMessage(message: string): Promise<void>;
     expectTranscriptContains(text: string): Promise<void>;
+    expectTurnSettled(): Promise<void>;
     expectActionButtonVisible(label: string): Promise<void>;
     clickActionButton(label: string): Promise<void>;
     expectStatusMessageContains(text: string): Promise<void>;
@@ -216,6 +217,12 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
     async expectTranscriptContains(text: string): Promise<void> {
       await expect(transcriptLocator(page)).toContainText(text, { timeout: 45_000 });
+    },
+
+    async expectTurnSettled(): Promise<void> {
+      await expect(page.getByRole("button", { name: "Stop streaming" })).toBeHidden({
+        timeout: 45_000,
+      });
     },
 
     async expectActionButtonVisible(label: string): Promise<void> {

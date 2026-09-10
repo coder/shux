@@ -1,12 +1,14 @@
+import { Duration, Effect, Exit, Schedule, Scope } from "effect";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
 import { log } from "./log";
 
-const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
-const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+export const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
+export const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const HOURS_TO_MS = 60 * 60 * 1000;
 
 /**
@@ -44,8 +46,18 @@ export class IdleCompactionService {
   private readonly historyService: HistoryService;
   private readonly extensionMetadata: ExtensionMetadataService;
   private readonly executeIdleCompaction: (workspaceId: string) => Promise<void>;
-  private initialTimeout: ReturnType<typeof setTimeout> | null = null;
-  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Runs the checker fork and the scope close. Context-bound in the app (the
+   * checker reads the runtime's `Clock` — a `TestClock` in tests); the global
+   * runtime by default.
+   */
+  private readonly runner: EffectRunner;
+  /**
+   * Owns the checker fiber forked by start(): sleep(INITIAL_CHECK_DELAY_MS),
+   * then check immediately and every CHECK_INTERVAL_MS. Closing the scope in
+   * stop() interrupts the fiber, synchronously clearing its pending timer.
+   */
+  private lifecycleScope: Scope.Closeable | null = null;
   private readonly queue: QueuedIdleCompaction[] = [];
   private readonly queuedWorkspaceIds = new Set<string>();
   private readonly activeWorkspaceIds = new Set<string>();
@@ -61,12 +73,14 @@ export class IdleCompactionService {
     config: Config,
     historyService: HistoryService,
     extensionMetadata: ExtensionMetadataService,
-    executeIdleCompaction: (workspaceId: string) => Promise<void>
+    executeIdleCompaction: (workspaceId: string) => Promise<void>,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.config = config;
     this.historyService = historyService;
     this.extensionMetadata = extensionMetadata;
     this.executeIdleCompaction = executeIdleCompaction;
+    this.runner = runner;
   }
 
   /**
@@ -76,14 +90,27 @@ export class IdleCompactionService {
   start(): void {
     this.stopped = false;
 
-    // First check after delay to let startup settle.
-    this.initialTimeout = setTimeout(() => {
-      void this.checkAllWorkspaces();
-      // Then periodically.
-      this.checkInterval = setInterval(() => {
-        void this.checkAllWorkspaces();
-      }, CHECK_INTERVAL_MS);
-    }, INITIAL_CHECK_DELAY_MS);
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    const scope = Scope.makeUnsafe();
+    this.lifecycleScope = scope;
+
+    const checker = Effect.gen(function* () {
+      // First check after delay to let startup settle.
+      yield* Effect.sleep(Duration.millis(INITIAL_CHECK_DELAY_MS));
+      // Effect.repeat runs the first check immediately (matching the legacy
+      // direct call when the initial timer fired), then Schedule.fixed
+      // reproduces setInterval cadence. The check stays fire-and-forget so a
+      // slow sweep never delays the next cadence slot (same as setInterval).
+      yield* Effect.sync(() => {
+        void self.checkAllWorkspaces();
+      }).pipe(Effect.repeat(Schedule.fixed(Duration.millis(CHECK_INTERVAL_MS))));
+    });
+    // Runs synchronously up to the checker's first sleep, so the initial-delay
+    // timer is registered before start() returns (same as the previous
+    // setTimeout call).
+    this.runner.runSync(Effect.forkIn(checker, scope));
+
     log.info("IdleCompactionService started", {
       initialDelayMs: INITIAL_CHECK_DELAY_MS,
       intervalMs: CHECK_INTERVAL_MS,
@@ -96,13 +123,12 @@ export class IdleCompactionService {
   stop(): void {
     this.stopped = true;
 
-    if (this.initialTimeout) {
-      clearTimeout(this.initialTimeout);
-      this.initialTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
+    if (this.lifecycleScope) {
+      const scope = this.lifecycleScope;
+      this.lifecycleScope = null;
+      // Interrupts the checker fiber, synchronously clearing its pending
+      // timer — the fiber only ever suspends on its clock timer.
+      this.runner.runSync(Scope.close(scope, Exit.void));
     }
 
     // Best-effort queue reset: do not start new compactions after stop().

@@ -14,7 +14,8 @@ import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIco
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { cn } from "@/common/lib/utils";
 import type { AvailableRoute } from "@/common/routing";
-import { getModelStats, type ModelStats } from "@/common/utils/tokens/modelStats";
+import { getModelStatsResolved, type ModelStats } from "@/common/utils/tokens/modelStats";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getAvailableThinkingLevels,
@@ -222,10 +223,17 @@ export interface ModelRowProps {
   onToggle1MContext?: () => void;
   /** Toggle visibility in model selector */
   onToggleVisibility?: () => void;
+  /**
+   * Providers config for metadata-aware identity resolution. Coder gateway
+   * rows (coder:<instance>/<model>) derive pricing/context/thinking data from
+   * the instance's TYPE, which arbitrary instance names cannot convey.
+   */
+  providersConfig?: ProvidersConfigMap | null;
 }
 
 export function ModelRow(props: ModelRowProps) {
-  const stats = getModelStats(props.mappedToModel ?? props.fullId);
+  const providersConfig = props.providersConfig ?? null;
+  const stats = getModelStatsResolved(props.mappedToModel ?? props.fullId, providersConfig);
 
   const contextBaseTokens = props.customContextWindowTokens ?? stats?.max_input_tokens ?? null;
   const mappedProvider = props.mappedToModel ? props.mappedToModel.split(":")[0] || null : null;
@@ -246,19 +254,20 @@ export function ModelRow(props: ModelRowProps) {
   const routeSelectValue =
     props.resolvedRoute && !props.resolvedRoute.isAuto ? props.resolvedRoute.route : "auto";
 
-  // Per-model minimum thinking: only models Mux explicitly recognizes as reasoning models
+  // Per-model minimum thinking: only models Xum explicitly recognizes as reasoning models
   // (with more than one level to choose from) expose a floor control. Unrecognized /
   // non-reasoning models and single-level models (e.g. gpt-5-pro) keep the legacy behavior
   // with no selector. The dropdown lists the model's full capability so users can pick any
   // floor, including off/low.
-  const thinkingCapability = getThinkingPolicyForModel(props.fullId);
+  const thinkingCapability = getThinkingPolicyForModel(props.fullId, providersConfig);
   const supportsMinThinking =
-    hasExplicitThinkingPolicy(props.fullId) && thinkingCapability.length > 1;
+    hasExplicitThinkingPolicy(props.fullId, providersConfig) && thinkingCapability.length > 1;
   // The selected value is the effective floor shown as a plain level (no "Default" wording).
   // It's always one of the capability options since available levels are a capability subset.
   const minThinkingFloorLevel = getAvailableThinkingLevels(
     props.fullId,
-    resolveMinimumThinkingLevel(props.fullId, props.minThinkingLevel)
+    resolveMinimumThinkingLevel(props.fullId, props.minThinkingLevel, providersConfig),
+    providersConfig
   )[0];
 
   // Editing mode - render as a full-width row

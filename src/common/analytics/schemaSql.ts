@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS events (
   output_tps DOUBLE,
   response_index INTEGER,
   is_sub_agent BOOLEAN DEFAULT false,
-  tool_name TEXT
+  tool_name TEXT,
+  requested_model VARCHAR,
+  refused_models_json VARCHAR
 )
 `;
 

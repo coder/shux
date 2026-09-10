@@ -2,7 +2,6 @@ import { z } from "zod";
 import { ThinkingLevelSchema } from "../../types/thinking";
 import { RuntimeConfigSchema } from "./runtime";
 import { WorkspaceAISettingsByAgentSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { TASK_GROUP_KIND_VALUES } from "@/common/utils/tools/taskGroups";
 import { GoalSnapshotSchema } from "./goal";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
@@ -30,13 +29,6 @@ export const BestOfGroupSchema = z.object({
   total: z.number().int().min(2).meta({
     description: "Total number of sibling tasks spawned in the grouped task request.",
   }),
-  kind: z.enum(TASK_GROUP_KIND_VALUES).optional().meta({
-    description:
-      'Optional grouped task mode ("bestOf" for repeated candidates or "variants" for labeled siblings). Missing values default to "bestOf" at read time for backward compatibility.',
-  }),
-  label: z.string().min(1).optional().meta({
-    description: "Optional per-sibling label for grouped task variants.",
-  }),
 });
 
 /**
@@ -48,7 +40,7 @@ export const BestOfGroupSchema = z.object({
  * value for new goals in this workspace". A workspace with all three
  * fields null is semantically identical to no override at all — the
  * backend should drop the entire object in that case to keep
- * `~/.mux/config.json` tidy.
+ * `~/.xum/config.json` tidy.
  *
  * Mirrors the heartbeat pattern (per-workspace override of a global
  * default, persisted inside `WorkspaceConfigSchema`) so the
@@ -247,6 +239,25 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
   }),
+  // Delegation changes the operator, not the computer; checkout isolation is independent.
+  taskDesktopOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Ancestor owning the shared desktop. Absent means this workspace owns its desktop.",
+  }),
+  taskIsolation: z.enum(["fork", "none"]).optional().meta({
+    description:
+      'Workspace isolation for an agent task. "none" shares an ancestor checkout and must never be treated as an independently managed worktree.',
+  }),
+  taskSticky: z.boolean().optional().meta({
+    description: "Legacy ignored retention marker kept for on-disk downgrade compatibility.",
+  }),
+  taskExecutionId: z.string().optional().meta({
+    description: "Latest internal execution handle for a reawakened persistent sub-agent.",
+  }),
+  taskExecutionStatus: z
+    .enum(["queued", "starting", "running", "completed", "interrupted", "error"])
+    .optional()
+    .meta({ description: "Status of the latest internal reawakened sub-agent execution." }),
   archivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last archived. Workspace is considered archived if archivedAt > unarchivedAt (or unarchivedAt is absent).",
@@ -275,12 +286,15 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
+  rootWorkspaceId: z.string().optional().meta({
+    description: "Task-family root derived from complete metadata, including archived ancestors.",
+  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
   incompatibleRuntime: z.string().optional().meta({
     description:
-      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of mux). The workspace should be displayed but interactions should show this error message.",
+      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of Xum). The workspace should be displayed but interactions should show this error message.",
   }),
   isRemoving: z.boolean().optional().meta({
     description: "True if this workspace is currently being deleted (deletion in progress).",
@@ -329,6 +343,10 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   isIdleCompaction: z.boolean().optional().meta({
     description: "Whether the current streaming activity is an idle (background) compaction",
   }),
+  activeWorkflowRunIds: z.array(z.string().min(1)).optional().meta({
+    description:
+      "IDs of top-level workflow runs in this workspace that are pending, running, or backgrounded.",
+  }),
   activeWorkflowRunCount: z.number().int().nonnegative().optional().meta({
     description:
       "Number of top-level workflow runs in this workspace that are pending, running, or backgrounded.",
@@ -350,12 +368,6 @@ export const WorkspaceActivitySnapshotSchema = z.object({
     description:
       "Internal frontend hint: merge only the goal field from this activity event; do not replace persisted activity fields.",
   }),
-});
-
-export const PostCompactionStateSchema = z.object({
-  planPath: z.string().nullable(),
-  trackedFilePaths: z.array(z.string()),
-  excludedItems: z.array(z.string()),
 });
 
 export const GitStatusSchema = z.object({
@@ -380,4 +392,15 @@ export const GitStatusSchema = z.object({
   /** Line deltas for changes that exist on origin's primary branch but not locally */
   incomingAdditions: z.number(),
   incomingDeletions: z.number(),
+});
+
+export const WorkspaceRemovalDescendantSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string(),
+  active: z.boolean(),
+});
+export const WorkspaceRemoveResultSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
 });

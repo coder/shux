@@ -754,13 +754,6 @@ describe("GitStatusStore", () => {
       expect(status1).toBe(status2);
       expect(status1).toBeNull(); // No workspace = null
     });
-
-    it("getStatus() returns same reference for same workspace when no changes", () => {
-      const status1 = store.getStatus("test-workspace");
-      const status2 = store.getStatus("test-workspace");
-      expect(status1).toBe(status2);
-      expect(status1).toBeNull(); // No workspace = null
-    });
   });
 
   describe("failure handling", () => {

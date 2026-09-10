@@ -3,6 +3,8 @@ import { EXPERIMENTS, EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { WorkflowTaskMetadataSchema } from "./workspace";
 import {
   StructuredTaskOutputSchema,
+  WorkflowDeclaredPhaseSchema,
+  WorkflowPhaseManifestSchema,
   WorkflowScriptDescriptorSchema,
   WorkflowEventSequenceSchema,
   WorkflowNameSchema,
@@ -126,6 +128,50 @@ describe("workflow domain schemas", () => {
     });
 
     expect(result.success).toBe(true);
+  });
+
+  test("round-trips descriptors with a hydrated phase manifest and rejects malformed phases", () => {
+    const descriptor = WorkflowScriptDescriptorSchema.parse({
+      name: "deep-research",
+      description: "Research a topic",
+      scope: "built-in",
+      executable: true,
+      phaseManifest: {
+        provenance: "declared",
+        phases: [
+          { name: "scope", label: "Scope", description: "Pick angles" },
+          { name: "verify", parallel: true },
+        ],
+      },
+    });
+    expect(descriptor.phaseManifest?.phases.map((phase) => phase.name)).toEqual([
+      "scope",
+      "verify",
+    ]);
+    // Legacy records without the field still parse.
+    expect(
+      WorkflowScriptDescriptorSchema.safeParse({
+        name: "deep-research",
+        description: "Research a topic",
+        scope: "built-in",
+        executable: true,
+      }).success
+    ).toBe(true);
+
+    // Strictness: unknown phase keys and empty manifests are rejected.
+    expect(WorkflowDeclaredPhaseSchema.safeParse({ name: "scope", next: ["x"] }).success).toBe(
+      false
+    );
+    expect(WorkflowDeclaredPhaseSchema.safeParse({ name: "" }).success).toBe(false);
+    expect(
+      WorkflowPhaseManifestSchema.safeParse({ provenance: "declared", phases: [] }).success
+    ).toBe(false);
+    expect(
+      WorkflowPhaseManifestSchema.safeParse({
+        provenance: "guessed",
+        phases: [{ name: "scope" }],
+      }).success
+    ).toBe(false);
   });
 
   test("accepts inline workflow script descriptors as project-scoped provenance", () => {

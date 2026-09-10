@@ -1,4 +1,5 @@
 import { describe, it, expect } from "bun:test";
+import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -216,6 +217,36 @@ describe("MemoryMetaService", () => {
       });
       // Entirely-default entries are dropped.
       expect(entries.has("global:all-defaults.md")).toBe(false);
+    });
+  });
+
+  describe("interruption safety", () => {
+    // Regression (codex P2 on #4022): a fiber interrupted mid-write must not
+    // leave the in-memory cache diverged from disk — the write + cache update
+    // are one uninterruptible unit. Race aborts at varied delays and assert
+    // cache and disk agree after every settled attempt; this can never
+    // false-fail, and any divergence is a real interruption-safety bug.
+    it("keeps cache and disk consistent when writes race with interruption", async () => {
+      using tempDir = new TestTempDir("test-memory-meta");
+      const service = new MemoryMetaService(tempDir.path);
+
+      for (let i = 0; i < 25; i++) {
+        const controller = new AbortController();
+        const attempt = Effect.runPromise(service.effects.setPinned(`global:race-${i}.md`, true), {
+          signal: controller.signal,
+        }).then(
+          () => undefined,
+          () => undefined // interruption/abort rejections are expected here
+        );
+        if (i % 5 === 0) controller.abort();
+        else setTimeout(() => controller.abort(), i % 5);
+        await attempt;
+
+        // Fresh instance = authoritative disk state; original = cached state.
+        const diskEntries = await new MemoryMetaService(tempDir.path).getEntries();
+        const cachedEntries = await service.getEntries();
+        expect(cachedEntries).toEqual(diskEntries);
+      }
     });
   });
 });

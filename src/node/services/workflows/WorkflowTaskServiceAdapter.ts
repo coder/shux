@@ -1,7 +1,3 @@
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-
-import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefinitions";
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -13,26 +9,19 @@ import type {
   WorkflowApplyPatchSpec,
   WorkflowTaskAdapter,
 } from "./WorkflowRunner";
-import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
-  getSubagentGitPatchMboxPath,
-  readSubagentGitPatchArtifact,
-} from "@/node/services/subagentGitPatchArtifacts";
-import {
-  applyTaskGitPatchArtifact,
-  findGitPatchArtifactInWorkspaceOrAncestors,
+  taskGitPatchEngine,
   type TaskApplyGitPatchArgs,
-  type TaskApplyGitPatchConfiguration,
   type TaskApplyGitPatchResult,
-} from "@/node/services/tools/task_apply_git_patch";
+  type TaskGitPatchApplyConfig,
+  type TaskGitPatchEngine,
+} from "@/node/services/taskGitPatchEngine";
 
 export const DEFAULT_WORKFLOW_AGENT_ID = "exec";
 
 interface WorkflowTaskExperiments {
   programmaticToolCalling?: boolean;
-  programmaticToolCallingExclusive?: boolean;
   advisorTool?: boolean;
-  execSubagentHardRestart?: boolean;
   workspaceHeartbeats?: boolean;
   subagentFileReports?: boolean;
   dynamicWorkflows?: boolean;
@@ -105,13 +94,9 @@ interface WorkflowTaskServiceLike {
     workspaceId: string,
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
+  withGitPatchArtifactOperationLock?<T>(taskId: string, operation: () => Promise<T>): Promise<T>;
   markWorkflowRunEnded?(workflowRunId: string): Promise<void>;
 }
-
-type WorkflowPatchArtifactApplier = (
-  args: TaskApplyGitPatchArgs,
-  options?: { abortSignal?: AbortSignal }
-) => Promise<TaskApplyGitPatchResult>;
 
 export interface WorkflowTaskServiceAdapterOptions {
   taskService: WorkflowTaskServiceLike;
@@ -127,8 +112,8 @@ export interface WorkflowTaskServiceAdapterOptions {
   experiments?: WorkflowTaskExperiments;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
-  patchToolConfig?: TaskApplyGitPatchConfiguration;
-  applyPatchArtifact?: WorkflowPatchArtifactApplier;
+  patchToolConfig?: TaskGitPatchApplyConfig;
+  patchEngine?: Pick<TaskGitPatchEngine, "applyPatch">;
   getProjectTrusted?: () => boolean | Promise<boolean>;
 }
 
@@ -138,8 +123,8 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
   private readonly workflowRunId: string;
   private readonly workflowName?: string;
   private readonly defaultAgentId: string;
-  private readonly patchToolConfig?: TaskApplyGitPatchConfiguration;
-  private readonly applyPatchArtifact?: WorkflowPatchArtifactApplier;
+  private readonly patchToolConfig?: TaskGitPatchApplyConfig;
+  private readonly patchEngine: Pick<TaskGitPatchEngine, "applyPatch">;
   private readonly getProjectTrusted?: () => boolean | Promise<boolean>;
   private readonly patchApplyMutex = new AsyncMutex();
   private readonly experiments?: WorkflowTaskExperiments;
@@ -165,7 +150,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     this.workflowName = options.workflowName;
     this.defaultAgentId = options.defaultAgentId;
     this.patchToolConfig = options.patchToolConfig;
-    this.applyPatchArtifact = options.applyPatchArtifact;
+    this.patchEngine = options.patchEngine ?? taskGitPatchEngine;
     this.getProjectTrusted = options.getProjectTrusted;
     this.experiments = options.experiments;
     this.modelString = options.modelString;
@@ -184,159 +169,42 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     if ((await this.getProjectTrusted?.()) !== true) {
       throw new Error("applyPatch requires Project Trust");
     }
-
-    // Applying one patch mutates HEAD, so complete each dry-run + real apply pair before
-    // checking the next patch. This preserves the old Orchestrator conflict model.
-    await using _lock = await this.patchApplyMutex.acquire();
-    const applyPatchArtifact = this.resolvePatchArtifactApplier();
-    const baseArgs: TaskApplyGitPatchArgs = {
-      task_id: spec.sourceTaskId,
-      ...(spec.projectPath != null ? { project_path: spec.projectPath } : {}),
-      ...(spec.expectedHeadSha != null ? { expected_head_sha: spec.expectedHeadSha } : {}),
-      three_way: spec.threeWay,
-      force: spec.force,
-    };
-
-    const dryRun = await applyPatchArtifact(
-      {
-        ...baseArgs,
-        dry_run: true,
-      },
-      options
-    );
-    if (!dryRun.success) {
-      return dryRun;
-    }
-
-    const pathViolation = await this.getAllowedPatchPathViolation(spec);
-    if (pathViolation != null) {
-      return { success: false, taskId: spec.sourceTaskId, error: pathViolation };
-    }
-
-    return await applyPatchArtifact(
-      {
-        ...baseArgs,
-        dry_run: false,
-      },
-      options
-    );
-  }
-
-  private resolvePatchArtifactApplier(): WorkflowPatchArtifactApplier {
-    if (this.applyPatchArtifact != null) {
-      return this.applyPatchArtifact;
-    }
     const patchToolConfig = this.patchToolConfig;
     if (patchToolConfig == null) {
       throw new Error("WorkflowTaskServiceAdapter.applyPatch requires patch tool configuration");
     }
-    return async (args, options) =>
-      await applyTaskGitPatchArtifact(
-        {
-          ...patchToolConfig,
-          trusted: true,
-        },
-        args,
-        { abortSignal: options?.abortSignal, allowAlreadyApplied: true }
+
+    await using _lock = await this.patchApplyMutex.acquire();
+    const apply = async (): Promise<TaskApplyGitPatchResult> => {
+      const baseArgs: TaskApplyGitPatchArgs = {
+        task_id: spec.sourceTaskId,
+        ...(spec.projectPath != null ? { project_path: spec.projectPath } : {}),
+        ...(spec.expectedHeadSha != null ? { expected_head_sha: spec.expectedHeadSha } : {}),
+        three_way: spec.threeWay,
+        force: spec.force,
+      };
+      const engineConfig = { ...patchToolConfig, trusted: true };
+      const engineOptions = {
+        abortSignal: options?.abortSignal,
+        allowAlreadyApplied: true,
+        allowedPathPrefixes: spec.allowedPathPrefixes,
+      };
+      const dryRun = await this.patchEngine.applyPatch(
+        engineConfig,
+        { ...baseArgs, dry_run: true },
+        engineOptions
       );
-  }
-
-  private async getAllowedPatchPathViolation(
-    spec: WorkflowApplyPatchSpec
-  ): Promise<string | undefined> {
-    if (spec.allowedPathPrefixes == null || spec.allowedPathPrefixes.length === 0) {
-      return undefined;
-    }
-    const workspaceSessionDir = this.patchToolConfig?.workspaceSessionDir;
-    if (workspaceSessionDir == null || workspaceSessionDir.length === 0) {
-      return "applyPatch allowedPathPrefixes requires patch artifact metadata";
-    }
-
-    const artifactLookup = await this.findPatchArtifactForPathValidation(
-      workspaceSessionDir,
-      spec.sourceTaskId
-    );
-    if (artifactLookup == null) {
-      return `Patch artifact not found for task ${spec.sourceTaskId}`;
-    }
-
-    const projectArtifacts = artifactLookup.artifact.projectArtifacts.filter(
-      (projectArtifact) =>
-        spec.projectPath == null || projectArtifact.projectPath === spec.projectPath
-    );
-    const violations = new Set<string>();
-    for (const projectArtifact of projectArtifacts) {
-      if (projectArtifact.status === "skipped") {
-        continue;
-      }
-      if (projectArtifact.status !== "ready") {
-        return `Patch artifact for ${projectArtifact.projectName} is ${projectArtifact.status}; cannot validate allowedPathPrefixes.`;
-      }
-      const patchPath = await this.getProjectPatchMboxPath(
-        artifactLookup.artifactSessionDir,
-        spec.sourceTaskId,
-        projectArtifact
+      if (!dryRun.success) return dryRun;
+      return await this.patchEngine.applyPatch(
+        engineConfig,
+        { ...baseArgs, dry_run: false },
+        engineOptions
       );
-      if (patchPath == null) {
-        return `Patch file is missing for task ${spec.sourceTaskId}`;
-      }
-      const patchText = await fs.readFile(patchPath, "utf-8");
-      const patchPaths = extractGitPatchPaths(patchText);
-      for (const patchPath of patchPaths) {
-        if (!isPatchPathAllowed(patchPath, spec.allowedPathPrefixes)) {
-          violations.add(patchPath);
-        }
-      }
-    }
+    };
 
-    if (violations.size === 0) {
-      return undefined;
-    }
-    return `Patch touches paths outside allowed prefixes (${spec.allowedPathPrefixes.join(", ")}): ${Array.from(violations).join(", ")}`;
-  }
-
-  private async findPatchArtifactForPathValidation(
-    workspaceSessionDir: string,
-    sourceTaskId: string
-  ): Promise<{ artifact: SubagentGitPatchArtifact; artifactSessionDir: string } | null> {
-    const workspaceId = this.patchToolConfig?.workspaceId;
-    if (workspaceId != null && workspaceId.length > 0) {
-      return await findGitPatchArtifactInWorkspaceOrAncestors({
-        workspaceId,
-        workspaceSessionDir,
-        childTaskId: sourceTaskId,
-      });
-    }
-
-    const artifact = await readSubagentGitPatchArtifact(workspaceSessionDir, sourceTaskId);
-    return artifact == null ? null : { artifact, artifactSessionDir: workspaceSessionDir };
-  }
-
-  private async getProjectPatchMboxPath(
-    artifactSessionDir: string,
-    taskId: string,
-    projectArtifact: { storageKey: string; mboxPath?: string }
-  ): Promise<string | undefined> {
-    const expectedPatchPath = getSubagentGitPatchMboxPath(
-      artifactSessionDir,
-      taskId,
-      projectArtifact.storageKey
-    );
-    const candidates = [projectArtifact.mboxPath, expectedPatchPath].filter(
-      (candidate): candidate is string =>
-        typeof candidate === "string" && isPathInsideDir(artifactSessionDir, candidate)
-    );
-    for (const candidate of candidates) {
-      try {
-        const stat = await fs.stat(candidate);
-        if (stat.isFile()) {
-          return candidate;
-        }
-      } catch {
-        // Try the next candidate.
-      }
-    }
-    return undefined;
+    return this.taskService.withGitPatchArtifactOperationLock == null
+      ? await apply()
+      : await this.taskService.withGitPatchArtifactOperationLock(spec.sourceTaskId, apply);
   }
 
   async interruptRun(): Promise<void> {
@@ -522,108 +390,4 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
         : {}),
     };
   }
-}
-
-function extractGitPatchPaths(patchText: string): string[] {
-  const paths = new Set<string>();
-  for (const line of patchText.split("\n")) {
-    if (line.startsWith("diff --git ")) {
-      const parts = splitGitPatchWords(line.slice("diff --git ".length));
-      if (parts.length >= 2) {
-        addPatchPath(paths, parts[0]);
-        addPatchPath(paths, parts[1]);
-      } else {
-        paths.add("<unparseable diff header>");
-      }
-    } else if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-      addPatchPath(paths, line.slice(4));
-    } else if (line.startsWith("rename from ")) {
-      addPatchPath(paths, line.slice("rename from ".length));
-    } else if (line.startsWith("rename to ")) {
-      addPatchPath(paths, line.slice("rename to ".length));
-    } else if (line.startsWith("copy from ")) {
-      addPatchPath(paths, line.slice("copy from ".length));
-    } else if (line.startsWith("copy to ")) {
-      addPatchPath(paths, line.slice("copy to ".length));
-    }
-  }
-  return Array.from(paths);
-}
-
-function splitGitPatchWords(value: string): string[] {
-  const words: string[] = [];
-  let current = "";
-  let quoted = false;
-  let escaped = false;
-  for (const char of value) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\" && quoted) {
-      current += char;
-      escaped = true;
-      continue;
-    }
-    if (char === '"') {
-      current += char;
-      quoted = !quoted;
-      continue;
-    }
-    if (!quoted && /\s/.test(char)) {
-      if (current.length > 0) {
-        words.push(current);
-        current = "";
-      }
-      continue;
-    }
-    current += char;
-  }
-  if (current.length > 0) {
-    words.push(current);
-  }
-  return words;
-}
-
-function addPatchPath(paths: Set<string>, rawPath: string | undefined): void {
-  const normalized = normalizePatchPath(rawPath);
-  if (normalized != null) {
-    paths.add(normalized);
-  }
-}
-
-function normalizePatchPath(rawPath: string | undefined): string | undefined {
-  if (rawPath == null) {
-    return undefined;
-  }
-  let value = rawPath.trim();
-  if (value.length === 0 || value === "/dev/null") {
-    return undefined;
-  }
-  if (value.startsWith('"') && value.endsWith('"')) {
-    try {
-      value = JSON.parse(value) as string;
-    } catch {
-      value = value.slice(1, -1);
-    }
-  }
-  if (value.startsWith("a/") || value.startsWith("b/")) {
-    value = value.slice(2);
-  }
-  const segments = value.split("/");
-  if (path.posix.isAbsolute(value) || segments.includes("..")) {
-    return value;
-  }
-  return segments.filter((segment) => segment.length > 0 && segment !== ".").join("/");
-}
-
-function isPatchPathAllowed(patchPath: string, allowedPrefixes: string[]): boolean {
-  return allowedPrefixes.some((prefix) => {
-    const normalizedPrefix = normalizePatchPath(prefix);
-    if (normalizedPrefix == null) {
-      return false;
-    }
-    return patchPath === normalizedPrefix || patchPath.startsWith(`${normalizedPrefix}/`);
-  });
 }

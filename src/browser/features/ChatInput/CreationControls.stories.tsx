@@ -420,7 +420,6 @@ export const NameGenerationAuthError: Story = {
     ),
 };
 
-/** Manual naming validation error for characters outside the workspace-name policy. */
 export const NameValidationError: Story = {
   render: () =>
     renderCreationControls(
@@ -430,7 +429,7 @@ export const NameValidationError: Story = {
         error: {
           kind: "validation",
           message:
-            "Workspace names can only contain lowercase letters, numbers, hyphens, and underscores",
+            'Branch names can only contain lowercase letters, numbers, hyphens, underscores, and "/" separators',
         },
       })
     ),

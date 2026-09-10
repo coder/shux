@@ -1,4 +1,3 @@
-import { spawn } from "child_process";
 import * as path from "path";
 import { Readable, Writable } from "stream";
 import type {
@@ -16,9 +15,9 @@ import type {
   FileStat,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
-import { expandTildeForSSH } from "./tildeExpansion";
 import { shescape, streamToString } from "./streamUtils";
 import {
   readHostGitconfig,
@@ -29,8 +28,8 @@ import {
   resolveSshAgentForwarding,
   type BindMount,
 } from "./credentialForwarding";
-import { devcontainerUp, devcontainerDown } from "./devcontainerCli";
-import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
+import { devcontainerUp, devcontainerDown, spawnDevcontainer } from "./devcontainerCli";
+import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -38,6 +37,16 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
+import {
+  ensureDirViaExec,
+  readFileViaExec,
+  statViaExec,
+  writeFileViaExec,
+  STAT_VIA_EXEC_COMMAND,
+} from "./execFileIO";
+
+const FILE_PATH_ENV = "XUM_INTERNAL_FILE_PATH";
+const TEMP_FILE_PATH_ENV = "XUM_INTERNAL_TEMP_FILE_PATH";
 
 export interface DevcontainerRuntimeOptions {
   srcBaseDir: string;
@@ -187,13 +196,6 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     return this.mapContainerPathToHost(filePath);
   }
 
-  private quoteForContainer(filePath: string): string {
-    if (filePath === "~" || filePath.startsWith("~/")) {
-      return expandTildeForSSH(filePath);
-    }
-    return shescape.quote(filePath);
-  }
-
   /**
    * Expand tilde in file paths for container operations.
    * Returns unexpanded path when container user is unknown (before ensureReady).
@@ -287,178 +289,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
   }
 
-  private readFileViaExec(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start: async (controller) => {
-        try {
-          const stream = await this.exec(`cat ${this.quoteForContainer(filePath)}`, {
-            cwd: this.getContainerBasePath(),
-            timeout: 300,
-            abortSignal,
-          });
-
-          const reader = stream.stdout.getReader();
-          const exitCodePromise = stream.exitCode;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-
-          const code = await exitCodePromise;
-          if (code !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to read file ${filePath}: ${stderr}`, "file_io");
-          }
-
-          controller.close();
-        } catch (err) {
-          if (err instanceof RuntimeError) {
-            controller.error(err);
-          } else {
-            controller.error(
-              new RuntimeError(
-                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-                "file_io",
-                err instanceof Error ? err : undefined
-              )
-            );
-          }
-        }
-      },
-    });
+  private mapPathForExec(filePath: string): string {
+    // Issue #3709: paths embedded in exec scripts must use the container namespace.
+    return this.mapHostPathToContainer(filePath) ?? filePath;
   }
 
-  private writeFileViaExec(
-    filePath: string,
-    abortSignal?: AbortSignal
-  ): WritableStream<Uint8Array> {
-    const quotedPath = this.quoteForContainer(filePath);
-    const tempPath = getAtomicWriteTempPath(filePath);
-    const quotedTempPath = this.quoteForContainer(tempPath);
-    const writeCommand = `mkdir -p $(dirname ${quotedPath}) && cat > ${quotedTempPath} && mv ${quotedTempPath} ${quotedPath}`;
-
-    let execPromise: Promise<ExecStream> | null = null;
-    const writeAbortController = new AbortController();
-    const abortWrite = () => writeAbortController.abort();
-    if (abortSignal?.aborted) {
-      writeAbortController.abort();
-    } else {
-      abortSignal?.addEventListener("abort", abortWrite, { once: true });
-    }
-    const cleanupAbortForwarder = () => {
-      abortSignal?.removeEventListener("abort", abortWrite);
-    };
-
-    const getExecStream = () => {
-      execPromise ??= this.exec(writeCommand, {
-        cwd: this.getContainerBasePath(),
-        timeout: 300,
-        abortSignal: writeAbortController.signal,
-      });
-      return execPromise;
-    };
-
-    return new WritableStream<Uint8Array>({
-      write: async (chunk) => {
-        const stream = await getExecStream();
-        const writer = stream.stdin.getWriter();
-        try {
-          await writer.write(chunk);
-        } finally {
-          writer.releaseLock();
-        }
-      },
-      close: async () => {
-        try {
-          const stream = await getExecStream();
-          await stream.stdin.close();
-          const exitCode = await stream.exitCode;
-
-          if (exitCode !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to write file ${filePath}: ${stderr}`, "file_io");
-          }
-        } finally {
-          cleanupAbortForwarder();
-        }
-      },
-      abort: async (reason?: unknown) => {
-        writeAbortController.abort();
-        if (execPromise) {
-          try {
-            const stream = await execPromise;
-            await stream.stdin.abort(reason).catch(() => undefined);
-            await stream.exitCode.catch(() => undefined);
-          } finally {
-            cleanupAbortForwarder();
-          }
-        } else {
-          cleanupAbortForwarder();
-        }
-        throw new RuntimeError(`Failed to write file ${filePath}: ${String(reason)}`, "file_io");
-      },
-    });
-  }
-
-  private async ensureDirViaExec(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
-    const stream = await this.exec(`mkdir -p ${this.quoteForContainer(dirPath)}`, {
-      cwd: "/",
-      timeout: 10,
-      abortSignal,
-    });
-
-    await stream.stdin.close();
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      const extra = stderr.trim() || stdout.trim();
-      throw new RuntimeError(
-        `Failed to create directory ${dirPath}: exit code ${exitCode}${extra ? `: ${extra}` : ""}`,
-        "file_io"
-      );
-    }
-  }
-
-  private async statViaExec(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    // -L follows symlinks so symlinked paths report the target's type
-    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForContainer(filePath)}`, {
-      cwd: this.getContainerBasePath(),
-      timeout: 10,
-      abortSignal,
-    });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      throw new RuntimeError(`Failed to stat ${filePath}: ${stderr}`, "file_io");
-    }
-
-    const parts = stdout.trim().split(" ");
-    if (parts.length < 3) {
-      throw new RuntimeError(`Failed to parse stat output for ${filePath}: ${stdout}`, "file_io");
-    }
-
-    const size = parseInt(parts[0], 10);
-    const mtime = parseInt(parts[1], 10);
-    const fileType = parts.slice(2).join(" ");
-
-    return {
-      size,
-      modifiedTime: new Date(mtime * 1000),
-      isDirectory: fileType === "directory",
-    };
-  }
   private mapHostPathToContainer(hostPath: string): string | null {
     if (!this.remoteWorkspaceFolder || !this.currentWorkspacePath) return null;
 
@@ -559,21 +394,22 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   /**
-   * Run .mux/init hook inside the devcontainer.
+   * Run .xum/init hook inside the devcontainer.
    */
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
     return runWorkspaceInitHook({
       params,
       runtimeType: "devcontainer",
-      hookCheckPath: params.workspacePath,
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
+      findHookRelativePath: () =>
+        findInitHookRelativePath(this, this.remoteWorkspaceFolder ?? params.workspacePath),
+      runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
         const containerWorkspacePath = this.remoteWorkspaceFolder ?? params.workspacePath;
-        const hookPath = `${containerWorkspacePath}/.mux/init`;
+        const hookPath = `${containerWorkspacePath}/${hookRelativePath}`;
         await runInitHookOnRuntime(
           this,
           hookPath,
           containerWorkspacePath,
-          muxEnv,
+          xumEnv,
           initLogger,
           abortSignal
         );
@@ -607,7 +443,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     // Merge cached container credential env + caller env + non-interactive vars.
     // Spread order: container env (lowest) < caller env < NON_INTERACTIVE (highest).
-    const envVars = { ...this.containerEnv, ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+    const mappedPathEnv = Object.fromEntries(
+      Object.entries(options.pathEnv ?? {}).map(([key, value]) => [key, this.mapPathForExec(value)])
+    );
+    const envVars = {
+      ...this.containerEnv,
+      ...options.env,
+      ...mappedPathEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+    };
     for (const [key, value] of Object.entries(envVars)) {
       args.push("--remote-env", `${key}=${value}`);
     }
@@ -616,10 +460,17 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     // Map host workspace path to container path; fall back to container workspace if unmappable
     const mappedCwd = options.cwd ? this.mapHostPathToContainer(options.cwd) : null;
     const cwd = mappedCwd ?? this.resolveContainerCwd(options.cwd, workspaceFolder);
-    const fullCommand = `cd ${shescape.quote(cwd)} && ${command}`;
+    const pathEnvPrelude = Object.entries(mappedPathEnv)
+      .map(([key, value]) =>
+        buildShellPathExport(key, value, (envValue) => shescape.quote(envValue))
+      )
+      .join(" && ");
+    const fullCommand = [`cd ${shescape.quote(cwd)}`, pathEnvPrelude, command]
+      .filter(Boolean)
+      .join(" && ");
     args.push("--", "bash", "-c", fullCommand);
 
-    const childProcess = spawn("devcontainer", args, {
+    const childProcess = spawnDevcontainer(args, {
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
       windowsHide: true,
@@ -636,11 +487,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     });
 
     // Convert Node.js streams to Web Streams (casts required for ExecStream compatibility)
-    /* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>;
+    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>;
-    /* eslint-enable @typescript-eslint/no-unnecessary-type-assertion */
 
     let timedOut = false;
     let aborted = false;
@@ -717,7 +569,17 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.readFile(hostPath, abortSignal);
     }
-    return this.readFileViaExec(filePath, abortSignal);
+    return readFileViaExec(
+      filePath,
+      (signal) =>
+        this.exec(`cat "$${FILE_PATH_ENV}"`, {
+          cwd: this.getContainerBasePath(),
+          pathEnv: { [FILE_PATH_ENV]: filePath },
+          timeout: 300,
+          abortSignal: signal,
+        }),
+      abortSignal
+    );
   }
 
   override writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {
@@ -725,23 +587,53 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.writeFile(hostPath, abortSignal);
     }
-    return this.writeFileViaExec(filePath, abortSignal);
+    return writeFileViaExec(
+      filePath,
+      (signal) =>
+        this.exec(
+          `mkdir -p "$(dirname "$${FILE_PATH_ENV}")" && cat > "$${TEMP_FILE_PATH_ENV}" && mv "$${TEMP_FILE_PATH_ENV}" "$${FILE_PATH_ENV}"`,
+          {
+            cwd: this.getContainerBasePath(),
+            pathEnv: {
+              [FILE_PATH_ENV]: filePath,
+              [TEMP_FILE_PATH_ENV]: getAtomicWriteTempPath(filePath),
+            },
+            timeout: 300,
+            abortSignal: signal,
+          }
+        ),
+      abortSignal
+    );
   }
 
-  override async stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
+  override stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
     const hostPath = this.resolveHostPathForMounted(filePath);
     if (hostPath) {
       return super.stat(hostPath, abortSignal);
     }
-    return this.statViaExec(filePath, abortSignal);
+    return statViaExec(filePath, () =>
+      this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
+        cwd: this.getContainerBasePath(),
+        pathEnv: { [FILE_PATH_ENV]: filePath },
+        timeout: 10,
+        abortSignal,
+      })
+    );
   }
 
-  override async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
+  override ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
     const hostPath = this.resolveHostPathForMounted(dirPath);
     if (hostPath) {
       return super.ensureDir(hostPath, abortSignal);
     }
-    return this.ensureDirViaExec(dirPath, abortSignal);
+    return ensureDirViaExec(dirPath, () =>
+      this.exec(`mkdir -p "$${FILE_PATH_ENV}"`, {
+        cwd: this.getContainerBasePath(),
+        pathEnv: { [FILE_PATH_ENV]: dirPath },
+        timeout: 10,
+        abortSignal,
+      })
+    );
   }
 
   override async resolvePath(filePath: string): Promise<string> {
@@ -776,8 +668,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
 
     const tmpPath = this.remoteWorkspaceFolder
-      ? path.posix.join(workspaceRoot, ".mux", "tmp")
-      : path.join(workspaceRoot, ".mux", "tmp");
+      ? path.posix.join(workspaceRoot, ".xum", "tmp")
+      : path.join(workspaceRoot, ".xum", "tmp");
     return Promise.resolve(tmpPath);
   }
 

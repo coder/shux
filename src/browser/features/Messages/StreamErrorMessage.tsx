@@ -91,7 +91,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     message.errorType === "quota" && message.routedThroughGateway === true;
 
   const title = isMuxGatewayQuotaError
-    ? "Mux Gateway credits depleted"
+    ? "Xum Gateway credits depleted"
     : isAnthropicOverloaded
       ? "Service overloaded"
       : isEmptyOutputError
@@ -103,7 +103,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
             : "Stream Error";
   const pill = isAnthropicOverloaded ? "overloaded" : message.errorType;
   const body = isMuxGatewayQuotaError
-    ? "Your Mux Gateway credits have been depleted. Add credits or configure another provider to continue."
+    ? "Your Xum Gateway credits have been depleted. Add credits or configure another provider to continue."
     : message.error;
 
   const ctaAction = isMuxGatewayQuotaError ? (

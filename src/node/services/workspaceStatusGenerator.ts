@@ -1,6 +1,7 @@
 import { streamText, tool } from "ai";
+import type { LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import { modelCostsIncluded } from "./providerModelFactory";
+import { Duration, Effect } from "effect";
 import type { AIService } from "./aiService";
 import { log } from "./log";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
@@ -119,6 +120,33 @@ export function buildWorkspaceStatusPrompt(
   ].join("");
 }
 
+export interface GenerateWorkspaceStatusOptions extends BuildWorkspaceStatusPromptOptions {
+  /**
+   * Best-effort cost telemetry: status generation bypasses StreamManager,
+   * so the caller records the successful candidate's usage into
+   * session-usage.json.
+   */
+  recordUsage?: (
+    modelString: string,
+    usage: LanguageModelV2Usage,
+    options: {
+      /**
+       * Step-accumulated provider metadata. Anthropic reports billed
+       * cache-write tokens only here (cacheCreationInputTokens), not in
+       * LanguageModelV2Usage — without it the recorder prices cache writes
+       * as ordinary input.
+       */
+      providerMetadata?: Record<string, unknown>;
+      /**
+       * Creation-time pricing identity from the same snapshot that created
+       * the model — a Coder catalog refresh mid-generation must not
+       * re-attribute this spend.
+       */
+      metadataModel: string;
+    }
+  ) => Promise<void>;
+}
+
 /**
  * Generate a sidebar agent-status summary using the same "small model" path
  * that powers workspace title generation. Tries up to 3 candidates so a
@@ -127,141 +155,186 @@ export function buildWorkspaceStatusPrompt(
  * `options.streaming` is forwarded to {@link buildWorkspaceStatusPrompt} so
  * the model can resolve ambiguous "in progress vs done" cases using the
  * live provider state rather than guessing from prose.
+ *
+ * Thin `Effect.runPromise` facade: AgentStatusService (and its tests, which
+ * spy this module export with Promise mocks) keep the Promise contract while
+ * the pipeline itself is Effect-native.
  */
-export async function generateWorkspaceStatus(
+export function generateWorkspaceStatus(
   transcript: string,
   candidates: readonly string[],
   aiService: AIService,
-  options: BuildWorkspaceStatusPromptOptions & {
-    /**
-     * Best-effort cost telemetry: status generation bypasses StreamManager,
-     * so the caller records the successful candidate's usage into
-     * session-usage.json. costsIncluded reflects subscription-covered routing
-     * (Codex OAuth) so those tokens are priced at $0.
-     */
-    recordUsage?: (
-      modelString: string,
-      usage: LanguageModelV2Usage,
-      options: {
-        costsIncluded: boolean;
-        /**
-         * Step-accumulated provider metadata. Anthropic reports billed
-         * cache-write tokens only here (cacheCreationInputTokens), not in
-         * LanguageModelV2Usage — without it the recorder prices cache writes
-         * as ordinary input.
-         */
-        providerMetadata?: Record<string, unknown>;
-      }
-    ) => Promise<void>;
-  } = {}
+  options: GenerateWorkspaceStatusOptions = {}
 ): Promise<Result<GenerateWorkspaceStatusResult, GenerateWorkspaceStatusFailure>> {
-  if (candidates.length === 0) {
-    return Err({
-      error: {
-        type: "unknown",
-        raw: "No model candidates provided for workspace status generation",
-      },
-      reachedProvider: false,
-    });
-  }
+  return Effect.runPromise(
+    generateWorkspaceStatusEffect(transcript, candidates, aiService, options)
+  );
+}
 
-  const maxAttempts = Math.min(candidates.length, 3);
-  let lastError: NameGenerationError | null = null;
-  // Track whether any candidate's createModel call succeeded — i.e., whether
-  // we actually crossed the wire to a provider. If every attempt fails at
-  // construction (no API key, OAuth not connected, provider disabled, etc.),
-  // the failure is about the user's config rather than the transcript and
-  // the caller must keep retrying so a later fix recovers.
-  let reachedProvider = false;
-
-  for (let i = 0; i < maxAttempts; i++) {
-    const modelString = candidates[i];
-
-    const modelResult = await aiService.createModel(modelString, undefined, {
-      agentInitiated: true,
-    });
-    if (!modelResult.success) {
-      lastError = mapModelCreationError(modelResult.error, modelString);
-      log.debug(`Status generation: skipping ${modelString} (${modelResult.error.type})`);
-      continue;
-    }
-    reachedProvider = true;
-
-    try {
-      const currentStream = streamText({
-        model: modelResult.data,
-        prompt: buildWorkspaceStatusPrompt(transcript, options),
-        tools: {
-          propose_status: tool({
-            description: TOOL_DEFINITIONS.propose_status.description,
-            inputSchema: ProposeStatusToolArgsSchema,
-            // eslint-disable-next-line @typescript-eslint/require-await -- AI SDK Tool.execute must return a Promise
-            execute: async (args) => ({ success: true as const, ...args }),
-          }),
+function generateWorkspaceStatusEffect(
+  transcript: string,
+  candidates: readonly string[],
+  aiService: AIService,
+  options: GenerateWorkspaceStatusOptions
+): Effect.Effect<Result<GenerateWorkspaceStatusResult, GenerateWorkspaceStatusFailure>> {
+  return Effect.gen(function* () {
+    if (candidates.length === 0) {
+      return Err({
+        error: {
+          type: "unknown",
+          raw: "No model candidates provided for workspace status generation",
         },
+        reachedProvider: false,
       });
+    }
 
-      const results = await currentStream.toolResults;
-      const toolResult = results.find((r) => r.dynamic !== true && r.toolName === "propose_status");
+    const maxAttempts = Math.min(candidates.length, 3);
+    let lastError: NameGenerationError | null = null;
+    // Track whether any candidate's createModel call succeeded — i.e., whether
+    // we actually crossed the wire to a provider. If every attempt fails at
+    // construction (no API key, OAuth not connected, provider disabled, etc.),
+    // the failure is about the user's config rather than the transcript and
+    // the caller must keep retrying so a later fix recovers.
+    let reachedProvider = false;
 
-      if (!toolResult) {
-        lastError = { type: "unknown", raw: "Model did not call propose_status tool" };
-        log.warn("Status generation: model did not call propose_status", { modelString });
+    for (let i = 0; i < maxAttempts; i++) {
+      const modelString = candidates[i];
+
+      // Pinned creation: the returned metadataModel comes from the SAME config
+      // snapshot as the SDK model, so usage recorded below cannot be
+      // re-attributed by a concurrent Coder catalog refresh. A construction
+      // rejection defects through the facade unchanged (v4 rethrows the raw
+      // error), matching the pre-Effect uncaught await.
+      const modelResult = yield* Effect.promise(async () =>
+        aiService.createModelWithPinnedMetadata(modelString, {
+          agentInitiated: true,
+        })
+      );
+      if (!modelResult.success) {
+        lastError = mapModelCreationError(modelResult.error, modelString);
+        log.debug(`Status generation: skipping ${modelString} (${modelResult.error.type})`);
         continue;
       }
+      reachedProvider = true;
 
-      const { emoji, message } = toolResult.output;
+      const attempt = yield* attemptCandidate(transcript, modelString, modelResult.data, options);
+      if (attempt.success) return Ok(attempt.data);
+      lastError = attempt.error;
+    }
 
-      if (options.recordUsage) {
-        try {
-          // Guard the usage read with a short timeout: a slow-settling SDK promise must not block the
-          // already-produced status — AgentStatusService.runTick() awaits
-          // in-flight generations, so a stuck read would wedge the workspace's
-          // sidebar status loop. The recorder itself never throws.
-          const settled = await Promise.race([
-            // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
-            Promise.all([currentStream.usage, currentStream.steps]),
-            new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000)),
-          ]);
-          if (settled !== undefined) {
-            const [usage, steps] = settled;
-            await options.recordUsage(modelString, usage, {
-              costsIncluded: modelCostsIncluded(modelResult.data),
-              providerMetadata: accumulateStepsProviderMetadata(steps),
-            });
-          }
-        } catch {
-          // Usage promise rejection must not fail an otherwise good status.
-        }
-      }
+    return Err({
+      error: lastError ?? {
+        type: "configuration",
+        raw: "No working model candidates were available for workspace status generation.",
+      },
+      reachedProvider,
+    });
+  });
+}
 
-      return Ok({
-        status: { emoji: emoji.trim(), message: message.trim() },
-        modelUsed: modelString,
-      });
-    } catch (error) {
-      lastError = mapNameGenerationError(error, modelString);
+/**
+ * One candidate attempt. The pre-Effect body was a single whole-attempt
+ * try/catch/finally, so the pipeline mirrors that classification exactly:
+ * every failure — typed channel or defect — folds into an `Err` so the
+ * candidate loop moves on instead of rejecting the facade, and the model
+ * cleanup runs via `Effect.ensuring` on every exit.
+ */
+function attemptCandidate(
+  transcript: string,
+  modelString: string,
+  created: { model: LanguageModel; metadataModel: string },
+  options: GenerateWorkspaceStatusOptions
+): Effect.Effect<Result<GenerateWorkspaceStatusResult, NameGenerationError>> {
+  const foldAttemptFailure = (
+    error: unknown
+  ): Effect.Effect<Result<GenerateWorkspaceStatusResult, NameGenerationError>> =>
+    Effect.sync(() => {
+      const mapped = mapNameGenerationError(error, modelString);
       log.warn("Status generation failed, trying next candidate", {
         modelString,
-        error: lastError,
+        error: mapped,
       });
-      continue;
-    } finally {
-      // Mirror workspaceTitleGenerator: some providers attach cleanup hooks
-      // to the created model (notably the OpenAI Responses WebSocket
-      // transport, which attaches webSocketTransport.close). Without this
-      // call the periodic AgentStatusService loop would leak transports
-      // for every successful or failed candidate, every tick, every
-      // workspace.
-      runLanguageModelCleanup(modelResult.data);
-    }
-  }
+      return Err(mapped);
+    });
 
-  return Err({
-    error: lastError ?? {
-      type: "configuration",
-      raw: "No working model candidates were available for workspace status generation.",
-    },
-    reachedProvider,
-  });
+  return Effect.gen(function* () {
+    const attempted = yield* Effect.tryPromise({
+      try: async () => {
+        const currentStream = streamText({
+          model: created.model,
+          prompt: buildWorkspaceStatusPrompt(transcript, options),
+          tools: {
+            propose_status: tool({
+              description: TOOL_DEFINITIONS.propose_status.description,
+              inputSchema: ProposeStatusToolArgsSchema,
+              // eslint-disable-next-line @typescript-eslint/require-await -- AI SDK Tool.execute must return a Promise
+              execute: async (args) => ({ success: true as const, ...args }),
+            }),
+          },
+        });
+
+        const results = await currentStream.toolResults;
+        const toolResult = results.find(
+          (r) => r.dynamic !== true && r.toolName === "propose_status"
+        );
+        return { currentStream, toolResult };
+      },
+      catch: (error) => error,
+    });
+
+    if (!attempted.toolResult) {
+      log.warn("Status generation: model did not call propose_status", { modelString });
+      return Err<NameGenerationError>({
+        type: "unknown",
+        raw: "Model did not call propose_status tool",
+      });
+    }
+
+    const { emoji, message } = attempted.toolResult.output;
+
+    if (options.recordUsage) {
+      // Guard the usage read with a short timeout (Effect.timeout interrupts
+      // the read after 2s — the old Promise.race + setTimeout): a
+      // slow-settling SDK promise must not block the already-produced status
+      // — AgentStatusService.runTick() awaits in-flight generations, so a
+      // stuck read would wedge the workspace's sidebar status loop. The
+      // recorder itself never throws, but usage-promise rejections and any
+      // recorder failure are swallowed like the pre-Effect catch.
+      const settled = yield* Effect.tryPromise({
+        // AI SDK 7: top-level `usage` is the all-steps total (old `totalUsage`).
+        try: async () =>
+          Promise.all([attempted.currentStream.usage, attempted.currentStream.steps]),
+        catch: (error) => error,
+      }).pipe(
+        Effect.timeout(Duration.millis(2000)),
+        Effect.catch(() => Effect.succeed(undefined))
+      );
+      if (settled !== undefined) {
+        const [usage, steps] = settled;
+        yield* Effect.tryPromise({
+          try: async () =>
+            options.recordUsage?.(modelString, usage, {
+              providerMetadata: accumulateStepsProviderMetadata(steps),
+              metadataModel: created.metadataModel,
+            }),
+          catch: (error) => error,
+        }).pipe(Effect.catch(() => Effect.succeed(undefined)));
+      }
+    }
+
+    return Ok({
+      status: { emoji: emoji.trim(), message: message.trim() },
+      modelUsed: modelString,
+    });
+  }).pipe(
+    Effect.catch(foldAttemptFailure),
+    Effect.catchDefect(foldAttemptFailure),
+    // Mirror workspaceTitleGenerator: some providers attach cleanup hooks
+    // to the created model (notably the OpenAI Responses WebSocket
+    // transport, which attaches webSocketTransport.close). Without this
+    // call the periodic AgentStatusService loop would leak transports
+    // for every successful or failed candidate, every tick, every
+    // workspace.
+    Effect.ensuring(Effect.sync(() => runLanguageModelCleanup(created.model)))
+  );
 }

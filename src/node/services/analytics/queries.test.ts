@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   HistogramBucketSchema,
   SpendByModelRowSchema,
+  SpendOverTimeRowSchema,
   SummaryRowSchema,
   TimingPercentilesRowSchema,
   TokensByModelRowSchema,
@@ -17,7 +18,7 @@ const duckDbHandlesToClose: Array<{ instance: DuckDBInstance; conn: DuckDBConnec
 interface EventSeed {
   workspaceId: string;
   date: string;
-  timestamp: number;
+  timestamp: number | bigint;
   model: string;
   toolName?: string | null;
   inputTokens: number;
@@ -211,5 +212,78 @@ describe("analytics queries", () => {
     }, 0);
     assert(Number.isInteger(histogramCount), "histogramCount should remain integral");
     expect(histogramCount).toBe(2);
+  });
+});
+
+describe("spend over time timezone buckets", () => {
+  test("uses the selected timezone for daily buckets and date filters", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "ws-timezone-boundary";
+
+    await insertEvent(conn, {
+      workspaceId,
+      date: "2026-08-12",
+      timestamp: BigInt(Date.parse("2026-08-12T03:30:00.000Z")),
+      model: "openai:gpt-4",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCostUsd: 100,
+    });
+    await insertEvent(conn, {
+      workspaceId,
+      date: "2026-08-12",
+      timestamp: BigInt(Date.parse("2026-08-12T05:30:00.000Z")),
+      model: "openai:gpt-4",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCostUsd: 200,
+    });
+
+    const rows = z.array(SpendOverTimeRowSchema).parse(
+      await executeNamedQuery(conn, "getSpendOverTime", {
+        granularity: "day",
+        from: "2026-08-11",
+        to: "2026-08-11",
+        timeZone: "America/New_York",
+      })
+    );
+
+    expect(rows).toEqual([
+      {
+        bucket: "2026-08-11",
+        model: "openai:gpt-4",
+        cost_usd: 100,
+      },
+    ]);
+  });
+
+  test("uses UTC when the timezone is omitted", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "ws-timezone-default";
+
+    await insertEvent(conn, {
+      workspaceId,
+      date: "2026-08-12",
+      timestamp: BigInt(Date.parse("2026-08-12T03:30:00.000Z")),
+      model: "openai:gpt-4",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCostUsd: 100,
+    });
+
+    const rows = z.array(SpendOverTimeRowSchema).parse(
+      await executeNamedQuery(conn, "getSpendOverTime", {
+        granularity: "day",
+        timeZone: "UTC",
+      })
+    );
+
+    expect(rows).toEqual([
+      {
+        bucket: "2026-08-12",
+        model: "openai:gpt-4",
+        cost_usd: 100,
+      },
+    ]);
   });
 });

@@ -3,20 +3,10 @@ import type { APIClient } from "@/browser/contexts/API";
 import {
   mergeGoalDefaults,
   resolveGoalSetIntent,
-  resolveModelGoalSetIntent,
-  type GoalSetIntent,
-  type GoalSetIntentInput,
   type WorkspaceGoalDefaultsOverride,
 } from "@/common/utils/goals/resolveGoalSetIntent";
 
-export {
-  mergeGoalDefaults,
-  resolveGoalSetIntent,
-  resolveModelGoalSetIntent,
-  type GoalSetIntent,
-  type GoalSetIntentInput,
-  type WorkspaceGoalDefaultsOverride,
-};
+export { mergeGoalDefaults, resolveGoalSetIntent, type WorkspaceGoalDefaultsOverride };
 
 /**
  * Load *effective* goal defaults via the API client.

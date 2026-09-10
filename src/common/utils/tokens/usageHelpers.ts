@@ -15,7 +15,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
  * AI SDK 7 moved `cachedInputTokens`/`reasoningTokens` into nested
  * `inputTokenDetails`/`outputTokenDetails`, and moved Anthropic cache-write
  * tokens from `providerMetadata.anthropic.cacheCreationInputTokens` into
- * `inputTokenDetails.cacheWriteTokens`. Mux persists (and sends over IPC) the
+ * `inputTokenDetails.cacheWriteTokens`. Xum persists (and sends over IPC) the
  * flat V2 shape, so live SDK usage must pass through {@link normalizeUsage}
  * before it is stored or displayed.
  */

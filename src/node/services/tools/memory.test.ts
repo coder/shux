@@ -8,7 +8,13 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
-import { createMemoryTool, resolveMemoryAccessPolicy } from "./memory";
+import { RefinementEvidenceSchema } from "@/common/types/refinement";
+import { readRefinementEvents } from "@/node/services/refinement/refinementTestHelpers";
+import {
+  createMemoryTool,
+  memoryScopeContextFromToolConfig,
+  resolveMemoryAccessPolicy,
+} from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryScopeAccess, MemoryScope } from "@/common/constants/memory";
@@ -23,7 +29,7 @@ function pathExists(target: string): Promise<boolean> {
 }
 
 interface MemoryToolFixture extends Disposable {
-  muxHome: string;
+  xumHome: string;
   checkout: string;
   config: ToolConfiguration;
   tool: Tool;
@@ -31,9 +37,9 @@ interface MemoryToolFixture extends Disposable {
 
 const FIXTURE_PROJECT_PATH = "/stable/project-id";
 
-function projectMemoryPath(muxHome: string, relPath: string): string {
+function projectMemoryPath(xumHome: string, relPath: string): string {
   return path.join(
-    muxHome,
+    xumHome,
     "memory",
     "project",
     projectMemoryDirName(FIXTURE_PROJECT_PATH),
@@ -43,23 +49,25 @@ function projectMemoryPath(muxHome: string, relPath: string): string {
 
 async function createFixture(options?: {
   memoryAccess?: MemoryScopeAccess;
+  memoryWritePath?: string;
 }): Promise<MemoryToolFixture> {
   const tempDir = new TestTempDir("test-memory-tool");
-  const muxHome = path.join(tempDir.path, "mux-home");
+  const xumHome = path.join(tempDir.path, "mux-home");
   const checkout = path.join(tempDir.path, "checkout");
-  await fsPromises.mkdir(muxHome, { recursive: true });
+  await fsPromises.mkdir(xumHome, { recursive: true });
   await fsPromises.mkdir(checkout, { recursive: true });
   const config = createTestToolConfig(checkout, { workspaceId: "ws-tool" });
   config.workspaceProjectPath = FIXTURE_PROJECT_PATH;
   config.runtime = new LocalRuntime(checkout);
-  config.memoryService = new MemoryService(new Config(muxHome), new MemoryMetaService(muxHome));
+  config.memoryService = new MemoryService(new Config(xumHome), new MemoryMetaService(xumHome));
   config.memoryAccess = options?.memoryAccess ?? {
     global: "readwrite",
     project: "readwrite",
     workspace: "readwrite",
   };
+  config.memoryWritePath = options?.memoryWritePath;
   return {
-    muxHome,
+    xumHome,
     checkout,
     config,
     tool: createMemoryTool(config),
@@ -86,7 +94,7 @@ describe("memory tool sub-project workspaces", () => {
       file_text: "root-anchored",
     });
     expect(result.success).toBe(true);
-    expect(await pathExists(projectMemoryPath(fixture.muxHome, "facts.md"))).toBe(true);
+    expect(await pathExists(projectMemoryPath(fixture.xumHome, "facts.md"))).toBe(true);
     expect(await pathExists(path.join(fixture.checkout, ".mux", "memory", "facts.md"))).toBe(false);
     expect(await pathExists(path.join(subProjectCwd, ".mux", "memory", "facts.md"))).toBe(false);
   });
@@ -114,7 +122,7 @@ describe("memory tool multi-project workspaces", () => {
       success: false,
       error: "Project memory is unavailable: no project is associated with this session",
     });
-    expect(await pathExists(path.join(fixture.muxHome, "memory", "project"))).toBe(false);
+    expect(await pathExists(path.join(fixture.xumHome, "memory", "project"))).toBe(false);
   });
 });
 
@@ -134,7 +142,7 @@ describe("memory tool", () => {
         file_text: "line one",
       });
       expect(created.success).toBe(true);
-      expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "notes.md"))).toBe(
+      expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "notes.md"))).toBe(
         true
       );
 
@@ -172,7 +180,7 @@ describe("memory tool", () => {
         path: "/memories/global/renamed.md",
       });
       expect(deleted.success).toBe(true);
-      expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "renamed.md"))).toBe(
+      expect(await pathExists(path.join(fixture.xumHome, "memory", "global", "renamed.md"))).toBe(
         false
       );
     });
@@ -308,6 +316,211 @@ describe("memory tool", () => {
     });
   });
 
+  describe("pinned write path", () => {
+    const notes = "/memories/workspace/context-notes.md";
+    // The pinned tool refuses reads (one step, one write), so verify contents via the service.
+    const readNotes = async (fixture: MemoryToolFixture) => {
+      const result = await fixture.config.memoryService!.readFileWithSha(
+        memoryScopeContextFromToolConfig(fixture.config),
+        notes
+      );
+      return result.success ? result.data.content : null;
+    };
+
+    it("allows mutations of the pinned file only, including normalized spellings", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      // Each tool instance allows one mutation; a later request (fresh instance) may update.
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "str_replace",
+            path: ` ${notes}/`,
+            old_str: "state",
+            new_str: "more state",
+          })
+        ).success
+      ).toBe(true);
+      expect(await readNotes(fixture)).toBe("more state");
+      // Reads are refused entirely: a view would spend the single step, and other stores must
+      // not be disclosed from the hidden turn.
+      for (const path of [
+        notes,
+        "/memories/global",
+        "/memories/workspace",
+        "/memories/project/x.md",
+      ]) {
+        const result = await run(fixture.tool, { command: "view", path });
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("may only create or update");
+      }
+    });
+
+    it("rejects mutations elsewhere, rename away from the pin, and non-workspace scopes", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      for (const input of [
+        { command: "create", path: "/memories/workspace/other.md", file_text: "x" },
+        { command: "create", path: "/memories/global/notes.md", file_text: "x" },
+        { command: "delete", path: "/memories/workspace" },
+        { command: "rename", old_path: notes, new_path: "/memories/global/context-notes.md" },
+        { command: "rename", old_path: notes, new_path: "/memories/workspace/moved.md" },
+      ] as const) {
+        const result = await run(createMemoryTool(fixture.config), input);
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toMatch(/may only (access|create or update)/);
+      }
+      expect(await readNotes(fixture)).toBe("state");
+    });
+
+    it("allows exactly one non-destructive mutation per tool instance", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect((await run(fixture.tool, { command: "delete", path: notes })).success).toBe(false);
+      expect(
+        (await run(fixture.tool, { command: "rename", old_path: notes, new_path: notes })).success
+      ).toBe(false);
+      // Refused destructive, malformed, mis-targeted, or oversized siblings do not consume the slot.
+      expect((await run(fixture.tool, { command: "create", path: notes })).success).toBe(false);
+      const oversized = await run(fixture.tool, {
+        command: "create",
+        path: notes,
+        file_text: "x".repeat(8 * 1024 + 1),
+      });
+      expect(oversized.success).toBe(false);
+      if (!oversized.success) expect(oversized.error).toContain("limited to");
+      expect(
+        (
+          await run(fixture.tool, {
+            command: "create",
+            path: "/memories/workspace/other.md",
+            file_text: "x",
+          })
+        ).success
+      ).toBe(false);
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+      // A null replacement still counts: the executor would treat it as deleting old_str.
+      const second = await run(fixture.tool, {
+        command: "str_replace",
+        path: notes,
+        old_str: "state",
+      });
+      expect(second.success).toBe(false);
+      if (!second.success) expect(second.error).toContain("single memory mutation");
+      // A fresh instance (next request) may mutate again.
+      const fresh = createMemoryTool(fixture.config);
+      // The resulting size is checked against the actual file (an irrelevant empty file_text
+      // does not hide an oversized insert); the refused write frees the slot.
+      const oversizedInsert = await run(fresh, {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "y".repeat(8 * 1024 + 1),
+        file_text: "",
+      });
+      expect(oversizedInsert.success).toBe(false);
+      if (!oversizedInsert.success) expect(oversizedInsert.error).toContain("limited to");
+      expect(
+        (await run(fresh, { command: "insert", path: notes, insert_line: 0, insert_text: "x" }))
+          .success
+      ).toBe(true);
+    });
+
+    it("never fails on a stale existence verdict: create replaces, updates create", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      // The prompt may have said "does not exist" while another writer created it meanwhile.
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "theirs" })).success
+      ).toBe(true);
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "create",
+            path: notes,
+            file_text: "ours",
+          })
+        ).success
+      ).toBe(true);
+      expect(await readNotes(fixture)).toBe("ours");
+      // ...or "exists" while it was deleted meanwhile.
+      await fixture.config.memoryService!.deletePath(
+        memoryScopeContextFromToolConfig(fixture.config),
+        notes,
+        "user"
+      );
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "str_replace",
+            path: notes,
+            old_str: "ours",
+            new_str: "recovered",
+          })
+        ).success
+      ).toBe(true);
+      expect(await readNotes(fixture)).toBe("recovered");
+    });
+
+    it("an aborted flush write cannot land after Stop", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      const controller = new AbortController();
+      controller.abort();
+      const result = (await fixture.tool.execute!(
+        TOOL_DEFINITIONS.memory.schema.parse({ command: "create", path: notes, file_text: "late" }),
+        { ...mockToolCallOptions, abortSignal: controller.signal }
+      )) as MemoryToolResult;
+      expect(result).toMatchObject({ success: false });
+      expect(await readNotes(fixture)).toBeNull();
+      // The refused write freed the single slot for a live retry.
+      expect(
+        (await run(fixture.tool, { command: "create", path: notes, file_text: "state" })).success
+      ).toBe(true);
+    });
+
+    it("caps the resulting notes file, not just the payload", async () => {
+      using fixture = await createFixture({ memoryWritePath: notes });
+      expect(
+        (
+          await run(fixture.tool, {
+            command: "create",
+            path: notes,
+            file_text: "a".repeat(6 * 1024),
+          })
+        ).success
+      ).toBe(true);
+      const grow = await run(createMemoryTool(fixture.config), {
+        command: "insert",
+        path: notes,
+        insert_line: 0,
+        insert_text: "b".repeat(3 * 1024),
+      });
+      expect(grow.success).toBe(false);
+      if (!grow.success) expect(grow.error).toContain("limited to");
+      // Replacing content that frees space is fine.
+      expect(
+        (
+          await run(createMemoryTool(fixture.config), {
+            command: "str_replace",
+            path: notes,
+            old_str: "a".repeat(6 * 1024),
+            new_str: "c".repeat(7 * 1024),
+          })
+        ).success
+      ).toBe(true);
+    });
+
+    it("rejects a pin that is not a file inside a scope", async () => {
+      using fixture = await createFixture();
+      fixture.config.memoryWritePath = "/memories/workspace";
+      expect(() => createMemoryTool(fixture.config)).toThrow();
+    });
+  });
+
   describe("policy derivation", () => {
     it("maps the three agent classes onto the locked write matrix", () => {
       expect(resolveMemoryAccessPolicy({ planLike: false, editingCapable: true })).toEqual({
@@ -400,5 +613,25 @@ describe("memory tool", () => {
       const tools = await getRegisteredTools({ memoryExperiment: true });
       expect(tools).not.toContain("memory");
     });
+  });
+});
+
+describe("memory tool refinement journal", () => {
+  it("threads the provider tool call id into the refinement row evidence", async () => {
+    using fixture = await createFixture();
+    const result = await run(fixture.tool, {
+      command: "create",
+      path: "/memories/global/notes.md",
+      file_text: "hello",
+    });
+    expect(result.success).toBe(true);
+
+    // Same session-dir resolution the service uses (Config path derivation is pure).
+    const sessionDir = path.join(new Config(fixture.xumHome).sessionsDir, "ws-tool");
+    const events = await readRefinementEvents(sessionDir);
+    expect(events).toHaveLength(1);
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.toolCallId).toBe("test-call-id");
+    expect(evidence.toolName).toBe("memory");
   });
 });

@@ -1,19 +1,19 @@
-import React from "react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-
-import { CommandSuggestions } from "./CommandSuggestions";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
+import { CommandSuggestions } from "./CommandSuggestions";
 
-function makeSuggestion(id: string): SlashSuggestion {
-  return {
-    id,
-    display: id,
-    description: `desc:${id}`,
-    replacement: id,
-  };
-}
+const makeSuggestion = (id: string): SlashSuggestion => ({
+  id,
+  display: id,
+  description: `desc:${id}`,
+  replacement: id,
+});
+const suggestions = ["a", "b", "c"].map(makeSuggestion);
+const option = (getByText: (text: string) => HTMLElement, id: string) =>
+  getByText(id).closest('[role="option"]')?.getAttribute("aria-selected");
 
 describe("CommandSuggestions", () => {
   let originalScrollIntoView: ((...args: unknown[]) => unknown) | undefined;
@@ -21,179 +21,104 @@ describe("CommandSuggestions", () => {
   beforeEach(() => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
-
     const prototype = globalThis.window.HTMLElement.prototype as unknown as {
       scrollIntoView?: (...args: unknown[]) => unknown;
     };
-
     originalScrollIntoView = prototype.scrollIntoView;
     prototype.scrollIntoView = () => undefined;
   });
 
   afterEach(() => {
     cleanup();
-
     const prototype = globalThis.window.HTMLElement.prototype as unknown as {
       scrollIntoView?: (...args: unknown[]) => unknown;
     };
-
     prototype.scrollIntoView = originalScrollIntoView;
-
     globalThis.window = undefined as unknown as Window & typeof globalThis;
     globalThis.document = undefined as unknown as Document;
   });
 
-  it("preserves the selected suggestion by id when suggestions reorder", () => {
-    const initialSuggestions = [makeSuggestion("a"), makeSuggestion("b"), makeSuggestion("c")];
-    const nextSuggestions = [makeSuggestion("c"), makeSuggestion("a"), makeSuggestion("b")];
-
+  it.each([
+    {
+      name: "preserves selection by id after reorder",
+      downs: 1,
+      before: "b",
+      next: ["c", "a", "b"],
+      after: "b",
+    },
+    {
+      name: "clamps selection when the selected item disappears",
+      downs: 2,
+      before: "c",
+      next: ["a", "b"],
+      after: "b",
+    },
+  ])("$name", ({ downs, before, next, after }) => {
     function Harness() {
-      const [suggestions, setSuggestions] = React.useState(initialSuggestions);
+      const [items, setItems] = useState(suggestions);
       return (
         <div>
           <CommandSuggestions
-            suggestions={suggestions}
+            suggestions={items}
             onSelectSuggestion={() => undefined}
             onDismiss={() => undefined}
             isVisible
           />
-          <button onClick={() => setSuggestions(nextSuggestions)}>Update</button>
+          <button onClick={() => setItems(next.map(makeSuggestion))}>Update</button>
         </div>
       );
     }
-
     const { getByText } = render(<Harness />);
-
-    // Move selection from 'a' -> 'b'
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-
-    expect(getByText("b").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
-
-    // Reorder suggestions; selection should follow 'b'
+    for (let index = 0; index < downs; index++) fireEvent.keyDown(document, { key: "ArrowDown" });
+    expect(option(getByText, before)).toBe("true");
     fireEvent.click(getByText("Update"));
-
-    expect(getByText("b").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
+    expect(option(getByText, after)).toBe("true");
   });
 
-  it("clamps the selection when the selected suggestion disappears", () => {
-    const initialSuggestions = [makeSuggestion("a"), makeSuggestion("b"), makeSuggestion("c")];
-    const nextSuggestions = [makeSuggestion("a"), makeSuggestion("b")];
-
-    function Harness() {
-      const [suggestions, setSuggestions] = React.useState(initialSuggestions);
-      return (
-        <div>
-          <CommandSuggestions
-            suggestions={suggestions}
-            onSelectSuggestion={() => undefined}
-            onDismiss={() => undefined}
-            isVisible
-          />
-          <button onClick={() => setSuggestions(nextSuggestions)}>Update</button>
-        </div>
-      );
-    }
-
-    const { getByText } = render(<Harness />);
-
-    // Move selection from 'a' -> 'c'
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-
-    expect(getByText("c").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
-
-    // Remove 'c'; selection should clamp (no out-of-range)
-    fireEvent.click(getByText("Update"));
-
-    expect(getByText("b").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
-  });
-
-  it("accepts the selected suggestion on Enter (slash commands)", () => {
-    const suggestions = [makeSuggestion("a"), makeSuggestion("b"), makeSuggestion("c")];
-    let selected: SlashSuggestion | null = null;
-
+  it.each([
+    ["Enter", 1, "b"],
+    ["Tab", 2, "c"],
+  ] as const)("accepts the selected suggestion on %s", (key, downs, expected) => {
+    const selectedIds: string[] = [];
     const { getByText } = render(
       <CommandSuggestions
         suggestions={suggestions}
-        onSelectSuggestion={(s) => {
-          selected = s;
-        }}
-        onDismiss={() => undefined}
-        isVisible
-        isFileSuggestion={false}
-      />
-    );
-
-    // Navigate to 'b'
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-    expect(getByText("b").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
-
-    // Press Enter to accept
-    fireEvent.keyDown(document, { key: "Enter" });
-
-    expect(selected).not.toBeNull();
-    expect(selected!.id).toBe("b");
-  });
-
-  it("accepts the selected suggestion on Tab", () => {
-    const suggestions = [makeSuggestion("a"), makeSuggestion("b"), makeSuggestion("c")];
-    let selected: SlashSuggestion | null = null;
-
-    const { getByText } = render(
-      <CommandSuggestions
-        suggestions={suggestions}
-        onSelectSuggestion={(s) => {
-          selected = s;
+        onSelectSuggestion={(suggestion) => {
+          selectedIds.push(suggestion.id);
         }}
         onDismiss={() => undefined}
         isVisible
       />
     );
-
-    // Navigate to 'c'
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-    fireEvent.keyDown(document, { key: "ArrowDown" });
-    expect(getByText("c").closest('[role="option"]')?.getAttribute("aria-selected")).toBe("true");
-
-    // Press Tab to accept
-    fireEvent.keyDown(document, { key: "Tab" });
-
-    expect(selected).not.toBeNull();
-    expect(selected!.id).toBe("c");
+    for (let index = 0; index < downs; index++) fireEvent.keyDown(document, { key: "ArrowDown" });
+    expect(option(getByText, expected)).toBe("true");
+    fireEvent.keyDown(document, { key });
+    expect(selectedIds).toEqual([expected]);
   });
 
-  it("does not accept on Shift+Enter (allows newline)", () => {
-    const suggestions = [makeSuggestion("a"), makeSuggestion("b")];
+  it("does not accept Shift+Enter", () => {
     let selected: SlashSuggestion | null = null;
-
     render(
       <CommandSuggestions
         suggestions={suggestions}
-        onSelectSuggestion={(s) => {
-          selected = s;
+        onSelectSuggestion={(suggestion) => {
+          selected = suggestion;
         }}
         onDismiss={() => undefined}
         isVisible
       />
     );
-
-    // Press Shift+Enter (should not select)
     fireEvent.keyDown(document, { key: "Enter", shiftKey: true });
-
     expect(selected).toBeNull();
   });
 
-  it("dismisses on Escape and stops propagation", () => {
-    const suggestions = [makeSuggestion("a"), makeSuggestion("b")];
+  it("dismisses on Escape without propagation", () => {
     let dismissed = false;
     let propagated = false;
-
-    // Add a window listener to detect if event propagates
     const windowListener = () => {
       propagated = true;
     };
     window.addEventListener("keydown", windowListener);
-
     render(
       <CommandSuggestions
         suggestions={suggestions}
@@ -204,13 +129,9 @@ describe("CommandSuggestions", () => {
         isVisible
       />
     );
-
-    // Press Escape
     fireEvent.keyDown(document, { key: "Escape" });
-
     expect(dismissed).toBe(true);
     expect(propagated).toBe(false);
-
     window.removeEventListener("keydown", windowListener);
   });
 });

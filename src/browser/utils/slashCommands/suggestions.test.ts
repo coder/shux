@@ -21,6 +21,24 @@ describe("resolveSlashCommandExperimentValue", () => {
       })
     ).toBe(true);
   });
+
+  it("requires the PTC parent flag for rlm-mode", () => {
+    // The backend refuses /refine unless RLM AND PTC are on, so the
+    // sub-flag alone must not surface the command.
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        workspaceHeartbeats: false,
+        rlm: true,
+      })
+    ).toBe(false);
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        workspaceHeartbeats: false,
+        rlm: true,
+        programmaticToolCalling: true,
+      })
+    ).toBe(true);
+  });
 });
 
 describe("getSlashCommandSuggestions", () => {
@@ -49,6 +67,7 @@ describe("getSlashCommandSuggestions", () => {
 
     expect(labels).not.toContain("/heartbeat");
     expect(labels).not.toContain("/dream");
+    expect(labels).not.toContain("/refine");
     // `/goal` graduated to GA — it must surface regardless of experiment state.
     expect(labels).toContain("/goal");
   });
@@ -57,6 +76,7 @@ describe("getSlashCommandSuggestions", () => {
     const enabledExperiments = new Set<ExperimentId>([
       EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
       EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+      EXPERIMENT_IDS.RLM,
     ]);
     const suggestions = getSlashCommandSuggestions("/", {
       isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
@@ -65,6 +85,7 @@ describe("getSlashCommandSuggestions", () => {
 
     expect(labels).toContain("/heartbeat");
     expect(labels).toContain("/dream");
+    expect(labels).toContain("/refine");
     // `/goal` is always available post-GA.
     expect(labels).toContain("/goal");
   });
@@ -92,6 +113,31 @@ describe("getSlashCommandSuggestions", () => {
     expect(skillSuggestion).toBeTruthy();
     expect(skillSuggestion?.replacement).toBe("/test-skill ");
     expect(skillSuggestion?.description).toContain("(project)");
+  });
+
+  it("includes MCP prompts with positional argument hints", () => {
+    const suggestions = getSlashCommandSuggestions("/mcp__coder", {
+      mcpPrompts: [
+        {
+          commandKey: "mcp__coder__review",
+          stableKey: "mcp__coder__review_11111111",
+          serverName: "coder",
+          promptName: "review",
+          description: "Review code",
+          arguments: [
+            { name: "path", required: true },
+            { name: "focus", required: false },
+          ],
+        },
+      ],
+    });
+
+    expect(suggestions).toContainEqual({
+      id: "mcp-prompt:mcp__coder__review",
+      display: "/mcp__coder__review [path] [focus?]",
+      description: "Review code (coder)",
+      replacement: "/mcp__coder__review ",
+    });
   });
 
   it("hides user-invocable: false skills from slash suggestions", () => {
@@ -209,5 +255,49 @@ describe("getSlashCommandSuggestions", () => {
     expect(haiku).toBeTruthy();
     expect(haiku?.description).toBeTruthy();
     expect(haiku?.replacement).toBe("/haiku ");
+  });
+
+  describe("plugin-contributed commands", () => {
+    const pluginCommands = [
+      {
+        name: "greet",
+        description: "Say hello",
+        expansion: "Please greet the user warmly.",
+        pluginName: "my-plugin",
+        scope: "global" as const,
+      },
+    ];
+
+    it("merges plugin commands as data-driven entries whose replacement is the expansion", () => {
+      const suggestions = getSlashCommandSuggestions("/gre", { pluginCommands });
+      const greet = suggestions.find((s) => s.id === "plugin-command:greet");
+
+      expect(greet).toBeTruthy();
+      expect(greet?.display).toBe("/greet");
+      expect(greet?.description).toBe("Say hello (plugin:my-plugin)");
+      expect(greet?.replacement).toBe("Please greet the user warmly.");
+    });
+
+    it("filters plugin commands by partial input", () => {
+      const suggestions = getSlashCommandSuggestions("/xyz", { pluginCommands });
+      expect(suggestions.find((s) => s.id === "plugin-command:greet")).toBeUndefined();
+    });
+
+    it("built-in commands and skills take precedence over plugin commands on collision", () => {
+      const colliding = [
+        { ...pluginCommands[0], name: "compact" },
+        { ...pluginCommands[0], name: "my-skill" },
+      ];
+      const suggestions = getSlashCommandSuggestions("/", {
+        pluginCommands: colliding,
+        agentSkills: [{ name: "my-skill", description: "A skill", scope: "project" }],
+      });
+
+      expect(suggestions.find((s) => s.id === "plugin-command:compact")).toBeUndefined();
+      expect(suggestions.find((s) => s.id === "plugin-command:my-skill")).toBeUndefined();
+      // The colliding names still resolve through their canonical providers.
+      expect(suggestions.find((s) => s.id === "command:compact")).toBeTruthy();
+      expect(suggestions.find((s) => s.id === "skill:my-skill")).toBeTruthy();
+    });
   });
 });

@@ -1,5 +1,6 @@
 import React from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useConnectionLatencyMs } from "@/browser/contexts/API";
+import { formatDuration } from "@/common/utils/formatDuration";
 
 const wrapperClassName =
   "pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 [&>*]:pointer-events-auto";
@@ -21,6 +22,7 @@ interface ConnectionStatusToastProps {
 
 export const ConnectionStatusToast: React.FC<ConnectionStatusToastProps> = ({ wrap = true }) => {
   const apiState = useAPI();
+  const latencyMs = useConnectionLatencyMs();
 
   // Don't show anything when connected or during initial connection.
   // Auth required is handled by a separate modal flow.
@@ -42,7 +44,18 @@ export const ConnectionStatusToast: React.FC<ConnectionStatusToastProps> = ({ wr
         <span className="bg-warning inline-block h-2 w-2 animate-pulse rounded-full" />
         <span>
           {apiState.status === "degraded" ? (
-            "Connection unstable — messages may be delayed"
+            <>
+              Server is slow to respond
+              {latencyMs !== null && (
+                // The figure changes every liveness tick; keep it out of the accessibility tree so
+                // the polite live region does not re-announce the whole warning each time.
+                <span aria-hidden="true">
+                  {" "}
+                  (<span className="counter-nums">{formatDuration(latencyMs, "precise")}</span>)
+                </span>
+              )}
+              ; messages may be delayed
+            </>
           ) : (
             <>
               Reconnecting to server

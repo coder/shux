@@ -1,7 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import * as path from "path";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
-import * as path from "path";
 
 import { Config } from "@/node/config";
 import { TaskHandleStore, WORKSPACE_TURN_TASK_ID_PREFIX } from "@/node/services/taskHandleStore";
@@ -44,10 +44,43 @@ describe("TaskHandleStore", () => {
     expect(listed.map((item) => item.handleId)).toEqual([`${WORKSPACE_TURN_TASK_ID_PREFIX}abc`]);
   });
 
+  it("listAllWorkspaceTurns skips one unreadable owner session", async () => {
+    const { config } = await createTempConfig("task-handle-store-owner-isolation");
+    const store = new TaskHandleStore(config);
+    await store.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}good`,
+      ownerWorkspaceId: "good-owner",
+      workspaceId: "child",
+      turnId: "turn-good",
+      status: "running",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:00:00.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    await fsPromises.mkdir(path.join(config.sessionsDir, "bad-owner"), { recursive: true });
+
+    const original = store.listWorkspaceTurns.bind(store);
+    const listWorkspaceTurns = spyOn(store, "listWorkspaceTurns").mockImplementation(
+      (ownerWorkspaceId, options) =>
+        ownerWorkspaceId === "bad-owner"
+          ? Promise.reject(new Error("permission denied"))
+          : original(ownerWorkspaceId, options)
+    );
+    try {
+      expect((await store.listAllWorkspaceTurns()).map((record) => record.handleId)).toEqual([
+        `${WORKSPACE_TURN_TASK_ID_PREFIX}good`,
+      ]);
+    } finally {
+      listWorkspaceTurns.mockRestore();
+    }
+  });
+
   it("rejects unsafe handle IDs before composing paths", async () => {
     const { config } = await createTempConfig("task-handle-store-unsafe-id");
     const store = new TaskHandleStore(config);
-    const sessionDir = config.getSessionDir("owner");
+    const sessionDir = path.join(config.sessionsDir, "owner");
     await fsPromises.mkdir(sessionDir, { recursive: true });
     await fsPromises.writeFile(
       path.join(sessionDir, "chat.json"),
@@ -73,7 +106,7 @@ describe("TaskHandleStore", () => {
   it("self-heals corrupt handle records by ignoring them", async () => {
     const { config } = await createTempConfig("task-handle-store-corrupt");
     const store = new TaskHandleStore(config);
-    const sessionDir = config.getSessionDir("owner");
+    const sessionDir = path.join(config.sessionsDir, "owner");
     await fsPromises.mkdir(path.join(sessionDir, "task-handles"), { recursive: true });
     await fsPromises.writeFile(
       path.join(sessionDir, "task-handles", `${WORKSPACE_TURN_TASK_ID_PREFIX}bad.json`),

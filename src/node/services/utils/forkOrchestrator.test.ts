@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import * as gitModule from "@/node/git";
@@ -107,6 +107,11 @@ describe("orchestrateFork", () => {
     detectDefaultTrunkBranchMock = spyOn(gitModule, "detectDefaultTrunkBranch").mockResolvedValue(
       "main"
     );
+  });
+
+  afterEach(() => {
+    // Later suites must receive real runtimes, not this suite's factory stub.
+    vi.restoreAllMocks();
   });
 
   it("returns Ok with fork metadata when forkWorkspace succeeds", async () => {

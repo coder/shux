@@ -22,7 +22,7 @@ export async function createTestHistoryService(): Promise<{
 }> {
   const tempDir = path.join(
     os.tmpdir(),
-    `mux-test-history-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    `xum-test-history-${Date.now()}-${Math.random().toString(36).slice(2)}`
   );
   await fs.mkdir(tempDir, { recursive: true });
   const config = new Config(tempDir);

@@ -29,7 +29,7 @@ const STAGED_EXTENSION_TO_MEDIA_TYPE: Record<string, string> = {
 };
 
 const DEFAULT_STAGED_MEDIA_TYPE = "application/octet-stream";
-const MAX_STAGED_MEDIA_TYPE_LENGTH = 100;
+export const MAX_ATTACHMENT_MEDIA_TYPE_LENGTH = 100;
 const MEDIA_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
 
 export function normalizeAttachmentMediaType(mediaType: string): string {
@@ -43,6 +43,19 @@ export function getAttachmentMediaTypeFromExtension(filename: string): string | 
 
 export function isSupportedAttachmentMediaType(mediaType: string): boolean {
   const normalized = normalizeAttachmentMediaType(mediaType);
+  // Media types are attacker-influencable metadata (e.g. MCP servers copy
+  // them verbatim into media parts), and every consumer of this predicate
+  // sits on a trust boundary that retains or interpolates the value
+  // (capture retention, request extraction, provider output sanitization).
+  // Require a well-formed type/subtype within a plausible length — a bare
+  // "image/" prefix check would qualify "image/" + megabytes of junk as a
+  // supported attachment type.
+  if (
+    normalized.length > MAX_ATTACHMENT_MEDIA_TYPE_LENGTH ||
+    !MEDIA_TYPE_PATTERN.test(normalized)
+  ) {
+    return false;
+  }
   return normalized.startsWith("image/") || normalized === PDF_MEDIA_TYPE;
 }
 
@@ -69,20 +82,12 @@ function sanitizeStagedAttachmentMediaType(mediaType: string): string | null {
   const normalized = normalizeAttachmentMediaType(mediaType);
   if (
     normalized.length === 0 ||
-    normalized.length > MAX_STAGED_MEDIA_TYPE_LENGTH ||
+    normalized.length > MAX_ATTACHMENT_MEDIA_TYPE_LENGTH ||
     !MEDIA_TYPE_PATTERN.test(normalized)
   ) {
     return null;
   }
   return normalized;
-}
-
-export function isSupportedStagedAttachmentMediaType(mediaType: string): boolean {
-  const normalized = normalizeAttachmentMediaType(mediaType);
-  return (
-    ZIP_MEDIA_TYPES.includes(normalized as (typeof ZIP_MEDIA_TYPES)[number]) ||
-    sanitizeStagedAttachmentMediaType(normalized) != null
-  );
 }
 
 export function getSupportedStagedAttachmentMediaType(args: {

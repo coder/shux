@@ -4,7 +4,7 @@ import type { ToolExecutionOptions } from "ai";
 import { createBashTool } from "./bash";
 import { createTaskAwaitTool } from "./task_await";
 import { createTaskListTool } from "./task_list";
-import { createTaskTerminateTool } from "./task_terminate";
+import { createTaskStopTool } from "./task_stop";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { TaskService } from "@/node/services/taskService";
@@ -324,7 +324,7 @@ describe("bash + task_* (background bash tasks)", () => {
       isDescendantAgentTask: mock(() => Promise.resolve(false)),
     } as unknown as TaskService;
 
-    const tool = createTaskTerminateTool({
+    const tool = createTaskStopTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "ws-1" }),
       backgroundProcessManager,
       taskService,
@@ -335,11 +335,9 @@ describe("bash + task_* (background bash tasks)", () => {
     );
 
     expect(getProcess).toHaveBeenCalledWith("proc-1");
-    expect(terminate).toHaveBeenCalledWith("proc-1");
+    expect(terminate).toHaveBeenCalledWith("proc-1", { monitorDisposition: "discard" });
     expect(result).toEqual({
-      results: [
-        { status: "terminated", taskId: "bash:proc-1", terminatedTaskIds: ["bash:proc-1"] },
-      ],
+      results: [{ status: "stopped", taskId: "bash:proc-1", stoppedTaskIds: ["bash:proc-1"] }],
     });
   });
 });

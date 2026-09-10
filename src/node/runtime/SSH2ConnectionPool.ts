@@ -159,34 +159,63 @@ function sanitizeProxyCommand(
   });
 }
 
-function getProxyShellArgs(command: string): { command: string; args: string[] } {
-  if (process.platform === "win32") {
+/**
+ * Build the shell invocation for a ProxyCommand string. Exported for tests.
+ *
+ * On Windows the command must reach cmd.exe verbatim. Without
+ * windowsVerbatimArguments, Node escapes the /c payload with MSVCRT rules
+ * (embedded `"` becomes `\"`), which cmd.exe does not understand. Mux's own
+ * ProxyCommand double-quotes every argument, so cmd.exe got a mangled
+ * command line, exited instantly, and the connection died with a bare
+ * "Premature close" (#3110). Mirror Node's `shell: true` handling instead:
+ * `cmd.exe /d /s /c "<command>"` passed verbatim, where /s strips the outer
+ * quotes so cmd.exe sees the original command byte-for-byte.
+ */
+export function getProxyShellArgs(
+  command: string,
+  platform: NodeJS.Platform = process.platform
+): { command: string; args: string[]; windowsVerbatimArguments: boolean } {
+  if (platform === "win32") {
     return {
       command: process.env.COMSPEC ?? "cmd.exe",
-      args: ["/d", "/s", "/c", command],
+      args: ["/d", "/s", "/c", `"${command}"`],
+      windowsVerbatimArguments: true,
     };
   }
 
-  return { command: "/bin/sh", args: ["-c", command] };
+  return { command: "/bin/sh", args: ["-c", command], windowsVerbatimArguments: false };
 }
 
-function spawnProxyCommand(
-  command: string,
-  tokens: { host: string; port: number; user: string }
-): {
+/** Bound the retained stderr so a chatty proxy can't grow memory unbounded. */
+const MAX_PROXY_STDERR_TAIL_CHARS = 2048;
+
+interface ProxyCommandHandle {
   sock: Duplex;
   process: ChildProcess;
-} {
-  const substituted = sanitizeProxyCommand(command, tokens);
-  const { command: shell, args } = getProxyShellArgs(substituted);
+  /** After the proxy process terminates, describes how (exit status + stderr tail). */
+  describeExit: () => string | undefined;
+}
 
-  const proc = spawn(shell, args, {
+/** Exported for tests. */
+export function spawnProxyCommand(
+  command: string,
+  tokens: { host: string; port: number; user: string }
+): ProxyCommandHandle {
+  const substituted = sanitizeProxyCommand(command, tokens);
+  const shell = getProxyShellArgs(substituted);
+
+  const proc = spawn(shell.command, shell.args, {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: shell.windowsVerbatimArguments,
   });
 
-  proc.stderr?.on("data", () => {
-    // Drain stderr to avoid blocking proxy process.
+  // Retain a bounded stderr tail (also keeps stderr drained so the proxy
+  // process can't block on a full pipe). A dying proxy can then explain
+  // itself in the connection error instead of a bare "Premature close".
+  let stderrTail = "";
+  proc.stderr?.on("data", (chunk: Buffer | string) => {
+    stderrTail = (stderrTail + String(chunk)).slice(-MAX_PROXY_STDERR_TAIL_CHARS);
   });
 
   if (!proc.stdin || !proc.stdout) {
@@ -195,7 +224,17 @@ function spawnProxyCommand(
 
   const sock = Duplex.from({ writable: proc.stdin, readable: proc.stdout });
 
-  return { sock, process: proc };
+  const describeExit = () => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      return undefined;
+    }
+    const exit =
+      proc.signalCode !== null ? `signal ${proc.signalCode}` : `code ${proc.exitCode ?? "unknown"}`;
+    const stderr = stderrTail.trim();
+    return `ProxyCommand exited with ${exit}${stderr ? `: ${stderr}` : ""}`;
+  };
+
+  return { sock, process: proc, describeExit };
 }
 
 /** Extract a message string from an error for `.includes()` matching.
@@ -396,7 +435,6 @@ export class SSH2ConnectionPool {
       clearTimeout(entry.idleTimer);
     }
 
-    // Set new idle timer
     entry.idleTimer = setTimeout(() => {
       this.closeIdleConnection(key, entry);
     }, IDLE_TIMEOUT_MS);
@@ -480,14 +518,18 @@ export class SSH2ConnectionPool {
           privateKey: Buffer | undefined,
           reportAuthFailure: boolean
         ): Promise<SSH2ConnectionEntry> => {
-          const proxy = resolvedConfigWithIdentities.proxyCommand
-            ? spawnProxyCommand(resolvedConfigWithIdentities.proxyCommand, proxyTokens)
-            : undefined;
-
           // Lazy-load ssh2 to avoid loading the native sshcrypto.node module at
           // startup. Bun doesn't support the libuv functions the NAPI module calls,
           // so eagerly importing ssh2 crashes the headless CLI in sandboxes.
+          // Import before spawning the proxy so everything from spawn to
+          // handler attachment below runs synchronously; an instantly-dying
+          // proxy can otherwise emit "error"/"close" during the await with no
+          // listeners attached.
           const { Client: SSH2Client } = await import("ssh2");
+
+          const proxy = resolvedConfigWithIdentities.proxyCommand
+            ? spawnProxyCommand(resolvedConfigWithIdentities.proxyCommand, proxyTokens)
+            : undefined;
           const client = new SSH2Client();
           const entry: SSH2ConnectionEntry = {
             client,
@@ -507,6 +549,17 @@ export class SSH2ConnectionPool {
               proxy.sock.destroy();
             }
             cleanupProxy();
+          };
+
+          // When the proxy process has died, a raw ssh2 error like "Premature
+          // close" hides the actual cause; append the proxy's exit status and
+          // stderr so the user sees why the proxy exited.
+          const withProxyExitContext = (err: Error): Error => {
+            const proxyExit = proxy?.describeExit();
+            if (proxyExit && !err.message.includes(proxyExit)) {
+              err.message = `${err.message} (${proxyExit})`;
+            }
+            return err;
           };
 
           if (proxy) {
@@ -550,7 +603,7 @@ export class SSH2ConnectionPool {
               clearTimeout(entry.idleTimer);
             }
             if (!aborted && (!isAuthFailure(err) || reportAuthFailure)) {
-              this.reportFailure(config, getErrorMessage(err));
+              this.reportFailure(config, getErrorMessage(withProxyExitContext(err)));
             }
             this.connections.delete(key);
             cleanupProxy();
@@ -564,7 +617,22 @@ export class SSH2ConnectionPool {
 
             const onError = (err: Error) => {
               cleanup();
-              reject(err);
+              reject(withProxyExitContext(err));
+            };
+
+            // Fail fast with the proxy's exit status + stderr when the proxy
+            // process dies before the handshake completes, instead of waiting
+            // for a readyTimeout or a bare stream error.
+            const onProxyClose = () => {
+              cleanup();
+              client.end();
+              cleanupProxySocket();
+              reject(
+                new Error(
+                  proxy?.describeExit() ??
+                    "ProxyCommand exited before the SSH connection was established"
+                )
+              );
             };
 
             const onAbort = () => {
@@ -578,11 +646,13 @@ export class SSH2ConnectionPool {
             const cleanup = () => {
               client.off("ready", onReady);
               client.off("error", onError);
+              proxy?.process.off("close", onProxyClose);
               abortSignal?.removeEventListener("abort", onAbort);
             };
 
             client.on("ready", onReady);
             client.on("error", onError);
+            proxy?.process.once("close", onProxyClose);
             abortSignal?.addEventListener("abort", onAbort, { once: true });
 
             if (abortSignal?.aborted) {

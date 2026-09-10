@@ -1,5 +1,6 @@
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 
 export type ProviderModelsConfig = Record<string, { models?: ProviderModelEntry[] } | undefined>;
 
@@ -82,8 +83,14 @@ function findProviderModelEntry(
  *
  * Checks the raw (possibly gateway-scoped) provider block first so
  * gateway-local overrides like contextWindowTokens and mappedToModel
- * take effect. Falls back to canonical lookup only when the scoped
- * lookup misses.
+ * take effect. Falls back to a canonical-identity lookup only when the
+ * scoped lookup misses. For coder: identities the fallback identity is
+ * TYPE-derived, never name-derived: {name: "openai", type: "anthropic"}
+ * name-canonicalizes to openai:<model>, and consulting the direct OpenAI
+ * block's entry would apply the wrong provider family's mappedToModel or
+ * context-window override to an Anthropic-wire gateway model. Unmappable
+ * or shadowed coder identities get no fallback — the raw scoped entry is
+ * their only override source.
  */
 function findProviderModelEntryScoped(
   fullModelId: string,
@@ -101,12 +108,14 @@ function findProviderModelEntryScoped(
     }
   }
 
-  const canonical = normalizeToCanonical(fullModelId);
-  if (canonical === fullModelId) {
+  const fallbackIdentity = fullModelId.startsWith("coder:")
+    ? resolveCoderGatewayMetadataModel(fullModelId, providersConfig)
+    : normalizeToCanonical(fullModelId);
+  if (fallbackIdentity == null || fallbackIdentity === fullModelId) {
     return null;
   }
 
-  const canonicalParsed = parseProviderModelId(canonical);
+  const canonicalParsed = parseProviderModelId(fallbackIdentity);
   if (!canonicalParsed) {
     return null;
   }
@@ -127,7 +136,50 @@ export function resolveModelForMetadata(
   providersConfig: ProviderModelsConfig | null
 ): string {
   const entry = findProviderModelEntryScoped(fullModelId, providersConfig);
-  return (entry ? getProviderModelEntryMappedTo(entry) : null) ?? fullModelId;
+  const mapped = entry ? getProviderModelEntryMappedTo(entry) : null;
+  if (mapped != null) {
+    // Explicit user override always wins.
+    return mapped;
+  }
+  // Gateway-scoped Coder strings carry no catalog identity of their own:
+  // pricing, context-window, and tokenizer lookups must target the
+  // instance's upstream, derived from its provider type. Without this,
+  // auto-discovered gateway models are unpriced (budgeted goals reject
+  // them) and have unknown context limits (no limit-driven compaction).
+  return resolveCoderGatewayMetadataModel(fullModelId, providersConfig) ?? fullModelId;
+}
+
+/**
+ * Usage-ledger key for a model string. Same as normalizeToCanonical, except
+ * Coder gateway identities resolve AT RECORD TIME to their durable priceable
+ * identity via resolveModelForMetadata: an explicit scoped mappedToModel
+ * ("Treat as") override wins, then the instance-type-derived upstream catalog
+ * identity (coder:prod-anthropic/<claude> -> anthropic:<claude>). Repricing
+ * (WorkspaceStore.repriceSessionUsage) sees ONLY this key: it cannot recover
+ * a Coder-scoped mapping or a removed instance's type from a stored key, so
+ * both must be applied before the key is persisted. Name-based
+ * canonicalization is ruled out too — it keys a cross-typed instance
+ * ({name: "openai", type: "anthropic"}) under openai:<claude>, so repricing
+ * strips the recorded Anthropic costs as unknown OpenAI-model costs.
+ * Unmappable identities (openai-compat instances, unknown instances, a
+ * custom provider shadowing the "coder" prefix) keep the raw key — it is
+ * their only durable identity.
+ */
+export function normalizeUsageModelKey(
+  modelString: string,
+  providersConfig?: ProviderModelsConfig | null
+): string {
+  if (modelString.startsWith("coder:")) {
+    try {
+      return resolveModelForMetadata(modelString, providersConfig ?? null);
+    } catch {
+      // Invalid model entries (hand-edited config) must not break usage
+      // recording or live frontend deltas — fall back to the type-derived
+      // identity (self-healing).
+      return resolveCoderGatewayMetadataModel(modelString, providersConfig) ?? modelString;
+    }
+  }
+  return normalizeToCanonical(modelString);
 }
 
 function parseModelId(rawValue: unknown): string | null {

@@ -1,6 +1,6 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import * as path from "path";
 import assert from "@/common/utils/assert";
 import type {
   DevToolsEvent,
@@ -11,6 +11,8 @@ import type {
 } from "@/common/types/devtools";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
@@ -82,7 +84,7 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
   };
 }
 
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy">>;
+type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -115,7 +117,7 @@ export class DevToolsService extends EventEmitter {
   setPendingRunMetadata(
     workspaceId: string,
     metadataId: string,
-    metadata: Partial<Pick<DevToolsRun, "toolPolicy">>
+    metadata: PendingRunMetadata
   ): void {
     assert(
       workspaceId.trim().length > 0,
@@ -360,11 +362,11 @@ export class DevToolsService extends EventEmitter {
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
-    await this.enqueueWrite(workspaceId, async () => {
-      const filePath = this.getSessionFilePath(workspaceId);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, "", "utf-8");
-    });
+    await this.enqueueWrite(workspaceId, () =>
+      this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.writeFile(filePath, "", "utf-8")
+      )
+    );
 
     this.emitWorkspaceEvent(workspaceId, { type: "cleared" });
   }
@@ -408,8 +410,25 @@ export class DevToolsService extends EventEmitter {
     this.emit(`update:${workspaceId}`, event);
   }
 
+  /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
+  async hasWorkspaceData(workspaceId: string): Promise<boolean> {
+    assert(
+      workspaceId.trim().length > 0,
+      "DevToolsService.hasWorkspaceData requires a workspaceId"
+    );
+    if (this.workspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fs.access(this.getSessionFilePath(workspaceId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private getSessionFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "devtools.jsonl");
+    return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
 
   private getOrCreateWorkspaceData(workspaceId: string): WorkspaceData {
@@ -624,9 +643,41 @@ export class DevToolsService extends EventEmitter {
         return;
       }
 
-      const filePath = this.getSessionFilePath(workspaceId);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+      await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8")
+      );
     });
+  }
+
+  /**
+   * r64: devtools.jsonl commits recreate the session directory via mkdir,
+   * and with XUM_ALLOW_MULTIPLE_INSTANCES=1 a foreign backend's in-flight
+   * stream survives the remover's process-local cancellation entirely — its
+   * step finalization would resurrect the directory the remover just
+   * deleted. Run every directory-creating disk commit inside the same
+   * sessionDir target mutation lock removal's tombstone+delete critical
+   * section holds, and recheck the durable removal tombstone in-lock (same
+   * posture as SessionUsageService.recordHeadlessUsage). Dropping the entry
+   * is correct: debug logs for a removed workspace have no reader. Callers
+   * never hold other target locks here, so this single-key acquisition
+   * cannot ABBA with removal's sorted multi-key acquisition.
+   */
+  private async commitToSessionFileUnlessRemoved(
+    workspaceId: string,
+    write: (filePath: string) => Promise<void>
+  ): Promise<void> {
+    await withTargetMutationLock(
+      this.config.rootDir,
+      path.join(this.config.sessionsDir, workspaceId),
+      async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          log.debug("Skipping DevTools write for removed workspace", { workspaceId });
+          return;
+        }
+        const filePath = this.getSessionFilePath(workspaceId);
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await write(filePath);
+      }
+    );
   }
 }

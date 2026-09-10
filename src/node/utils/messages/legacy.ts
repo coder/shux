@@ -1,4 +1,4 @@
-import type { MuxMessageMetadata, MuxMessage, MuxMetadata } from "@/common/types/message";
+import type { MuxMessageMetadata, MuxMetadata } from "@/common/types/message";
 
 interface LegacyMuxMetadata extends MuxMetadata {
   cmuxMetadata?: MuxMessageMetadata;
@@ -6,13 +6,14 @@ interface LegacyMuxMetadata extends MuxMetadata {
 }
 
 /**
- * Normalize persisted messages from older builds.
+ * Normalize persisted messages from older builds. Only metadata is required,
+ * so control rows with damaged IDs/parts use the same compatibility logic.
  *
  * Migrations:
  * - `cmuxMetadata` → `muxMetadata` (mux rename)
  * - `{ compacted: true, idleCompacted: true }` → `{ compacted: "idle" }`
  */
-export function normalizeLegacyMuxMetadata(message: MuxMessage): MuxMessage {
+export function normalizeLegacyMuxMetadata<Row extends { metadata?: object }>(message: Row): Row {
   const metadata = message.metadata as LegacyMuxMetadata | undefined;
   if (!metadata) return message;
 

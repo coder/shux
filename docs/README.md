@@ -1,6 +1,6 @@
-# mux Documentation
+# Xum Documentation
 
-This directory contains the source for mux documentation hosted on [Mintlify](https://mintlify.com/).
+This directory contains the source for Xum documentation hosted on [Mintlify](https://mintlify.com/).
 
 **Live docs:** https://mux.coder.com
 

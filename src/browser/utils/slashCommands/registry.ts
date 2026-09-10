@@ -75,9 +75,6 @@ function parseCommandHeaderBody(rawInput: string): CommandHeaderBody {
   };
 }
 
-// Re-export MODEL_ABBREVIATIONS from constants for backwards compatibility
-export { MODEL_ABBREVIATIONS };
-
 // Suggestion helper functions
 function filterAndMapSuggestions<T extends SuggestionDefinition>(
   definitions: readonly T[],
@@ -120,6 +117,24 @@ const dreamCommandDefinition: SlashCommandDefinition = {
   description:
     "Consolidate this workspace's agent memory now (merge duplicates, prune stale facts)",
   handler: (): ParsedCommand => ({ type: "dream" }),
+};
+
+const refineCommandDefinition: SlashCommandDefinition = {
+  key: "refine",
+  experimentGate: EXPERIMENT_IDS.RLM,
+  description:
+    "Distill durable lessons from this workspace's trajectory into staged memory/skill edits; approve them with '/refine apply'",
+  handler: ({ rawInput }): ParsedCommand => {
+    // Security: /refine only STAGES model-proposed edits; the explicit
+    // "apply" argument is the user's approval step that writes them.
+    const arg = rawInput.trim();
+    if (arg === "apply") return { type: "refine", apply: true };
+    if (arg === "") return { type: "refine" };
+    // Mistyped approvals ("/refine Apply", "/refine apply now") must NOT
+    // fall through to a fresh run: that would overwrite the staged proposal
+    // the user meant to approve and cost another model call.
+    return { type: "unknown-command", command: "refine", subcommand: arg };
+  },
 };
 
 const compactCommandDefinition: SlashCommandDefinition = {
@@ -678,6 +693,7 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   clearCommandDefinition,
   compactCommandDefinition,
   dreamCommandDefinition,
+  refineCommandDefinition,
   modelCommandDefinition,
   planCommandDefinition,
 

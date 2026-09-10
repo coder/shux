@@ -113,6 +113,28 @@ function getWorkflowResultField(value: unknown, field: string): unknown {
   return undefined;
 }
 
+/**
+ * agent()-based workflows return `{ reportMarkdown, structuredOutput }` — exactly the fields
+ * hoisted to the payload top level. Repeating them verbatim under `result` doubled the token
+ * cost of every workflow-completion context message, so `result` keeps only fields that were
+ * NOT hoisted (non-standard result shapes) and is dropped when nothing else remains.
+ */
+function getResidualWorkflowResult(
+  resultValue: unknown,
+  hoistedFields: readonly string[]
+): unknown {
+  if (hoistedFields.length === 0 || !isRecordValue(resultValue)) {
+    return resultValue;
+  }
+  const residual: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(resultValue)) {
+    if (!hoistedFields.includes(key)) {
+      residual[key] = value;
+    }
+  }
+  return Object.keys(residual).length > 0 ? residual : null;
+}
+
 function stringifyWorkflowResultPayload(payload: unknown): string {
   try {
     return JSON.stringify(payload, null, 2);
@@ -139,6 +161,11 @@ export function buildWorkflowResultContextMessage(input: {
   const resultValue = getWorkflowResultValue(input.result, input.run);
   const reportMarkdown = getWorkflowResultField(resultValue, "reportMarkdown");
   const structuredOutput = getWorkflowResultField(resultValue, "structuredOutput");
+  const hoistedFields = [
+    ...(typeof reportMarkdown === "string" ? ["reportMarkdown"] : []),
+    ...(structuredOutput !== undefined ? ["structuredOutput"] : []),
+  ];
+  const residualResult = getResidualWorkflowResult(resultValue, hoistedFields);
   const workflowError = getWorkflowError({
     run: input.run,
     status: input.status,
@@ -152,7 +179,7 @@ export function buildWorkflowResultContextMessage(input: {
     },
     ...(typeof reportMarkdown === "string" ? { reportMarkdown } : {}),
     ...(structuredOutput !== undefined ? { structuredOutput } : {}),
-    ...(resultValue != null ? { result: resultValue } : {}),
+    ...(residualResult != null ? { result: residualResult } : {}),
     ...(workflowError ? { error: workflowError } : {}),
   };
 
@@ -161,6 +188,41 @@ export function buildWorkflowResultContextMessage(input: {
     `Original workflow command: ${input.rawCommand}`,
     `<${WORKFLOW_RESULT_XML_TAG}>\n${stringifyWorkflowResultPayload(payload)}\n</${WORKFLOW_RESULT_XML_TAG}>`,
   ].join("\n\n");
+}
+
+/**
+ * Recognize this run's result payload inside a coalesced terminal-attention prompt from the
+ * builder's own output format. The drain's synthetic user row can coalesce several runs into
+ * one message and carries no workflow-result metadata, so currentness checks must read the
+ * consumption evidence out of the text: each payload block is parsed back and matched on the
+ * exact workflow.runId the builder wrote, not on a raw substring, so a run ID merely quoted
+ * inside another run's report cannot count as consumption.
+ */
+export function textContainsWorkflowResultPayload(text: string, runId: string): boolean {
+  assert(runId.length > 0, "textContainsWorkflowResultPayload: runId is required");
+  if (!text.includes(WORKFLOW_RESULT_MESSAGE_OPENING_SENTENCE)) {
+    return false;
+  }
+  const blockPattern = new RegExp(
+    `<${WORKFLOW_RESULT_XML_TAG}>\\n([\\s\\S]*?)\\n</${WORKFLOW_RESULT_XML_TAG}>`,
+    "g"
+  );
+  for (const match of text.matchAll(blockPattern)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(match[1] ?? "");
+    } catch {
+      continue;
+    }
+    if (!isRecordValue(payload)) {
+      continue;
+    }
+    const workflow = payload.workflow;
+    if (isRecordValue(workflow) && workflow.runId === runId) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export interface WorkflowRunCardInput {

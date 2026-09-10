@@ -20,6 +20,7 @@ import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/Wor
 import type {
   AgentRowRenderMeta,
   WorkspaceDelegatedActivity,
+  WorkspaceSubAgentsSummary,
 } from "@/browser/utils/ui/workspaceFiltering";
 import type { StreamAbortReasonSnapshot } from "@/common/types/stream";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -47,6 +48,7 @@ type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorks
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
 let mockWorkspaceHeartbeatsEnabled = false;
+let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
 let mockWorkspaceSidebarState: MockWorkspaceSidebarState;
 
@@ -79,6 +81,22 @@ function createWorkspaceSidebarState(
     activeBashMonitorCount: 0,
     terminalActiveCount: 0,
     terminalSessionCount: 0,
+    ...overrides,
+  };
+}
+
+function makeHiddenSummary(
+  overrides: Partial<WorkspaceSubAgentsSummary> = {}
+): WorkspaceSubAgentsSummary {
+  return {
+    subAgentCount: 0,
+    runningSubAgentCount: 0,
+    queuedSubAgentCount: 0,
+    runningWorkflowRunCount: 0,
+    queuedWorkflowRunCount: 0,
+    runningWorkflowAgentCount: 0,
+    queuedWorkflowAgentCount: 0,
+    workflowRunIds: new Set(),
     ...overrides,
   };
 }
@@ -124,6 +142,14 @@ function installAgentListItemTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(((props: { children: ReactNode }) => (
     <>{props.children}</>
   )) as unknown as typeof TooltipModule.TooltipContent);
+  spyOn(TooltipModule, "TooltipIfPresent").mockImplementation(((props: {
+    children: ReactNode;
+    tooltip?: string;
+  }) => (
+    <span data-testid="badge-tooltip" data-tooltip-content={props.tooltip}>
+      {props.children}
+    </span>
+  )) as unknown as typeof TooltipModule.TooltipIfPresent);
   spyOn(WorkspaceStatusIndicatorModule, "WorkspaceStatusIndicator").mockImplementation(((props: {
     workspaceId: string;
   }) => (
@@ -155,7 +181,10 @@ function installAgentListItemTestDoubles() {
 
   void mock.module("react-dnd", () => ({
     ...actualReactDnd,
-    useDrag: () => [{ isDragging: false }, passthroughRef, () => undefined] as const,
+    useDrag: (spec: () => { item?: () => Record<string, unknown> }) => {
+      latestUseDragSpec = spec;
+      return [{ isDragging: false }, passthroughRef, () => undefined] as const;
+    },
     useDrop: () => [{ isPinnedReorderTarget: false }, passthroughRef] as const,
   }));
 
@@ -251,10 +280,14 @@ function renderWorkspaceItem(
     rowRenderMeta?: AgentRowRenderMeta;
     subAgentConnectorLayout?: "default" | "task-group-member";
     taskGroupHeaderTitle?: string;
+    isWorkspaceLiveActive?: boolean;
     delegatedActivity?: WorkspaceDelegatedActivity;
+    hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
+    getWorkflowRunName?: (runId: string) => string | undefined;
     completedChildrenExpanded?: boolean;
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
+    projectBadgeName?: string;
   } = {}
 ) {
   const metadata = options.metadata ?? createMetadata();
@@ -263,13 +296,17 @@ function renderWorkspaceItem(
       metadata={metadata}
       projectPath={metadata.projectPath}
       projectName={metadata.projectName}
+      projectBadgeName={options.projectBadgeName}
       isSelected={options.isSelected ?? false}
       isArchiving={options.isArchiving}
       depth={options.depth ?? options.rowRenderMeta?.depth}
       rowRenderMeta={options.rowRenderMeta}
       subAgentConnectorLayout={options.subAgentConnectorLayout}
       taskGroupHeaderTitle={options.taskGroupHeaderTitle}
+      isWorkspaceLiveActive={options.isWorkspaceLiveActive}
       delegatedActivity={options.delegatedActivity}
+      hiddenSubAgentsSummary={options.hiddenSubAgentsSummary}
+      getWorkflowRunName={options.getWorkflowRunName}
       completedChildrenExpanded={options.completedChildrenExpanded}
       onToggleCompletedChildren={options.onToggleCompletedChildren}
       onSelectWorkspace={options.onSelectWorkspace ?? (() => undefined)}
@@ -315,50 +352,62 @@ describe("AgentListItem", () => {
     mock.restore();
   });
 
-  test("suppresses group-member titles that repeat the group header (D8)", () => {
-    // Variant member: label-only row keeps the variant label as the title text.
-    const variant = renderWorkspaceItem({
-      metadata: createMetadata({
-        title: "Split review",
-        parentWorkspaceId: "parent",
-        bestOf: { groupId: "g1", index: 0, total: 2, kind: "variants", label: "frontend" },
-      }),
-      subAgentConnectorLayout: "task-group-member",
-      taskGroupHeaderTitle: "Split review",
-    });
-    expect(variant.view.getByRole("button", { name: "Select workspace frontend" })).toBeTruthy();
-    expect(variant.view.queryByText("Split review")).toBeNull();
-    cleanup();
+  test("exposes the full project badge label through the shared tooltip", () => {
+    // The badge's width cap end-truncates hierarchical "Parent / Sub" names,
+    // so the shared tooltip wrapper must carry the full label.
+    const badgeName = "Parent Project With A Long Name / Frontend";
+    const { view } = renderWorkspaceItem({ projectBadgeName: badgeName });
 
-    // Best-of member: bare letters become "Candidate A" so the row stays readable.
+    const badge = view.getByTestId(`workspace-project-badge-${TEST_WORKSPACE_ID}`);
+    const tooltip = badge.closest('[data-testid="badge-tooltip"]');
+    expect(tooltip?.getAttribute("data-tooltip-content")).toBe(badgeName);
+  });
+
+  test("falls back to the row's sub-project scope for drag section identity", () => {
+    // Flat rows omit the sectionId prop (it also drives section indentation),
+    // so the drag item must carry metadata.subProjectPath instead; drop zones
+    // rely on it to treat same-section drops as no-ops.
+    renderWorkspaceItem({
+      metadata: createMetadata({ subProjectPath: "/tmp/project/features" }),
+    });
+    const item = latestUseDragSpec?.().item?.();
+    expect(item?.workspaceId).toBe(TEST_WORKSPACE_ID);
+    expect(item?.currentSectionId).toBe("/tmp/project/features");
+  });
+
+  test("suppresses best-of member titles that repeat the group header (D8)", () => {
     const candidate = renderWorkspaceItem({
       metadata: createMetadata({
-        title: "Split review",
+        title: "Compare options",
         parentWorkspaceId: "parent",
         bestOf: { groupId: "g1", index: 0, total: 2 },
       }),
       subAgentConnectorLayout: "task-group-member",
-      taskGroupHeaderTitle: "Split review",
+      taskGroupHeaderTitle: "Compare options",
     });
     expect(
       candidate.view.getByRole("button", { name: "Select workspace Candidate A" })
     ).toBeTruthy();
+    expect(candidate.view.queryByText("Compare options")).toBeNull();
     cleanup();
 
-    // A custom (differing) title still renders alongside the label.
+    // A custom (differing) title still renders alongside the candidate label.
     const customTitle = renderWorkspaceItem({
       metadata: createMetadata({
         title: "My renamed run",
         parentWorkspaceId: "parent",
-        bestOf: { groupId: "g1", index: 1, total: 2, kind: "variants", label: "backend" },
+        bestOf: { groupId: "g1", index: 1, total: 2 },
       }),
       subAgentConnectorLayout: "task-group-member",
-      taskGroupHeaderTitle: "Split review",
+      taskGroupHeaderTitle: "Compare options",
     });
     expect(
-      customTitle.view.getByRole("button", { name: "Select workspace backend · My renamed run" })
+      customTitle.view.getByRole("button", {
+        name: "Select workspace My renamed run, scope B",
+      })
     ).toBeTruthy();
     expect(customTitle.view.getByText("My renamed run")).toBeTruthy();
+    expect(customTitle.view.getByText("scope: B")).toBeTruthy();
   });
 
   test("shows workflow-only activity on idle workspace rows", () => {
@@ -518,7 +567,7 @@ describe("AgentListItem", () => {
     const rowView = within(row);
 
     expect(row.querySelector(".bg-border-pending.border-surface-sky")).toBeTruthy();
-    expect(rowView.getByText("Mux has a few questions")).toBeTruthy();
+    expect(rowView.getByText("Xum has a few questions")).toBeTruthy();
     expect(rowView.queryByText("Workflow running · 1 sub-agent active")).toBeNull();
   });
 
@@ -554,6 +603,298 @@ describe("AgentListItem", () => {
 
     expect(row.querySelector(".bg-content-destructive.border-surface-destructive")).toBeTruthy();
     expect(rowView.queryByText("Workflow running · 1 sub-agent active")).toBeNull();
+  });
+
+  test("summarizes hidden sub-agents with only the active count", () => {
+    const { row } = renderWorkspaceItem({
+      delegatedActivity: {
+        activeCount: 1,
+        queuedCount: 0,
+        workflowActiveCount: 0,
+        workflowQueuedCount: 0,
+      },
+      hiddenSubAgentsSummary: makeHiddenSummary({ subAgentCount: 3, runningSubAgentCount: 1 }),
+    });
+    const rowView = within(row);
+
+    expect(row.querySelector(".workspace-status-dot-active")).toBeTruthy();
+    const indicator = rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`);
+    expect(indicator.textContent).toBe("1 sub-agent active");
+    expect(indicator.querySelector("svg")).toBeTruthy();
+    expect(rowView.queryByTestId(`workspace-delegated-activity-${TEST_WORKSPACE_ID}`)).toBeNull();
+  });
+
+  test("summarizes a hidden workflow run with its name and agent count", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-1"],
+      activeWorkflowRunCount: 1,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 5,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+    const rowView = within(row);
+
+    expect(rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent).toBe(
+      "Deep Research running (5 agents)"
+    );
+    expect(rowView.queryByText("Workflow running")).toBeNull();
+  });
+
+  test("shows the workflow name and current step for a single running worker", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 1,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+        runningWorkflowStepTitle: "Implementer",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research · Implementer");
+  });
+
+  test("appends queued workers after the current step label", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 1,
+        queuedWorkflowAgentCount: 2,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+        runningWorkflowStepTitle: "Implementer",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research · Implementer · 2 queued");
+  });
+
+  test("labels a lone gap-only run with its retained workflow name", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-gap"],
+      activeWorkflowRunCount: 1,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary(),
+      getWorkflowRunName: (runId) => (runId === "run-gap" ? "Deep Research" : undefined),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research running");
+  });
+
+  test("shows the hidden sub-agents summary while the coordinator itself streams", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      canInterrupt: true,
+      agentStatus: { emoji: "🔄", message: "Validating and packaging" },
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({ subAgentCount: 2, runningSubAgentCount: 2 }),
+    });
+    const rowView = within(row);
+
+    expect(rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent).toBe(
+      "2 sub-agents active"
+    );
+    expect(rowView.queryByTestId(`workspace-status-indicator-${TEST_WORKSPACE_ID}`)).toBeNull();
+    // The row's own streaming state still shows through the green dot.
+    expect(row.querySelector(".bg-content-success")).toBeTruthy();
+  });
+
+  test("shows the hidden sub-agents summary over an armed bash monitor", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({ activeBashMonitorCount: 1 });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({ subAgentCount: 2, runningSubAgentCount: 2 }),
+    });
+    const rowView = within(row);
+
+    expect(rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent).toBe(
+      "2 sub-agents active"
+    );
+    expect(rowView.queryByText("Watching background bash")).toBeNull();
+  });
+
+  test("distinguishes queued from running hidden sub-agents", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        subAgentCount: 3,
+        runningSubAgentCount: 1,
+        queuedSubAgentCount: 2,
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("1 sub-agent active · 2 queued");
+  });
+
+  test("labels a workflow with only queued workers as queued, not running", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        queuedWorkflowRunCount: 1,
+        queuedWorkflowAgentCount: 2,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research queued (2 agents)");
+  });
+
+  test("appends queued workflow workers after the running count", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 2,
+        queuedWorkflowAgentCount: 1,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research running (2 agents) · 1 queued");
+  });
+
+  test("does not count queued-only runs in the running workflow label", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        queuedWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 2,
+        queuedWorkflowAgentCount: 1,
+        workflowRunIds: new Set(["run-1", "run-2"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research running (2 agents) · 1 queued");
+  });
+
+  test("keeps a workflow line through step gaps when only the run itself is active", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-1"],
+      activeWorkflowRunCount: 1,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary(),
+    });
+    const rowView = within(row);
+
+    const indicator = rowView.getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`);
+    expect(indicator.textContent).toBe("Workflow running");
+    expect(indicator.querySelector("svg")).toBeTruthy();
+  });
+
+  test("counts an own run in a step gap alongside a concurrent run's workers", () => {
+    // run-2 is between steps (no live worker), so only the workspace's own
+    // active run list knows about it; the label must not report just run-1.
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-1", "run-2"],
+      activeWorkflowRunCount: 2,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 1,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("2 workflows running (1 agent)");
+  });
+
+  test("does not borrow a queued run's name for a gap-only running label", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-queued", "run-gap"],
+      activeWorkflowRunCount: 2,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        queuedWorkflowRunCount: 1,
+        queuedWorkflowAgentCount: 2,
+        workflowRunIds: new Set(["run-queued"]),
+        workflowName: "Deep Research",
+      }),
+      getWorkflowRunName: (runId) => (runId === "run-queued" ? "Deep Research" : undefined),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Workflow running · 2 queued");
+  });
+
+  test("shows running sub-agents ahead of a queued-only workflow", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        subAgentCount: 2,
+        runningSubAgentCount: 1,
+        queuedWorkflowRunCount: 1,
+        queuedWorkflowAgentCount: 2,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("1 sub-agent active · Deep Research queued (2 agents)");
+  });
+
+  test("keeps a running workflow ahead of running sub-agents in the combined line", () => {
+    mockWorkspaceSidebarState = createWorkspaceSidebarState({
+      activeWorkflowRunIds: ["run-1"],
+      activeWorkflowRunCount: 1,
+    });
+
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({
+        subAgentCount: 2,
+        runningSubAgentCount: 1,
+        runningWorkflowRunCount: 1,
+        runningWorkflowAgentCount: 3,
+        workflowRunIds: new Set(["run-1"]),
+        workflowName: "Deep Research",
+      }),
+    });
+
+    expect(
+      within(row).getByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`).textContent
+    ).toBe("Deep Research running (3 agents) · 1 sub-agent active");
+  });
+
+  test("falls back to the normal status line when hidden sub-agents are all inactive", () => {
+    const { row } = renderWorkspaceItem({
+      hiddenSubAgentsSummary: makeHiddenSummary({ subAgentCount: 3 }),
+    });
+    const rowView = within(row);
+
+    expect(rowView.queryByTestId(`workspace-hidden-subagents-${TEST_WORKSPACE_ID}`)).toBeNull();
   });
 
   test("keeps archiving feedback inline instead of rendering a secondary status row", () => {
@@ -634,6 +975,22 @@ describe("AgentListItem", () => {
     expect(topSegment.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`width: ${width}`);
+  });
+
+  test("keeps the sub-agent elbow active during live interrupted-state fallback", () => {
+    const { view } = renderWorkspaceItem({
+      metadata: createMetadata({
+        parentWorkspaceId: "parent",
+        taskStatus: "interrupted",
+      }),
+      depth: 1,
+      rowRenderMeta: SUBAGENT_ROW_META,
+      isWorkspaceLiveActive: true,
+    });
+
+    const elbow = view.getByTestId("subagent-connector-elbow");
+    expect(elbow.tagName.toLowerCase()).toBe("svg");
+    expect(elbow.querySelector(".subagent-connector-elbow-active")).toBeTruthy();
   });
 
   test("does not render a heartbeat icon fallback when completed children indicator is shown", () => {
@@ -749,7 +1106,7 @@ describe("AgentListItem", () => {
       name: "question rows",
       sidebarState: createWorkspaceSidebarState({ awaitingUserQuestion: true }),
       expectedSelector: ".bg-border-pending.border-surface-sky",
-      expectedText: "Mux has a few questions",
+      expectedText: "Xum has a few questions",
     },
     {
       name: "error rows",

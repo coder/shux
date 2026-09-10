@@ -45,6 +45,7 @@ let workerFile = "tokenizer.worker.js";
 
 // Check if we're running under Bun (not Node with ts-jest)
 // ts-jest transpiles .ts files but runs them via Node, which can't load .ts workers
+// eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
 const isBun = !!(process as unknown as { isBun?: boolean }).isBun;
 
 if (isBun && extname(__filename) === ".ts") {

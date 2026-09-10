@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
+import {
+  sanitizeFallbackModelString,
+  sanitizeModelFallbacks,
+} from "@/common/utils/ai/modelFallbacks";
 import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 
 export interface ModelFallbacksState {
@@ -85,7 +87,9 @@ export function useModelFallbacks(): ModelFallbacksState {
 
   const setFallbackChain = useCallback(
     (sourceModel: string, models: string[]) => {
-      const key = normalizeToCanonical(sourceModel).trim();
+      // Coder gateway keys stay gateway-scoped (see sanitizeFallbackModelString);
+      // the editor passes metadata-aware normalized sources already.
+      const key = sanitizeFallbackModelString(sourceModel);
       if (!key) {
         return;
       }

@@ -74,7 +74,7 @@ interface StoryDef {
 }
 
 const STORIES: StoryDef[] = [
-  // README hero uses mux-demo.gif; screenshot captures start at code-review.webp.
+  // README hero uses xum-demo.gif; screenshot captures start at code-review.webp.
   {
     exportName: "CodeReview",
     storyId: `${STORY_ID_PREFIX}code-review`,

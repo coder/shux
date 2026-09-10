@@ -176,7 +176,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     const checkout = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-checkout-"));
     const subprojectPath = path.join(checkout, "packages", "app");
     await fs.mkdir(subprojectPath, { recursive: true });
-    const muxHome = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-muxhome-"));
+    const xumHome = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-muxhome-"));
 
     const pluginDir = path.join(checkout, ".mux", "plugins", "demo-plugin");
     const skillDir = path.join(pluginDir, "skills", "plugin-skill");
@@ -204,9 +204,9 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         isAgentPluginsEnabled: () => true,
         // Mirrors AIService: checkout root anchors plugin containers even though
         // the execution path is the subproject directory.
-        resolveMuxToolScopeForWorkspace: () => ({
+        resolveXumToolScopeForWorkspace: () => ({
           type: "project",
-          muxHome,
+          xumHome,
           projectRoot: subprojectPath,
           projectStorageAuthority: "host-local",
           checkoutRoot: checkout,

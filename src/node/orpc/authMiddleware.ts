@@ -112,11 +112,10 @@ export function extractCookieValues(
 
 /** Create auth middleware that validates Authorization header or session cookie from context */
 export function createAuthMiddleware(authToken?: string) {
-  if (!authToken?.trim()) {
-    return os.middleware(({ next }) => next());
-  }
-
-  const expectedToken = authToken.trim();
+  // oRPC >=1.14 no longer accepts a union of differently-typed middlewares in
+  // `.use()`, so the "no token configured" case is folded into a single
+  // middleware instead of returning a separately-typed pass-through.
+  const expectedToken = authToken?.trim();
 
   return os
     .$context<ORPCContext>()
@@ -126,6 +125,10 @@ export function createAuthMiddleware(authToken?: string) {
       },
     })
     .middleware(async ({ context, errors, next }) => {
+      if (!expectedToken) {
+        return next();
+      }
+
       const presentedToken = extractBearerToken(context.headers?.authorization);
 
       if (presentedToken && safeEq(presentedToken, expectedToken)) {

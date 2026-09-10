@@ -5,6 +5,8 @@
 import { DEFAULT_MODEL, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import { formatCompactModelDisplayName, formatModelDisplayName } from "./modelDisplay";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 
 export const defaultModel = DEFAULT_MODEL;
 
@@ -103,6 +105,22 @@ export function resolveProviderOptionsNamespaceKey(
 }
 
 /**
+ * Equality key for UI selection tracking (explicit-change origin recording,
+ * same-model warning suppression).
+ *
+ * Collapses passthrough gateway aliases to canonical identity — a persisted
+ * rewrite like mux-gateway:openai/x must still match an explicit openai:x
+ * switch — but keeps raw coder:<instance>/<model> identities distinct: the
+ * instance's TYPE (not its name) decides the upstream, so name-only
+ * canonicalization would equate a cross-typed gateway selection with an
+ * unrelated direct model and drop the switch/warning.
+ */
+export function modelSelectionEqualityKey(modelString: string): string {
+  const trimmed = modelString.trim();
+  return trimmed.startsWith("coder:") ? trimmed : normalizeToCanonical(trimmed);
+}
+
+/**
  * Normalize a selected model while preserving explicit gateway routing choices.
  * User-selected gateway identities like openrouter:openai/gpt-5 should stay intact.
  */
@@ -161,7 +179,9 @@ const OPTIONAL_VERSION_SUFFIX = String.raw`(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?`;
 const ANTHROPIC_NATIVE_1M_PATTERNS = [
   // Mythos-class models (Fable 5 / Mythos 5) ship 1M context as standard metadata.
   new RegExp(`^claude-fable-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-fable-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-mythos-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-mythos-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-8${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-7${OPTIONAL_VERSION_SUFFIX}$`, "i"),
@@ -185,8 +205,44 @@ function matchesAnthropicPattern(modelName: string, patterns: readonly RegExp[])
  * - `beta`: 1M requires Anthropic's opt-in beta header.
  * - `none`: model does not offer 1M context.
  */
-export function getAnthropic1MContextMode(modelString: string): Anthropic1MContextMode {
-  const normalized = normalizeToCanonical(modelString);
+export function getAnthropic1MContextMode(
+  modelString: string,
+  providersConfig?: Record<string, unknown> | null
+): Anthropic1MContextMode {
+  // Coder gateway instances inherit the upstream's runtime capabilities (the
+  // gateway is a transparent proxy), so map coder:<instance>/<model> through
+  // the instance's provider type before pattern-matching. This deliberately
+  // does NOT apply mappedToModel ("Treat as") overrides: treat-as targets
+  // must not confer the 1M beta onto models that cannot accept the header.
+  // With metadata available the mapping is CONCLUSIVE: an unmappable
+  // instance (cross-typed compat upstream, shadowed prefix) has no known
+  // Anthropic upstream, and falling back to name-based normalization would
+  // grant the beta to coder:anthropic/<claude> fronting a non-Anthropic
+  // upstream.
+  let capabilityModel = modelString;
+  // The beta requires the opt-in anthropic-beta HEADER, which only an
+  // Anthropic wire can carry (anthropic/bedrock instance types). A
+  // vercel/google-typed instance fronting a Claude model maps to anthropic:*
+  // for pricing/metadata but speaks openai-chat on the wire — conferring the
+  // beta would grow sessions past the model's effective non-beta limit and
+  // fail with context errors. Native 1M is standard model metadata (no
+  // header), so it is not wire-gated.
+  let wireCarriesAnthropicBeta = true;
+  if (providersConfig != null && modelString.startsWith("coder:")) {
+    const mapped = resolveCoderGatewayMetadataModel(modelString, providersConfig);
+    if (mapped == null) {
+      return "none";
+    }
+    capabilityModel = mapped;
+    const wire = resolveCoderWireCanonicalModel(
+      modelString.slice("coder:".length),
+      providersConfig.coder as
+        | { discoveredProviders?: unknown; additionalProviders?: unknown }
+        | undefined
+    );
+    wireCarriesAnthropicBeta = wire?.origin === "anthropic";
+  }
+  const normalized = normalizeToCanonical(capabilityModel);
   const [provider, modelName] = normalized.split(":", 2);
   const normalizedModelName = modelName?.toLowerCase() ?? "";
 
@@ -199,22 +255,28 @@ export function getAnthropic1MContextMode(modelString: string): Anthropic1MConte
   }
 
   if (matchesAnthropicPattern(normalizedModelName, ANTHROPIC_BETA_1M_PATTERNS)) {
-    return "beta";
+    return wireCarriesAnthropicBeta ? "beta" : "none";
   }
 
   return "none";
 }
 
 /**
- * Check if a model supports Anthropic's optional 1M beta mode used by Mux's context toggle.
+ * Check if a model supports Anthropic's optional 1M beta mode used by Xum's context toggle.
  *
  * Native long-context models like Claude Opus 4.6, Claude Sonnet 4.6, and GPT-5.5 expose
  * their larger window directly through model metadata and should not appear behind this toggle.
  */
-export function supports1MContext(modelString: string): boolean {
-  return getAnthropic1MContextMode(modelString) === "beta";
+export function supports1MContext(
+  modelString: string,
+  providersConfig?: Record<string, unknown> | null
+): boolean {
+  return getAnthropic1MContextMode(modelString, providersConfig) === "beta";
 }
 
-export function hasNative1MContext(modelString: string): boolean {
-  return getAnthropic1MContextMode(modelString) === "native";
+export function hasNative1MContext(
+  modelString: string,
+  providersConfig?: Record<string, unknown> | null
+): boolean {
+  return getAnthropic1MContextMode(modelString, providersConfig) === "native";
 }

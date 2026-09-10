@@ -14,6 +14,7 @@ import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
@@ -101,9 +102,12 @@ function getAttachmentTypes(
   return attachments.map((attachment) => attachment.type);
 }
 
+const WORKSPACE_ID = "workspace-post-compaction-test";
+
 function createSessionForHistory(historyService: HistoryService, sessionDir: string): AgentSession {
   const aiEmitter = new EventEmitter();
   const aiService: AIService = {
+    ...createStreamLifecycleMocks(),
     on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
       aiEmitter.on(String(eventName), listener);
       return this;
@@ -133,12 +137,14 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
   } as unknown as BackgroundProcessManager;
 
   const config: Config = {
+    rootDir: path.dirname(sessionDir),
+    sessionsDir: path.dirname(sessionDir),
     srcDir: "/tmp",
-    getSessionDir: mock(() => sessionDir),
+    loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 
   return new AgentSession({
-    workspaceId: "workspace-post-compaction-test",
+    workspaceId: WORKSPACE_ID,
     config,
     historyService,
     aiService,
@@ -183,7 +189,9 @@ async function writePendingPostCompactionState(args: {
   sessionDir: string;
   diffs: Array<{ path: string; diff: string; truncated: boolean }>;
   loadedSkills: LoadedSkillSnapshot[];
+  readFiles?: string[];
 }): Promise<void> {
+  await fs.mkdir(args.sessionDir, { recursive: true });
   await fs.writeFile(
     path.join(args.sessionDir, "post-compaction.json"),
     JSON.stringify({
@@ -191,14 +199,76 @@ async function writePendingPostCompactionState(args: {
       createdAt: Date.now(),
       diffs: args.diffs,
       loadedSkills: args.loadedSkills,
+      ...(args.readFiles ? { readFiles: args.readFiles } : {}),
     })
   );
+}
+
+function getReadFilePaths(attachments: PostCompactionAttachment[]): string[] {
+  const readFilesAttachment = attachments.find(
+    (
+      attachment
+    ): attachment is Extract<PostCompactionAttachment, { type: "read_files_reference" }> =>
+      attachment.type === "read_files_reference"
+  );
+  return readFilesAttachment?.paths ?? [];
 }
 
 describe("AgentSession post-compaction attachments", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
   afterEach(async () => {
     await historyCleanup?.();
+  });
+
+  test("a context boundary discards read carryover so later turns inject no pre-boundary paths", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-boundary-read-carryover");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    // A compaction persisted cumulative pre-boundary read paths...
+    await writePendingPostCompactionState({
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      diffs: [],
+      loadedSkills: [],
+      readFiles: ["/tmp/pre-boundary-read.ts"],
+    });
+
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
+    const privateSession = session as unknown as {
+      getPostCompactionAttachmentsIfNeeded: (
+        includeReadFiles: boolean
+      ) => Promise<PostCompactionAttachment[] | null>;
+    };
+    try {
+      // ...which a turn injects (guards the fixture against silent rot).
+      const injected = await privateSession.getPostCompactionAttachmentsIfNeeded(true);
+      expect(injected).not.toBeNull();
+      expect(getReadFilePaths(injected ?? [])).toEqual(["/tmp/pre-boundary-read.ts"]);
+
+      // A new context segment starts (context reset / full history clear):
+      // the reset was meant to discard that context, so...
+      await session.clearPostCompactionState();
+
+      // ...no later turn may re-inject pre-boundary paths — neither
+      // immediately from pending state nor via the periodic re-merge.
+      for (let turn = 0; turn <= TURNS_BETWEEN_ATTACHMENTS; turn++) {
+        expect(await privateSession.getPostCompactionAttachmentsIfNeeded(true)).toBeNull();
+      }
+      // The persisted pending state is discarded too, so a NEW session after
+      // an app restart cannot resurrect the carryover either.
+      const stateExists = await fs
+        .access(path.join(sessionDir.path, WORKSPACE_ID, "post-compaction.json"))
+        .then(
+          () => true,
+          () => false
+        );
+      expect(stateExists).toBe(false);
+    } finally {
+      await session.dispose();
+    }
   });
 
   test("extracts edited file diffs from the latest durable compaction boundary slice", async () => {
@@ -239,13 +309,16 @@ describe("AgentSession post-compaction attachments", () => {
       await historyService.appendToHistory(workspaceId, msg);
     }
 
-    const session = createSessionForHistory(historyService, sessionDir.path);
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
 
     try {
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-epoch-2.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -273,13 +346,16 @@ describe("AgentSession post-compaction attachments", () => {
       await historyService.appendToHistory(workspaceId, msg);
     }
 
-    const session = createSessionForHistory(historyService, sessionDir.path);
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
 
     try {
       const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent.ts", "/tmp/stale.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -293,7 +369,7 @@ describe("AgentSession post-compaction attachments", () => {
       body: "Avoid unnecessary useEffect calls.",
     });
     await writePendingPostCompactionState({
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       diffs: [
         {
           path: "/tmp/post-compaction.ts",
@@ -304,11 +380,14 @@ describe("AgentSession post-compaction attachments", () => {
       loadedSkills: [loadedSkill],
     });
     await fs.writeFile(
-      path.join(sessionDir.path, "todos.json"),
+      path.join(sessionDir.path, WORKSPACE_ID, "todos.json"),
       JSON.stringify([{ content: "Verify loaded skills", status: "in_progress" }])
     );
 
-    const session = createSessionForHistory(historyService, sessionDir.path);
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
 
     try {
       const attachments = await getImmediatePostCompactionAttachments(session);
@@ -324,7 +403,7 @@ describe("AgentSession post-compaction attachments", () => {
       );
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/post-compaction.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -351,7 +430,10 @@ describe("AgentSession post-compaction attachments", () => {
       await historyService.appendToHistory(workspaceId, msg);
     }
 
-    const session = createSessionForHistory(historyService, sessionDir.path);
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
     const loadedSkill = createLoadedSkillFixture({
       name: "react-effects",
       body: "Persist this guardrail across follow-up turns.",
@@ -365,7 +447,7 @@ describe("AgentSession post-compaction attachments", () => {
       );
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-periodic.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 
@@ -375,7 +457,7 @@ describe("AgentSession post-compaction attachments", () => {
     historyCleanup = cleanup;
 
     await writePendingPostCompactionState({
-      sessionDir: sessionDir.path,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
       diffs: [
         {
           path: "/tmp/excluded-skills.ts",
@@ -391,15 +473,18 @@ describe("AgentSession post-compaction attachments", () => {
       ],
     });
     await fs.writeFile(
-      path.join(sessionDir.path, "todos.json"),
+      path.join(sessionDir.path, WORKSPACE_ID, "todos.json"),
       JSON.stringify([{ content: "Keep todo attached", status: "pending" }])
     );
     await fs.writeFile(
-      path.join(sessionDir.path, "exclusions.json"),
+      path.join(sessionDir.path, WORKSPACE_ID, "exclusions.json"),
       JSON.stringify({ excludedItems: ["skills"] })
     );
 
-    const session = createSessionForHistory(historyService, sessionDir.path);
+    const session = createSessionForHistory(
+      historyService,
+      path.join(sessionDir.path, WORKSPACE_ID)
+    );
 
     try {
       const attachments = await getImmediatePostCompactionAttachments(session);
@@ -408,7 +493,7 @@ describe("AgentSession post-compaction attachments", () => {
       expect(getLoadedSkillNames(attachments)).toEqual([]);
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/excluded-skills.ts"]);
     } finally {
-      session.dispose();
+      await session.dispose();
     }
   });
 });

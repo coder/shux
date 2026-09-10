@@ -6,6 +6,7 @@ import type {
   EditedFilesReferenceAttachment,
   CompletedReportEntry,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import { isNestedWorkflowRun, type WorkflowRunEvent } from "@/common/types/workflow";
 import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
@@ -51,10 +52,9 @@ export class AttachmentService {
     workspaceId: string,
     runtime: Runtime
   ): Promise<PlanFileReferenceAttachment | null> {
-    const muxHome = runtime.getMuxHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, muxHome);
-    // Legacy paths only used for non-Docker runtimes (Docker has no legacy files)
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId);
+    const xumHome = runtime.getXumHome();
+    const planFilePath = getPlanFilePath(workspaceName, projectName, xumHome);
+    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
 
     // Try new path first
     try {
@@ -230,6 +230,20 @@ export class AttachmentService {
     };
   }
 
+  /**
+   * Generate the RLM read-files attachment (paths only, newest-first).
+   * Returns null when nothing was tracked; callers gate on RLM mode.
+   */
+  static generateReadFilesAttachment(readFilePaths: string[]): ReadFilesReferenceAttachment | null {
+    if (readFilePaths.length === 0) {
+      return null;
+    }
+    return {
+      type: "read_files_reference",
+      paths: readFilePaths,
+    };
+  }
+
   static generateLoadedSkillsAttachment(
     loadedSkills: LoadedSkillSnapshot[],
     excludedItems: Set<string> = new Set<string>()
@@ -259,9 +273,9 @@ export class AttachmentService {
     excludedItems: Set<string> = new Set<string>()
   ): Promise<PostCompactionAttachment[]> {
     const attachments: PostCompactionAttachment[] = [];
-    const muxHome = runtime.getMuxHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, muxHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId);
+    const xumHome = runtime.getXumHome();
+    const planFilePath = getPlanFilePath(workspaceName, projectName, xumHome);
+    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
 
     // Plan file reference (skip if excluded)
     let planRef: PlanFileReferenceAttachment | null = null;
@@ -282,7 +296,6 @@ export class AttachmentService {
       attachments.push(loadedSkillsAttachment);
     }
 
-    // Filter out excluded files
     const filteredDiffs = fileDiffs.filter((f) => !excludedItems.has(`file:${f.path}`));
 
     // Edited files reference - always filter out both new and legacy plan paths

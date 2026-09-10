@@ -1,4 +1,5 @@
-# mux server docker-compose configuration
+# Xum server docker-compose configuration
+# Legacy service/container/volume identifiers stay stable for existing automation and data.
 #
 # Quick start:
 #   docker compose up -d

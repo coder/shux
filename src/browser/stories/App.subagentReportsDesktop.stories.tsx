@@ -1,7 +1,7 @@
 /** Full-app visual coverage for sub-agent progress and terminal report presentation. */
 
 import { appMeta, AppWithMocks, PIXEL_DUAL_THEME, type AppStory } from "./meta.js";
-import { setupSubagentReportStory } from "./helpers/subagentReportStory";
+import { setupSubagentFailureStory, setupSubagentReportStory } from "./helpers/subagentReportStory";
 
 export default {
   ...appMeta,
@@ -20,4 +20,9 @@ export const Preview: AppStory = {
   },
   // Pixel captures the complete desktop composition. Production behavior is covered by
   // MessageRenderer.test.tsx because the full App can exceed the Storybook smoke-test budget.
+};
+
+export const Failures: AppStory = {
+  ...Preview,
+  render: () => <AppWithMocks setup={setupSubagentFailureStory} />,
 };

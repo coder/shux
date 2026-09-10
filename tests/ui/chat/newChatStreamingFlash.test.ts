@@ -80,19 +80,21 @@ async function createCreationHarness(options?: {
   }
 }
 
-type WorkspaceSendMessageFn = TestEnvironment["orpc"]["workspace"]["sendMessage"];
+type WorkspaceServiceSendMessage = TestEnvironment["services"]["workspaceService"]["sendMessage"];
 
+// The oRPC router client builds a fresh proxy on every property access, so an override must land
+// on the service the router handler calls into; assigning onto `env.orpc.workspace` is discarded.
 function overrideWorkspaceSendMessage(
   env: TestEnvironment,
-  override: WorkspaceSendMessageFn
+  override: (original: WorkspaceServiceSendMessage) => WorkspaceServiceSendMessage
 ): () => void {
-  const workspaceApi = env.orpc.workspace as typeof env.orpc.workspace & {
-    sendMessage: WorkspaceSendMessageFn;
+  const service = env.services.workspaceService as typeof env.services.workspaceService & {
+    sendMessage: WorkspaceServiceSendMessage;
   };
-  const originalSendMessage = workspaceApi.sendMessage;
-  workspaceApi.sendMessage = override;
+  const originalSendMessage = service.sendMessage.bind(service) as WorkspaceServiceSendMessage;
+  service.sendMessage = override(originalSendMessage);
   return () => {
-    workspaceApi.sendMessage = originalSendMessage;
+    service.sendMessage = originalSendMessage;
   };
 }
 
@@ -128,13 +130,14 @@ describe("New chat streaming flash regression", () => {
     let restoreSendMessage: () => void = () => {};
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
-        restoreSendMessage = overrideWorkspaceSendMessage(env, (async (input) => {
-          await sendGate;
-          return originalSendMessage(input);
-        }) as WorkspaceSendMessageFn);
+        restoreSendMessage = overrideWorkspaceSendMessage(
+          env,
+          (original) =>
+            (async (...args) => {
+              await sendGate;
+              return original(...args);
+            }) as WorkspaceServiceSendMessage
+        );
       },
     });
 

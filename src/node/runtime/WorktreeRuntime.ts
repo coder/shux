@@ -9,7 +9,6 @@ import type {
   WorkspaceForkResult,
 } from "./Runtime";
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
-import { runWorkspaceInitHook } from "./initHook";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { isGitRepository } from "@/node/utils/pathUtils";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
@@ -108,14 +107,7 @@ export class WorktreeRuntime extends LocalBaseRuntime {
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
-    return runWorkspaceInitHook({
-      params,
-      runtimeType: "worktree",
-      hookCheckPath: params.projectPath,
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
-        await this.runInitHook(params.workspacePath, muxEnv, initLogger, abortSignal);
-      },
-    });
+    return this.initLocalWorkspace(params, "worktree");
   }
 
   async renameWorkspace(

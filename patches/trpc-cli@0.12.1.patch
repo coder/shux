@@ -1,0 +1,50 @@
+diff --git a/dist/index.js b/dist/index.js
+index 476387edaa6d28a0d1bc6ce519fad894b0bbf154..3762c504650a52e2bd2e30580db145ddf668e1c7 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -64,7 +64,21 @@ const parseTrpcRouter = ({ router, ...params }) => {
+ // eslint-disable-next-line @typescript-eslint/no-explicit-any
+ const parseOrpcRouter = (params) => {
+     const entries = [];
+-    const { traverseContractProcedures, isProcedure } = getOrpcServerModule();
++    // xum patch: oRPC >=1.14 removed `traverseContractProcedures` and `isProcedure`
++    // from @orpc/server. Duck-type procedures by their '~orpc' definition and walk
++    // the router locally. Lazy routers are not used by xum, so lazyRoutes stays [].
++    const isProcedure = (value) => Boolean(value) && typeof value === 'object' && typeof value['~orpc'] === 'object' && typeof value['~orpc'].handler === 'function';
++    const traverseContractProcedures = ({ path, router }, visit) => {
++        for (const [key, value] of Object.entries(router)) {
++            if (!value || typeof value !== 'object')
++                continue;
++            if (isProcedure(value))
++                visit({ contract: value, path: [...path, key] });
++            else
++                traverseContractProcedures({ path: [...path, key], router: value }, visit);
++        }
++        return [];
++    };
+     const router = params.router;
+     const lazyRoutes = traverseContractProcedures({ path: [], router }, ({ contract, path }) => {
+         let procedure = params.router;
+@@ -72,7 +86,7 @@ const parseOrpcRouter = (params) => {
+             procedure = procedure[p];
+         if (!isProcedure(procedure))
+             return; // if it's contract-only, we can't run it via CLI (user may have passed an implemented contract router? should we tell them? it's undefined behaviour so kinda on them)
+-        const procedureInputsResult = parseProcedureInputs([contract['~orpc'].inputSchema], {
++        const procedureInputsResult = parseProcedureInputs([contract['~orpc'].inputSchema ?? contract['~orpc'].inputSchemas?.[0]], {
+             '@valibot/to-json-schema': params['@valibot/to-json-schema'],
+             effect: params.effect,
+         });
+diff --git a/dist/trpc-compat.d.ts b/dist/trpc-compat.d.ts
+index 9278e603fc3c71c4a2ffc6751c5423bfd57000da..8d264e2bf4f928a78a98b915a0b7eea29ee56a0a 100644
+--- a/dist/trpc-compat.d.ts
++++ b/dist/trpc-compat.d.ts
+@@ -57,6 +57,9 @@ export type OrpcProcedureLike<Ctx> = {
+     '~orpc': {
+         __initialContext?: (context: Ctx) => unknown;
+         inputSchema?: StandardSchemaV1;
++        /** xum patch: oRPC >=1.14 renamed the context brand and pluralized schemas. */
++        __TInitialContext?: (type: Ctx) => unknown;
++        inputSchemas?: StandardSchemaV1<any, any>[];
+     };
+ };
+ export type OrpcRouterLike<Ctx> = {

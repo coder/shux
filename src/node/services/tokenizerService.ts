@@ -9,6 +9,8 @@ import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailabilit
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import { log } from "./log";
+import type { AIService } from "./aiService";
+import type { ProviderService } from "./providerService";
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -33,8 +35,27 @@ export class TokenizerService {
   private latestCalcIdByWorkspace = new Map<string, number>();
   private nextCalcId = 0;
 
-  constructor(sessionUsageService: SessionUsageService) {
+  constructor(
+    sessionUsageService: SessionUsageService,
+    private readonly aiService: Pick<AIService, "getWorkspaceMetadata">,
+    private readonly providerService: Pick<ProviderService, "getConfig">
+  ) {
     this.sessionUsageService = sessionUsageService;
+  }
+
+  async calculateWorkspaceStats(input: {
+    workspaceId: string;
+    messages: MuxMessage[];
+    model: string;
+  }): Promise<ChatStats> {
+    const metadata = await this.aiService.getWorkspaceMetadata(input.workspaceId);
+    return this.calculateStats(
+      input.workspaceId,
+      input.messages,
+      input.model,
+      this.providerService.getConfig(),
+      metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null
+    );
   }
 
   /**

@@ -1,13 +1,15 @@
 import type { ProjectConfig } from "@/common/types/project";
 import { PlatformPaths } from "@/common/utils/paths";
 
-function normalizeForDescendantComparison(value: string): string {
-  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+export function normalizeForDescendantComparison(value: string): string {
+  const normalizedSeparators = value.replace(/\\/g, "/");
+  const isWindowsPath =
+    /^[a-z]:(?:\/|$)/i.test(normalizedSeparators) || normalizedSeparators.startsWith("//");
+  const normalized = normalizedSeparators.replace(/\/+$/, "");
   // Windows paths are case-insensitive, and user input / persisted config can
-  // differ in drive-letter or segment casing. Treat drive-letter paths as
-  // case-insensitive so hierarchy derivation is stable on Windows while POSIX
-  // paths keep their normal case-sensitive semantics.
-  return /^[a-z]:\//i.test(normalized) ? normalized.toLowerCase() : normalized;
+  // differ in segment casing. Detect the platform form before trimming a drive
+  // root separator so `C:/` and the dirname result `C:` stay equivalent.
+  return isWindowsPath ? normalized.toLowerCase() : normalized;
 }
 
 export function isPathDescendant(parentPath: string, candidatePath: string): boolean {

@@ -2,7 +2,7 @@ import type * as NodePty from "@lydell/node-pty";
 import type { IPty } from "@lydell/node-pty";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
-import { sanitizeMuxChildEnv, sanitizeMuxChildPath } from "./childProcessEnv";
+import { sanitizeXumChildEnv, sanitizeXumChildPath } from "./childProcessEnv";
 
 interface PtySpawnRequest {
   runtimeLabel: string;
@@ -53,12 +53,12 @@ export function resolvePathEnv(
     env.Path ??
     (process.platform === "win32" ? undefined : "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
 
-  return sanitizeMuxChildPath(basePath, env);
+  return sanitizeXumChildPath(basePath, env);
 }
 
 export function spawnPtyProcess(request: PtySpawnRequest): IPty {
   const pty = loadNodePty(request.runtimeLabel, request.preferElectronBuild);
-  const mergedEnv = sanitizeMuxChildEnv({ ...process.env, ...request.env });
+  const mergedEnv = sanitizeXumChildEnv({ ...process.env, ...request.env });
   const pathEnv = resolvePathEnv(mergedEnv, request.pathEnv);
 
   const env: NodeJS.ProcessEnv = {

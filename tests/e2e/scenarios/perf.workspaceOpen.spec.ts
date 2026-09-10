@@ -1,4 +1,5 @@
 import { electronTest as test, electronExpect as expect } from "../electronTest";
+import { getXumE2EEnv } from "../env";
 import { parseHistoryProfilesFromEnv, seedWorkspaceHistoryProfile } from "../utils/historyFixture";
 import {
   readReactProfileSnapshot,
@@ -7,8 +8,8 @@ import {
   writePerfArtifacts,
 } from "../utils/perfProfile";
 
-const shouldRunPerfScenarios = process.env.MUX_E2E_RUN_PERF === "1";
-const selectedProfiles = parseHistoryProfilesFromEnv(process.env.MUX_E2E_PERF_PROFILES);
+const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
+const selectedProfiles = parseHistoryProfilesFromEnv(getXumE2EEnv("E2E_PERF_PROFILES"));
 
 test.skip(
   ({ browserName }) => browserName !== "chromium",
@@ -16,7 +17,7 @@ test.skip(
 );
 
 test.describe("workspace open performance profiling", () => {
-  test.skip(!shouldRunPerfScenarios, "Set MUX_E2E_RUN_PERF=1 to run perf profiling scenarios");
+  test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
   for (const profile of selectedProfiles) {
     test(`perf: open workspace with ${profile} history profile`, async ({

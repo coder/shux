@@ -136,6 +136,24 @@ function parseGranularity(value: unknown): Granularity {
   return value;
 }
 
+function parseTimeZone(value: unknown): string {
+  if (value == null) {
+    return "UTC";
+  }
+
+  assert(typeof value === "string", "Analytics timeZone must be a string");
+  const timeZone = value.trim();
+  assert(timeZone.length > 0, "Analytics timeZone must not be empty");
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format();
+  } catch {
+    throw new Error(`Invalid analytics timeZone: ${timeZone}`);
+  }
+
+  return timeZone;
+}
+
 function parseTimingMetric(value: unknown): TimingMetric {
   assert(
     value === "ttft" || value === "duration" || value === "tps",
@@ -205,35 +223,60 @@ async function querySpendOverTime(
     projectPath: string | null;
     from: string | null;
     to: string | null;
+    timeZone: string;
   }
 ): Promise<SpendOverTimeRow[]> {
   const bucketExpression: Record<Granularity, string> = {
-    hour: "DATE_TRUNC('hour', to_timestamp(timestamp / 1000.0))",
-    day: "DATE_TRUNC('day', date)",
-    week: "DATE_TRUNC('week', date)",
+    hour: "DATE_TRUNC('hour', localized_timestamp)",
+    day: "CAST(calendar_date AS DATE)",
+    week: "CAST(DATE_TRUNC('week', calendar_date) AS DATE)",
   };
 
   const bucketExpr = bucketExpression[params.granularity];
   const bucketNullFilter =
-    params.granularity === "hour" ? "AND timestamp IS NOT NULL" : "AND date IS NOT NULL";
+    params.granularity === "hour"
+      ? "AND localized_timestamp IS NOT NULL"
+      : "AND calendar_date IS NOT NULL";
 
   return typedQuery(
     conn,
     `
+    WITH event_times AS (
+      SELECT
+        events.*,
+        CASE
+          WHEN timestamp IS NOT NULL THEN timezone(?, to_timestamp(timestamp / 1000.0))
+          ELSE NULL
+        END AS localized_timestamp
+      FROM events
+    ), localized_events AS (
+      SELECT
+        event_times.*,
+        COALESCE(CAST(localized_timestamp AS DATE), date) AS calendar_date
+      FROM event_times
+    )
     SELECT
       CAST(${bucketExpr} AS VARCHAR) AS bucket,
       COALESCE(model, 'unknown') AS model,
       COALESCE(SUM(total_cost_usd), 0) AS cost_usd
-    FROM events
+    FROM localized_events
     WHERE
       (? IS NULL OR project_path = ?)
-      AND (? IS NULL OR date >= CAST(? AS DATE))
-      AND (? IS NULL OR date <= CAST(? AS DATE))
+      AND (? IS NULL OR calendar_date >= CAST(? AS DATE))
+      AND (? IS NULL OR calendar_date <= CAST(? AS DATE))
       ${bucketNullFilter}
     GROUP BY 1, 2
     ORDER BY 1 ASC, 2 ASC
     `,
-    [params.projectPath, params.projectPath, params.from, params.from, params.to, params.to],
+    [
+      params.timeZone,
+      params.projectPath,
+      params.projectPath,
+      params.from,
+      params.from,
+      params.to,
+      params.to,
+    ],
     SpendOverTimeRowSchema
   );
 }
@@ -588,6 +631,7 @@ export async function executeNamedQuery(
         projectPath: parseOptionalString(params.projectPath),
         from: parseDateFilter(params.from),
         to: parseDateFilter(params.to),
+        timeZone: parseTimeZone(params.timeZone),
       });
     }
 

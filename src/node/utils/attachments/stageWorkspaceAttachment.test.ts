@@ -256,10 +256,10 @@ describe("stageWorkspaceAttachment", () => {
 
   test("extracts current and legacy staged attachment paths from persisted text", () => {
     const text =
-      "before `.mux/user-attachments/one/notes.md` middle `.mux/user-attachments/two/data.csv` legacy `.mux/user-attachments/three/ARCHIVE.ZIP` after";
+      "before `.xum/user-attachments/one/notes.md` middle `.mux/user-attachments/two/data.csv` legacy `.mux/user-attachments/three/ARCHIVE.ZIP` after";
 
     expect(extractStagedAttachmentPathsFromText(text)).toEqual([
-      ".mux/user-attachments/one/notes.md",
+      ".xum/user-attachments/one/notes.md",
       ".mux/user-attachments/two/data.csv",
       ".mux/user-attachments/three/ARCHIVE.ZIP",
     ]);

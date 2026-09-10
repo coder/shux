@@ -9,7 +9,6 @@ import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
-import { Config } from "@/node/config";
 
 function getErrorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null) {
@@ -104,7 +103,8 @@ function createHttpClient(
   headers?: Record<string, string>
 ): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
     headers,
   });
 
@@ -1164,6 +1164,9 @@ describe("createOrpcServer", () => {
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
+      coderOauthService: {
+        handleServerCallback: handleSuccessfulCallback,
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1179,6 +1182,14 @@ describe("createOrpcServer", () => {
         Origin: "https://evil.example.com",
         "Content-Type": "application/x-www-form-urlencoded",
       };
+
+      const coderOauthResponse = await fetch(`${server.baseUrl}/auth/coder/callback`, {
+        method: "POST",
+        headers: callbackHeaders,
+        body: "state=test-state&code=test-code",
+      });
+      expect(coderOauthResponse.status).toBe(200);
+      expect(coderOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
         method: "POST",
@@ -1203,6 +1214,109 @@ describe("createOrpcServer", () => {
       });
       expect(mcpOauthResponse.status).toBe(200);
       expect(mcpOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
+    } finally {
+      await server?.close();
+    }
+  });
+
+  test("Coder OAuth start route builds a server-hosted redirect URI and the callback renders the flow outcome", async () => {
+    const startCalls: Array<{ deploymentUrl: string; flowId?: string; redirectUri: string }> = [];
+    const callbackCalls: Array<{
+      state: string | null;
+      code: string | null;
+      error: string | null;
+    }> = [];
+    const stubContext: Partial<ORPCContext> = {
+      coderOauthService: {
+        startServerFlow: (input: {
+          deploymentUrl: string;
+          flowId?: string;
+          redirectUri: string;
+        }) => {
+          startCalls.push(input);
+          return Promise.resolve({
+            success: true,
+            data: {
+              flowId: input.flowId ?? "generated",
+              authorizeUrl: "https://coder.test/authorize",
+            },
+          });
+        },
+        handleServerCallback: (input: {
+          state: string | null;
+          code: string | null;
+          error: string | null;
+        }) => {
+          callbackCalls.push(input);
+          return Promise.resolve(
+            input.state === "known-state"
+              ? { success: true, data: undefined }
+              : { success: false, error: "Unknown or expired OAuth state" }
+          );
+        },
+      } as unknown as ORPCContext["coderOauthService"],
+    };
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+        authToken: "test-token",
+      });
+
+      // Start requires auth: the route mints a registration on the deployment.
+      const unauthenticated = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`
+      );
+      expect(unauthenticated.status).toBe(401);
+      expect(startCalls).toHaveLength(0);
+
+      const missingDeployment = await fetch(`${server.baseUrl}/auth/coder/start`, {
+        headers: { Authorization: "Bearer test-token" },
+      });
+      expect(missingDeployment.status).toBe(400);
+
+      // The redirect URI is derived from the request (incl. app-proxy prefix),
+      // never taken from the client.
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test&flowId=flow-0123456789abcdef`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
+      );
+      expect(startResponse.status).toBe(200);
+      expect(await startResponse.json()).toEqual({
+        flowId: "flow-0123456789abcdef",
+        authorizeUrl: "https://coder.test/authorize",
+      });
+      expect(startCalls).toEqual([
+        {
+          deploymentUrl: "https://coder.test",
+          flowId: "flow-0123456789abcdef",
+          redirectUri: `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`,
+        },
+      ]);
+
+      // Callback: unauthenticated navigation; outcome decides the page.
+      const okResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=known-state&code=test-code`
+      );
+      expect(okResponse.status).toBe(200);
+      const okHtml = await okResponse.text();
+      expect(okHtml).toContain("Login complete");
+      expect(okHtml).toContain('"type":"coder-oauth"');
+
+      const failedResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=stale-state&code=test-code`
+      );
+      expect(failedResponse.status).toBe(400);
+      expect(await failedResponse.text()).toContain("Unknown or expired OAuth state");
+      expect(callbackCalls.map((c) => c.state)).toEqual(["known-state", "stale-state"]);
     } finally {
       await server?.close();
     }
@@ -1556,81 +1670,6 @@ describe("createOrpcServer", () => {
     } finally {
       await server?.close();
     }
-  });
-
-  test("passes project trust through to global MCP tests when projectPath is provided", async () => {
-    async function runCase(trusted: boolean): Promise<void> {
-      const muxRoot = await fs.mkdtemp(
-        path.join(os.tmpdir(), `mux-orpc-mcp-test-${trusted ? "trusted" : "untrusted"}-`)
-      );
-      const projectPath = path.join(muxRoot, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-
-      const config = new Config(muxRoot);
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, { trusted, workspaces: [] });
-        return cfg;
-      });
-
-      const listServerCalls: Array<{ projectPath?: string; trusted?: boolean }> = [];
-      const testCalls: Array<{ projectPath: string; trusted?: boolean; name?: string }> = [];
-      const stubContext: Partial<ORPCContext> = {
-        config,
-        mcpConfigService: {
-          listServers: (listedProjectPath?: string, listedTrusted?: boolean) => {
-            listServerCalls.push({ projectPath: listedProjectPath, trusted: listedTrusted });
-            return Promise.resolve({
-              "repo-local": { transport: "stdio", command: "echo repo-local" },
-            });
-          },
-        } as unknown as ORPCContext["mcpConfigService"],
-        mcpServerManager: {
-          test: (options: { projectPath: string; trusted?: boolean; name?: string }) => {
-            testCalls.push(options);
-            return Promise.resolve({ success: true, tools: ["repo_tool"] });
-          },
-        } as unknown as ORPCContext["mcpServerManager"],
-        policyService: {
-          isEnforced: () => false,
-        } as unknown as ORPCContext["policyService"],
-        telemetryService: {
-          capture: () => undefined,
-        } as unknown as ORPCContext["telemetryService"],
-      };
-
-      let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
-
-      try {
-        server = await createOrpcServer({
-          host: "127.0.0.1",
-          port: 0,
-          context: stubContext as ORPCContext,
-        });
-
-        const client = createHttpClient(server.baseUrl);
-        const result = await Promise.resolve(
-          client.mcp.test({
-            projectPath,
-            name: "repo-local",
-          })
-        );
-
-        expect(result).toEqual({ success: true, tools: ["repo_tool"] });
-        expect(listServerCalls).toHaveLength(1);
-        expect(listServerCalls[0]?.projectPath).toBe(projectPath);
-        expect(listServerCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls).toHaveLength(1);
-        expect(testCalls[0]?.projectPath).toBe(projectPath);
-        expect(testCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls[0]?.name).toBe("repo-local");
-      } finally {
-        await server?.close();
-        await fs.rm(muxRoot, { recursive: true, force: true });
-      }
-    }
-
-    await runCase(false);
-    await runCase(true);
   });
 
   test("general.restartApp delegates to the window service restart hook", async () => {

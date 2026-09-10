@@ -34,7 +34,7 @@ import type {
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
-import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
+import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -652,8 +652,8 @@ export class SSHRuntime extends RemoteRuntime {
    *   early-return path in `unpack()`. The same lesson was never applied
    *   to the promisor path added three years later.
    *
-   *   Mux never deliberately turns the shared base repo into a partial
-   *   clone, but legacy bare repos populated by earlier Mux versions, or
+   *   Xum never deliberately turns the shared base repo into a partial
+   *   clone, but legacy bare repos populated by earlier Xum versions, or
    *   by user-initiated `git fetch --filter` runs on the remote, can
    *   carry these keys. Stripping them makes `repo_has_promisor_remote()`
    *   return false, routing `check_connected()` through the slow rev-list
@@ -1943,7 +1943,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<void> {
     // Snapshot markers stay deterministic, but the uploaded bundle itself must use
-    // a per-attempt temp path so concurrent Mux processes do not stream into the same file.
+    // a per-attempt temp path so concurrent Xum processes do not stream into the same file.
     const remoteBundlePath = path.posix.join(
       "~/.mux-bundles",
       layout.projectId,
@@ -2505,18 +2505,18 @@ export class SSHRuntime extends RemoteRuntime {
     return runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
-      hookCheckPath: params.projectPath,
+      findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
       beforeHook: async () => {
         await this.prepareWorkspaceCheckout(params, nhp);
       },
-      runHook: async ({ muxEnv, initLogger, abortSignal }) => {
+      runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
         // Expand tilde in hook path (quoted paths don't auto-expand on remote).
-        const hookPath = expandTildeForSSH(`${params.workspacePath}/.mux/init`);
+        const hookPath = expandTildeForSSH(`${params.workspacePath}/${hookRelativePath}`);
         await runInitHookOnRuntime(
           this,
           hookPath,
           params.workspacePath,
-          muxEnv,
+          xumEnv,
           initLogger,
           abortSignal
         );
@@ -3368,7 +3368,7 @@ export class SSHRuntime extends RemoteRuntime {
         // Skip protected trunk branch names to avoid accidental deletion.
         const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
         if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
-          // HEAD neutralization migrates legacy *Mux-owned* base repos whose
+          // HEAD neutralization migrates legacy *Xum-owned* base repos whose
           // HEAD still points at a user branch (the Graphite-poisoning state)
           // so `branch -D` keeps Git's native checked-out-branch guard instead
           // of refusing because the bare repo "has the branch checked out".

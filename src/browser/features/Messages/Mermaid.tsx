@@ -3,7 +3,9 @@ import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import mermaid from "mermaid";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 
 const MIN_HEIGHT = 300;
 const DEFAULT_ZOOM = 1;
@@ -11,7 +13,6 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
 
-// Initialize mermaid
 mermaid.initialize({
   startOnLoad: false,
   theme: "dark",
@@ -219,6 +220,7 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
 }) => {
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
@@ -284,8 +286,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const modalContainerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [svg, setSvg] = useState<string>("");
-  const lastValidSvgRef = useRef<string>("");
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
+    null
+  );
+  const svg = renderedDiagram?.svg ?? "";
   const stableId = useId();
 
   // Debounce chart changes to avoid flickering during streaming
@@ -339,8 +344,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           throw new Error("Mermaid returned invalid SVG output");
         }
 
-        lastValidSvgRef.current = sanitizedSvg;
-        setSvg(sanitizedSvg);
+        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -385,7 +389,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   // Keep one stable diagram frame while streaming or while the async Mermaid render is pending.
   // When no SVG has rendered yet, reserve the normal minimum diagram height so the transcript
   // doesn't expand from a short placeholder to a full diagram after debounce/parse/render.
-  const displaySvg = svg || (isStreaming ? lastValidSvgRef.current : "");
+  const displaySvg = svg;
   const showPendingPlaceholder = !displaySvg;
 
   return (
@@ -426,6 +430,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         </div>
         <div
           className="mermaid-container"
+          ref={(element) => {
+            if (!element) return;
+            if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
+            else transcriptMermaidSources.delete(element);
+          }}
           style={{
             maxWidth: "70%",
             margin: "0 auto",

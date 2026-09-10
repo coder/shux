@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { WorkflowRunStore } from "./WorkflowRunStore";
+import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
 
 const definition = {
   name: "deep-research",
@@ -46,6 +46,52 @@ describe("WorkflowRunStore", () => {
     expect(run.source).toBe(source);
     expect(run.sourceHash).toMatch(/^sha256:/);
     expect(run.events.map((event) => event.sequence)).toEqual([1]);
+  });
+
+  test("never persists a hydrated phaseManifest into run.json (store boundary)", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-phase-manifest-boundary");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path, staleLeaseMs: 10 });
+    // Simulate a hydrated outbound descriptor accidentally fed back into a write.
+    await store.createRun({
+      id: "wfr_manifest",
+      workspaceId: "workspace-1",
+      workflow: {
+        ...definition,
+        phaseManifest: { provenance: "declared", phases: [{ name: "scope" }] },
+      },
+      source,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+
+    const rawRunFile = await fs.readFile(
+      path.join(tmp.path, "workflows", "wfr_manifest", "run.json"),
+      "utf-8"
+    );
+    expect(rawRunFile).not.toContain("phaseManifest");
+    // Reads return the stored (non-hydrated) descriptor.
+    const run = await store.getRun("wfr_manifest");
+    expect(run.workflow.phaseManifest).toBeUndefined();
+  });
+
+  test("a malformed persisted phaseManifest never makes run.json unreadable", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-malformed-manifest");
+    const store = await createStore(tmp.path);
+    const runFile = path.join(tmp.path, "workflows", "wfr_123", "run.json");
+    const currentRun = JSON.parse(await fs.readFile(runFile, "utf-8")) as {
+      workflow: Record<string, unknown>;
+    };
+    // Derived data with an invalid shape (hand-edited / corrupted): stripped before
+    // schema validation, so the durable run still loads and lists.
+    currentRun.workflow.phaseManifest = { provenance: "bogus", phases: "not-an-array" };
+    await fs.writeFile(runFile, JSON.stringify(currentRun, null, 2), "utf-8");
+
+    const run = await store.getRun("wfr_123");
+    expect(run.workflow.phaseManifest).toBeUndefined();
+    expect(run.id).toBe("wfr_123");
+    expect((await store.listRunStatusSnapshots()).map((snapshot) => snapshot.id)).toContain(
+      "wfr_123"
+    );
   });
 
   test("loads legacy workflow source snapshot filenames", async () => {
@@ -627,5 +673,24 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
+  });
+});
+
+describe("isPathSafeWorkspaceId", () => {
+  test("accepts single-segment ids and rejects traversal attempts", () => {
+    expect(isPathSafeWorkspaceId("workspace-1")).toBe(true);
+    for (const unsafe of [
+      "",
+      ".",
+      "..",
+      "../evil",
+      "..\\evil",
+      "a/../b",
+      "nested/dir",
+      "/absolute",
+      "C:\\sessions",
+    ]) {
+      expect(isPathSafeWorkspaceId(unsafe)).toBe(false);
+    }
   });
 });

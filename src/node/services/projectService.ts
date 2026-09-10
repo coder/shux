@@ -1,5 +1,6 @@
-import type { Config, ProjectConfig } from "@/node/config";
+import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
+import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
@@ -15,6 +16,8 @@ import type { Secret } from "@/common/types/secrets";
 import type { Stats } from "fs";
 import * as fsPromises from "fs/promises";
 import { execFileAsync, killProcessTree } from "@/node/utils/disposableExec";
+import { normalizeRepoUrlForClone } from "@/node/utils/gitUrls";
+import { GIT_SCOPE_ENV_UNSET } from "@/node/services/backup/credentials";
 import {
   buildFileCompletionsIndex,
   EMPTY_FILE_COMPLETIONS_INDEX,
@@ -27,18 +30,36 @@ import { createMediatedAskpassSession } from "@/node/runtime/openSshPromptMediat
 import {
   classifySshCloneFailure,
   summarizeCloneStderr,
+  withCloneReadAccessHint,
   type CloneErrorCode,
 } from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
-import { getMuxProjectsDir } from "@/common/constants/paths";
+import { getXumProjectsDir } from "@/common/constants/paths";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { getErrorMessage } from "@/common/utils/errors";
 import { deriveProjectHierarchy, isPathDescendant } from "@/common/utils/subProjects";
-import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
+import {
+  getProjectWorkspaceCounts,
+  type ProjectWorkspaceCounts,
+} from "@/common/utils/projectRemoval";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { z } from "zod";
+import { ORPCError } from "@orpc/server";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import {
+  type ProjectRegistrationLockHandle,
+  withProjectRegistrationFileLock,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -132,6 +153,10 @@ interface WorkspaceRemover {
   remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
 }
 
+interface WorkspaceMetadataRefresher {
+  refreshAndEmitMetadata(workspaceId: string): Promise<void>;
+}
+
 function isTildePrefixedPath(value: string): boolean {
   return value === "~" || value.startsWith("~/") || value.startsWith("~\\");
 }
@@ -145,7 +170,7 @@ function resolveProjectParentDir(
   parentDir: string | null | undefined,
   defaultProjectDir: string | undefined
 ): string {
-  const rawParentDir = parentDir ?? defaultProjectDir ?? getMuxProjectsDir();
+  const rawParentDir = parentDir ?? defaultProjectDir ?? getXumProjectsDir();
   const trimmedParentDir = rawParentDir.trim();
 
   if (!trimmedParentDir) {
@@ -226,52 +251,6 @@ function deriveRepoFolderName(repoUrl: string): string {
   return safeFolderName;
 }
 
-const GITHUB_SHORTHAND_PATTERN = /^[a-zA-Z0-9][\w-]*\/[a-zA-Z0-9][\w.-]*$/;
-
-function hasLikelySshCredentials(): boolean {
-  const sshAgentSocket = process.env.SSH_AUTH_SOCK;
-  // Be conservative: only prefer git@github.com shorthand when the session has an active
-  // SSH agent. The mere presence of local key files does not imply GitHub SSH access.
-  return typeof sshAgentSocket === "string" && sshAgentSocket.trim().length > 0;
-}
-
-/**
- * Normalize a repo URL so git clone receives a valid remote.
- * Expands "owner/repo" shorthand to either SSH or HTTPS based on likely local credentials.
- * All other inputs (HTTPS URLs, SSH URLs, SCP-style, etc.) pass through unchanged.
- */
-function normalizeRepoUrlForClone(repoUrl: string): string {
-  const trimmedRepoUrl = repoUrl.trim();
-  const shorthandCandidate = trimmedRepoUrl.replace(/[\\/]+$/, "");
-
-  // owner/repo shorthand: exactly two non-empty segments separated by a single slash,
-  // where the first segment looks like a GitHub username (letters, digits, hyphens).
-  // Excludes local paths like ../repo, ./foo, foo/bar/baz, and absolute paths.
-  // Note: bare `foo/bar` style local relative paths are intentionally treated as GitHub
-  // shorthand here because this function is only called from the Clone dialog, which is
-  // specifically for remote repos. Users cloning local repos should use the "Local folder" tab.
-  if (GITHUB_SHORTHAND_PATTERN.test(shorthandCandidate)) {
-    // Strip existing .git suffix before appending to avoid double .git (e.g. owner/repo.git → owner/repo.git.git)
-    const withoutGitSuffix = shorthandCandidate.replace(/\.git$/i, "");
-
-    // Prefer SSH for shorthand only when the current session has an active SSH agent.
-    // This avoids assuming GitHub access from unrelated key files on disk.
-    if (hasLikelySshCredentials()) {
-      return `git@github.com:${withoutGitSuffix}.git`;
-    }
-
-    return `https://github.com/${withoutGitSuffix}.git`;
-  }
-
-  // Strip query strings and fragments only from URL-like inputs (protocol:// or git@),
-  // not from local paths where # and ? may be valid filename characters.
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmedRepoUrl) || trimmedRepoUrl.startsWith("git@")) {
-    return trimmedRepoUrl.replace(/[?#].*$/, "");
-  }
-
-  return trimmedRepoUrl;
-}
-
 function parseScpStyleSshUrl(url: string): { host: string } | undefined {
   const trimmedUrl = url.trim();
 
@@ -293,9 +272,6 @@ function parseScpStyleSshUrl(url: string): { host: string } | undefined {
 
   return { host: scpLikeMatch[1] };
 }
-
-/** Protocol schemes that Git routes through SSH transport. */
-const SSH_PROTOCOL_SCHEMES = new Set(["ssh:", "git+ssh:", "ssh+git:"]);
 
 type CloneTransport =
   | { kind: "ssh"; hostname: string; port: number }
@@ -419,19 +395,36 @@ function hasRegisteredSubProjectAncestor(
 
 export class ProjectService {
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
+  /** Canonical paths with git initialization in flight; see create() claim below. */
+  private readonly activeGitInits = new Set<string>();
+  private activeClones = 0;
+  private shuttingDown = false;
   private directoryPicker?: (initialPath?: string | null) => Promise<string | null>;
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
+  private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
+  private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
 
   constructor(
     private readonly config: Config,
-    sshPromptService?: SshPromptService
+    sshPromptService?: SshPromptService,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     this.sshPromptService = sshPromptService;
   }
 
   setWorkspaceService(workspaceService: WorkspaceRemover): void {
     this.workspaceService = workspaceService;
+  }
+
+  setWorkspaceMetadataRefresher(workspaceService: WorkspaceMetadataRefresher): void {
+    this.workspaceMetadataRefresher = workspaceService;
+  }
+
+  setMcpServerManager(
+    mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
+  ): void {
+    this.mcpServerManager = mcpServerManager;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -444,8 +437,48 @@ export class ProjectService {
   }
 
   async create(
-    projectPath: string
+    projectPath: string,
+    options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    // No registration lock around the validation: it stats, resolves, and reads git roots
+    // along the new path, which on a slow or unavailable filesystem can take as long as the
+    // lock's wait bound — and every config save in every process waits for that lock, so
+    // holding it here would stall unrelated workspace, task, and settings saves behind one
+    // stuck create. createUnlocked takes the lock itself around what mutates state (a git
+    // init, the registering write) and re-validates under it; withRegistrationLock callers
+    // pass the window they already hold.
+    return this.createUnlocked(projectPath, options, null);
+  }
+
+  /**
+   * Registration held stable — no project can be registered or removed underneath `fn` —
+   * with a `create` that registers inside that window and the lock's own ownership check.
+   * A backup import resolves its target's identity, registers it when needed, and writes its
+   * memory within one such window, so the project it wrote into is the project registered
+   * when it reports success.
+   */
+  withRegistrationLock<T>(
+    fn: (registrar: {
+      create: ProjectService["create"];
+      assertStillOwned: ProjectRegistrationLockHandle["assertStillOwned"];
+    }) => Promise<T>
+  ): Promise<T> {
+    return withProjectRegistrationLock(this.config.rootDir, (lock) =>
+      fn({
+        create: (projectPath, options) => this.createUnlocked(projectPath, options, lock),
+        assertStillOwned: () => lock.assertStillOwned(),
+      })
+    );
+  }
+
+  /** `lock`: the caller's registration window, or null to open one for the mutating steps. */
+  private async createUnlocked(
+    projectPath: string,
+    options: { initGit?: boolean; displayName?: string } | undefined,
+    lock: ProjectRegistrationLockHandle | null
+  ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
+    let gitInitClaimKey: string | null = null;
     try {
       // Validate input
       if (!projectPath || projectPath.trim().length === 0) {
@@ -453,7 +486,7 @@ export class ProjectService {
       }
 
       // Resolve the path:
-      // - Bare names like "my-project" → ~/.mux/projects/my-project
+      // - Bare names like "my-project" → ~/.xum/projects/my-project
       // - Paths with ~ → expand to home directory
       // - Absolute/relative paths → resolve normally
       const isBareProjectName =
@@ -473,7 +506,7 @@ export class ProjectService {
         projectPath.startsWith("~/") ||
         projectPath.startsWith("~\\")
       ) {
-        // Tilde expansion - uses expandTilde to respect MUX_ROOT for ~/.mux paths
+        // Tilde expansion - uses expandTilde to respect MUX_ROOT for ~/.xum paths
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
@@ -497,31 +530,84 @@ export class ProjectService {
         return Err("Project path is not a directory");
       }
 
+      if (options?.initGit && existingStat) {
+        const entries = await fsPromises.readdir(normalizedPath);
+        if (entries.length > 0) {
+          return Err("Directory already exists and is not empty");
+        }
+      }
+
       if (config.projects.has(normalizedPath)) {
         return Err("Project already exists");
       }
 
-      const createdDirectory = existingStat == null;
-      const cleanupCreatedDirectory = async () => {
-        if (!createdDirectory) return;
+      // Create the directory if it doesn't exist. The non-recursive mkdir on the leaf is
+      // an exclusive ownership claim: only the call that actually created the directory
+      // may remove it later, so concurrent creates of the same absent path cannot delete
+      // each other's work. Keep the user-facing path stable in config; Windows realpath
+      // may expand 8.3 short names and surprise callers.
+      let createdDirectory = false;
+      if (existingStat == null) {
         try {
-          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+          await fsPromises.mkdir(path.dirname(normalizedPath), { recursive: true });
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          // Recursive mkdir never rejects an existing directory, so EEXIST here means a
+          // path component exists as a file: report it like ENOTDIR ("not a folder").
+          const friendly = friendlyFsError(
+            err.code === "EEXIST" ? { ...err, code: "ENOTDIR" } : error,
+            "create folder",
+            normalizedPath
+          );
+          if (friendly) {
+            return Err(friendly);
+          }
+          throw error;
+        }
+        try {
+          await fsPromises.mkdir(normalizedPath);
+          createdDirectory = true;
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code !== "EEXIST") {
+            const friendly = friendlyFsError(error, "create folder", normalizedPath);
+            if (friendly) {
+              return Err(friendly);
+            }
+            throw error;
+          }
+          // Lost a creation race: the path now belongs to the concurrent winner, so
+          // re-validate it as a pre-existing entry instead of claiming ownership.
+          const raceStat = await fsPromises.stat(normalizedPath).catch(() => null);
+          if (!raceStat?.isDirectory()) {
+            return Err("Project path is not a directory");
+          }
+          // Never git-init a directory that appeared mid-call: the winner may still be
+          // initializing it, and interleaved git operations could corrupt or delete its
+          // work. A retry sees the directory as pre-existing and validates it normally.
+          if (options?.initGit) {
+            return Err("Directory already exists");
+          }
+        }
+      }
+
+      let initializedGitDir = false;
+      const cleanupCreatedDirectory = async () => {
+        try {
+          if (createdDirectory) {
+            await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+          } else if (initializedGitDir) {
+            // We only initialized git inside a pre-existing directory: remove the .git
+            // we created so a retry does not hit the non-empty-directory rejection.
+            await fsPromises.rm(path.join(normalizedPath, ".git"), {
+              recursive: true,
+              force: true,
+            });
+          }
         } catch (error) {
           log.error(`Failed to clean up rejected project directory ${normalizedPath}:`, error);
         }
       };
-
-      // Create the directory if it doesn't exist (like mkdir -p). Keep the user-facing
-      // path stable in config; Windows realpath may expand 8.3 short names and surprise callers.
-      try {
-        await fsPromises.mkdir(normalizedPath, { recursive: true });
-      } catch (error) {
-        const friendly = friendlyFsError(error, "create folder", normalizedPath);
-        if (friendly) {
-          return Err(friendly);
-        }
-        throw error;
-      }
       const canonicalPath = await resolveRealProjectPath(normalizedPath);
 
       if (config.projects.has(canonicalPath)) {
@@ -536,6 +622,17 @@ export class ProjectService {
       }
 
       const parentProjectPath = findDeepestTopLevelParentProject(normalizedPath, config.projects);
+      // Initializing a nested repository would flip the new directory's git root after
+      // the same-repository validation below, persisting a sub-project from a different
+      // repository (mirrors the clone-into-project-tree rejection). Check the canonical
+      // path too so a symlinked alias into a registered checkout cannot bypass this.
+      if (
+        options?.initGit &&
+        (parentProjectPath ?? findDeepestTopLevelParentProject(canonicalPath, config.projects))
+      ) {
+        await cleanupCreatedDirectory();
+        return Err("Cannot create a new git repository inside an existing project");
+      }
       if (parentProjectPath) {
         const [parentGitRoot, subProjectGitRoot] = await Promise.all([
           readGitTopLevel(parentProjectPath),
@@ -563,85 +660,225 @@ export class ProjectService {
         }
       }
 
-      // Register the project inside the serialized editConfig transform, re-checking for
-      // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
-      // snapshot would clobber concurrent config edits (lost-update race). The async
-      // validations above (git roots, sub-project depth) ran against the snapshot; the
-      // transform only re-resolves state that a concurrent edit could have changed.
-      let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
-        Err("Project already exists");
-      // Distinguishes in-transform failures for directory cleanup: when a concurrent
-      // call registered this same path ("duplicate"), the directory belongs to that
-      // winner and must not be deleted; other rejections leave the directory ours.
-      let transformFailure:
-        | "duplicate"
-        | "depth"
-        | "hierarchy-changed"
-        | "hierarchy-changed-descendant"
-        | null = null;
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
-          transformFailure = "duplicate";
-          createResult = Err("Project already exists");
-          return freshConfig;
-        }
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
-        // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
-        // can introduce a sub-project ancestor that the snapshot-time check missed,
-        // which would persist a second-level sub-project.
-        if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
-          transformFailure = "depth";
-          createResult = Err("Sub-projects can only be one level deep");
-          return freshConfig;
-        }
-        const freshParentProjectPath = findDeepestTopLevelParentProject(
-          normalizedPath,
-          freshConfig.projects
-        );
-        // The same-git-repository validations above ran against the snapshot hierarchy
-        // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
-        // If a concurrent edit introduced a different parent or new descendants, those
-        // were never git-validated — reject instead of persisting an unvalidated
-        // hierarchy (e.g. a sub-project from a different git repository).
-        const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
-          (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
-        );
-        const hasNewDescendantProject = freshDescendantProjectPaths.some(
-          (candidatePath) => !descendantProjectPaths.includes(candidatePath)
-        );
-        if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
-          // A new descendant registered under this path claims the directory tree we
-          // created: recursive cleanup would delete that project's checkout, so treat
-          // it like the duplicate case and leave the directory alone.
-          transformFailure = hasNewDescendantProject
-            ? "hierarchy-changed-descendant"
-            : "hierarchy-changed";
-          createResult = Err("Project hierarchy changed concurrently; please retry");
-          return freshConfig;
-        }
-        const projectConfig: ProjectConfig = {
-          workspaces: [],
-          parentProjectPath: freshParentProjectPath ?? undefined,
-        };
-        freshConfig.projects.set(normalizedPath, projectConfig);
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        createResult = Ok({ projectConfig, normalizedPath });
-        return freshConfig;
-      });
+      // From here on the request mutates state — a git init into the directory, the
+      // registering write — so it runs under the registration lock: the window a
+      // withRegistrationLock caller holds, or one opened here. The read-only validation above
+      // stayed outside it (see create).
+      const register = async (
+        lock: ProjectRegistrationLockHandle
+      ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> => {
+        if (options?.initGit) {
+          // The project set as it is under the lock, before anything is written into the
+          // directory: registered meanwhile — a settings-backup import into this same empty
+          // directory, say — it is the winner's now, and this request fails as the duplicate
+          // it is without having initialized a repository inside the winner's checkout only
+          // to roll it back again.
+          const current = this.config.loadConfigOrDefault();
+          if (current.projects.has(normalizedPath) || current.projects.has(canonicalPath)) {
+            return Err("Project already exists");
+          }
+          // Exclusive per-canonical-path claim: two initGit creates targeting the same
+          // pre-existing empty directory would otherwise interleave git init and failure
+          // rollback, letting one call delete the .git the other just initialized.
+          if (this.activeGitInits.has(canonicalPath)) {
+            return Err("Another project creation is already initializing this directory");
+          }
+          this.activeGitInits.add(canonicalPath);
+          gitInitClaimKey = canonicalPath;
 
-      // Do NOT clean up the created directory when a concurrent registration claims
-      // it: a duplicate owns this exact path, and a new descendant project lives
-      // inside the tree we created — recursive removal would destroy the winner's
-      // checkout either way (including files created after its call returned). Only
-      // depth and parent-only hierarchy rejections leave the directory ours to remove.
-      if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
-        await cleanupCreatedDirectory();
-      }
-      return createResult;
+          const gitInitResult = await this.initializeGitRepository(normalizedPath);
+          if (!gitInitResult.success) {
+            await cleanupCreatedDirectory();
+            return gitInitResult;
+          }
+          initializedGitDir = gitInitResult.data.initializedGitDir;
+        }
+
+        // Register the project inside the serialized editConfig transform, re-checking for
+        // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
+        // snapshot would clobber concurrent config edits (lost-update race). The async
+        // validations above (git roots, sub-project depth) ran against the snapshot; the
+        // transform only re-resolves state that a concurrent edit could have changed.
+        let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
+          Err("Project already exists");
+        // Distinguishes in-transform failures for directory cleanup: when a concurrent
+        // call registered this same path ("duplicate"), the directory belongs to that
+        // winner and must not be deleted; other rejections leave the directory ours.
+        let transformFailure:
+          | "duplicate"
+          | "depth"
+          | "hierarchy-changed"
+          | "hierarchy-changed-descendant"
+          | null = null;
+        // The .git this request initialized is never the winner's to keep (see below).
+        const removeInitializedGitDir = () =>
+          fsPromises
+            .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+            .catch((cleanupError: unknown) => {
+              log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+            });
+        const registerEdit = (freshConfig: ProjectsConfig): ProjectsConfig => {
+          if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
+            transformFailure = "duplicate";
+            createResult = Err("Project already exists");
+            return freshConfig;
+          }
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
+          // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
+          // can introduce a sub-project ancestor that the snapshot-time check missed,
+          // which would persist a second-level sub-project.
+          if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
+            transformFailure = "depth";
+            createResult = Err("Sub-projects can only be one level deep");
+            return freshConfig;
+          }
+          const freshParentProjectPath = findDeepestTopLevelParentProject(
+            normalizedPath,
+            freshConfig.projects
+          );
+          // The same-git-repository validations above ran against the snapshot hierarchy
+          // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
+          // If a concurrent edit introduced a different parent or new descendants, those
+          // were never git-validated — reject instead of persisting an unvalidated
+          // hierarchy (e.g. a sub-project from a different git repository).
+          const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
+            (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
+          );
+          const hasNewDescendantProject = freshDescendantProjectPaths.some(
+            (candidatePath) => !descendantProjectPaths.includes(candidatePath)
+          );
+          // Re-check the canonical parent for initGit: the snapshot-time rejection above
+          // can miss a parent registered concurrently, and the lexical freshParent check
+          // below cannot see it when this path reaches the checkout through a symlink.
+          if (
+            options?.initGit &&
+            findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
+          ) {
+            transformFailure = "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
+            // A new descendant registered under this path claims the directory tree we
+            // created: recursive cleanup would delete that project's checkout, so treat
+            // it like the duplicate case and leave the directory alone.
+            transformFailure = hasNewDescendantProject
+              ? "hierarchy-changed-descendant"
+              : "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          const projectConfig: ProjectConfig = {
+            workspaces: [],
+            parentProjectPath: freshParentProjectPath ?? undefined,
+            // Set in the same config write as the registration (a backup restore names
+            // imported projects) rather than as a second write and notification.
+            ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
+          };
+          freshConfig.projects.set(normalizedPath, projectConfig);
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          createResult = Ok({ projectConfig, normalizedPath });
+          return freshConfig;
+        };
+        try {
+          await this.config.editConfig(registerEdit, { withinRegistrationLock: lock });
+        } catch (error) {
+          // The write itself was refused — most likely this process's hold was judged stale
+          // and reclaimed while git init ran (assertStillOwned). Whatever the request wrote
+          // into the directory must not stay behind unregistered: a leftover .git would fail
+          // every retry on the non-empty-directory check. A request that wrote nothing has
+          // nothing to roll back and no lock to wait for.
+          if (createdDirectory || initializedGitDir) {
+            await this.rollBackRefusedCreate(lock, normalizedPath, {
+              initializedGitDir,
+              cleanupCreatedDirectory,
+              removeInitializedGitDir,
+            });
+          }
+          throw error;
+        }
+
+        // Do NOT clean up the created directory when a concurrent registration claims
+        // it: a duplicate owns this exact path, and a new descendant project lives
+        // inside the tree we created — recursive removal would destroy the winner's
+        // checkout either way (including files created after its call returned). Only
+        // depth and parent-only hierarchy rejections leave the directory ours to remove.
+        if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
+          await cleanupCreatedDirectory();
+        } else if (
+          (transformFailure === "hierarchy-changed-descendant" ||
+            transformFailure === "duplicate") &&
+          initializedGitDir
+        ) {
+          // The winning registration owns the files (a duplicate winner registered this
+          // exact pre-existing directory; a descendant winner lives inside it), but the
+          // .git this losing request created would silently turn the winner's project
+          // into a repository it never asked for, or wrap its checkout in an
+          // unregistered outer repository that changes git discovery.
+          await removeInitializedGitDir();
+        }
+        if (
+          createResult.success &&
+          !this.config.loadConfigOrDefault().projects.has(normalizedPath)
+        ) {
+          // Config persistence (editConfig → private saveConfig) logs-and-continues on
+          // write failures. Without this check a git-initialized project would report
+          // success, vanish after restart, and block retries on the leftover .git.
+          await cleanupCreatedDirectory();
+          return Err("Failed to save project configuration");
+        }
+        return createResult;
+      };
+      // A lock failure (a wait on another process timing out, an unwritable locks
+      // directory) is caught below like every other failure, so the Result contract holds.
+      return lock === null
+        ? await withProjectRegistrationLock(this.config.rootDir, register)
+        : await register(lock);
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to create project: ${message}`);
+    } finally {
+      if (gitInitClaimKey) {
+        this.activeGitInits.delete(gitInitClaimKey);
+      }
+    }
+  }
+
+  /**
+   * Rollback for a create whose registering write threw after the request had mutated the
+   * directory. With the caller's hold still ours, nothing else can have registered anything
+   * (every registration takes the lock), so everything the request created goes. With the
+   * hold reclaimed, whoever reclaimed it may have registered this very directory meanwhile —
+   * under any spelling, so the registry's keys cannot prove it did not, and resolving every
+   * key's real path here would wait on the same unavailable mounts a restore is bounded
+   * against. The directory therefore stays (an empty one this request created is a harmless
+   * leftover a retry finds empty and uses); only the .git this request initialized goes,
+   * which is never a winner's to keep (see the duplicate case), under a fresh hold of the
+   * file lock so it cannot interleave with a winner's own git init. Best effort: a failure
+   * here is logged, and the create's own error is what the caller sees.
+   */
+  private async rollBackRefusedCreate(
+    lock: ProjectRegistrationLockHandle,
+    normalizedPath: string,
+    created: {
+      initializedGitDir: boolean;
+      cleanupCreatedDirectory: () => Promise<void>;
+      removeInitializedGitDir: () => Promise<void>;
+    }
+  ): Promise<void> {
+    try {
+      const stillOwned = await lock.assertStillOwned().then(
+        () => true,
+        () => false
+      );
+      if (stillOwned) {
+        await created.cleanupCreatedDirectory();
+      } else if (created.initializedGitDir) {
+        await withProjectRegistrationFileLock(this.config.rootDir, created.removeInitializedGitDir);
+      }
+    } catch (error) {
+      log.error(`Failed to roll back rejected project creation ${normalizedPath}:`, error);
     }
   }
 
@@ -658,9 +895,12 @@ export class ProjectService {
     }));
   }
 
-  private validateAndPrepareClone(
-    input: CloneProjectParams
-  ): Result<{ cloneUrl: string; normalizedPath: string; cloneParentDir: string }> {
+  private validateAndPrepareClone(input: CloneProjectParams): Result<{
+    cloneUrl: string;
+    fallbackCloneUrl?: string;
+    normalizedPath: string;
+    cloneParentDir: string;
+  }> {
     try {
       const repoUrl = input.repoUrl.trim();
       if (!repoUrl) {
@@ -685,7 +925,7 @@ export class ProjectService {
       }
 
       return Ok({
-        cloneUrl: normalizeRepoUrlForClone(repoUrl),
+        ...normalizeRepoUrlForClone(repoUrl),
         normalizedPath,
         cloneParentDir,
       });
@@ -695,7 +935,30 @@ export class ProjectService {
     }
   }
 
+  /** Clones and git inits in flight; a restart between them would leave a partial project. */
+  getMutationCount(): number {
+    return this.activeClones + this.activeGitInits.size;
+  }
+
+  /** A mutation admitted during teardown would be killed half-done by the exit that follows. */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
   async *cloneWithProgress(
+    input: CloneProjectParams,
+    signal?: AbortSignal
+  ): AsyncGenerator<CloneEvent> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
+    this.activeClones++;
+    try {
+      yield* this.cloneWithProgressTracked(input, signal);
+    } finally {
+      this.activeClones--;
+    }
+  }
+
+  private async *cloneWithProgressTracked(
     input: CloneProjectParams,
     signal?: AbortSignal
   ): AsyncGenerator<CloneEvent> {
@@ -705,12 +968,9 @@ export class ProjectService {
       return;
     }
 
-    const { cloneUrl, normalizedPath, cloneParentDir } = prepared.data;
+    const { cloneUrl, fallbackCloneUrl, normalizedPath, cloneParentDir } = prepared.data;
     const cloneWorkPath = `${normalizedPath}.mux-clone-${randomBytes(6).toString("hex")}`;
     let cloneSucceeded = false;
-    // Preserve full stderr so failed clones can surface git's fatal message instead of only exit code 128.
-    let collectedStderr = "";
-    let askpass: Awaited<ReturnType<typeof createMediatedAskpassSession>> | undefined;
 
     const cleanupPartialClone = async () => {
       if (cloneSucceeded) {
@@ -781,21 +1041,164 @@ export class ProjectService {
 
       await fsPromises.mkdir(cloneParentDir, { recursive: true });
 
-      // Set up SSH askpass mediation for SSH clone URLs.
-      // This allows clone to surface host-key and credential prompts through the
-      // same in-app dialog used by SSH runtime probes.
-      askpass =
-        isSshCloneUrl(cloneUrl) && this.sshPromptService
-          ? await createMediatedAskpassSession({
-              sshPromptService: this.sshPromptService,
-              promptPolicy: { allowHostKey: true, allowCredential: true },
-              // Deduplicate host-key prompts by SSH endpoint identity (host:port),
-              // not by full repo path, so concurrent clones to the same host coalesce.
-              dedupeKey: deriveSshClonePromptDedupeKey(cloneUrl),
-              getStderrContext: () => collectedStderr,
-            })
-          : undefined;
+      const attemptUrls = fallbackCloneUrl != null ? [cloneUrl, fallbackCloneUrl] : [cloneUrl];
 
+      for (const [attemptIndex, attemptUrl] of attemptUrls.entries()) {
+        const outcome = yield* this.runGitCloneAttempt(attemptUrl, cloneWorkPath, signal);
+        if (outcome.kind === "success") {
+          break;
+        }
+
+        await cleanupPartialClone();
+
+        if (outcome.kind === "cancelled") {
+          yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
+          return;
+        }
+
+        // Do not bypass a rejected host key or cancelled credential by retrying over HTTPS.
+        const nextUrl = attemptUrls[attemptIndex + 1];
+        if (nextUrl != null && outcome.code === "clone_failed") {
+          yield {
+            type: "progress",
+            line: `\nClone from ${attemptUrl} failed; retrying with ${nextUrl}...\n`,
+          };
+          continue;
+        }
+
+        yield { type: "error", code: outcome.code, error: outcome.error };
+        return;
+      }
+
+      if (signal?.aborted) {
+        await cleanupPartialClone();
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
+        return;
+      }
+
+      try {
+        await fsPromises.rename(cloneWorkPath, normalizedPath);
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === "EEXIST" || err.code === "ENOTEMPTY") {
+          await cleanupPartialClone();
+
+          let existingDestinationStat: Stats | null = null;
+          try {
+            existingDestinationStat = await fsPromises.stat(normalizedPath);
+          } catch (statError) {
+            const statErr = statError as NodeJS.ErrnoException;
+            if (statErr.code !== "ENOENT") {
+              throw statError;
+            }
+          }
+
+          if (existingDestinationStat?.isDirectory()) {
+            yield {
+              type: "error",
+              code: "destination_exists",
+              error: `Destination already exists: ${normalizedPath}`,
+              normalizedPath,
+            };
+          } else {
+            yield {
+              type: "error",
+              code: "clone_failed",
+              error: `Destination already exists: ${normalizedPath}`,
+            };
+          }
+          return;
+        }
+        throw error;
+      }
+
+      if (signal?.aborted) {
+        // Abort won the race after rename but before config mutation.
+        // Remove the newly materialized destination so cancellation remains authoritative.
+        try {
+          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+        } catch {
+          // Best-effort cleanup only.
+        }
+        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
+        return;
+      }
+
+      const projectConfig: ProjectConfig = { workspaces: [] };
+      await this.config.editConfig((freshConfig) => {
+        if (freshConfig.projects.has(normalizedPath)) {
+          return freshConfig;
+        }
+        const updatedProjects = new Map(freshConfig.projects);
+        updatedProjects.set(normalizedPath, projectConfig);
+        return { ...freshConfig, projects: updatedProjects };
+      });
+
+      if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
+        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
+        // failures, so verify persistence explicitly before reporting success.
+        try {
+          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+        } catch {
+          // Best-effort rollback only.
+        }
+        yield {
+          type: "error",
+          code: "clone_failed",
+          error: "Failed to persist cloned project configuration",
+        };
+        return;
+      }
+
+      cloneSucceeded = true;
+      yield { type: "success", projectConfig, normalizedPath };
+    } catch (error) {
+      const message = getErrorMessage(error);
+      yield {
+        type: "error",
+        code: "clone_failed",
+        error: `Failed to clone repository: ${message}`,
+      };
+    } finally {
+      await cleanupPartialClone();
+    }
+  }
+
+  private async *runGitCloneAttempt(
+    cloneUrl: string,
+    cloneWorkPath: string,
+    signal?: AbortSignal
+  ): AsyncGenerator<
+    Extract<CloneEvent, { type: "progress" }>,
+    | { kind: "success" }
+    | { kind: "cancelled" }
+    | { kind: "failure"; code: CloneErrorCode; error: string }
+  > {
+    // An abort delivered between attempts (e.g. while the caller yielded the retry
+    // notice) must not spawn another clone.
+    if (signal?.aborted) {
+      return { kind: "cancelled" };
+    }
+
+    // Preserve full stderr so failed clones can surface git's fatal message instead of only exit code 128.
+    let collectedStderr = "";
+
+    // Set up SSH askpass mediation for SSH clone URLs.
+    // This allows clone to surface host-key and credential prompts through the
+    // same in-app dialog used by SSH runtime probes.
+    const askpass =
+      isSshCloneUrl(cloneUrl) && this.sshPromptService
+        ? await createMediatedAskpassSession({
+            sshPromptService: this.sshPromptService,
+            promptPolicy: { allowHostKey: true, allowCredential: true },
+            // Deduplicate host-key prompts by SSH endpoint identity (host:port),
+            // not by full repo path, so concurrent clones to the same host coalesce.
+            dedupeKey: deriveSshClonePromptDedupeKey(cloneUrl),
+            getStderrContext: () => collectedStderr,
+          })
+        : undefined;
+
+    try {
       const child = spawn("git", ["clone", "--progress", "--", cloneUrl, cloneWorkPath], {
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...(askpass?.env ?? {}) },
@@ -917,131 +1320,39 @@ export class ProjectService {
       }
 
       if (spawnErrorMessage != null) {
-        await cleanupPartialClone();
-        const errorMessage = summarizeStderr() ?? spawnErrorMessage;
-        yield { type: "error", code: "clone_failed", error: errorMessage };
-        return;
+        return {
+          kind: "failure",
+          code: "clone_failed",
+          error: summarizeStderr() ?? spawnErrorMessage,
+        };
       }
 
       if (signal?.aborted) {
-        await cleanupPartialClone();
-        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
-        return;
+        return { kind: "cancelled" };
       }
 
       const exitCode = child.exitCode;
       const exitSignal = child.signalCode;
 
       if (exitCode !== 0 || exitSignal != null) {
-        await cleanupPartialClone();
         const errorMessage =
           summarizeStderr() ??
           (exitSignal != null
             ? `Clone failed: process terminated by signal ${String(exitSignal)}`
             : `Clone failed with exit code ${exitCode ?? "unknown"}`);
-        yield {
-          type: "error",
+        return {
+          kind: "failure",
           code: classifySshCloneFailure({
             stderr: collectedStderr,
             promptOutcome: askpass?.getLastPromptOutcome() ?? null,
           }),
-          error: errorMessage,
+          error: withCloneReadAccessHint(errorMessage, collectedStderr),
         };
-        return;
       }
 
-      if (signal?.aborted) {
-        await cleanupPartialClone();
-        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
-        return;
-      }
-
-      try {
-        await fsPromises.rename(cloneWorkPath, normalizedPath);
-      } catch (error) {
-        const err = error as NodeJS.ErrnoException;
-        if (err.code === "EEXIST" || err.code === "ENOTEMPTY") {
-          await cleanupPartialClone();
-
-          let existingDestinationStat: Stats | null = null;
-          try {
-            existingDestinationStat = await fsPromises.stat(normalizedPath);
-          } catch (statError) {
-            const statErr = statError as NodeJS.ErrnoException;
-            if (statErr.code !== "ENOENT") {
-              throw statError;
-            }
-          }
-
-          if (existingDestinationStat?.isDirectory()) {
-            yield {
-              type: "error",
-              code: "destination_exists",
-              error: `Destination already exists: ${normalizedPath}`,
-              normalizedPath,
-            };
-          } else {
-            yield {
-              type: "error",
-              code: "clone_failed",
-              error: `Destination already exists: ${normalizedPath}`,
-            };
-          }
-          return;
-        }
-        throw error;
-      }
-
-      if (signal?.aborted) {
-        // Abort won the race after rename but before config mutation.
-        // Remove the newly materialized destination so cancellation remains authoritative.
-        try {
-          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
-        } catch {
-          // Best-effort cleanup only.
-        }
-        yield { type: "error", code: "clone_failed", error: "Clone cancelled" };
-        return;
-      }
-
-      const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
-
-      if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
-        // failures, so verify persistence explicitly before reporting success.
-        try {
-          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
-        } catch {
-          // Best-effort rollback only.
-        }
-        yield {
-          type: "error",
-          code: "clone_failed",
-          error: "Failed to persist cloned project configuration",
-        };
-        return;
-      }
-
-      cloneSucceeded = true;
-      yield { type: "success", projectConfig, normalizedPath };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      yield {
-        type: "error",
-        code: "clone_failed",
-        error: `Failed to clone repository: ${message}`,
-      };
+      return { kind: "success" };
     } finally {
       askpass?.cleanup();
-      await cleanupPartialClone();
     }
   }
 
@@ -1062,6 +1373,7 @@ export class ProjectService {
   }
 
   async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
@@ -1073,7 +1385,7 @@ export class ProjectService {
 
       if (projectConfig.parentProjectPath) {
         try {
-          await this.config.updateProjectSecrets(normalizedPath, []);
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
@@ -1094,11 +1406,12 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        this.mcpServerManager?.forgetProjectTrust(normalizedPath);
         return Ok(undefined);
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
-      // This handles the case where a user manually deleted workspace dirs from ~/.mux/src/.
+      // This handles the case where a user manually deleted workspace dirs from ~/.xum/src/.
       // Only check local/worktree runtimes — remote runtimes (SSH, Docker, devcontainer)
       // have paths on the remote host that won't exist locally.
       const localRuntimeTypes = new Set(["local", "worktree"]);
@@ -1157,6 +1470,19 @@ export class ProjectService {
 
       const totalWorkspaces = counts.activeCount + counts.archivedCount;
       if (force && totalWorkspaces > 0) {
+        // Fail fast on cross-project references BEFORE the cascade: the force
+        // loop below only deletes this project's own bucket, so proceeding
+        // would permanently delete owned workspaces and then still fail on the
+        // external references, leaving a partially-deleted project behind.
+        const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+        if (crossCounts.activeCount + crossCounts.archivedCount > 0) {
+          return Err({
+            type: "workspace_blockers" as const,
+            activeCount: counts.activeCount + crossCounts.activeCount,
+            archivedCount: counts.archivedCount + crossCounts.archivedCount,
+          });
+        }
+
         if (!this.workspaceService) {
           return Err({
             type: "unknown" as const,
@@ -1204,35 +1530,12 @@ export class ProjectService {
         counts = getProjectWorkspaceCounts(projectConfig.workspaces);
       }
 
-      // Also count multi-project workspace references to this project from OTHER project buckets.
-      // Multi-project workspaces can be stored under _multi (interactive creation) or under
-      // any project bucket (task/fork creation via taskService).
-      let crossProjectActiveCount = 0;
-      let crossProjectArchivedCount = 0;
-      for (const [configKey, otherConfig] of config.projects) {
-        if (configKey === normalizedPath) {
-          // Project workspaces in this bucket are already counted above.
-          continue;
-        }
-
-        const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
-          workspace.projects?.some(
-            (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
-          )
-        );
-
-        if (referencingWorkspaces.length === 0) {
-          continue;
-        }
-
-        const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
-        crossProjectActiveCount += referencingWorkspaceCounts.activeCount;
-        crossProjectArchivedCount += referencingWorkspaceCounts.archivedCount;
-      }
-
+      // Also count multi-project workspace references to this project from OTHER
+      // project buckets (recomputed from the post-cascade config snapshot).
+      const crossProjectCounts = this.countCrossProjectReferences(config, normalizedPath);
       counts = {
-        activeCount: counts.activeCount + crossProjectActiveCount,
-        archivedCount: counts.archivedCount + crossProjectArchivedCount,
+        activeCount: counts.activeCount + crossProjectCounts.activeCount,
+        archivedCount: counts.archivedCount + crossProjectCounts.archivedCount,
       };
 
       if (counts.activeCount + counts.archivedCount > 0) {
@@ -1257,18 +1560,21 @@ export class ProjectService {
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {
-          await this.config.updateProjectSecrets(subProjectPath, []);
+          await this.secretsStore.updateProjectSecrets(subProjectPath, []);
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${subProjectPath}:`, error);
         }
       }
 
       try {
-        await this.config.updateProjectSecrets(normalizedPath, []);
+        await this.secretsStore.updateProjectSecrets(normalizedPath, []);
       } catch (error) {
         log.error(`Failed to clean up secrets for project ${normalizedPath}:`, error);
       }
 
+      for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
+        this.mcpServerManager?.forgetProjectTrust(removedPath);
+      }
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -1276,10 +1582,83 @@ export class ProjectService {
     }
   }
 
+  /**
+   * Count multi-project workspace references to this project stored in OTHER
+   * project buckets. Multi-project workspaces can live under _multi
+   * (interactive creation) or any project bucket (task/fork creation).
+   */
+  private countCrossProjectReferences(
+    config: { projects: Map<string, ProjectConfig> },
+    normalizedPath: string
+  ): ProjectWorkspaceCounts {
+    let activeCount = 0;
+    let archivedCount = 0;
+    for (const [configKey, otherConfig] of config.projects) {
+      if (configKey === normalizedPath) {
+        // Project workspaces in this bucket are counted by the caller.
+        continue;
+      }
+
+      const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
+        workspace.projects?.some(
+          (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
+        )
+      );
+
+      if (referencingWorkspaces.length === 0) {
+        continue;
+      }
+
+      const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
+      activeCount += referencingWorkspaceCounts.activeCount;
+      archivedCount += referencingWorkspaceCounts.archivedCount;
+    }
+    return { activeCount, archivedCount };
+  }
+
+  /**
+   * Read-only removal preflight: reports the same blocker counts remove()
+   * enforces (own bucket + cross-project references) WITHOUT remove()'s side
+   * effects (stale-entry pruning, deletion of empty projects). The delete
+   * confirmation dialog needs this because projects.list no longer carries
+   * archived workspaces to count client-side.
+   */
+  getRemovalBlockers(projectPath: string): ProjectWorkspaceCounts {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const config = this.config.loadConfigOrDefault();
+    const projectConfig = config.projects.get(normalizedPath);
+    if (!projectConfig) {
+      return { activeCount: 0, archivedCount: 0 };
+    }
+    const ownCounts = getProjectWorkspaceCounts(projectConfig.workspaces);
+    const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+    return {
+      activeCount: ownCounts.activeCount + crossCounts.activeCount,
+      archivedCount: ownCounts.archivedCount + crossCounts.archivedCount,
+    };
+  }
+
   list(): Array<[string, ProjectConfig]> {
     try {
       const config = this.config.loadConfigOrDefault();
-      return Array.from(deriveProjectHierarchy(config.projects).entries());
+      // Read-side projection: exclude archived workspaces from the listing. On
+      // archive-heavy configs they dominate the payload (measured 84% of a
+      // 1.1 MB projects.list response re-fetched on every config change), and
+      // the UI loads archived workspaces on demand via
+      // workspace.list({ archived: true }). Build new arrays instead of
+      // mutating the loaded config: persisted config.json must keep archived
+      // entries (upgrade/downgrade safety).
+      return Array.from(deriveProjectHierarchy(config.projects).entries()).map(
+        ([projectPath, project]): [string, ProjectConfig] => [
+          projectPath,
+          {
+            ...project,
+            workspaces: project.workspaces.filter(
+              (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+            ),
+          },
+        ]
+      );
     } catch (error) {
       log.error("Failed to list projects:", error);
       return [];
@@ -1322,62 +1701,107 @@ export class ProjectService {
     }
   }
 
+  /** Reports whether it created the `.git` directory so callers can roll that back. */
+  private async initializeGitRepository(
+    normalizedPath: string
+  ): Promise<Result<{ initializedGitDir: boolean }>> {
+    // Set before running `git init`: even a failing init can leave a partial .git
+    // behind (e.g. a broken init template), which must be rolled back too.
+    let initializedGitDir = false;
+    try {
+      const isGitRepo = await isGitRepository(normalizedPath);
+
+      if (isGitRepo) {
+        const branches = await listLocalBranches(normalizedPath);
+        if (branches.length > 0) {
+          return Err("Directory is already a git repository with commits");
+        }
+      } else {
+        initializedGitDir = true;
+        using initProc = execFileAsync("git", ["-C", normalizedPath, "init", "-b", "main"], {
+          // Inherited repository selectors (GIT_DIR/GIT_WORK_TREE) win over -C and
+          // would redirect init/commit into an unrelated external repository.
+          env: GIT_SCOPE_ENV_UNSET,
+        });
+        await initProc.result;
+      }
+
+      // A born branch is required by worktree and SSH runtimes. Keep the fallback
+      // identity scoped to this initial commit instead of changing repository config.
+      using commitProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          normalizedPath,
+          "-c",
+          "user.name=mux",
+          "-c",
+          "user.email=mux@localhost",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Initial commit",
+        ],
+        { env: GIT_SCOPE_ENV_UNSET }
+      );
+      await commitProc.result;
+
+      this.fileCompletionsCache.delete(normalizedPath);
+      return Ok({ initializedGitDir });
+    } catch (error) {
+      // Roll back a .git we created (or that a failed init left partially behind) so
+      // the directory returns to its prior state and a retry is not rejected as
+      // non-empty (e.g. when the initial commit fails).
+      if (initializedGitDir) {
+        await fsPromises
+          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+          .catch((cleanupError: unknown) => {
+            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+          });
+      }
+      const message = getErrorMessage(error);
+      log.error("Failed to initialize git repository:", error);
+      return Err(`Failed to initialize git repository: ${message}`);
+    }
+  }
+
   /**
    * Initialize a git repository in the project directory.
    * Runs `git init` and creates an initial commit so branches exist.
    * Also handles "unborn" repos (git init already run but no commits yet).
    */
   async gitInit(projectPath: string): Promise<Result<void>> {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     if (typeof projectPath !== "string" || projectPath.trim().length === 0) {
       return Err("Project path is required");
     }
+    let claimKey: string | null = null;
     try {
       const validation = await validateProjectPath(projectPath);
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
       const normalizedPath = validation.expandedPath!;
-
-      const isGitRepo = await isGitRepository(normalizedPath);
-
-      if (isGitRepo) {
-        // Check if repo is "unborn" (git init but no commits yet)
-        const branches = await listLocalBranches(normalizedPath);
-        if (branches.length > 0) {
-          return Err("Directory is already a git repository with commits");
-        }
-        // Repo exists but is unborn - just create the initial commit
-      } else {
-        // Initialize git repository with main as default branch
-        using initProc = execFileAsync("git", ["-C", normalizedPath, "init", "-b", "main"]);
-        await initProc.result;
+      // Same exclusive claim as create(): concurrent initializations of one directory
+      // could double-commit or let one call's failure rollback delete the other's .git.
+      const canonicalPath = await resolveRealProjectPath(normalizedPath).catch(
+        () => normalizedPath
+      );
+      if (this.activeGitInits.has(canonicalPath)) {
+        return Err("Another project creation is already initializing this directory");
       }
-
-      // Create an initial empty commit so the branch exists and worktree/SSH can work
-      // Without a commit, the repo is "unborn" and has no branches
-      // Use -c flags to set identity only for this commit (don't persist to repo config)
-      using commitProc = execFileAsync("git", [
-        "-C",
-        normalizedPath,
-        "-c",
-        "user.name=mux",
-        "-c",
-        "user.email=mux@localhost",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Initial commit",
-      ]);
-      await commitProc.result;
-
-      // Invalidate file completions cache since the repo state changed
-      this.fileCompletionsCache.delete(normalizedPath);
-
-      return Ok(undefined);
+      this.activeGitInits.add(canonicalPath);
+      claimKey = canonicalPath;
+      const result = await this.initializeGitRepository(normalizedPath);
+      return result.success ? Ok(undefined) : result;
     } catch (error) {
       const message = getErrorMessage(error);
       log.error("Failed to initialize git repository:", error);
       return Err(`Failed to initialize git repository: ${message}`);
+    } finally {
+      if (claimKey) {
+        this.activeGitInits.delete(claimKey);
+      }
     }
   }
 
@@ -1459,7 +1883,7 @@ export class ProjectService {
 
   getSecrets(projectPath: string): Secret[] {
     try {
-      return this.config.getProjectSecrets(projectPath);
+      return this.secretsStore.getProjectSecrets(projectPath);
     } catch (error) {
       log.error("Failed to get project secrets:", error);
       return [];
@@ -1499,7 +1923,7 @@ export class ProjectService {
 
   async updateSecrets(projectPath: string, secrets: Secret[]): Promise<Result<void>> {
     try {
-      await this.config.updateProjectSecrets(projectPath, secrets);
+      await this.secretsStore.updateProjectSecrets(projectPath, secrets);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -1546,6 +1970,113 @@ export class ProjectService {
     }
   }
 
+  async setTrust(projectPath: string, trusted: boolean): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      let project = config.projects.get(normalizedPath);
+      if (!project) {
+        project = { workspaces: [] };
+        config.projects.set(normalizedPath, project);
+      }
+      project.trusted = trusted;
+      return config;
+    });
+
+    const affectedPaths = [normalizedPath];
+    for (const [candidatePath, project] of this.config.loadConfigOrDefault().projects) {
+      if (
+        project.parentProjectPath !== undefined &&
+        stripTrailingSlashes(project.parentProjectPath) === normalizedPath
+      ) {
+        affectedPaths.push(candidatePath);
+      }
+    }
+    this.mcpServerManager?.applyProjectTrust(
+      affectedPaths.map((candidatePath) => ({
+        projectPath: candidatePath,
+        trusted: isProjectTrusted(this.config, candidatePath),
+      }))
+    );
+  }
+
+  async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.displayName = displayName ?? undefined;
+      return config;
+    });
+  }
+
+  async setColor(projectPath: string, color: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setCustomInstructions(
+    projectPath: string,
+    customInstructions: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.customInstructions = customInstructions?.trim() ? customInstructions : undefined;
+      return config;
+    });
+  }
+
+  async setCodeWorkspaceSyncPath(
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const trimmed = codeWorkspaceSyncPath?.trim() ?? "";
+    if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+      throw new ORPCError("BAD_REQUEST", {
+        message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+      });
+    }
+
+    let previousValue: string | undefined;
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      previousValue = project.codeWorkspaceSyncPath;
+      project.codeWorkspaceSyncPath = trimmed || undefined;
+      return config;
+    });
+
+    if (!trimmed) {
+      return;
+    }
+    const result = await syncProjectCodeWorkspace(this.config, normalizedPath);
+    if (result.ok) {
+      return;
+    }
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (project?.codeWorkspaceSyncPath === trimmed) {
+        project.codeWorkspaceSyncPath = previousValue;
+      }
+      return config;
+    });
+    throw new ORPCError("BAD_REQUEST", { message: result.error });
+  }
   // ─────────────────────────────────────────────────────────────────────────────
   // Section Management
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1616,5 +2147,39 @@ export class ProjectService {
       const message = getErrorMessage(error);
       return Err(`Failed to assign workspace to sub-project: ${message}`);
     }
+  }
+
+  async assignWorkspaceToSubProjectAndSync(
+    projectPath: string,
+    workspaceId: string,
+    subProjectPath: string | null
+  ): Promise<Result<void>> {
+    const previousMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+      (metadata) => metadata.id === workspaceId
+    );
+    const result = await this.assignWorkspaceToSubProject(projectPath, workspaceId, subProjectPath);
+    if (!result.success) {
+      return result;
+    }
+
+    await this.workspaceMetadataRefresher?.refreshAndEmitMetadata(workspaceId);
+    if (subProjectPath !== null) {
+      await syncProjectCodeWorkspace(this.config, subProjectPath);
+    }
+    const previousSubProjectPath =
+      previousMetadata?.subProjectPath != null
+        ? stripTrailingSlashes(previousMetadata.subProjectPath)
+        : null;
+    const newSubProjectPath = subProjectPath !== null ? stripTrailingSlashes(subProjectPath) : null;
+    if (
+      previousMetadata &&
+      previousSubProjectPath !== null &&
+      previousSubProjectPath !== newSubProjectPath
+    ) {
+      await syncProjectCodeWorkspace(this.config, previousSubProjectPath, {
+        extraManagedRootDirs: managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+      });
+    }
+    return result;
   }
 }

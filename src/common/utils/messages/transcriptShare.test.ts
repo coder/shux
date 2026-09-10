@@ -1,3 +1,8 @@
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import {
+  createContextBudgetRejectedMessage,
+  restoreContextBudgetRejectedMessageForDisplay,
+} from "./contextBudgetRejection";
 import { describe, expect, it } from "bun:test";
 import type { MuxMessage } from "@/common/types/message";
 import { buildChatJsonlForSharing } from "./transcriptShare";
@@ -7,6 +12,62 @@ function splitJsonlLines(jsonl: string): string[] {
 }
 
 describe("buildChatJsonlForSharing", () => {
+  it("keeps rejection capsules inert while redacting their original tool output for sharing", () => {
+    const original: MuxMessage = {
+      id: "rejected-payload",
+      role: "assistant",
+      metadata: { historySequence: 4, synthetic: true, uiVisible: true, partial: true },
+      parts: [
+        { type: "text", text: "Visible original response" },
+        {
+          type: "dynamic-tool",
+          toolCallId: "call",
+          toolName: "bash",
+          state: "output-available",
+          input: {},
+          output: "private-result",
+        },
+      ],
+    };
+    const capsule = createContextBudgetRejectedMessage(original);
+    const jsonl = buildChatJsonlForSharing([capsule], { includeToolOutput: false });
+    expect(jsonl).not.toContain("private-result");
+    const exported = MuxMessageSchema.parse(JSON.parse(jsonl));
+    expect(exported).toMatchObject({
+      role: "assistant",
+      parts: [],
+      metadata: { contextBudgetRejected: true },
+    });
+    expect(exported.metadata?.partial).toBeUndefined();
+    expect(restoreContextBudgetRejectedMessageForDisplay(exported).parts).toEqual([
+      original.parts[0],
+      {
+        type: "dynamic-tool",
+        toolCallId: "call",
+        toolName: "bash",
+        state: "output-redacted",
+        input: {},
+      },
+    ]);
+    expect(buildChatJsonlForSharing([capsule], { includeToolOutput: true })).toContain(
+      "private-result"
+    );
+    const damaged = MuxMessageSchema.parse({
+      ...capsule,
+      metadata: {
+        ...capsule.metadata,
+        contextBudgetRejectedMessage: {
+          ...capsule.metadata?.contextBudgetRejectedMessage,
+          metadata: { timestamp: "invalid" },
+        },
+      },
+    });
+    expect(buildChatJsonlForSharing([damaged], { includeToolOutput: false })).not.toContain(
+      "private-result"
+    );
+    expect(capsule.metadata?.contextBudgetRejectedMessage?.parts).toEqual(original.parts);
+  });
+
   it("strips tool output and sets state to output-redacted when includeToolOutput=false", () => {
     const messages: MuxMessage[] = [
       {
@@ -46,6 +107,117 @@ describe("buildChatJsonlForSharing", () => {
     }
     expect(originalPart.state).toBe("output-available");
     expect(originalPart).toHaveProperty("output");
+  });
+
+  it("redacts local paths from preserved lifecycle results when includeToolOutput=false", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "tc-1",
+            toolName: "task_workspace_lifecycle",
+            state: "output-available",
+            input: { action: "archive", targets: [{ workspaceId: "ws-1" }] },
+            output: {
+              results: [
+                {
+                  status: "requires_confirmation",
+                  action: "archive",
+                  workspaceId: "ws-1",
+                  paths: ["secret-notes.md", "wip/patch.diff"],
+                  note: "confirm /home/user/secret-notes.md",
+                },
+                {
+                  status: "error",
+                  action: "archive",
+                  workspaceId: "ws-2",
+                  error: "Failed at /home/user/project/file.txt",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    const jsonl = buildChatJsonlForSharing(messages, { includeToolOutput: false });
+    const parsed = JSON.parse(splitJsonlLines(jsonl)[0]) as MuxMessage;
+    const part = parsed.parts[0];
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected preserved tool output");
+    }
+
+    // Statuses survive (the lifecycle card renders from them), local filenames do not.
+    const output = part.output as { results: Array<Record<string, unknown>> };
+    expect(output.results[0].status).toBe("requires_confirmation");
+    expect(output.results[0].workspaceId).toBe("ws-1");
+    expect(output.results[0]).not.toHaveProperty("paths");
+    expect(output.results[0]).not.toHaveProperty("note");
+    expect(output.results[1].status).toBe("error");
+    expect(output.results[1]).not.toHaveProperty("error");
+
+    // Full sharing keeps the fields; and stripping must not mutate the original.
+    const fullJsonl = buildChatJsonlForSharing(messages, { includeToolOutput: true });
+    const fullPart = (JSON.parse(splitJsonlLines(fullJsonl)[0]) as MuxMessage).parts[0];
+    if (fullPart.type !== "dynamic-tool" || fullPart.state !== "output-available") {
+      throw new Error("Expected full tool output");
+    }
+    const fullOutput = fullPart.output as { results: Array<Record<string, unknown>> };
+    expect(fullOutput.results[0].paths).toEqual(["secret-notes.md", "wip/patch.diff"]);
+  });
+
+  it("redacts lifecycle results wrapped in the SDK JSON container when includeToolOutput=false", () => {
+    // Persistence can store results as { type: "json", value: ... } — the renderer unwraps
+    // that shape, so redaction must too or wrapped exports leak the local paths.
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "tc-1",
+            toolName: "task_workspace_lifecycle",
+            state: "output-available",
+            input: { action: "archive", targets: [{ workspaceId: "ws-1" }] },
+            output: {
+              type: "json",
+              value: {
+                results: [
+                  {
+                    status: "requires_confirmation",
+                    action: "archive",
+                    workspaceId: "ws-1",
+                    paths: ["/home/user/secret-notes.md"],
+                    note: "confirm /home/user/secret-notes.md",
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    const jsonl = buildChatJsonlForSharing(messages, { includeToolOutput: false });
+    const parsed = JSON.parse(splitJsonlLines(jsonl)[0]) as MuxMessage;
+    const part = parsed.parts[0];
+    if (part.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected preserved tool output");
+    }
+    const output = part.output as {
+      type: string;
+      value: { results: Array<Record<string, unknown>> };
+    };
+    // The container shape survives (the renderer unwraps it), the local paths do not.
+    expect(output.type).toBe("json");
+    expect(output.value.results[0].status).toBe("requires_confirmation");
+    expect(output.value.results[0].workspaceId).toBe("ws-1");
+    expect(output.value.results[0]).not.toHaveProperty("paths");
+    expect(output.value.results[0]).not.toHaveProperty("note");
   });
 
   it("strips nestedCalls output and sets nestedCalls state to output-redacted when includeToolOutput=false", () => {

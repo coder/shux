@@ -71,7 +71,7 @@ function replaceMuxBlock(existingContent: string, nextMuxBlock: string): string 
   const endMarkerIndex = existingContent.indexOf(MUX_CODER_SSH_BLOCK_END, startMarkerIndex);
 
   if (startMarkerIndex === -1 || endMarkerIndex === -1 || endMarkerIndex < startMarkerIndex) {
-    throw new Error("Corrupted SSH config: invalid Mux Coder SSH marker order.");
+    throw new Error("Corrupted SSH config: invalid Xum Coder SSH marker order.");
   }
 
   const lineStartIndex = existingContent.lastIndexOf("\n", startMarkerIndex);
@@ -237,11 +237,11 @@ export async function ensureMuxCoderSSHConfigFile(
   const endMarkerCount = countOccurrences(existingContent, MUX_CODER_SSH_BLOCK_END);
 
   if (startMarkerCount > 1 || endMarkerCount > 1) {
-    throw new Error("Corrupted SSH config: duplicate Mux Coder SSH markers detected.");
+    throw new Error("Corrupted SSH config: duplicate Xum Coder SSH markers detected.");
   }
 
   if (startMarkerCount !== endMarkerCount) {
-    throw new Error("Corrupted SSH config: mismatched Mux Coder SSH markers detected.");
+    throw new Error("Corrupted SSH config: mismatched Xum Coder SSH markers detected.");
   }
 
   const nextMuxBlock = renderMuxBlock(opts.coderBinaryPath);

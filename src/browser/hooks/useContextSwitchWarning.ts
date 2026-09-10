@@ -11,7 +11,7 @@ import type { AppRouter } from "@/node/orpc/router";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useRouting } from "@/browser/hooks/useRouting";
 import {
@@ -267,7 +267,11 @@ export function useContextSwitchWarning(
 
   const handleModelChange = useCallback(
     (newModel: string) => {
-      if (normalizeToCanonical(newModel).trim() === normalizeToCanonical(pendingModel).trim()) {
+      // Gateway-preserving equality: coder:<instance>/<model> and the direct
+      // <provider>:<model> are distinct selections even when the instance
+      // name matches the provider — name-only canonicalization would treat
+      // them as equal and return before persisting the switch.
+      if (normalizeSelectedModel(newModel).trim() === normalizeSelectedModel(pendingModel).trim()) {
         return;
       }
 

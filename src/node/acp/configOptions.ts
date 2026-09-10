@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
 import { getThinkingOptionLabel, isThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
@@ -127,27 +128,13 @@ async function resolveAvailableAgentIds(
 }
 
 type WorkspaceInfo = NonNullable<Awaited<ReturnType<ORPCClient["workspace"]["getInfo"]>>>;
-type UpdateAgentAiSettingsResult = Awaited<
-  ReturnType<ORPCClient["workspace"]["updateAgentAISettings"]>
->;
-
 interface BuildConfigOptionsArgs {
   activeAgentId?: string;
+  aiSettings?: ResolvedAiSettings;
 }
 
-interface HandleSetConfigOptionArgs {
-  activeAgentId?: string;
+interface HandleSetConfigOptionArgs extends BuildConfigOptionsArgs {
   onAgentModeChanged?: (agentId: string, aiSettings: ResolvedAiSettings) => Promise<void> | void;
-}
-
-function isModeAgentId(agentId: string): agentId is "plan" | "exec" {
-  return agentId === "plan" || agentId === "exec";
-}
-
-function ensureUpdateSucceeded(result: UpdateAgentAiSettingsResult, operation: string): void {
-  if (!result.success) {
-    throw new Error(`${operation} failed: ${result.error}`);
-  }
 }
 
 async function getWorkspaceInfoOrThrow(
@@ -184,6 +171,9 @@ async function resolveCurrentAiSettings(
         workspaceAiSettings.model,
         workspaceAiSettings.thinkingLevel
       ),
+      ...(workspaceAiSettings.reasoningMode != null
+        ? { reasoningMode: workspaceAiSettings.reasoningMode }
+        : {}),
     };
   }
 
@@ -191,6 +181,9 @@ async function resolveCurrentAiSettings(
   return {
     model: resolvedDefaults.model,
     thinkingLevel: enforceThinkingPolicy(resolvedDefaults.model, resolvedDefaults.thinkingLevel),
+    ...(resolvedDefaults.reasoningMode != null
+      ? { reasoningMode: resolvedDefaults.reasoningMode }
+      : {}),
   };
 }
 
@@ -211,11 +204,14 @@ function buildAgentModeSelectOptions(
   return options;
 }
 
-function buildModelSelectOptions(currentModel: string): SessionConfigSelectOption[] {
-  const options: SessionConfigSelectOption[] = Object.values(KNOWN_MODELS).map((model) => ({
-    value: model.id,
-    name: model.id,
-  }));
+function buildModelSelectOptions(
+  currentModel: string,
+  hiddenModels: readonly string[]
+): SessionConfigSelectOption[] {
+  const hidden = new Set(hiddenModels);
+  const options: SessionConfigSelectOption[] = Object.values(KNOWN_MODELS)
+    .filter((model) => !hidden.has(model.id))
+    .map((model) => ({ value: model.id, name: model.id }));
 
   if (!options.some((option) => option.value === currentModel)) {
     options.unshift({ value: currentModel, name: currentModel });
@@ -233,30 +229,6 @@ function buildThinkingLevelSelectOptions(modelString: string): SessionConfigSele
   }));
 }
 
-async function persistAgentAiSettings(
-  client: ORPCClient,
-  workspaceId: string,
-  agentId: string,
-  aiSettings: ResolvedAiSettings
-): Promise<void> {
-  if (isModeAgentId(agentId)) {
-    const updateModeResult = await client.workspace.updateModeAISettings({
-      workspaceId,
-      mode: agentId,
-      aiSettings,
-    });
-    ensureUpdateSucceeded(updateModeResult, "workspace.updateModeAISettings");
-    return;
-  }
-
-  const updateAgentResult = await client.workspace.updateAgentAISettings({
-    workspaceId,
-    agentId,
-    aiSettings,
-  });
-  ensureUpdateSucceeded(updateAgentResult, "workspace.updateAgentAISettings");
-}
-
 export async function buildConfigOptions(
   client: ORPCClient,
   workspaceId: string,
@@ -266,9 +238,10 @@ export async function buildConfigOptions(
 
   const workspace = await getWorkspaceInfoOrThrow(client, workspaceId);
   const overrideAgentId = args?.activeAgentId?.trim();
-  const [exposedAgentModes, availableAgentIds] = await Promise.all([
+  const [exposedAgentModes, availableAgentIds, config] = await Promise.all([
     resolveExposedAgentModes(client, workspaceId),
     resolveAvailableAgentIds(client, workspaceId),
+    client.config.getConfig(),
   ]);
   const currentAgentId = resolveCurrentAgentId(
     typeof overrideAgentId === "string" && overrideAgentId.length > 0
@@ -276,12 +249,9 @@ export async function buildConfigOptions(
       : getCurrentAgentId(workspace),
     availableAgentIds.length > 0 ? availableAgentIds : exposedAgentModes.map((mode) => mode.value)
   );
-  const currentAiSettings = await resolveCurrentAiSettings(
-    client,
-    workspace,
-    workspaceId,
-    currentAgentId
-  );
+  const currentAiSettings =
+    args?.aiSettings ??
+    (await resolveCurrentAiSettings(client, workspace, workspaceId, currentAgentId));
   const agentModeOptions = buildAgentModeSelectOptions(exposedAgentModes, currentAgentId);
 
   const effectiveThinkingLevel = enforceThinkingPolicy(
@@ -304,7 +274,10 @@ export async function buildConfigOptions(
       type: "select",
       category: "model",
       currentValue: currentAiSettings.model,
-      options: buildModelSelectOptions(currentAiSettings.model),
+      options: buildModelSelectOptions(
+        currentAiSettings.model,
+        config.hiddenModels ?? DEFAULT_HIDDEN_MODELS
+      ),
     },
     {
       id: THINKING_LEVEL_CONFIG_ID,
@@ -349,71 +322,70 @@ export async function handleSetConfigOption(
     knownAgentIds
   );
 
+  let nextAgentId = currentAgentId;
+  let nextAiSettings: ResolvedAiSettings;
   if (trimmedConfigId === AGENT_MODE_CONFIG_ID) {
-    const nextAgentId = resolveCurrentAgentId(trimmedValue, knownAgentIds);
+    nextAgentId = resolveCurrentAgentId(trimmedValue, knownAgentIds);
 
     // Prefer workspace-specific settings already saved for the target agent
     // (e.g., user customized model/thinking for this mode).  Only fall back
     // to resolved defaults when no prior settings exist for the agent.
-    const existingSettings = workspace.aiSettingsByAgent?.[nextAgentId];
+    const existingSettings =
+      (nextAgentId === currentAgentId ? args?.aiSettings : undefined) ??
+      workspace.aiSettingsByAgent?.[nextAgentId];
     const resolvedAiSettings =
       existingSettings?.model != null && existingSettings?.thinkingLevel != null
-        ? { model: existingSettings.model, thinkingLevel: existingSettings.thinkingLevel }
+        ? {
+            model: existingSettings.model,
+            thinkingLevel: existingSettings.thinkingLevel,
+            reasoningMode: existingSettings.reasoningMode,
+          }
         : await resolveAgentAiSettings(client, nextAgentId, trimmedWorkspaceId);
 
-    const normalizedAiSettings: ResolvedAiSettings = {
+    nextAiSettings = {
       model: resolvedAiSettings.model,
       thinkingLevel: enforceThinkingPolicy(
         resolvedAiSettings.model,
         resolvedAiSettings.thinkingLevel
       ),
+      ...(resolvedAiSettings.reasoningMode != null
+        ? { reasoningMode: resolvedAiSettings.reasoningMode }
+        : {}),
     };
+  } else {
+    const currentAiSettings =
+      args?.aiSettings ??
+      (await resolveCurrentAiSettings(client, workspace, trimmedWorkspaceId, currentAgentId));
 
-    await persistAgentAiSettings(client, trimmedWorkspaceId, nextAgentId, normalizedAiSettings);
-    if (args?.onAgentModeChanged != null) {
-      await args.onAgentModeChanged(nextAgentId, normalizedAiSettings);
+    if (trimmedConfigId === MODEL_CONFIG_ID) {
+      const model = normalizeSelectedModel(trimmedValue).trim();
+      if (!isValidModelFormat(model)) {
+        throw new Error(`Invalid model format: ${trimmedValue}`);
+      }
+      // The send path re-gates pro mode for the selected model and route.
+      nextAiSettings = {
+        ...currentAiSettings,
+        model,
+        thinkingLevel: enforceThinkingPolicy(model, currentAiSettings.thinkingLevel),
+      };
+    } else if (trimmedConfigId === THINKING_LEVEL_CONFIG_ID) {
+      if (!isThinkingLevel(trimmedValue)) {
+        throw new Error(
+          `handleSetConfigOption: value must be a valid ThinkingLevel, got '${trimmedValue}'`
+        );
+      }
+      nextAiSettings = {
+        ...currentAiSettings,
+        thinkingLevel: enforceThinkingPolicy(currentAiSettings.model, trimmedValue),
+      };
+    } else {
+      throw new Error(`Unsupported config option id '${trimmedConfigId}'`);
     }
-
-    return buildConfigOptions(client, trimmedWorkspaceId, { activeAgentId: nextAgentId });
   }
 
-  const currentAiSettings = await resolveCurrentAiSettings(
-    client,
-    workspace,
-    trimmedWorkspaceId,
-    currentAgentId
-  );
-
-  if (trimmedConfigId === MODEL_CONFIG_ID) {
-    const clampedThinkingLevel = enforceThinkingPolicy(
-      trimmedValue,
-      currentAiSettings.thinkingLevel
-    );
-
-    await persistAgentAiSettings(client, trimmedWorkspaceId, currentAgentId, {
-      model: trimmedValue,
-      thinkingLevel: clampedThinkingLevel,
-    });
-
-    return buildConfigOptions(client, trimmedWorkspaceId, { activeAgentId: currentAgentId });
-  }
-
-  if (trimmedConfigId === THINKING_LEVEL_CONFIG_ID) {
-    if (!isThinkingLevel(trimmedValue)) {
-      throw new Error(
-        `handleSetConfigOption: value must be a valid ThinkingLevel, got '${trimmedValue}'`
-      );
-    }
-
-    const clampedThinkingLevel = enforceThinkingPolicy(currentAiSettings.model, trimmedValue);
-
-    await persistAgentAiSettings(client, trimmedWorkspaceId, currentAgentId, {
-      model: currentAiSettings.model,
-      thinkingLevel: clampedThinkingLevel,
-    });
-
-    return buildConfigOptions(client, trimmedWorkspaceId, { activeAgentId: currentAgentId });
-  }
-
-  throw new Error(`Unsupported config option id '${trimmedConfigId}'`);
+  await args?.onAgentModeChanged?.(nextAgentId, nextAiSettings);
+  return buildConfigOptions(client, trimmedWorkspaceId, {
+    activeAgentId: nextAgentId,
+    aiSettings: nextAiSettings,
+  });
 }

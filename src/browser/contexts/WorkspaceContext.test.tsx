@@ -8,6 +8,9 @@ import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectCo
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
+  DEFAULT_MODEL_KEY,
+  HIDDEN_MODELS_KEY,
+  RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -19,8 +22,13 @@ import {
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  syncPersistedStateFromBackend,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -71,6 +79,146 @@ describe("WorkspaceContext", () => {
 
     currentClientMock = {};
   });
+
+  test.each(["resolves", "rejects", "stalls"])(
+    "hydrates preferences when migration persistence %s",
+    async (writeState) => {
+      const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+      const legacyHidden = "openrouter:openai/gpt-5";
+      const defaultModel = "openai:gpt-5.6-terra";
+      createMockAPI({
+        localStorage: {
+          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+          [DEFAULT_MODEL_KEY]: JSON.stringify(defaultModel),
+          [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: true }),
+        },
+      });
+      const updateModelPreferences = mock(() => {
+        if (writeState === "stalls") return new Promise<void>(() => undefined);
+        if (writeState === "rejects") return Promise.reject(new Error("config write failed"));
+        return Promise.resolve();
+      });
+      const cfg = await createMockORPCClient().config.getConfig();
+      currentClientMock.config = {
+        getConfig: () =>
+          Promise.resolve({
+            ...cfg,
+            hiddenModels: seeded,
+            hiddenModelsInitialized: false,
+            runtimeEnablement: { ssh: false },
+          }),
+        updateModelPreferences,
+      };
+      await setup();
+      await waitFor(() => {
+        expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
+          ...seeded,
+          legacyHidden,
+        ]);
+      });
+      expect(updateModelPreferences).toHaveBeenCalledWith({
+        defaultModel,
+        hiddenModels: [...seeded, legacyHidden],
+      });
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
+      expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
+    }
+  );
+
+  test.each(
+    ["local", "cross-tab", "cross-tab-delayed"].flatMap((source) =>
+      (source === "cross-tab-delayed"
+        ? ["hidden", "default"]
+        : ["hidden", "default", "hidden-aba", "default-aba"]
+      ).map((changed) => [source, changed])
+    )
+  )(
+    "keeps %s %s preference edits ahead of stale startup config until reconnect",
+    async (source, changed) => {
+      const blue = "openai:daybreak-blue-latest";
+      const red = "openai:daybreak-red-latest";
+      const legacyHidden = "openrouter:openai/gpt-5";
+      const legacyDefault = "openai:gpt-5.6-terra";
+      const chosenDefault = "anthropic:claude-opus-4-6";
+      createMockAPI({
+        localStorage: {
+          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+          [DEFAULT_MODEL_KEY]: JSON.stringify(legacyDefault),
+        },
+      });
+      const cfg = await createMockORPCClient().config.getConfig();
+      let resolveConfig!: (value: typeof cfg) => void;
+      const pendingConfig = new Promise<typeof cfg>((resolve) => {
+        resolveConfig = resolve;
+      });
+      const updateModelPreferences = mock(() => Promise.resolve());
+      currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
+      await setup();
+      const writePreference = (key: string, value: unknown) => {
+        if (source === "local") {
+          updatePersistedState(key, value);
+          return;
+        }
+        // Seed the shared value without emitting a local write in this tab.
+        syncPersistedStateFromBackend(key, value);
+        if (source === "cross-tab-delayed") return;
+        window.dispatchEvent(
+          new window.StorageEvent("storage", { key, storageArea: window.localStorage })
+        );
+      };
+      act(() => {
+        if (changed.startsWith("default")) {
+          writePreference(DEFAULT_MODEL_KEY, chosenDefault);
+          if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
+        } else {
+          writePreference(HIDDEN_MODELS_KEY, [red, legacyHidden]);
+          if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
+        }
+      });
+      resolveConfig({
+        ...cfg,
+        hiddenModels: [blue, red],
+        hiddenModelsInitialized: false,
+        runtimeEnablement: { ssh: false },
+      });
+      await waitFor(() =>
+        expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(
+        changed === "default" ? chosenDefault : legacyDefault
+      );
+      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
+        changed.startsWith("default")
+          ? [blue, red, legacyHidden]
+          : changed === "hidden"
+            ? [red, legacyHidden]
+            : [legacyHidden]
+      );
+      expect(updateModelPreferences).toHaveBeenCalledWith(
+        changed.startsWith("default")
+          ? { hiddenModels: [blue, red, legacyHidden] }
+          : { defaultModel: legacyDefault }
+      );
+
+      cleanup();
+      getWorkspaceStoreRaw().dispose();
+      currentClientMock.config = {
+        getConfig: () =>
+          Promise.resolve({
+            ...cfg,
+            defaultModel: legacyDefault,
+            hiddenModels: [],
+            hiddenModelsInitialized: true,
+          }),
+        updateModelPreferences,
+      };
+      await setup();
+      await waitFor(() =>
+        expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([])
+      );
+      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
+    }
+  );
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
@@ -129,6 +277,58 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(workspaceApi.onMetadata.mock.calls.length).toBeGreaterThan(0));
     expect(workspaceApi.onMetadata).toHaveBeenCalled();
+  });
+
+  test("deletion metadata waits for one config notification to refresh projects", async () => {
+    const workspaces = Array.from({ length: 5 }, (_, index) =>
+      createProjectWorkspaceMetadata("child-" + index, "/alpha")
+    );
+    const deletions = workspaces.map(() => Promise.withResolvers<void>());
+    const configChanged = Promise.withResolvers<void>();
+    const { projects } = createMockAPI({
+      workspace: {
+        list: () => Promise.resolve(workspaces),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              for (const [index, workspace] of workspaces.entries()) {
+                await deletions[index].promise;
+                yield { workspaceId: workspace.id, metadata: null };
+              }
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+    currentClientMock = {
+      ...currentClientMock,
+      config: {
+        onConfigChanged: () =>
+          Promise.resolve(
+            (async function* () {
+              await configChanged.promise;
+              yield undefined;
+            })() as unknown as Awaited<ReturnType<APIClient["config"]["onConfigChanged"]>>
+          ),
+      },
+    };
+    const contexts = await setupWithProjectContext();
+    await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(5));
+    await waitFor(() => expect(contexts.project().loading).toBe(false));
+    await act(async () => {
+      await contexts.project().refreshProjects();
+    });
+    const initialRequests = projects.list.mock.calls.length;
+    for (const [index, deletion] of deletions.entries()) {
+      act(() => {
+        deletion.resolve();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(4 - index));
+      expect(projects.list).toHaveBeenCalledTimes(initialRequests);
+    }
+    act(() => {
+      configChanged.resolve();
+    });
+    await waitFor(() => expect(projects.list).toHaveBeenCalledTimes(initialRequests + 1));
   });
 
   test("switches selection to parent when selected child workspace is deleted", async () => {
@@ -437,59 +637,6 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace?.workspaceId).toBe(parentId);
   });
 
-  test("refreshes projects when metadata delete event is received", async () => {
-    const workspaceId = "ws-delete-refresh";
-
-    const workspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
-        id: workspaceId,
-        projectPath: "/alpha",
-        projectName: "alpha",
-        name: "main",
-        namedWorkspacePath: "/alpha-main",
-      }),
-    ];
-
-    let emitDelete:
-      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
-      | null = null;
-
-    const { projects: projectsApi } = createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(workspaces),
-        onMetadata: () =>
-          Promise.resolve(
-            (async function* () {
-              const event = await new Promise<{
-                workspaceId: string;
-                metadata: FrontendWorkspaceMetadata | null;
-              }>((resolve) => {
-                emitDelete = resolve;
-              });
-              yield event;
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          ),
-      },
-      projects: {
-        list: () => Promise.resolve([]),
-      },
-    });
-
-    await setup();
-
-    await waitFor(() => expect(emitDelete).toBeTruthy());
-    await waitFor(() => expect(projectsApi.list).toHaveBeenCalled());
-    const callsBeforeDelete = projectsApi.list.mock.calls.length;
-
-    act(() => {
-      emitDelete?.({ workspaceId, metadata: null });
-    });
-
-    await waitFor(() => {
-      expect(projectsApi.list.mock.calls.length).toBeGreaterThan(callsBeforeDelete);
-    });
-  });
-
   test("seeds model + thinking localStorage from backend metadata", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
       createWorkspaceMetadata({
@@ -520,15 +667,22 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test("stale metadata does not override a main workspace agent selection", async () => {
+  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
+    const changed = change !== "unchanged";
+    const nextAgentId = change === "mode" ? "auto" : "plan";
     const workspaceId = "ws-agent-main";
+    const saved = createWorkspaceMetadata({
+      id: workspaceId,
+      agentId: "plan",
+      aiSettingsByAgent: { plan: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
+    });
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
 
     createMockAPI({
       workspace: {
-        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        list: () => Promise.resolve([saved]),
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
@@ -551,19 +705,34 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
     act(() => {
+      updatePersistedState(getAgentIdKey(workspaceId), "exec");
+      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
       emitMetadata?.({
         workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+        metadata: {
+          ...saved,
+          title: "Updated title",
+          ...(changed
+            ? {
+                agentId: nextAgentId,
+                aiSettingsByAgent: {
+                  [nextAgentId]: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+                },
+              }
+            : {}),
+        },
       });
     });
 
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "exec"
+    await waitFor(() =>
+      expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
   });
 
   test("child workspace metadata still seeds the locked backend agent", async () => {
@@ -747,6 +916,23 @@ describe("WorkspaceContext", () => {
     expect(result.error).toBe("Failed");
   });
 
+  test("removeWorkspace forwards descendant consent and preserves blockers", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    const ctx = await setup();
+    const failure = {
+      success: false,
+      error: "A descendant is active",
+      descendants: [{ workspaceId: "child", title: "Reviewer", active: true }],
+    };
+    workspaceApi.remove.mockResolvedValue(failure);
+    const options = { force: true, acknowledgedDescendantIds: ["child"] };
+
+    const result = await ctx().removeWorkspace("parent", options);
+
+    expect(workspaceApi.remove).toHaveBeenCalledWith({ workspaceId: "parent", options });
+    expect(result).toEqual(failure);
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";
@@ -868,6 +1054,101 @@ describe("WorkspaceContext", () => {
       expect(readPersistedState<Record<string, string>>(terminalTitlesKey, {})).toEqual({
         t1: "still-open",
       });
+    });
+
+    test("marks the workspace as archiving only while preflight or archive is in flight", async () => {
+      const workspaceId = "ws-archive-pending";
+      let settleArchive: (() => void) | undefined;
+      let failPreflight: ((error: Error) => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((_resolve, reject) => {
+              failPreflight = reject;
+            }),
+        },
+      });
+
+      const ctx = await setup();
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      let archivePromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      // A failed request must clear the indicator too, or the row would read "Archiving..."
+      // forever after a dropped connection.
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        failPreflight?.(new Error("WebSocket closed"));
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
+
+    test("keeps the workspace marked until the last overlapping request settles", async () => {
+      const workspaceId = "ws-archive-overlap";
+      let settleArchive: (() => void) | undefined;
+      let settlePreflight: (() => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((resolve) => {
+              settlePreflight = () =>
+                resolve({ success: true as const, data: { kind: "ready" as const } });
+            }),
+        },
+      });
+
+      const ctx = await setup();
+
+      // Header-started archive in flight, then the sidebar shortcut fires a preflight.
+      let archivePromise: Promise<unknown> | undefined;
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      // The first request to finish must not clear the indicator while the other is running.
+      await act(async () => {
+        settlePreflight?.();
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
     });
   });
 
@@ -1853,6 +2134,10 @@ function createMockAPI(options: MockAPIOptions = {}) {
     archive: mock(
       options.workspace?.archive ??
         (() => Promise.resolve({ success: true as const, data: { kind: "archived" as const } }))
+    ),
+    preflightArchive: mock(
+      options.workspace?.preflightArchive ??
+        (() => Promise.resolve({ success: true as const, data: { kind: "ready" as const } }))
     ),
     unarchive: mock(
       options.workspace?.unarchive ??

@@ -11,8 +11,11 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { useModelFallbacks } from "@/browser/hooks/useModelFallbacks";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { MODEL_FALLBACK_CHAIN_LIMIT } from "@/common/utils/ai/modelFallbacks";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import {
+  MODEL_FALLBACK_CHAIN_LIMIT,
+  normalizeFallbackModelKey,
+} from "@/common/utils/ai/modelFallbacks";
 
 const SELECT_TRIGGER_CLASS =
   "border-border-medium bg-background-secondary hover:bg-hover h-7 w-64 cursor-pointer rounded-md border px-2 text-xs transition-colors";
@@ -28,6 +31,7 @@ const SELECT_TRIGGER_CLASS =
 export function ModelFallbacksEditor() {
   const { modelFallbacks, setFallbackChain } = useModelFallbacks();
   const { models } = useModelsFromSettings();
+  const { config: providersConfig } = useProvidersConfig();
   // Draft source model for a chain being created (entries with empty chains
   // are never persisted, so the first fallback pick materializes the entry).
   const [draftSource, setDraftSource] = useState<string | null>(null);
@@ -35,9 +39,12 @@ export function ModelFallbacksEditor() {
   const entries = Object.entries(modelFallbacks).sort(([a], [b]) => a.localeCompare(b));
   const configuredSources = new Set(entries.map(([source]) => source));
   // Settings can list aliases that canonicalize to the same model (e.g. a
-  // gateway-prefixed copy of a built-in). Dedupe via canonical form so
-  // SelectItem values stay unique; chains store canonical strings anyway.
-  const modelCandidates = Array.from(new Set(models.map((model) => normalizeToCanonical(model))));
+  // gateway-prefixed copy of a built-in). Dedupe via the metadata-aware
+  // fallback key so SelectItem values stay unique while cross-typed Coder
+  // instances keep a chain distinct from the direct provider's.
+  const modelCandidates = Array.from(
+    new Set(models.map((model) => normalizeFallbackModelKey(model, providersConfig)))
+  );
   const sourceCandidates = modelCandidates.filter((model) => !configuredSources.has(model));
 
   const chainFor = (source: string): string[] => modelFallbacks[source]?.models ?? [];
@@ -167,10 +174,11 @@ export function ModelFallbacksEditor() {
 
       {entries.map(([source, entry]) => renderChainRow(source, entry.models))}
 
-      {draftSource !== null && !configuredSources.has(normalizeToCanonical(draftSource)) ? (
+      {draftSource !== null &&
+      !configuredSources.has(normalizeFallbackModelKey(draftSource, providersConfig)) ? (
         renderChainRow(
-          normalizeToCanonical(draftSource),
-          chainFor(normalizeToCanonical(draftSource))
+          normalizeFallbackModelKey(draftSource, providersConfig),
+          chainFor(normalizeFallbackModelKey(draftSource, providersConfig))
         )
       ) : (
         <div className="flex items-center gap-2">

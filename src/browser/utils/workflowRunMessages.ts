@@ -17,7 +17,6 @@ import {
 } from "@/common/utils/workflowRunMessages";
 
 export { buildWorkflowRunCardMessage, filterWorkflowDisplayOnlyMessages };
-export type { WorkflowRunCardInput, WorkflowRunCardResult };
 
 function getLatestWorkflowResult(run: WorkflowRunRecord): unknown {
   return run.events.findLast((event) => event.type === "result")?.result ?? null;

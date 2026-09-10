@@ -40,6 +40,9 @@ export const CommandIds = {
   navNext: () => "nav:next" as const,
   navPrev: () => "nav:prev" as const,
   navToggleSidebar: () => "nav:toggleSidebar" as const,
+  navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
+  navToggleFlatChatList: () => "nav:toggle-flat-chat-list" as const,
+  navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,
@@ -91,9 +94,25 @@ export const CommandIds = {
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
+  coderDisconnect: () => "providers:coder:disconnect" as const,
+  coderRefreshModels: () => "providers:coder:refresh-models" as const,
+
+  // Agent Plugin commands (agent-plugins experiment)
+  pluginsInstall: () => "plugins:install" as const,
+  pluginsAddComponents: () => "plugins:add-components" as const,
+  pluginsUninstall: () => "plugins:uninstall" as const,
+  pluginsCheckUpdates: () => "plugins:check-updates" as const,
+  pluginsUpdateAll: () => "plugins:update-all" as const,
+  pluginsUpdateOne: () => "plugins:update-one" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,
+  aboutOpen: () => "about:open" as const,
+  updateCheck: () => "update:check" as const,
+  updateDownload: () => "update:download" as const,
+  updateInstall: () => "update:install" as const,
+  updateInstallForce: () => "update:install-force" as const,
+  updateChannel: (channel: string) => `update:channel:${channel}` as const,
 } as const;
 
 /**

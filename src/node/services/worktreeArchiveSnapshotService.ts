@@ -247,7 +247,7 @@ export class WorktreeArchiveSnapshotService {
       return Err("Workspace is missing its persisted branch name");
     }
 
-    const sessionDir = this.config.getSessionDir(args.workspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, args.workspaceId);
     const stateDir = path.join(sessionDir, SNAPSHOT_DIR_NAME);
     const tempStateDir = path.join(
       sessionDir,
@@ -528,7 +528,7 @@ export class WorktreeArchiveSnapshotService {
         if (!headShaAvailable) {
           const committedPatchPath = projectSnapshot.committedPatchPath
             ? this.resolveSessionRelativePath(
-                this.config.getSessionDir(args.workspaceId),
+                path.join(this.config.sessionsDir, args.workspaceId),
                 projectSnapshot.committedPatchPath
               )
             : undefined;
@@ -551,7 +551,7 @@ export class WorktreeArchiveSnapshotService {
 
         if (projectSnapshot.stagedPatchPath) {
           const stagedPatchPath = this.resolveSessionRelativePath(
-            this.config.getSessionDir(args.workspaceId),
+            path.join(this.config.sessionsDir, args.workspaceId),
             projectSnapshot.stagedPatchPath
           );
           if (!(await this.pathExists(stagedPatchPath))) {
@@ -569,7 +569,7 @@ export class WorktreeArchiveSnapshotService {
 
         if (projectSnapshot.unstagedPatchPath) {
           const unstagedPatchPath = this.resolveSessionRelativePath(
-            this.config.getSessionDir(args.workspaceId),
+            path.join(this.config.sessionsDir, args.workspaceId),
             projectSnapshot.unstagedPatchPath
           );
           if (!(await this.pathExists(unstagedPatchPath))) {
@@ -883,7 +883,7 @@ export class WorktreeArchiveSnapshotService {
       args[0] === "am"
         ? {
             ...GIT_NO_HOOKS_ENV,
-            GIT_COMMITTER_NAME: "Mux Archive Restore",
+            GIT_COMMITTER_NAME: "Xum Archive Restore",
             GIT_COMMITTER_EMAIL: "mux-archive-restore@local",
           }
         : GIT_NO_HOOKS_ENV;
@@ -927,7 +927,7 @@ export class WorktreeArchiveSnapshotService {
     workspaceId: string,
     snapshot: WorktreeArchiveSnapshot
   ): Promise<void> {
-    const sessionDir = this.config.getSessionDir(workspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     const stateDir = this.resolveSessionRelativePath(sessionDir, snapshot.stateDirPath);
     await fsPromises.rm(stateDir, { recursive: true, force: true });
 
@@ -1065,7 +1065,7 @@ export class WorktreeArchiveSnapshotService {
     try {
       return await fsPromises.readFile(
         this.resolveSessionRelativePath(
-          this.config.getSessionDir(args.workspaceId),
+          path.join(this.config.sessionsDir, args.workspaceId),
           args.artifactPath
         ),
         "utf-8"

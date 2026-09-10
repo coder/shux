@@ -90,9 +90,9 @@ function createMockProviderService(
       deps.setConfigCalls.push({ provider, keyPath, value });
       return Promise.resolve(deps.setConfigResult);
     },
-    setModels: (provider: string, models: ProviderModelEntry[]): Result<void, string> => {
+    setModels: (provider: string, models: ProviderModelEntry[]): Promise<Result<void, string>> => {
       deps.setModelsCalls.push({ provider, models });
-      return deps.setModelsResult;
+      return Promise.resolve(deps.setModelsResult);
     },
   };
 }

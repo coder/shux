@@ -199,6 +199,37 @@ describe("OAuthFlowManager", () => {
   });
 
   // -----------------------------------------------------------------------
+  // cancelAll
+  // -----------------------------------------------------------------------
+
+  describe("cancelAll", () => {
+    it("cancels every active flow and removes them before resolving", async () => {
+      const entry1 = createFlowEntry();
+      const entry2 = createFlowEntry();
+      manager.register("f1", entry1);
+      manager.register("f2", entry2);
+
+      await manager.cancelAll();
+
+      // Removed synchronously with the cancel: commit-path liveness checks
+      // (`has`) must reject cancelled flows once cancelAll resolves.
+      expect(manager.has("f1")).toBe(false);
+      expect(manager.has("f2")).toBe(false);
+      for (const entry of [entry1, entry2]) {
+        const result = await entry.resultDeferred.promise;
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("cancelled");
+        }
+      }
+    });
+
+    it("is a no-op when there are no flows", async () => {
+      await manager.cancelAll();
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // finish
   // -----------------------------------------------------------------------
 
@@ -258,6 +289,74 @@ describe("OAuthFlowManager", () => {
       await manager.finish("f1", Ok(undefined));
 
       expect(manager.has("f1")).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // guaranteed cleanup (per-flow scope)
+  // -----------------------------------------------------------------------
+
+  describe("guaranteed cleanup", () => {
+    it("closes the server and clears the timeout even when the deferred resolve throws", async () => {
+      // Per-flow scope guarantee: each resource has an independent release, so
+      // a defect while settling the deferred cannot leak the loopback server
+      // or the registration timeout. (The pre-Effect implementation skipped
+      // the server close when resolve threw.)
+      let serverClosed = false;
+      const mockServer = {
+        close: (cb?: (err?: Error) => void) => {
+          serverClosed = true;
+          if (cb) cb();
+          return mockServer;
+        },
+      } as unknown as http.Server;
+
+      let timeoutFired = false;
+      const entry: OAuthFlowEntry = {
+        server: mockServer,
+        resultDeferred: {
+          promise: createDeferred<Result<void, string>>().promise,
+          resolve: () => {
+            throw new Error("resolve exploded");
+          },
+        },
+        timeoutHandle: setTimeout(() => {
+          timeoutFired = true;
+        }, 10),
+      };
+      manager.register("f1", entry);
+
+      // Must not reject despite the resolve defect.
+      await manager.finish("f1", Ok(undefined));
+
+      expect(manager.has("f1")).toBe(false);
+      expect(serverClosed).toBe(true);
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(timeoutFired).toBe(false);
+    });
+
+    it("closes the loopback server after a waitFor timeout even though waitFor already returned", async () => {
+      // The timeout-path cleanup is fire-and-forget (waitFor resolves without
+      // waiting for the server close); the detached release fiber must still
+      // complete after waitFor's own fiber has exited.
+      let serverClosed = false;
+      const mockServer = {
+        close: (cb?: (err?: Error) => void) => {
+          serverClosed = true;
+          if (cb) cb();
+          return mockServer;
+        },
+      } as unknown as http.Server;
+
+      manager.register("f1", createFlowEntry(mockServer));
+
+      const result = await manager.waitFor("f1", 10);
+      expect(result.success).toBe(false);
+      expect(manager.has("f1")).toBe(false);
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(serverClosed).toBe(true);
     });
   });
 

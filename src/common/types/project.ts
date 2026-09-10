@@ -11,13 +11,14 @@ import type {
   UpdateChannel,
 } from "@/common/config/schemas/appConfigOnDisk";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { RuntimeEnablementId } from "./runtime";
-import type { TaskSettings, SubagentAiDefaults } from "./tasks";
+import type { TaskSettings } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
-import type { ThinkingLevel } from "./thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
@@ -71,25 +72,25 @@ export interface ProjectsConfig {
   /**
    * Default parent directory for new projects (cloning and bare-name creation).
    *
-   * When unset, falls back to getMuxProjectsDir() (~/.mux/projects).
+   * When unset, falls back to getXumProjectsDir() (~/.xum/projects).
    */
   defaultProjectDir?: string;
   /** IDs of splash screens that have been viewed */
   viewedSplashScreens?: string[];
-  /** User preferences shared across local browser origins through ~/.mux/config.json. */
+  /** User preferences shared across local browser origins through ~/.xum/config.json. */
   userPreferences?: UserPreferences;
   /** Global task settings (agent sub-workspaces, queue limits, nesting depth) */
   taskSettings?: TaskSettings;
-  /** UI layout presets + hotkeys (shared via ~/.mux/config.json). */
+  /** UI layout presets + hotkeys (shared via ~/.xum/config.json). */
   layoutPresets?: LayoutPresetsConfig;
   /** Let chat transcripts use the full chat pane width instead of the default readable column. */
   chatTranscriptFullWidth?: boolean;
   /**
-   * Mux Gateway routing preferences (shared via ~/.mux/config.json).
+   * Xum Gateway routing preferences (shared via ~/.xum/config.json).
    * Mirrors browser localStorage so switching server ports doesn't reset the UI.
    */
   muxGatewayEnabled?: boolean;
-  /** Enable recording AI SDK devtools logs to ~/.mux/sessions/<workspace>/devtools.jsonl */
+  /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
@@ -114,7 +115,7 @@ export interface ProjectsConfig {
   modelFallbacks?: ModelFallbacks;
 
   /**
-   * Default model used for new workspaces (shared via ~/.mux/config.json).
+   * Default model used for new workspaces (shared via ~/.xum/config.json).
    * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
    */
   defaultModel?: string;
@@ -122,32 +123,31 @@ export interface ProjectsConfig {
   advisorModelString?: string;
   /** Global advisor reasoning override for the experimental advisor tool. */
   advisorThinkingLevel?: ThinkingLevel;
+  /** Advisor Pro/Standard selection, independent of effort and the parent chat mode. */
+  advisorReasoningMode?: OpenAIReasoningMode;
   /** Positive per-turn advisor cap; null/undefined means unlimited. */
   advisorMaxUsesPerTurn?: number | null;
   /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
   advisorMaxOutputTokens?: number | null;
   /**
-   * Hidden model IDs (shared via ~/.mux/config.json).
+   * Hidden model IDs (shared via ~/.xum/config.json).
    * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).
    */
   hiddenModels?: string[];
-  /** Default model + thinking overrides per agentId (applies to UI agents and subagents). */
-  agentAiDefaults?: AgentAiDefaults;
   /**
-   * Sparse per-agent override that wins over agentAiDefaults when an agent runs as a
-   * sub-agent. The exec key is canonical storage for the sub-agent Exec slot.
-   * Other keys are kept for legacy mirror compatibility, but new code should write
-   * to agentAiDefaults instead.
+   * Default model/thinking/reasoning overrides per agentId. Base fields are the
+   * interactive profile; the sparse nested `subagent` profile holds
+   * delegated-run differences (see AgentAiDefaultsEntrySchema).
    */
-  subagentAiDefaults?: SubagentAiDefaults;
+  agentAiDefaults?: AgentAiDefaults;
   /** Internal one-time migration markers. Not surfaced in user-facing config UI. */
   migrations?: AppConfigMigrations;
   /** Use built-in SSH2 library instead of system OpenSSH for remote connections (non-Windows only) */
   useSSH2Transport?: boolean;
 
-  /** Mux Governor server URL (normalized origin, no trailing slash) */
+  /** Xum Governor server URL (normalized origin, no trailing slash) */
   muxGovernorUrl?: string;
-  /** Mux Governor OAuth access token (secret - never return to UI) */
+  /** Xum Governor OAuth access token (secret - never return to UI) */
   muxGovernorToken?: string;
 
   /**
@@ -196,11 +196,17 @@ export interface ProjectsConfig {
   terminalDefaultShell?: string;
 
   /**
-   * Runtime enablement overrides (shared via ~/.mux/config.json).
+   * Runtime enablement overrides (shared via ~/.xum/config.json).
    * Defaults to enabled; store `false` only to keep config.json minimal.
    */
   runtimeEnablement?: Partial<Record<RuntimeEnablementId, false>>;
 
-  /** Optional 1Password account name used for desktop SDK account selection. */
-  onePasswordAccountName?: string;
+  settingsBackup?: SettingsBackup;
+
+  /**
+   * Legacy 1Password account name. The integration was removed; the value is
+   * preserved across saves (never used at runtime) so downgrading restores a
+   * working 1Password setup without re-entering the account.
+   */
+  legacyOnePasswordAccountName?: string;
 }

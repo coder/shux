@@ -12,7 +12,7 @@ describe("formatOrpcError", () => {
           path: ["slots", 0, "preset"],
         },
       ],
-      data: { version: 2, slots: [] },
+      invalidData: { version: 2, slots: [] },
     });
 
     const error = new ORPCError("INTERNAL_SERVER_ERROR", {

@@ -31,6 +31,23 @@ export type WorkspaceTurnTaskStatus =
   | "interrupted"
   | "error";
 
+export type ActiveWorkspaceTurnTaskStatus = Extract<
+  WorkspaceTurnTaskStatus,
+  "queued" | "starting" | "running"
+>;
+
+const ACTIVE_WORKSPACE_TURN_TASK_STATUSES = new Set<WorkspaceTurnTaskStatus>([
+  "queued",
+  "starting",
+  "running",
+]);
+
+export function isActiveWorkspaceTurnTaskStatus(
+  status: WorkspaceTurnTaskStatus | null | undefined
+): status is ActiveWorkspaceTurnTaskStatus {
+  return status != null && ACTIVE_WORKSPACE_TURN_TASK_STATUSES.has(status);
+}
+
 export interface WorkspaceTurnTaskHandleRecord {
   kind: "workspace_turn";
   handleId: string;
@@ -66,6 +83,10 @@ export interface WorkspaceTurnTaskHandleRecord {
    * accepted/sent for this handle. Restart-safe one-shot dedupe: a present marker
    * prevents a duplicate wake-up during stale recovery or duplicate settlement.
    */
+  /** ISO timestamp proving a post-upgrade settlement requires direct-parent result delivery. */
+  directParentResultDeliveryRequiredAt?: string;
+  /** ISO timestamp set after that continuation result is delivered to its direct parent. */
+  directParentResultDeliveredAt?: string;
   terminalAttentionNotifiedAt?: string;
 }
 
@@ -99,6 +120,8 @@ const WorkspaceTurnTaskHandleRecordSchema = z
     deferredMessageIds: z.array(z.string().min(1)).optional(),
     error: z.string().optional(),
     attentionPolicy: BackgroundWorkAttentionPolicySchema.optional(),
+    directParentResultDeliveryRequiredAt: z.string().optional(),
+    directParentResultDeliveredAt: z.string().optional(),
     terminalAttentionNotifiedAt: z.string().optional(),
   })
   .strict();
@@ -204,7 +227,19 @@ export class TaskHandleStore {
     const recordsByOwner = await Promise.all(
       entries
         .filter((entry) => entry.isDirectory())
-        .map((entry) => this.listWorkspaceTurns(entry.name, options))
+        .map(async (entry) => {
+          try {
+            return await this.listWorkspaceTurns(entry.name, options);
+          } catch (error: unknown) {
+            // Startup reconciliation is best-effort: one unreadable session must not prevent every
+            // other workspace (or the app itself) from loading.
+            log.warn("Skipping unreadable workspace-turn handle directory", {
+              ownerWorkspaceId: entry.name,
+              error,
+            });
+            return [];
+          }
+        })
     );
     return recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
@@ -218,7 +253,7 @@ export class TaskHandleStore {
 
   private getOwnerHandleDir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "ownerWorkspaceId must be non-empty");
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), TASK_HANDLES_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, TASK_HANDLES_DIR);
   }
 
   private getHandlePath(ownerWorkspaceId: string, handleId: string): string {

@@ -3,7 +3,7 @@ import React from "react";
 import { cn } from "@/common/lib/utils";
 import type { WorkflowScriptDescriptor } from "@/common/types/workflow";
 import { DetailSection } from "./Shared/ToolPrimitives";
-import { HighlightedCode, JsonHighlight } from "./Shared/HighlightedCode";
+import { JsonHighlight } from "./Shared/HighlightedCode";
 
 export const WORKFLOW_ACTION_BUTTON_CLASS =
   "text-muted hover:text-foreground border-border rounded border px-2 py-1 disabled:opacity-50 disabled:hover:text-muted";
@@ -71,27 +71,6 @@ export function WorkflowJsonBlock(props: {
     >
       <JsonHighlight value={props.value} />
     </div>
-  );
-}
-
-export function WorkflowSourceBlock(props: {
-  source: string;
-  title?: string;
-  className?: string;
-  maxHeightClassName?: string;
-}) {
-  const source = props.source.trimEnd();
-  return (
-    <WorkflowSection title={props.title ?? "Source"} className={props.className}>
-      <div
-        className={cn(
-          "border-border bg-code-bg overflow-auto rounded border p-2",
-          props.maxHeightClassName ?? "max-h-[420px]"
-        )}
-      >
-        <HighlightedCode language="javascript" code={source} showLineNumbers />
-      </div>
-    </WorkflowSection>
   );
 }
 

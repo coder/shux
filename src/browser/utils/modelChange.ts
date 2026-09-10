@@ -1,5 +1,5 @@
 import { getModelKey } from "@/common/constants/storage";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
@@ -13,7 +13,10 @@ interface ExplicitModelChange {
 // User request: keep origin tracking in-memory so UI-only warnings don't add persistence complexity.
 const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 
-const normalizeExplicitModel = (model: string): string => normalizeToCanonical(model).trim();
+// Coder identities stay raw so switches between coder:<instance>/<model> and the
+// direct <provider>:<model> are tracked as explicit actions; passthrough gateway
+// aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
+const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
 export function recordWorkspaceModelChange(
   workspaceId: string,

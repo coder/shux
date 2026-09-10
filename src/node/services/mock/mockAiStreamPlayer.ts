@@ -1,5 +1,5 @@
 import assert from "@/common/utils/assert";
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import type { Result } from "@/common/types/result";
@@ -7,6 +7,12 @@ import { Ok, Err } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
 import type { AIService } from "@/node/services/aiService";
 import { createErrorEvent } from "@/node/services/utils/sendMessageError";
+import {
+  createTurnCompletionController,
+  type StopStreamOptions,
+  type TurnCompletion,
+  type TurnStreamHandle,
+} from "@/node/services/streamManager";
 import { log } from "@/node/services/log";
 import type {
   MockAssistantEvent,
@@ -20,6 +26,7 @@ import type {
   StreamStartEvent,
   StreamDeltaEvent,
   StreamEndEvent,
+  StreamAbortEvent,
   UsageDeltaEvent,
 } from "@/common/types/stream";
 import type { ToolCallStartEvent, ToolCallEndEvent } from "@/common/types/stream";
@@ -126,11 +133,19 @@ interface ActiveStream {
   historySequence: number;
   startTime: number;
   model: string;
+  mode?: MockStreamStartEvent["mode"];
+  agentId?: string;
+  thinkingLevel?: MockStreamStartEvent["thinkingLevel"];
+  muxMetadata?: MuxMessageMetadata;
   parts: MuxMessage["parts"];
   partialWriteTimer: ReturnType<typeof setTimeout> | null;
   eventQueue: Array<() => Promise<void>>;
   isProcessing: boolean;
+  processing?: ReturnType<typeof Promise.withResolvers<void>>;
+  cancelPromise?: Promise<void>;
+  terminalCompletion?: TurnCompletion;
   cancelled: boolean;
+  settleCompletion: (completion: TurnCompletion) => void;
 }
 
 export class MockAiStreamPlayer {
@@ -225,33 +240,52 @@ export class MockAiStreamPlayer {
       }
     });
   }
-  private async stopActiveStream(workspaceId: string): Promise<void> {
+  private stopActiveStream(workspaceId: string, options?: StopStreamOptions): Promise<void> {
     const active = this.activeStreams.get(workspaceId);
-    if (!active) return;
-
-    active.cancelled = true;
-
-    // Emit stream-abort event to mirror real streaming behavior before we await disk cleanup.
-    this.deps.aiService.emit("stream-abort", {
+    if (!active) return Promise.resolve();
+    if (active.cancelPromise) return active.cancelPromise;
+    const canceled = Promise.withResolvers<void>();
+    active.cancelPromise = canceled.promise;
+    this.cancelTimers(active);
+    const abortReason = options?.abortReason ?? "system";
+    const streamAbort: StreamAbortEvent = {
       type: "stream-abort",
       workspaceId,
       messageId: active.messageId,
-      abortReason: "user",
-    });
-
-    this.cleanup(workspaceId);
-
-    // User-initiated mock interrupts should not leave behind resumable partial state.
-    const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
-    if (!deletePartialResult.success) {
-      log.error(
-        `Failed to clear mock partial on stop for ${active.messageId}: ${deletePartialResult.error}`
-      );
-    }
+      abortReason,
+      abandonPartial: options?.abandonPartial,
+    };
+    (async () => {
+      // Join the exact running event/write before touching partial.json. A replacement
+      // joins this same cancellation, including persistence and raw delivery.
+      await active.processing?.promise;
+      if (active.terminalCompletion) return;
+      try {
+        const result = options?.abandonPartial
+          ? await this.deps.historyService.deletePartialIfMessageIdMatches(
+              workspaceId,
+              active.messageId
+            )
+          : await this.deps.historyService.commitPartial(workspaceId, active.messageId);
+        if (!result.success)
+          log.error("Failed to finalize mock partial", { workspaceId, error: result.error });
+      } catch (error) {
+        log.error("Failed to finalize mock partial", { workspaceId, error });
+      }
+      try {
+        this.deps.aiService.emit("stream-abort", streamAbort);
+      } finally {
+        if (this.activeStreams.get(workspaceId) === active) this.activeStreams.delete(workspaceId);
+        active.settleCompletion({ status: "aborted", abortReason, streamAbort });
+      }
+    })()
+      .catch((error: unknown) => log.error("Mock abort delivery failed", { error }))
+      .finally(canceled.resolve);
+    return canceled.promise;
   }
 
-  async stop(workspaceId: string): Promise<void> {
-    await this.stopActiveStream(workspaceId);
+  stop(workspaceId: string, options?: StopStreamOptions): Promise<void> {
+    return this.stopActiveStream(workspaceId, options);
   }
 
   private async deleteAssistantPlaceholder(workspaceId: string, messageId: string): Promise<void> {
@@ -272,10 +306,12 @@ export class MockAiStreamPlayer {
     workspaceId: string,
     options?: {
       model?: string;
+      agentId?: string;
       thinkingLevel?: StreamStartEvent["thinkingLevel"];
+      muxMetadata?: MuxMessageMetadata;
       abortSignal?: AbortSignal;
     }
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<TurnStreamHandle | undefined, SendMessageError>> {
     const abortSignal = options?.abortSignal;
     if (abortSignal?.aborted) {
       return Ok(undefined);
@@ -312,6 +348,7 @@ export class MockAiStreamPlayer {
     const events = buildMockStreamEventsFromReply(reply, {
       messageId,
       model: options?.model,
+      agentId: options?.agentId,
       thinkingLevel: options?.thinkingLevel,
     });
 
@@ -359,6 +396,10 @@ export class MockAiStreamPlayer {
     const assistantMessage = createMuxMessage(messageId, "assistant", "", {
       timestamp: Date.now(),
       model: streamStart.model,
+      ...(streamStart.mode && { mode: streamStart.mode }),
+      ...(streamStart.agentId && { agentId: streamStart.agentId }),
+      ...(streamStart.thinkingLevel && { thinkingLevel: streamStart.thinkingLevel }),
+      ...(options?.muxMetadata && { muxMetadata: options.muxMetadata }),
     });
 
     if (abortSignal?.aborted) {
@@ -391,14 +432,16 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    this.scheduleEvents(workspaceId, events, messageId, historySequence);
+    const handle = this.scheduleEvents(
+      workspaceId,
+      events,
+      messageId,
+      historySequence,
+      options?.muxMetadata
+    );
 
     await streamStartPromise;
-    if (abortSignal?.aborted) {
-      return Ok(undefined);
-    }
-
-    return Ok(undefined);
+    return Ok(handle);
   }
 
   async replayStream(_workspaceId: string): Promise<void> {
@@ -409,20 +452,30 @@ export class MockAiStreamPlayer {
     workspaceId: string,
     events: MockAssistantEvent[],
     messageId: string,
-    historySequence: number
-  ): void {
+    historySequence: number,
+    muxMetadata?: MuxMessageMetadata
+  ): TurnStreamHandle {
     const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const streamStart = events.find(
+      (event): event is MockStreamStartEvent => event.kind === "stream-start"
+    );
+    const completionController = createTurnCompletionController();
     this.activeStreams.set(workspaceId, {
       timers,
       messageId,
       historySequence,
       startTime: Date.now(),
-      model: KNOWN_MODELS.OPUS.id,
+      model: streamStart?.model ?? KNOWN_MODELS.OPUS.id,
+      mode: streamStart?.mode,
+      agentId: streamStart?.agentId,
+      thinkingLevel: streamStart?.thinkingLevel,
+      muxMetadata,
       parts: [],
       partialWriteTimer: null,
       eventQueue: [],
       isProcessing: false,
       cancelled: false,
+      settleCompletion: completionController.settle,
     });
 
     for (const event of events) {
@@ -433,6 +486,7 @@ export class MockAiStreamPlayer {
       }, event.delay);
       timers.push(timer);
     }
+    return { messageId, completion: completionController.promise };
   }
 
   private enqueueEvent(workspaceId: string, messageId: string, handler: () => Promise<void>): void {
@@ -448,6 +502,8 @@ export class MockAiStreamPlayer {
     if (!active || active.isProcessing) return;
 
     active.isProcessing = true;
+    const processing = Promise.withResolvers<void>();
+    active.processing = processing;
 
     while (active.eventQueue.length > 0) {
       const handler = active.eventQueue.shift();
@@ -461,6 +517,8 @@ export class MockAiStreamPlayer {
     }
 
     active.isProcessing = false;
+    active.processing = undefined;
+    processing.resolve();
   }
 
   private appendTextPart(active: ActiveStream, text: string, timestamp: number): void {
@@ -583,6 +641,10 @@ export class MockAiStreamPlayer {
         historySequence: active.historySequence,
         timestamp: active.startTime,
         model: active.model,
+        ...(active.mode && { mode: active.mode }),
+        ...(active.agentId && { agentId: active.agentId }),
+        ...(active.thinkingLevel && { thinkingLevel: active.thinkingLevel }),
+        ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
         partial: true,
       },
       parts: structuredClone(active.parts),
@@ -598,7 +660,7 @@ export class MockAiStreamPlayer {
     workspaceId: string,
     active: ActiveStream
   ): Promise<void> {
-    if (this.isCurrentActiveStream(workspaceId, active)) {
+    if (this.isCurrentActiveStream(workspaceId, active) || active.cancelPromise) {
       return;
     }
 
@@ -661,6 +723,7 @@ export class MockAiStreamPlayer {
           historySequence,
           startTime: Date.now(),
           ...(event.mode && { mode: event.mode }),
+          ...(event.agentId && { agentId: event.agentId }),
           ...(event.thinkingLevel && { thinkingLevel: event.thinkingLevel }),
         };
         active.model = event.model;
@@ -772,15 +835,23 @@ export class MockAiStreamPlayer {
           return;
         }
 
-        this.deps.aiService.emit(
-          "error",
-          createErrorEvent(workspaceId, {
-            messageId,
-            error: payload.error,
-            errorType: payload.errorType,
-          })
-        );
-        this.cleanup(workspaceId);
+        active.terminalCompletion = {
+          status: "failed",
+          streamError: { messageId, error: payload.error, errorType: payload.errorType },
+        };
+        try {
+          this.deps.aiService.emit(
+            "error",
+            createErrorEvent(workspaceId, {
+              messageId,
+              error: payload.error,
+              errorType: payload.errorType,
+            })
+          );
+        } finally {
+          this.cleanup(workspaceId);
+          active.settleCompletion(active.terminalCompletion);
+        }
         break;
       }
       case "stream-end": {
@@ -795,6 +866,10 @@ export class MockAiStreamPlayer {
           messageId,
           metadata: {
             model: event.metadata.model,
+            ...(active.mode && { mode: active.mode }),
+            ...(active.agentId && { agentId: active.agentId }),
+            ...(active.thinkingLevel && { thinkingLevel: active.thinkingLevel }),
+            ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
             systemMessageTokens: event.metadata.systemMessageTokens,
           },
           parts: completedParts,
@@ -839,8 +914,13 @@ export class MockAiStreamPlayer {
 
         if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
-        this.deps.aiService.emit("stream-end", payload);
-        this.cleanup(workspaceId);
+        active.terminalCompletion = { status: "completed", streamEnd: payload };
+        try {
+          this.deps.aiService.emit("stream-end", payload);
+        } finally {
+          this.cleanup(workspaceId);
+          active.settleCompletion(active.terminalCompletion);
+        }
         break;
       }
     }
@@ -850,6 +930,11 @@ export class MockAiStreamPlayer {
     const active = this.activeStreams.get(workspaceId);
     if (!active) return;
 
+    this.cancelTimers(active);
+    if (this.activeStreams.get(workspaceId) === active) this.activeStreams.delete(workspaceId);
+  }
+
+  private cancelTimers(active: ActiveStream): void {
     active.cancelled = true;
 
     if (active.partialWriteTimer) {
@@ -864,8 +949,6 @@ export class MockAiStreamPlayer {
 
     // Clear event queue to prevent any pending events from processing
     active.eventQueue = [];
-
-    this.activeStreams.delete(workspaceId);
   }
 
   private extractText(message: MuxMessage): string {

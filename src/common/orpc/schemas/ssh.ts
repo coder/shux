@@ -55,5 +55,3 @@ export const SshPromptResponseInputSchema = z
     response: z.string(),
   })
   .strict();
-
-export type SshPromptResponseInput = z.infer<typeof SshPromptResponseInputSchema>;

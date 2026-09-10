@@ -5,9 +5,9 @@ import type {
 } from "@/common/config/schemas/providersConfig";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { isGrok45Model } from "@/common/types/thinking";
+import { isGrokFrontierModel } from "@/common/types/thinking";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
-import { openaiDirectProviderOptionsAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type FastModeProvider = "openai" | "xai";
@@ -25,19 +25,19 @@ export interface FastModeAvailabilityOptions {
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
 
-/** Return the direct provider whose priority tier powers Fast mode for this model. */
+/** Return the provider preference whose priority tier powers Fast mode on this route. */
 export function getFastModeProvider(
   modelString: string,
   options?: FastModeAvailabilityOptions
 ): FastModeProvider | null {
-  if (openaiDirectProviderOptionsAvailable(modelString, options)) {
+  if (openaiServiceTierAvailable(modelString, options)) {
     return "openai";
   }
 
   const normalized = normalizeToCanonical(modelString);
   const [origin] = normalized.split(":", 2);
   const capabilityModel = resolveModelForMetadata(normalized, options?.providersConfig ?? null);
-  if (origin !== "xai" || !isGrok45Model(capabilityModel)) return null;
+  if (origin !== "xai" || !isGrokFrontierModel(capabilityModel)) return null;
 
   // xAI service_tier is also provider-native and cannot survive a gateway route.
   const explicitGateway = getExplicitGatewayPrefix(modelString);

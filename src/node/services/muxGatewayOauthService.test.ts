@@ -1,21 +1,19 @@
 import http from "node:http";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
-import type { Result } from "@/common/types/result";
-import { Ok } from "@/common/types/result";
 import {
   MUX_GATEWAY_AUTHORIZE_URL,
   MUX_GATEWAY_EXCHANGE_URL,
+  MUX_GATEWAY_ORIGIN,
+  MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
 } from "@/common/constants/muxGatewayOAuth";
+import { Err, Ok } from "@/common/types/result";
+import type { ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
+import { createDeferred } from "@/node/utils/oauthUtils";
 import { MuxGatewayOauthService } from "./muxGatewayOauthService";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Simple GET helper that returns { status, body }. */
 async function httpGet(url: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     http
@@ -30,7 +28,6 @@ async function httpGet(url: string): Promise<{ status: number; body: string }> {
   });
 }
 
-/** Build a mock JSON response. */
 function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -38,64 +35,50 @@ function jsonResponse(body: Record<string, unknown>, status = 200): Response {
   });
 }
 
-/**
- * Helper to mock globalThis.fetch without needing the `preconnect` property.
- */
 function mockFetch(
   fn: (input: RequestInfo | URL, init?: RequestInit) => Response | Promise<Response>
 ): void {
-  globalThis.fetch = Object.assign(fn, {
-    preconnect: (_url: string | URL) => {
-      // no-op in tests
-    },
-  }) as typeof fetch;
+  globalThis.fetch = Object.assign(fn, { preconnect: () => undefined }) as typeof fetch;
+}
+
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  return input instanceof URL ? input.toString() : input.url;
 }
 
 interface MockDeps {
+  providersConfig: ReturnType<ProvidersConfigStore["loadProvidersConfig"]>;
   setConfigCalls: Array<{ provider: string; keyPath: string[]; value: string }>;
-  setConfigResult: Result<void, string>;
   focusCalls: number;
 }
 
-function createMockDeps(): MockDeps {
-  return {
-    setConfigCalls: [],
-    setConfigResult: Ok(undefined),
-    focusCalls: 0,
+function createService(deps: MockDeps): MuxGatewayOauthService {
+  const providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig"> = {
+    loadProvidersConfig: () => deps.providersConfig,
   };
-}
-
-function createMockProviderService(deps: MockDeps): Pick<ProviderService, "setConfig"> {
-  return {
-    setConfig: (
-      provider: string,
-      keyPath: string[],
-      value: string
-    ): Promise<Result<void, string>> => {
-      deps.setConfigCalls.push({ provider, keyPath, value });
-      return Promise.resolve(deps.setConfigResult);
+  const providerService: Pick<ProviderService, "setConfig"> = {
+    setConfig: (provider, keyPath, value) => {
+      deps.setConfigCalls.push({ provider, keyPath, value: String(value) });
+      return Promise.resolve(Ok(undefined));
     },
   };
-}
-
-function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMainWindow"> {
-  return {
+  const windowService: Pick<WindowService, "focusMainWindow"> = {
     focusMainWindow: () => {
       deps.focusCalls++;
     },
   };
-}
-
-function createService(deps: MockDeps): MuxGatewayOauthService {
   return new MuxGatewayOauthService(
-    createMockProviderService(deps) as ProviderService,
-    createMockWindowService(deps) as WindowService
+    providersConfigStore,
+    providerService as ProviderService,
+    windowService as WindowService
   );
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+async function startFlow(service: MuxGatewayOauthService) {
+  const result = await service.startDesktopFlow();
+  if (!result.success) throw new Error(result.error);
+  return result.data;
+}
 
 describe("MuxGatewayOauthService", () => {
   let deps: MockDeps;
@@ -103,7 +86,11 @@ describe("MuxGatewayOauthService", () => {
   const originalFetch = globalThis.fetch;
 
   beforeEach(() => {
-    deps = createMockDeps();
+    deps = {
+      providersConfig: {},
+      setConfigCalls: [],
+      focusCalls: 0,
+    };
     service = createService(deps);
   });
 
@@ -112,126 +99,137 @@ describe("MuxGatewayOauthService", () => {
     await service.dispose();
   });
 
-  describe("startDesktopFlow", () => {
-    it("returns flowId, authorizeUrl, and redirectUri", async () => {
-      const result = await service.startDesktopFlow();
-      expect(result.success).toBe(true);
-      if (!result.success) return;
+  describe("getAccountStatus", () => {
+    beforeEach(() => {
+      deps.providersConfig = { "mux-gateway": { couponCode: "gateway-token" } };
+    });
 
-      expect(result.data.flowId).toBeTruthy();
-      expect(result.data.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+    it("returns the validated balance with the configured credential", async () => {
+      const balance = {
+        remaining_microdollars: 12_345,
+        ai_gateway_concurrent_requests_per_user: 7,
+      };
+      let request: { url: string; init?: RequestInit } | undefined;
+      mockFetch((input, init) => {
+        request = { url: requestUrl(input), init };
+        return jsonResponse(balance);
+      });
+      expect(await service.getAccountStatus()).toEqual(Ok(balance));
+      expect(request?.url).toBe(MUX_GATEWAY_ORIGIN + "/api/v1/balance");
+      expect(request?.init?.headers).toEqual({
+        Accept: "application/json",
+        Authorization: "Bearer gateway-token",
+      });
+    });
 
-      const authorizeUrl = new URL(result.data.authorizeUrl);
-      expect(`${authorizeUrl.origin}${authorizeUrl.pathname}`).toBe(MUX_GATEWAY_AUTHORIZE_URL);
-      expect(authorizeUrl.searchParams.get("response_type")).toBe("code");
-      expect(authorizeUrl.searchParams.get("state")).toBe(result.data.flowId);
-      expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(result.data.redirectUri);
+    it("clears stored credentials on an expired session", async () => {
+      mockFetch(() => new Response(null, { status: 401 }));
+      expect(await service.getAccountStatus()).toEqual(Err(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE));
+      expect(deps.setConfigCalls).toEqual([
+        { provider: "mux-gateway", keyPath: ["couponCode"], value: "" },
+        { provider: "mux-gateway", keyPath: ["voucher"], value: "" },
+      ]);
+    });
 
-      await service.cancelDesktopFlow(result.data.flowId);
+    const errorCases: Array<[() => void, string]> = [
+      [
+        () => {
+          deps.providersConfig = {};
+        },
+        "Xum Gateway is not logged in",
+      ],
+      [
+        () => mockFetch(() => Promise.reject(new Error("offline"))),
+        "Xum Gateway balance request failed: offline",
+      ],
+      [
+        () => mockFetch(() => new Response("upstream exploded", { status: 503 })),
+        "Xum Gateway balance request failed (HTTP 503): upstream exploded",
+      ],
+      [
+        () => mockFetch(() => jsonResponse({ remaining_microdollars: -1 })),
+        "Xum Gateway returned an invalid balance payload",
+      ],
+      [
+        () => {
+          const response = jsonResponse({});
+          response.json = () => Promise.reject(new Error("broken JSON"));
+          mockFetch(() => response);
+        },
+        "Xum Gateway balance response was not valid JSON: broken JSON",
+      ],
+    ];
+
+    it.each(errorCases)("returns exact balance errors", async (arrange, error) => {
+      arrange();
+      expect(await service.getAccountStatus()).toEqual(Err(error));
     });
   });
+  it("starts a desktop flow with the expected authorization URL", async () => {
+    const flow = await startFlow(service);
+    const authorizeUrl = new URL(flow.authorizeUrl);
 
-  describe("desktop callback flow", () => {
-    it("callback with code + successful exchange resolves waitFor success and renders success HTML", async () => {
-      let capturedUrl = "";
-      let capturedBody = "";
+    expect(flow.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+    expect(authorizeUrl.origin + authorizeUrl.pathname).toBe(MUX_GATEWAY_AUTHORIZE_URL);
+    expect(authorizeUrl.searchParams.get("response_type")).toBe("code");
+    expect(authorizeUrl.searchParams.get("state")).toBe(flow.flowId);
+    expect(authorizeUrl.searchParams.get("redirect_uri")).toBe(flow.redirectUri);
+    await service.cancelDesktopFlow(flow.flowId);
+  });
 
-      mockFetch((input, init) => {
-        capturedUrl =
-          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-        capturedBody =
-          typeof init?.body === "string"
-            ? init.body
-            : init?.body instanceof URLSearchParams
-              ? init.body.toString()
-              : "";
-        return jsonResponse({ access_token: "gateway-token" });
-      });
-
-      const startResult = await service.startDesktopFlow();
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
-
-      const flowId = startResult.data.flowId;
-      const callbackUrl = `${startResult.data.redirectUri}?state=${flowId}&code=ok-code`;
-
-      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      const callbackResponsePromise = httpGet(callbackUrl);
-
-      const [waitResult, callbackResponse] = await Promise.all([
-        waitPromise,
-        callbackResponsePromise,
-      ]);
-
-      expect(waitResult).toEqual(Ok(undefined));
-      expect(callbackResponse.status).toBe(200);
-      expect(callbackResponse.body).toContain("Login complete");
-
-      expect(capturedUrl).toBe(MUX_GATEWAY_EXCHANGE_URL);
-      expect(capturedBody).toContain("code=ok-code");
-
-      expect(deps.setConfigCalls).toEqual([
-        {
-          provider: "mux-gateway",
-          keyPath: ["couponCode"],
-          value: "gateway-token",
-        },
-      ]);
-      expect(deps.focusCalls).toBe(1);
+  it("exchanges a desktop callback code and persists the token", async () => {
+    let capturedUrl = "";
+    let capturedBody = "";
+    mockFetch((input, init) => {
+      capturedUrl = requestUrl(input);
+      capturedBody = init?.body instanceof URLSearchParams ? init.body.toString() : "";
+      return jsonResponse({ access_token: "gateway-token" });
     });
 
-    it("callback with code + failed exchange resolves waitFor error and renders failure HTML", async () => {
-      let releaseExchange!: () => void;
-      const exchangeStarted = new Promise<void>((resolveStarted) => {
-        const exchangeBlocked = new Promise<void>((resolveBlocked) => {
-          releaseExchange = () => resolveBlocked();
-        });
+    const flow = await startFlow(service);
+    const callback = httpGet(flow.redirectUri + "?state=" + flow.flowId + "&code=ok-code");
+    expect(await service.waitForDesktopFlow(flow.flowId, { timeoutMs: 5000 })).toEqual(
+      Ok(undefined)
+    );
+    const callbackResponse = await callback;
 
-        mockFetch(async () => {
-          resolveStarted();
-          await exchangeBlocked;
-          return new Response("upstream exploded", { status: 500 });
-        });
-      });
+    expect(callbackResponse.status).toBe(200);
+    expect(callbackResponse.body).toContain("Login complete");
+    expect(capturedUrl).toBe(MUX_GATEWAY_EXCHANGE_URL);
+    expect(capturedBody).toContain("code=ok-code");
+    expect(deps.setConfigCalls).toEqual([
+      { provider: "mux-gateway", keyPath: ["couponCode"], value: "gateway-token" },
+    ]);
+    expect(deps.focusCalls).toBe(1);
+  });
 
-      const startResult = await service.startDesktopFlow();
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
+  it("keeps the failure callback pending until the exchange finishes", async () => {
+    const started = createDeferred<void>();
+    const blocked = createDeferred<void>();
+    mockFetch(async () => {
+      started.resolve();
+      await blocked.promise;
+      return new Response("upstream exploded", { status: 500 });
+    });
 
-      const flowId = startResult.data.flowId;
-      const callbackUrl = `${startResult.data.redirectUri}?state=${flowId}&code=bad-code`;
-
-      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      const callbackResponsePromise = httpGet(callbackUrl);
-
-      await exchangeStarted;
-
-      const callbackState = await Promise.race([
-        callbackResponsePromise.then(() => "settled" as const),
+    const flow = await startFlow(service);
+    const wait = service.waitForDesktopFlow(flow.flowId, { timeoutMs: 5000 });
+    const callback = httpGet(flow.redirectUri + "?state=" + flow.flowId + "&code=bad-code");
+    await started.promise;
+    expect(
+      await Promise.race([
+        callback.then(() => "settled" as const),
         new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 100)),
-      ]);
-      expect(callbackState).toBe("pending");
+      ])
+    ).toBe("pending");
+    blocked.resolve();
 
-      releaseExchange();
-
-      const [waitResult, callbackResponse] = await Promise.all([
-        waitPromise,
-        callbackResponsePromise,
-      ]);
-
-      expect(waitResult.success).toBe(false);
-      if (!waitResult.success) {
-        expect(waitResult.error).toContain("Mux Gateway exchange failed (500)");
-      }
-
-      expect(callbackResponse.status).toBe(400);
-      expect(callbackResponse.body).toContain("Login failed");
-      expect(callbackResponse.body).toContain(
-        "Mux Gateway exchange failed (500): upstream exploded"
-      );
-
-      expect(deps.setConfigCalls).toHaveLength(0);
-      expect(deps.focusCalls).toBe(0);
-    });
+    expect(await wait).toEqual(Err("Xum Gateway exchange failed (500): upstream exploded"));
+    const callbackResponse = await callback;
+    expect(callbackResponse.status).toBe(400);
+    expect(callbackResponse.body).toContain("Login failed");
+    expect(callbackResponse.body).toContain("Xum Gateway exchange failed (500): upstream exploded");
+    expect(deps.setConfigCalls).toHaveLength(0);
+    expect(deps.focusCalls).toBe(0);
   });
 });

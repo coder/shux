@@ -6,11 +6,13 @@ import { capitalize } from "../capitalize";
 
 /** Compact labels preserve the distinguishing model tier when the shared family prefix would truncate it. */
 export function formatCompactModelDisplayName(modelName: string): string {
-  // GPT-5.6's durable tier name carries more information than the shared family prefix when the
-  // composer is space-constrained. Keep the full model name everywhere else.
-  const gptTierMatch = /^gpt-\d+(?:\.\d+)?-(sol|terra|luna)(?:-\d{8}|-\d{4}-\d{2}-\d{2})?$/.exec(
-    modelName.toLowerCase()
-  );
+  // OpenAI's durable tier names (GPT-5.6 Sol/Terra/Luna, GPT-6 Astra) carry more information than
+  // the shared family prefix when the composer is space-constrained. Keep the full model name
+  // everywhere else.
+  const gptTierMatch =
+    /^gpt-\d+(?:\.\d+)?-(sol|terra|luna|astra)(?:-\d{8}|-\d{4}-\d{2}-\d{2})?$/.exec(
+      modelName.toLowerCase()
+    );
   if (gptTierMatch) {
     return capitalize(gptTierMatch[1]);
   }
@@ -79,6 +81,12 @@ export function formatModelDisplayName(modelName: string): string {
       const tier = capitalize(parts[0]);
       return `${tier} ${parts[1]}`;
     }
+  }
+
+  // GLM models
+  if (lower.startsWith("glm-")) {
+    const parts = lower.slice("glm-".length).split("-");
+    return `GLM ${parts.map(capitalize).join(" ")}`;
   }
 
   // GPT models
@@ -240,7 +248,6 @@ function parseBedrockModelName(modelId: string): string | null {
     return null;
   }
 
-  // Split by dot to get parts
   const dotParts = modelId.split(".");
 
   // Need at least vendor.modelName (2 parts)

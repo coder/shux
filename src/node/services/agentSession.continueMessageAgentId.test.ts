@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import type { TurnCoordinator } from "./turnCoordinator";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
+import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
@@ -28,12 +31,12 @@ interface SessionInternals {
   sendMessage: (
     message: string,
     options?: SendOptions,
-    internal?: { synthetic?: boolean }
+    internal?: { synthetic?: boolean; agentInitiated?: boolean }
   ) => Promise<SendMessageResult>;
-  scheduleStartupRecovery: () => void;
-  startupRecoveryPromise: Promise<void> | null;
-  startupRecoveryScheduled: boolean;
+  runStartupRecovery: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  coordinator: TurnCoordinator;
+  onPostCompactionStateChange?: () => void;
 }
 
 const idleFollowUp = (): CompactionFollowUpRequest => ({
@@ -60,6 +63,30 @@ function compactionSummaryMessage(
   } satisfies MuxMessage;
 }
 
+/**
+ * RLM keep-recent floor: a durable compaction boundary summary followed by
+ * preserved-tail copies. The startup follow-up recovery branch must locate the
+ * summary through the epoch read when the last history row is a tail copy.
+ */
+function rlmSummaryBoundaryMessage(pendingFollowUp: CompactionFollowUpRequest): MuxMessage {
+  return createMuxMessage("rlm-summary", "assistant", "Compaction summary", {
+    compacted: true,
+    compactionBoundary: true,
+    compactionEpoch: 1,
+    muxMetadata: {
+      type: "compaction-summary",
+      pendingFollowUp,
+    },
+  });
+}
+
+function preservedTailCopy(id: string, role: "user" | "assistant", text: string): MuxMessage {
+  return createMuxMessage(id, role, text, {
+    synthetic: true,
+    rlmPreservedTailCopy: true,
+  });
+}
+
 function heartbeatBoundaryMessage(pendingFollowUp = idleFollowUp()): MuxMessage {
   return createMuxMessage("heartbeat-boundary", "assistant", "Reset boundary", {
     compacted: "heartbeat",
@@ -74,12 +101,24 @@ function heartbeatBoundaryMessage(pendingFollowUp = idleFollowUp()): MuxMessage 
 
 function createAiService(): AIService {
   return {
+    getWorkspaceMetadata: (id: string) =>
+      Promise.resolve({
+        success: true as const,
+        data: {
+          id,
+          name: id,
+          projectName: "project",
+          projectPath: "/tmp/project",
+          runtimeConfig: { type: "local" as const },
+        },
+      }),
     on() {
       return this;
     },
     off() {
       return this;
     },
+    ...createStreamLifecycleMocks(),
     isStreaming: () => false,
     stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
   } as unknown as AIService;
@@ -105,8 +144,10 @@ function createBackgroundProcessManager(): BackgroundProcessManager {
 
 function createConfig(): Config {
   return {
+    rootDir: "/tmp",
+    sessionsDir: "/tmp",
     srcDir: "/tmp",
-    getSessionDir: mock(() => "/tmp"),
+    loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }
 
@@ -116,13 +157,14 @@ describe("AgentSession continue-message agentId fallback", () => {
 
   afterEach(async () => {
     for (const session of sessions.splice(0)) {
-      session.dispose();
+      await session.dispose();
     }
     await historyCleanup?.();
     historyCleanup = undefined;
+    mock.restore();
   });
 
-  const createSession = async (messages: MuxMessage[] = []) => {
+  const createSession = async (messages: MuxMessage[] = [], config = createConfig()) => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     for (const message of messages) {
@@ -131,7 +173,7 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     const session = new AgentSession({
       workspaceId: "ws",
-      config: createConfig(),
+      config,
       historyService,
       aiService: createAiService(),
       initStateManager: createInitStateManager(),
@@ -146,10 +188,61 @@ describe("AgentSession continue-message agentId fallback", () => {
     };
   };
 
+  test.each(
+    [false, true].flatMap((heartbeat) =>
+      [false, true].map((published) => ({ heartbeat, published }))
+    )
+  )(
+    "a new turn respects the follow-up cleanup receipt (heartbeat=$heartbeat, published=$published)",
+    async ({ heartbeat, published }) => {
+      const summary = heartbeat
+        ? heartbeatBoundaryMessage()
+        : compactionSummaryMessage("summary", idleFollowUp());
+      const { session, internals, historyService } = await createSession([summary]);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const cleanup = historyService.cleanupCompactionFollowUp.bind(historyService);
+      spyOn(historyService, "cleanupCompactionFollowUp").mockImplementationOnce(async (...args) => {
+        const result = published ? await cleanup(...args) : undefined;
+        entered.resolve();
+        await release.promise;
+        return result ?? cleanup(...args);
+      });
+      const changed = mock(() => undefined);
+      internals.onPostCompactionStateChange = changed;
+      session.queueMessage("manual work", { model: "openai:gpt-4o", agentId: "exec" });
+      const dispatch = internals.dispatchPendingFollowUp();
+      try {
+        await entered.promise;
+        const admission = internals.coordinator.prepare({
+          kind: "fresh",
+          intent: "direct",
+          expectedTurnId: internals.coordinator.turnId,
+        });
+        expect(admission.status).toBe("admitted");
+        release.resolve();
+        expect(await dispatch).toBe(false);
+        const history = await historyService.getLastMessages("ws", 1);
+        assert(history.success, "Expected history after follow-up cleanup");
+        if (!published) {
+          expect(history.data[0].metadata?.muxMetadata).toHaveProperty("pendingFollowUp");
+        } else if (heartbeat) {
+          expect(history.data).toHaveLength(0);
+        } else {
+          expect(history.data[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
+        }
+        expect(changed).toHaveBeenCalledTimes(published && heartbeat ? 1 : 0);
+      } finally {
+        release.resolve();
+        await dispatch;
+      }
+    }
+  );
+
   test("legacy continueMessage.mode does not fall back to compact agent", async () => {
     let dispatchedMessage: string | undefined;
     let dispatchedOptions: SendOptions | undefined;
-    let dispatchedInternal: { synthetic?: boolean } | undefined;
+    let dispatchedInternal: { synthetic?: boolean; agentInitiated?: boolean } | undefined;
     const legacyFollowUp = {
       text: "follow up",
       model: "openai:gpt-4o",
@@ -161,7 +254,11 @@ describe("AgentSession continue-message agentId fallback", () => {
     ]);
 
     internals.sendMessage = mock(
-      (message: string, options?: SendOptions, internal?: { synthetic?: boolean }) => {
+      (
+        message: string,
+        options?: SendOptions,
+        internal?: { synthetic?: boolean; agentInitiated?: boolean }
+      ) => {
         dispatchedMessage = message;
         dispatchedOptions = options;
         dispatchedInternal = internal;
@@ -174,6 +271,125 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchedMessage).toBe("follow up");
     expect(dispatchedOptions?.agentId).toBe("plan");
     expect(dispatchedInternal?.synthetic).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp aliases legacy exclusive-PTC experiments", async () => {
+    // An older build can persist {programmaticToolCalling: false,
+    // programmaticToolCallingExclusive: true}; dispatch copies raw persisted
+    // JSON into the next send, and the explicit false would otherwise win
+    // over backend overrides while the removed legacy field is ignored —
+    // silently downgrading the crash-safe follow-up to PTC-off (and making
+    // its rlm flag inert).
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-legacy-ptc", {
+        text: "continue after compaction",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        experiments: {
+          programmaticToolCalling: false,
+          programmaticToolCallingExclusive: true,
+          rlm: true,
+        },
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatchedOptions?.experiments?.programmaticToolCalling).toBe(true);
+    expect(dispatchedOptions?.experiments?.rlm).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp preserves agent-initiated attribution", async () => {
+    let dispatchedInternal: { synthetic?: boolean; agentInitiated?: boolean } | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-agent-initiated", {
+        text: "continue delegated work",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        agentInitiated: true,
+      }),
+    ]);
+    internals.sendMessage = mock(
+      (
+        _message: string,
+        _options?: SendOptions,
+        internal?: { synthetic?: boolean; agentInitiated?: boolean }
+      ) => {
+        dispatchedInternal = internal;
+        return Promise.resolve({ success: true as const });
+      }
+    );
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatchedInternal).toMatchObject({ synthetic: true, agentInitiated: true });
+    expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp forwards strictAgentResolution to the resumed turn", async () => {
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-strict", {
+        text: "continue delegated work",
+        model: "openai:gpt-4o",
+        agentId: "plan",
+        strictAgentResolution: true,
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    // The requested agent may have been removed/hidden/disabled while compaction ran;
+    // the resumed turn must stay loud instead of silently falling back to exec.
+    expect(dispatchedOptions?.agentId).toBe("plan");
+    expect(dispatchedOptions?.strictAgentResolution).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp leaves the follow-up pending when the workspace is archived on disk", async () => {
+    const archivedConfig = {
+      ...createConfig(),
+      loadConfigOrDefault: () => ({
+        projects: new Map([
+          [
+            "/tmp",
+            {
+              workspaces: [{ id: "ws", path: "/tmp/ws", archivedAt: "2026-01-01T00:00:00.000Z" }],
+            },
+          ],
+        ]),
+      }),
+    } as unknown as Config;
+    const { historyService, internals } = await createSession(
+      [
+        compactionSummaryMessage("summary-archived", {
+          text: "resume after compaction",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+        }),
+      ],
+      archivedConfig
+    );
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+    // Still pending for the next startup after an unarchive.
+    const lastMessages = await historyService.getLastMessages("ws", 1);
+    expect(lastMessages.success && lastMessages.data[0]?.metadata?.muxMetadata).toMatchObject({
+      type: "compaction-summary",
+      pendingFollowUp: { text: "resume after compaction" },
+    });
   });
 
   test("dispatchPendingFollowUp skips idle-only follow-ups when queued user input exists", async () => {
@@ -212,6 +428,33 @@ describe("AgentSession continue-message agentId fallback", () => {
       { model: "openai:gpt-4o", agentId: "exec" },
       { synthetic: false }
     );
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getLastMessages("ws", 10);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`Expected history read to succeed: ${historyResult.error}`);
+    }
+    expect(historyResult.data.map((message) => message.id)).toEqual(["before-reset"]);
+  });
+
+  test("dispatchPendingFollowUp rolls back heartbeat boundaries when a service send is in preflight", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cRi_N): a manual service-level send still in
+    // preflight is user contention too — the heartbeat reset boundary must be
+    // rolled back (as for queued input), not left in history with the
+    // follow-up silently cleared.
+    const earlierMessage = createMuxMessage("before-reset", "assistant", "Earlier context");
+    const { session, historyService, internals } = await createSession([
+      earlierMessage,
+      heartbeatBoundaryMessage(),
+    ]);
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
 
     const dispatched = await internals.dispatchPendingFollowUp();
 
@@ -271,9 +514,9 @@ describe("AgentSession continue-message agentId fallback", () => {
     const { internals } = await createSession([
       compactionSummaryMessage("summary-completing-turn", idleFollowUp()),
     ]);
-    const completingInternals = internals as SessionInternals & { turnPhase: string };
+    const completingInternals = internals as SessionInternals & { coordinator: TurnCoordinator };
     completingInternals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
-    completingInternals.turnPhase = "completing";
+    completingInternals.coordinator.beginPolicy(completingInternals.coordinator.turnId);
 
     const dispatched = await completingInternals.dispatchPendingFollowUp();
 
@@ -372,9 +615,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       return Promise.resolve({ success: true as const });
     });
 
-    internals.scheduleStartupRecovery();
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await Promise.all([internals.runStartupRecovery(), internals.runStartupRecovery()]);
 
     expect(sendCount).toBe(1);
   });
@@ -399,16 +640,69 @@ describe("AgentSession continue-message agentId fallback", () => {
       return Promise.resolve({ success: true as const });
     });
 
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await internals.runStartupRecovery();
 
     expect(sendCount).toBe(1);
-    expect(internals.startupRecoveryScheduled).toBe(false);
 
-    internals.scheduleStartupRecovery();
-    await internals.startupRecoveryPromise;
+    await internals.runStartupRecovery();
 
     expect(sendCount).toBe(2);
-    expect(internals.startupRecoveryScheduled).toBe(true);
+  });
+
+  // RLM keep-recent floor: post-crash recovery when the compaction summary is
+  // no longer the last history row because preserved-tail copies trail it.
+  test("startup recovery dispatches the follow-up when preserved-tail copies trail the summary", async () => {
+    let dispatchedMessage: string | undefined;
+    const { internals } = await createSession([
+      rlmSummaryBoundaryMessage({
+        text: "follow up after tail",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      }),
+      preservedTailCopy("tail-copy-1", "user", "original user message"),
+      preservedTailCopy("tail-copy-2", "assistant", "original assistant reply"),
+    ]);
+    internals.sendMessage = mock((message: string) => {
+      dispatchedMessage = message;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.runStartupRecovery();
+
+    expect(dispatchedMessage).toBe("follow up after tail");
+    expect(internals.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("startup recovery declines a trailing tail copy when a non-copy row follows the boundary", async () => {
+    // Staleness guard: the epoch is not exactly [summary, ...tail copies], so
+    // "compaction just completed" no longer holds and the follow-up must stay
+    // parked on the summary for a later legitimate recovery.
+    const { historyService, internals } = await createSession([
+      rlmSummaryBoundaryMessage({
+        text: "stale follow up",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      }),
+      preservedTailCopy("tail-copy-1", "user", "original user message"),
+      createMuxMessage("post-compaction-turn", "assistant", "new turn after compaction"),
+      preservedTailCopy("tail-copy-2", "assistant", "trailing copy"),
+    ]);
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getLastMessages("ws", 10);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`Expected history read to succeed: ${historyResult.error}`);
+    }
+    const summary = historyResult.data.find((message) => message.id === "rlm-summary");
+    expect(summary?.metadata?.muxMetadata).toMatchObject({
+      type: "compaction-summary",
+      pendingFollowUp: { text: "stale follow up" },
+    });
   });
 });

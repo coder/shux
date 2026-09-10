@@ -1,12 +1,14 @@
 import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 interface InlineSkillSuggestionContext {
   /** The token typed after `$`. Empty string is allowed (just typed `$`). */
   partial: string;
   /** Already-loaded descriptors for current discovery target. */
   descriptors: AgentSkillDescriptor[];
+  mcpPrompts?: MCPPromptDescriptor[];
 }
 
 interface InlineSkillSuggestionRefreshContext {
@@ -15,6 +17,8 @@ interface InlineSkillSuggestionRefreshContext {
   partial: string;
   previousDescriptors: AgentSkillDescriptor[] | null;
   descriptors: AgentSkillDescriptor[];
+  previousMcpPrompts?: MCPPromptDescriptor[] | null;
+  mcpPrompts?: MCPPromptDescriptor[];
 }
 
 const INLINE_SKILL_INSERT_EXISTING_SEPARATOR_RE = /[\s.,;:!?)\]}>"'`]/;
@@ -25,7 +29,8 @@ export function shouldRefreshInlineSkillSuggestions(
   return (
     context.inputChanged ||
     context.previousPartial !== context.partial ||
-    context.previousDescriptors !== context.descriptors
+    context.previousDescriptors !== context.descriptors ||
+    context.previousMcpPrompts !== context.mcpPrompts
   );
 }
 
@@ -37,21 +42,11 @@ export function getInlineSkillInsertionTrailingText(after: string): "" | " " {
   return " ";
 }
 
-/**
- * Returns suggestions for `$skill` autocomplete.
- *
- * - Filter rule: full-name prefix or hyphen-segment prefix, matching slash skill commands.
- * - Empty `partial` returns the full descriptor list (so typing just `$` opens the menu).
- * - Result order: descriptors order from caller (no re-sort). Caller already lists in
- *   scope-priority order.
- * - We do NOT filter out skills whose name collides with a slash command (e.g. `clear`):
- *   `$clear` should reference a skill named `clear` even though `/clear` is a built-in.
- * - user-invocable: false skills are hidden (inline `$skill` is a user-facing surface).
- */
+/** MCP prompts with required arguments are omitted because inline references cannot supply them. */
 export function getInlineSkillSuggestions(
   context: InlineSkillSuggestionContext
 ): SlashSuggestion[] {
-  return context.descriptors
+  const skills = context.descriptors
     .filter((descriptor) => descriptor.userInvocable !== false)
     .filter((descriptor) => matchesNameBySegmentPrefix(descriptor.name, context.partial))
     .map((descriptor) => ({
@@ -60,4 +55,14 @@ export function getInlineSkillSuggestions(
       description: descriptor.description ?? "",
       replacement: `$${descriptor.name}`,
     }));
+  const prompts = (context.mcpPrompts ?? [])
+    .filter((prompt) => !(prompt.arguments ?? []).some((argument) => argument.required))
+    .filter((prompt) => matchesNameBySegmentPrefix(prompt.commandKey, context.partial))
+    .map((prompt) => ({
+      id: `inline-mcp-prompt:${prompt.commandKey}`,
+      display: `$${prompt.commandKey}`,
+      description: prompt.description ?? `MCP prompt from ${prompt.serverName}`,
+      replacement: `$${prompt.commandKey}`,
+    }));
+  return [...skills, ...prompts];
 }

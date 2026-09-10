@@ -423,120 +423,139 @@ describe("ProjectContext", () => {
     });
   });
 
-  test("refreshProjects ignores stale responses (race condition)", async () => {
-    let staleResolver: ((value: Array<[string, ProjectConfig]>) => void) | null = null;
-    const stalePromise = new Promise<Array<[string, ProjectConfig]>>((resolve) => {
-      staleResolver = resolve;
-    });
-
-    let latestResolver: ((value: Array<[string, ProjectConfig]>) => void) | null = null;
-    const latestPromise = new Promise<Array<[string, ProjectConfig]>>((resolve) => {
-      latestResolver = resolve;
-    });
-
-    let listCallCount = 0;
-    createMockAPI({
-      list: () => {
-        listCallCount += 1;
-
-        // Mount refresh (stale)
-        if (listCallCount === 1) {
-          return stalePromise;
-        }
-
-        // Manual refresh (latest)
-        if (listCallCount === 2) {
-          return latestPromise;
-        }
-
-        return Promise.resolve([]);
-      },
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
-      listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
-      secrets: {
-        get: () => Promise.resolve([]),
-        update: () => Promise.resolve({ success: true as const, data: undefined }),
-      },
-    });
-
+  test("coalesces callers and awaits invalidations during each pending request", async () => {
+    const first = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const second = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const third = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const projectsApi = createMockAPI({ list: () => first.promise });
+    projectsApi.list
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockImplementationOnce(() => third.promise);
     const ctx = await setup();
-
-    // Resolve the manual refresh first.
-    await act(async () => {
-      const refreshPromise = ctx().refreshProjects();
-      latestResolver!([["/new", { workspaces: [] }]]);
-      await refreshPromise;
-    });
-
-    await waitFor(() => {
-      expect(ctx().userProjects.has("/new")).toBe(true);
-    });
-
-    // Now resolve the stale mount refresh; it should be ignored.
+    await waitFor(() => expect(projectsApi.list).toHaveBeenCalledTimes(1));
+    const completed = mock(() => undefined);
+    const callers = Array.from({ length: 20 }, () => ctx().refreshProjects().then(completed));
+    expect(projectsApi.list).toHaveBeenCalledTimes(1);
     act(() => {
-      staleResolver!([["/stale", { workspaces: [] }]]);
+      first.resolve([["/old", { workspaces: [] }]]);
     });
-
-    await waitFor(() => {
-      expect(ctx().userProjects.has("/new")).toBe(true);
+    await waitFor(() => expect(projectsApi.list).toHaveBeenCalledTimes(2));
+    expect(completed).not.toHaveBeenCalled();
+    const later = ctx().refreshProjects().then(completed);
+    expect(projectsApi.list).toHaveBeenCalledTimes(2);
+    act(() => {
+      second.resolve([["/intermediate", { workspaces: [] }]]);
     });
-    expect(ctx().userProjects.has("/stale")).toBe(false);
+    await waitFor(() => expect(projectsApi.list).toHaveBeenCalledTimes(3));
+    expect(completed).not.toHaveBeenCalled();
+    await act(async () => {
+      third.resolve([["/final", { workspaces: [] }]]);
+      await Promise.all([...callers, later]);
+    });
+    expect(completed).toHaveBeenCalledTimes(21);
+    expect([...ctx().userProjects.keys()]).toEqual(["/final"]);
+    expect(projectsApi.list).toHaveBeenCalledTimes(3);
+    expect(ctx().loading).toBe(false);
   });
 
-  test("refreshProjects applies older success if a newer overlapping refresh fails", async () => {
-    let olderResolver: ((value: Array<[string, ProjectConfig]>) => void) | null = null;
-    const olderPromise = new Promise<Array<[string, ProjectConfig]>>((resolve) => {
-      olderResolver = resolve;
-    });
-
-    let newerRejecter: ((error: unknown) => void) | null = null;
-    const newerPromise = new Promise<Array<[string, ProjectConfig]>>((_, reject) => {
-      newerRejecter = reject;
-    });
-
-    let listCallCount = 0;
-    createMockAPI({
-      list: () => {
-        listCallCount += 1;
-
-        // Mount refresh (older)
-        if (listCallCount === 1) {
-          return olderPromise;
-        }
-
-        // Manual refresh (newer, but fails)
-        if (listCallCount === 2) {
-          return newerPromise;
-        }
-
-        return Promise.resolve([]);
-      },
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
-      listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
-      secrets: {
-        get: () => Promise.resolve([]),
-        update: () => Promise.resolve({ success: true as const, data: undefined }),
-      },
-    });
-
+  test("preserves older success after a trailing error and permits retry", async () => {
+    const first = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const second = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const projectsApi = createMockAPI({ list: () => first.promise });
+    projectsApi.list
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockResolvedValue([["/retry", { workspaces: [] }]]);
     const ctx = await setup();
-
-    // Trigger a newer refresh, but reject it while the mount refresh is still in-flight.
-    await act(async () => {
-      const refreshPromise = ctx().refreshProjects();
-      newerRejecter!(new Error("boom"));
-      await refreshPromise;
-    });
-
-    // Now resolve the mount refresh; it should populate the list.
+    const trailing = ctx().refreshProjects();
     act(() => {
-      olderResolver!([["/older", { workspaces: [] }]]);
+      first.resolve([["/older", { workspaces: [] }]]);
     });
-
-    await waitFor(() => {
-      expect(ctx().userProjects.has("/older")).toBe(true);
+    await waitFor(() => expect(projectsApi.list).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      second.reject(new Error("trailing failure"));
+      await trailing;
     });
+    expect([...ctx().userProjects.keys()]).toEqual(["/older"]);
+    expect(ctx().loaded).toBe(true);
+    expect(ctx().loadError).toBe("trailing failure");
+    await act(async () => {
+      await ctx().refreshProjects();
+    });
+    expect([...ctx().userProjects.keys()]).toEqual(["/retry"]);
+    expect(ctx().loadError).toBeNull();
   });
+
+  test("runs a queued refresh after an initial error", async () => {
+    const first = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+    const projectsApi = createMockAPI({ list: () => first.promise });
+    projectsApi.list
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue([["/recovered", { workspaces: [] }]]);
+    const ctx = await setup();
+    const trailing = ctx().refreshProjects();
+    await act(async () => {
+      first.reject(new Error("initial failure"));
+      await trailing;
+    });
+    expect(projectsApi.list).toHaveBeenCalledTimes(2);
+    expect([...ctx().userProjects.keys()]).toEqual(["/recovered"]);
+    expect(ctx().loaded).toBe(true);
+    expect(ctx().loadError).toBeNull();
+  });
+
+  test.each(["success", "error"])(
+    "ignores old client %s and refreshes the replacement client",
+    async (outcome) => {
+      const oldRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+      const newRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
+      const oldApi = createMockAPI({ list: () => oldRequest.promise });
+      const oldClient = currentClientMock as APIClient;
+      const newList = mock(() => newRequest.promise);
+      const newClient = { ...oldClient, projects: { ...oldClient.projects, list: newList } };
+      let context: ProjectContextModule.ProjectContext | null = null;
+      function Capture() {
+        context = useProjectContext();
+        return null;
+      }
+      const tree = (client: APIClient) => (
+        <APIProvider client={client}>
+          <ProjectProvider>
+            <Capture />
+          </ProjectProvider>
+        </APIProvider>
+      );
+      const view = render(tree(oldClient));
+      const ctx = () => context!;
+      await waitFor(() => expect(oldApi.list).toHaveBeenCalledTimes(1));
+      const oldRefresh = ctx().refreshProjects;
+      const waiting = oldRefresh();
+      view.rerender(tree(newClient));
+      await oldRefresh();
+      expect(oldApi.list).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(newList).toHaveBeenCalledTimes(1));
+      expect(ctx().userProjects.size).toBe(0);
+      expect(ctx().loading).toBe(true);
+      await act(async () => {
+        newRequest.resolve([["/new-client", { workspaces: [] }]]);
+        await newRequest.promise;
+      });
+      await waitFor(() => expect(ctx().loading).toBe(false));
+      expect([...ctx().userProjects.keys()]).toEqual(["/new-client"]);
+      // The new client finishes before the old transport settles.
+      await act(async () => {
+        if (outcome === "success") oldRequest.resolve([["/wrong-client", { workspaces: [] }]]);
+        else oldRequest.reject(new Error("old client failure"));
+        await waiting;
+      });
+      expect(oldApi.list).toHaveBeenCalledTimes(1);
+      expect(newList).toHaveBeenCalledTimes(1);
+      expect([...ctx().userProjects.keys()]).toEqual(["/new-client"]);
+      expect(ctx().loading).toBe(false);
+      expect(ctx().loadError).toBeNull();
+    }
+  );
 
   test("getBranchesForProject sanitizes malformed branch data", async () => {
     createMockAPI({

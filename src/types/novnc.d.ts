@@ -18,6 +18,7 @@ declare module "@novnc/novnc/lib/rfb" {
     constructor(target: HTMLElement, urlOrChannel: string | WebSocket, options?: RFBOptions);
 
     // Properties
+    background: string;
     viewOnly: boolean;
     focusOnClick: boolean;
     clipViewport: boolean;

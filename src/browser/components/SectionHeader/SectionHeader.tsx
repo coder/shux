@@ -26,7 +26,8 @@ interface SectionHeaderProps {
   isExpanded: boolean;
   workspaceCount: number;
   hasAttention: boolean;
-  onToggleExpand: () => void;
+  /** Omitted in the flat sidebar's management rows: nothing nests under them. */
+  onToggleExpand?: () => void;
   onAddWorkspace: () => void;
   onRename: (name: string) => void;
   onChangeColor: (color: string) => void;
@@ -115,30 +116,36 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
       data-section-id={section.id}
     >
       {/* Expand/Collapse Button */}
-      <button
-        onClick={onToggleExpand}
-        className="text-secondary hover:text-foreground flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border-none bg-transparent p-0 transition-colors"
-        aria-label={isExpanded ? "Collapse sub-project" : "Expand sub-project"}
-        aria-expanded={isExpanded}
-      >
-        <span className="relative flex h-3.5 w-3.5 items-center justify-center">
-          <ChevronRight
-            className="absolute inset-0 h-3.5 w-3.5 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-            style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
-          />
-          {isExpanded ? (
-            <FolderOpen
-              className="h-3.5 w-3.5 transition-opacity duration-200 group-hover:opacity-0"
-              style={{ color: sectionColor }}
+      {onToggleExpand ? (
+        <button
+          onClick={onToggleExpand}
+          className="text-secondary hover:text-foreground flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border-none bg-transparent p-0 transition-colors"
+          aria-label={isExpanded ? "Collapse sub-project" : "Expand sub-project"}
+          aria-expanded={isExpanded}
+        >
+          <span className="relative flex h-3.5 w-3.5 items-center justify-center">
+            <ChevronRight
+              className="absolute inset-0 h-3.5 w-3.5 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+              style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
             />
-          ) : (
-            <Folder
-              className="h-3.5 w-3.5 transition-opacity duration-200 group-hover:opacity-0"
-              style={{ color: sectionColor }}
-            />
-          )}
+            {isExpanded ? (
+              <FolderOpen
+                className="h-3.5 w-3.5 transition-opacity duration-200 group-hover:opacity-0"
+                style={{ color: sectionColor }}
+              />
+            ) : (
+              <Folder
+                className="h-3.5 w-3.5 transition-opacity duration-200 group-hover:opacity-0"
+                style={{ color: sectionColor }}
+              />
+            )}
+          </span>
+        </button>
+      ) : (
+        <span className="text-secondary flex h-5 w-5 shrink-0 items-center justify-center">
+          <Folder className="h-3.5 w-3.5" style={{ color: sectionColor }} />
         </span>
-      </button>
+      )}
 
       {/* Section Name */}
       {isEditing ? (

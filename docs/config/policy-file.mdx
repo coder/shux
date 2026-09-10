@@ -3,7 +3,7 @@ title: Policy File
 description: Admin-enforced restrictions for providers, models, MCP, and runtimes
 ---
 
-Mux supports an **admin-controlled policy file** that can restrict what users can do in the app.
+Xum supports an **admin-controlled policy file** that can restrict what users can do in the app.
 
 - It is **opt-in** (no behavior changes unless enabled).
 - It is **enforced server-side** (users can’t bypass it via the UI, slash commands, or manual edits).
@@ -11,18 +11,18 @@ Mux supports an **admin-controlled policy file** that can restrict what users ca
 
 ## Enable the policy file
 
-Set `MUX_POLICY_FILE` to either:
+Set `XUM_POLICY_FILE` to either:
 
-- an absolute path on the machine running Mux, or
-- a remote `http://` / `https://` URL that Mux can fetch.
+- an absolute path on the machine running Xum, or
+- a remote `http://` / `https://` URL that Xum can fetch.
 
 ```bash
-export MUX_POLICY_FILE="/etc/mux/policy.json"
+export XUM_POLICY_FILE="/etc/xum/policy.json"
 # or
-export MUX_POLICY_FILE="https://example.com/mux/policy.json"
+export XUM_POLICY_FILE="https://example.com/xum/policy.json"
 ```
 
-If `MUX_POLICY_FILE` is set but the file can’t be read/fetched/parsed/validated, Mux will **block startup** with an error.
+If `XUM_POLICY_FILE` is set but the file can’t be read/fetched/parsed/validated, Xum will **block startup** with an error.
 
 ## File format
 
@@ -63,7 +63,7 @@ If `provider_access` is present, only providers listed there are allowed.
 Each entry supports:
 
 - `id` (required): provider ID (matches what you see in Settings → Providers)
-- `base_url` (optional): if set to a non-empty string, Mux forces that provider base URL
+- `base_url` (optional): if set to a non-empty string, Xum forces that provider base URL
 - `model_access` (optional): list of allowed model IDs
 
 `model_access` behavior:
@@ -72,9 +72,9 @@ Each entry supports:
 - If present but an empty list, all models for that provider are allowed.
 - If non-empty, only the listed models are allowed.
 
-### Mux Gateway models
+### Xum Gateway models
 
-The Mux Gateway provider ID is `mux-gateway`. Gateway model IDs use the form:
+The Xum Gateway provider ID is `mux-gateway`. Gateway model IDs use the form:
 
 - `anthropic/<modelId>`
 - `openai/<modelId>`
@@ -141,11 +141,11 @@ Example: allow only worktrees and Coder-managed SSH:
 ## Operational behavior
 
 - The policy is loaded at startup and refreshed every **15 minutes**.
-- If a refresh fails, Mux keeps the **last-known-good** policy (it does not fall back to allow-all).
-- If the policy changes to disallow the currently selected provider/model/runtime, Mux will **block the action** (it will not auto-switch).
+- If a refresh fails, Xum keeps the **last-known-good** policy (it does not fall back to allow-all).
+- If the policy changes to disallow the currently selected provider/model/runtime, Xum will **block the action** (it will not auto-switch).
 
 ## Troubleshooting
 
-- **Mux won’t start and mentions policy**: fix the policy file, or temporarily unset `MUX_POLICY_FILE`.
-- **Changes aren’t visible yet**: policy reloads every 15 minutes (or restart Mux to reload immediately).
+- **Xum won’t start and mentions policy**: fix the policy file, or temporarily unset `XUM_POLICY_FILE`.
+- **Changes aren’t visible yet**: policy reloads every 15 minutes (or restart Xum to reload immediately).
 - **Need help finding provider IDs**: see [Providers](/config/providers) and [Models](/config/models).

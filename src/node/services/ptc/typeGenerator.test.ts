@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { z } from "zod";
 import type { Tool } from "ai";
-import { generateMuxTypes, getCachedMuxTypes, clearTypeCache } from "./typeGenerator";
+import { generateXumTypes, getCachedXumTypes, clearTypeCache } from "./typeGenerator";
 
 /**
  * Create a mock tool with the given schema and optional execute function.
@@ -14,7 +14,7 @@ function createMockTool(schema: z.ZodType, hasExecute = true): Tool {
   } as unknown as Tool;
 }
 
-describe("generateMuxTypes", () => {
+describe("generateXumTypes", () => {
   test("generates interface from tool input schema", async () => {
     const fileReadTool = createMockTool(
       z.object({
@@ -24,7 +24,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ file_read: fileReadTool });
+    const types = await generateXumTypes({ file_read: fileReadTool });
 
     expect(types).toContain("interface FileReadArgs");
     expect(types).toContain("filePath: string");
@@ -39,7 +39,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ file_read: fileReadTool });
+    const types = await generateXumTypes({ file_read: fileReadTool });
 
     // Asyncify makes async host functions appear synchronous to QuickJS
     expect(types).toContain("function file_read(args: FileReadArgs): FileReadResult");
@@ -53,7 +53,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ file_read: fileReadTool });
+    const types = await generateXumTypes({ file_read: fileReadTool });
 
     // Should include FileReadResult type definition
     expect(types).toContain("type FileReadResult =");
@@ -73,7 +73,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ my_tool: tool });
+    const types = await generateXumTypes({ my_tool: tool });
 
     // Fields with .default() should be optional (matching Zod input type)
     expect(types).toContain("run_in_background?:");
@@ -93,13 +93,32 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ bash: bashTool });
+    const types = await generateXumTypes({ bash: bashTool });
 
     // Should have success branches
     expect(types).toContain("success: true");
     expect(types).toContain("success: false");
     // Should have discriminated union (multiple object types joined by |)
     expect(types).toMatch(/\{[^}]*success: true[^}]*\}[^|]*\|[^{]*\{/);
+  });
+
+  test("generates result types for RLM family messaging tools (not unknown)", async () => {
+    const messageArgs = z.object({ message: z.string() });
+    const types = await generateXumTypes({
+      task_message_parent: createMockTool(messageArgs),
+      task_message_sibling: createMockTool(z.object({ task_id: z.string(), message: z.string() })),
+    });
+
+    // Both tools must resolve through catalog result schemas so the kernel sees their
+    // status discriminants instead of an opaque unknown return type.
+    expect(types).toContain(
+      "function task_message_parent(args: TaskMessageParentArgs): TaskMessageParentResult"
+    );
+    expect(types).toContain(
+      "function task_message_sibling(args: TaskMessageSiblingArgs): TaskMessageSiblingResult"
+    );
+    expect(types).not.toContain("): unknown");
+    expect(types).toContain('status: "sent"');
   });
 
   test("handles MCP tools with MCPCallToolResult", async () => {
@@ -110,7 +129,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ mcp__github__create_issue: mcpTool });
+    const types = await generateXumTypes({ mcp__github__create_issue: mcpTool });
 
     // MCP tools also return directly (not Promise) due to Asyncify
     expect(types).toContain(
@@ -129,9 +148,24 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ file_read: fileReadTool });
+    const types = await generateXumTypes({ file_read: fileReadTool });
 
     expect(types).not.toContain("MCPCallToolResult");
+  });
+
+  test("generates a typed result for mcp_prompt_get", async () => {
+    const promptGetTool = createMockTool(
+      z.object({
+        name: z.string(),
+        arguments: z.record(z.string(), z.string()).nullish(),
+      })
+    );
+
+    const types = await generateXumTypes({ mcp_prompt_get: promptGetTool });
+
+    expect(types).toContain("type McpPromptGetResult =");
+    expect(types).toContain("mcp_prompt_get(args: McpPromptGetArgs): McpPromptGetResult");
+    expect(types).not.toContain("mcp_prompt_get(args: McpPromptGetArgs): unknown");
   });
 
   test("handles tools without known result type (returns unknown)", async () => {
@@ -141,7 +175,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ custom_tool: customTool });
+    const types = await generateXumTypes({ custom_tool: customTool });
 
     expect(types).toContain("function custom_tool(args: CustomToolArgs): unknown");
     expect(types).not.toContain("Promise<unknown>");
@@ -149,7 +183,7 @@ describe("generateMuxTypes", () => {
   });
 
   test("declares console global", async () => {
-    const types = await generateMuxTypes({});
+    const types = await generateXumTypes({});
 
     expect(types).toContain("declare var console");
     expect(types).toContain("log(...args: unknown[]): void");
@@ -166,7 +200,7 @@ describe("generateMuxTypes", () => {
       })
     );
 
-    const types = await generateMuxTypes({ file_edit_replace_string: tool });
+    const types = await generateXumTypes({ file_edit_replace_string: tool });
 
     expect(types).toContain("FileEditReplaceStringArgs");
     expect(types).toContain("FileEditReplaceStringResult");
@@ -179,7 +213,7 @@ describe("generateMuxTypes", () => {
       m_middle: createMockTool(z.object({ z: z.string() })),
     };
 
-    const types = await generateMuxTypes(tools);
+    const types = await generateXumTypes(tools);
 
     // Find positions of each function declaration
     const aPos = types.indexOf("function a_first");
@@ -203,7 +237,7 @@ describe("generateMuxTypes", () => {
       web_fetch: createMockTool(z.object({ url: z.string() })),
     };
 
-    const types = await generateMuxTypes(tools);
+    const types = await generateXumTypes(tools);
 
     // All should have result types (not unknown)
     expect(types).toContain("BashResult");
@@ -221,7 +255,7 @@ describe("generateMuxTypes", () => {
   });
 
   test("heartbeat tool gets a typed result so sandbox code can check result.success", async () => {
-    const types = await generateMuxTypes({
+    const types = await generateXumTypes({
       heartbeat: createMockTool(z.object({ action: z.string() })),
     });
     expect(types).toContain("HeartbeatResult");
@@ -229,7 +263,7 @@ describe("generateMuxTypes", () => {
   });
 
   test("memory tool gets a typed result so sandbox code can check result.success", async () => {
-    const types = await generateMuxTypes({
+    const types = await generateXumTypes({
       memory: createMockTool(z.object({ command: z.string() })),
     });
     expect(types).toContain("MemoryResult");
@@ -251,7 +285,7 @@ describe("generateMuxTypes", () => {
       execute: () => Promise.resolve({ content: [] }),
     } as unknown as Tool;
 
-    const types = await generateMuxTypes({ mcp__github__list_repos: mcpTool });
+    const types = await generateXumTypes({ mcp__github__list_repos: mcpTool });
 
     expect(types).toContain("interface McpGithubListReposArgs");
     expect(types).toContain("repo: string");
@@ -274,7 +308,7 @@ describe("generateMuxTypes", () => {
       execute: () => Promise.resolve({ content: [] }),
     } as unknown as Tool;
 
-    const types = await generateMuxTypes({ mcp__github__list_repos: mcpTool });
+    const types = await generateXumTypes({ mcp__github__list_repos: mcpTool });
 
     // `repo` must remain required even though it has a `default`
     expect(types).toContain("repo: string");
@@ -282,15 +316,17 @@ describe("generateMuxTypes", () => {
     expect(types).toContain("owner: string");
   });
   test("handles empty tool set", async () => {
-    const types = await generateMuxTypes({});
+    const types = await generateXumTypes({});
 
-    expect(types).toContain("declare namespace mux {");
+    expect(types).toContain("declare namespace xum {");
+    expect(types).toContain("declare const mux: typeof xum;");
+    expect(types).not.toContain("declare namespace mux {");
     expect(types).toContain("}");
     expect(types).toContain("declare var console");
   });
 });
 
-describe("getCachedMuxTypes", () => {
+describe("getCachedXumTypes", () => {
   beforeEach(() => {
     clearTypeCache();
   });
@@ -299,12 +335,12 @@ describe("getCachedMuxTypes", () => {
     const toolV1 = createMockTool(z.object({ name: z.string() }));
     const toolV2 = createMockTool(z.object({ name: z.string(), age: z.number() }));
 
-    const types1 = await getCachedMuxTypes({ my_tool: toolV1 });
+    const types1 = await getCachedXumTypes({ my_tool: toolV1 });
     expect(types1).toContain("name: string");
     expect(types1).not.toContain("age");
 
     // Same tool name, different schema - should regenerate
-    const types2 = await getCachedMuxTypes({ my_tool: toolV2 });
+    const types2 = await getCachedXumTypes({ my_tool: toolV2 });
     expect(types2).toContain("name: string");
     expect(types2).toContain("age: number");
   });
@@ -322,20 +358,55 @@ describe("getCachedMuxTypes", () => {
       execute: () => Promise.resolve({ success: true }),
     } as unknown as Tool;
 
-    const types1 = await getCachedMuxTypes({ my_tool: tool1 });
+    const types1 = await getCachedXumTypes({ my_tool: tool1 });
     expect(types1).toContain("Version 1");
 
-    const types2 = await getCachedMuxTypes({ my_tool: tool2 });
+    const types2 = await getCachedXumTypes({ my_tool: tool2 });
     expect(types2).toContain("Version 2");
   });
 
   test("returns cached types when tools are identical", async () => {
     const tool = createMockTool(z.object({ value: z.string() }));
 
-    const types1 = await getCachedMuxTypes({ my_tool: tool });
-    const types2 = await getCachedMuxTypes({ my_tool: tool });
+    const types1 = await getCachedXumTypes({ my_tool: tool });
+    const types2 = await getCachedXumTypes({ my_tool: tool });
 
     // Should be the exact same object reference (cached)
     expect(types1).toBe(types2);
+  });
+
+  test("kernel mode is part of the cache identity (RLM on/off must not share types)", async () => {
+    const tool = createMockTool(z.object({ prompt: z.string() }));
+
+    const kernelOff = await getCachedXumTypes({ task: tool });
+    const kernelOn = await getCachedXumTypes({ task: tool }, { kernel: true });
+    expect(kernelOff).not.toContain("task_spawn");
+    expect(kernelOn).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
+    // Re-fetching kernel-off after kernel-on must not serve stale kernel types.
+    expect(await getCachedXumTypes({ task: tool })).toBe(kernelOff);
+  });
+});
+
+describe("kernel declarations (RLM)", () => {
+  test("RLM off: no kernel members in the generated namespace", async () => {
+    const tool = createMockTool(z.object({ prompt: z.string() }));
+    const types = await generateXumTypes({ task: tool });
+    expect(types).not.toContain("task_spawn");
+    expect(types).not.toContain("function events()");
+  });
+
+  test("kernel mode declares task_spawn (reusing TaskArgs) and events", async () => {
+    const tool = createMockTool(z.object({ prompt: z.string() }));
+    const types = await generateXumTypes({ task: tool }, { kernel: true });
+    expect(types).toContain("function task_spawn(args: TaskArgs): TaskSpawnResult;");
+    expect(types).toContain("function events(): HostEvent[];");
+    expect(types).toContain('type HostEvent = { type: "task-terminal";');
+  });
+
+  test("kernel mode without a bridged task tool declares events but not task_spawn", async () => {
+    const tool = createMockTool(z.object({ filePath: z.string() }));
+    const types = await generateXumTypes({ file_read: tool }, { kernel: true });
+    expect(types).not.toContain("task_spawn");
+    expect(types).toContain("function events(): HostEvent[];");
   });
 });

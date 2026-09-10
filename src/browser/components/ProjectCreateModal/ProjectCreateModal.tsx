@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useEffect, useImperativeHandle, useRef } from "react";
-import { FolderOpen, Github } from "lucide-react";
+import { FolderOpen, FolderPlus, Github } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -95,6 +95,8 @@ interface ProjectCreateFormProps {
   submitLabel?: string;
   /** Optional override for the path placeholder. */
   placeholder?: string;
+  /** Create and initialize a new git repository instead of adding an existing folder. */
+  createNewGitRepo?: boolean;
   /** Hide the footer actions (submit/cancel buttons). */
   hideFooter?: boolean;
   onErrorChange?: (hasError: boolean) => void;
@@ -114,16 +116,24 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
       showCancelButton = false,
       autoFocus = false,
       onIsCreatingChange,
-      submitLabel = "Add Project",
-      placeholder = window.api?.platform === "win32"
-        ? "C:\\Users\\user\\projects\\my-project"
-        : "/home/user/projects/my-project",
+      submitLabel,
+      placeholder,
+      createNewGitRepo = false,
       hideFooter = false,
       onErrorChange,
     },
     ref
   ) {
     const { api } = useAPI();
+    const resolvedSubmitLabel =
+      submitLabel ?? (createNewGitRepo ? "Create Project" : "Add Project");
+    const resolvedPlaceholder =
+      placeholder ??
+      (createNewGitRepo
+        ? "my-new-project"
+        : window.api?.platform === "win32"
+          ? "C:\\Users\\user\\projects\\my-project"
+          : "/home/user/projects/my-project");
     const [path, setPath] = useState(initialPath ?? "");
     const [error, setErrorState] = useState("");
     const [isCreating, setIsCreating] = useState(false);
@@ -191,8 +201,11 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
         const existingProjects = await api.projects.list();
         const existingPaths = new Map(existingProjects);
 
-        // Backend handles path resolution (bare names → ~/.mux/projects/name)
-        const result = await api.projects.create({ projectPath: trimmedPath });
+        // Backend handles path resolution (bare names → ~/.xum/projects/name)
+        const result = await api.projects.create({
+          projectPath: trimmedPath,
+          initGit: createNewGitRepo || undefined,
+        });
 
         if (result.success) {
           // Check if duplicate (backend may normalize the path)
@@ -214,14 +227,13 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
         setError(errorMessage);
         return false;
       } catch (err) {
-        // Unexpected error
         const errorMessage = err instanceof Error ? err.message : "An unexpected error occurred";
         setError(`Failed to add project: ${errorMessage}`);
         return false;
       } finally {
         setCreating(false);
       }
-    }, [api, isCreating, onClose, onSuccess, path, reset, setCreating, setError]);
+    }, [api, createNewGitRepo, isCreating, onClose, onSuccess, path, reset, setCreating, setError]);
 
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent) => {
@@ -255,7 +267,7 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
                 setError("");
               }}
               onKeyDown={handleKeyDown}
-              placeholder={placeholder}
+              placeholder={resolvedPlaceholder}
               autoFocus={autoFocus}
               disabled={isCreating}
               className="border-border-medium bg-modal-bg text-foreground placeholder:text-muted focus:border-accent min-w-0 flex-1 rounded border px-3 py-2 font-mono text-sm focus:outline-none disabled:opacity-50"
@@ -273,6 +285,13 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
           </div>
         </div>
 
+        {createNewGitRepo && (
+          <p className="text-muted text-xs">
+            Bare names are created in the default projects directory and initialized as git
+            repositories.
+          </p>
+        )}
+
         {error && <p className="text-error text-xs">{error}</p>}
 
         {!hideFooter && (
@@ -283,7 +302,7 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
               </Button>
             )}
             <Button onClick={() => void handleSelect()} disabled={isCreating}>
-              {isCreating ? "Adding..." : submitLabel}
+              {isCreating ? (createNewGitRepo ? "Creating..." : "Adding...") : resolvedSubmitLabel}
             </Button>
           </DialogFooter>
         )}
@@ -296,8 +315,7 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
 
 ProjectCreateForm.displayName = "ProjectCreateForm";
 
-// Keep the existing path-based add flow unchanged while adding clone as an alternate mode.
-export type ProjectCreateMode = "pick-folder" | "clone";
+export type ProjectCreateMode = "pick-folder" | "clone" | "new";
 
 interface ProjectCloneFormProps {
   onSuccess: (normalizedPath: string, projectConfig: ProjectConfig) => void;
@@ -776,14 +794,21 @@ function ProjectAddFormFooter(props: {
   onClose?: () => void;
 }) {
   const handleSubmit = () => {
-    if (props.mode === "pick-folder") {
-      void props.createFormRef.current?.submit();
-    } else {
+    if (props.mode === "clone") {
       void props.cloneFormRef.current?.submit();
+    } else {
+      void props.createFormRef.current?.submit();
     }
   };
 
-  const actionLabel = props.mode === "pick-folder" ? "Add Project" : "Clone Project";
+  const actionLabel =
+    props.mode === "pick-folder"
+      ? "Add Project"
+      : props.mode === "clone"
+        ? "Clone Project"
+        : "Create Project";
+  const creatingLabel =
+    props.mode === "pick-folder" ? "Adding…" : props.mode === "clone" ? "Cloning…" : "Creating…";
 
   return (
     <DialogFooter className={props.showCancelButton ? "justify-between" : undefined}>
@@ -793,7 +818,7 @@ function ProjectAddFormFooter(props: {
         </Button>
       )}
       <Button onClick={handleSubmit} disabled={props.isCreating}>
-        {props.isCreating ? (props.mode === "pick-folder" ? "Adding…" : "Cloning…") : actionLabel}
+        {props.isCreating ? creatingLabel : actionLabel}
       </Button>
     </DialogFooter>
   );
@@ -888,7 +913,7 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
     const onErrorChange = props.onErrorChange;
     const handleModeChange = useCallback(
       (nextMode: string) => {
-        if (nextMode !== "pick-folder" && nextMode !== "clone") {
+        if (nextMode !== "pick-folder" && nextMode !== "clone" && nextMode !== "new") {
           return;
         }
 
@@ -907,16 +932,16 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
       ref,
       () => ({
         submit: async () => {
-          if (mode === "pick-folder") {
-            return (await projectCreateFormRef.current?.submit()) ?? false;
+          if (mode === "clone") {
+            return (await projectCloneFormRef.current?.submit()) ?? false;
           }
-          return (await projectCloneFormRef.current?.submit()) ?? false;
+          return (await projectCreateFormRef.current?.submit()) ?? false;
         },
         getTrimmedInput: () => {
-          if (mode === "pick-folder") {
-            return projectCreateFormRef.current?.getTrimmedPath() ?? "";
+          if (mode === "clone") {
+            return projectCloneFormRef.current?.getTrimmedRepoUrl() ?? "";
           }
-          return projectCloneFormRef.current?.getTrimmedRepoUrl() ?? "";
+          return projectCreateFormRef.current?.getTrimmedPath() ?? "";
         },
         getMode: () => mode,
       }),
@@ -929,12 +954,13 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
             visually cohesive, while DialogFooter renders outside the wrapper
             as a direct DialogContent grid child for proper edge alignment. */}
         <div className="space-y-3">
+          {/* flex-wrap keeps the three labeled modes inside narrow dialogs (~375px). */}
           <ToggleGroup
             type="single"
             value={mode}
             onValueChange={handleModeChange}
             disabled={isCreating}
-            className="h-9 bg-transparent"
+            className="h-auto min-h-9 flex-wrap gap-y-1 bg-transparent"
           >
             <ToggleGroupItem value="pick-folder" size="sm" className="h-7 gap-1.5 px-3 text-[13px]">
               <FolderOpen className="h-3.5 w-3.5" />
@@ -944,21 +970,13 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
               <Github className="h-3.5 w-3.5" />
               Clone repo
             </ToggleGroupItem>
+            <ToggleGroupItem value="new" size="sm" className="h-7 gap-1.5 px-3 text-[13px]">
+              <FolderPlus className="h-3.5 w-3.5" />
+              New project
+            </ToggleGroupItem>
           </ToggleGroup>
 
-          {mode === "pick-folder" ? (
-            <ProjectCreateForm
-              initialPath={props.initialPath}
-              ref={projectCreateFormRef}
-              onSuccess={props.onSuccess}
-              onClose={props.onClose}
-              showCancelButton={props.showCancelButton ?? false}
-              autoFocus={props.autoFocus}
-              onIsCreatingChange={setCreating}
-              onErrorChange={props.onErrorChange}
-              hideFooter
-            />
-          ) : (
+          {mode === "clone" ? (
             <ProjectCloneForm
               ref={projectCloneFormRef}
               onSuccess={props.onSuccess}
@@ -969,6 +987,20 @@ export const ProjectAddForm = React.forwardRef<ProjectAddFormHandle, ProjectAddF
               onErrorChange={props.onErrorChange}
               hideFooter
               autoFocus={props.autoFocus}
+            />
+          ) : (
+            <ProjectCreateForm
+              key={mode}
+              initialPath={props.initialPath}
+              ref={projectCreateFormRef}
+              onSuccess={props.onSuccess}
+              onClose={props.onClose}
+              showCancelButton={props.showCancelButton ?? false}
+              autoFocus={props.autoFocus}
+              onIsCreatingChange={setCreating}
+              onErrorChange={props.onErrorChange}
+              createNewGitRepo={mode === "new"}
+              hideFooter
             />
           )}
         </div>
@@ -1020,7 +1052,9 @@ export const ProjectCreateModal: React.FC<ProjectCreateModalProps> = ({
       <DialogContent showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>Add Project</DialogTitle>
-          <DialogDescription>Pick a folder or clone a project repository</DialogDescription>
+          <DialogDescription>
+            Pick a folder, clone a repository, or create a new project
+          </DialogDescription>
         </DialogHeader>
 
         <ProjectAddForm

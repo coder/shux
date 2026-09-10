@@ -235,13 +235,13 @@ describe("MuxGovernorOauthService", () => {
 
       expect(waitResult.success).toBe(false);
       if (!waitResult.success) {
-        expect(waitResult.error).toContain("Mux Governor exchange failed (502)");
+        expect(waitResult.error).toContain("Xum Governor exchange failed (502)");
       }
 
       expect(callbackResponse.status).toBe(400);
       expect(callbackResponse.body).toContain("Enrollment failed");
       expect(callbackResponse.body).toContain(
-        "Mux Governor exchange failed (502): governor unavailable"
+        "Xum Governor exchange failed (502): governor unavailable"
       );
 
       expect(deps.editConfigCalls).toBe(0);

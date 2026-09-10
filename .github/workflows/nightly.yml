@@ -70,10 +70,14 @@ jobs:
             nightly-docker.txt
             # Versioned Linux release assets ensure reruns don't skip partially
             # published AppImage/checksum outputs.
-            "mux-${RELEASE_VERSION}-x86_64.AppImage"
-            "mux-${RELEASE_VERSION}-arm64.AppImage"
-            "mux-${RELEASE_VERSION}-x86_64.AppImage.sha256"
-            "mux-${RELEASE_VERSION}-arm64.AppImage.sha256"
+            "xum-${RELEASE_VERSION}-x86_64-linux.AppImage"
+            "xum-${RELEASE_VERSION}-arm64-linux.AppImage"
+            "xum-${RELEASE_VERSION}-x86_64-linux.AppImage.sha256"
+            "xum-${RELEASE_VERSION}-arm64-linux.AppImage.sha256"
+            "mux-${RELEASE_VERSION}-x86_64-linux.AppImage"
+            "mux-${RELEASE_VERSION}-arm64-linux.AppImage"
+            "mux-${RELEASE_VERSION}-x86_64-linux.AppImage.sha256"
+            "mux-${RELEASE_VERSION}-arm64-linux.AppImage.sha256"
           )
 
           # Re-runs with no new commits may find an existing nightly release.

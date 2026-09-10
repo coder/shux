@@ -8,9 +8,8 @@ A few reasons parallel workspaces matter:
 - **Keep context aligned**: Create dedicated workspaces for threads like `code-review`, `refactor`, and `new-feature`.
 - **Run long jobs in the background**: Kick off a slow, high-accuracy model for a deep investigation or refactor.
   - Streams resume after restarts or intermittent connection issues.
-  - Mux shows an indicator when the model finishes.
+  - Xum shows an indicator when the model finishes.
 - **Alternative answers**: Use [Best of N](/agents/best-of-n) when you want several independent answers to the same ask.
-- **Split one task across lanes**: Use variants when the same prompt template should run across labels like GitHub issues, commit windows, or review lanes such as `frontend`, `backend`, `tests`, and `docs`.
 - **Tangent management**: Fork or create a new workspace for side quests so the main thread stays focused.
 
-In short: best-of explores alternative answers, while variants reuse one task template across labeled parallel slices.
+In short: parallel workspaces keep long-running, alternative, and tangential work isolated without losing visibility.

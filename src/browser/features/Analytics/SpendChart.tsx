@@ -25,6 +25,7 @@ interface SpendChartProps {
   loading: boolean;
   error: string | null;
   granularity: "hour" | "day" | "week";
+  timeZoneMode: "local" | "utc";
 }
 
 interface SpendChartRow {
@@ -75,7 +76,8 @@ export function SpendChart(props: SpendChartProps) {
           ? "Model-attributed weekly spend."
           : props.granularity === "hour"
             ? "Model-attributed hourly spend."
-            : "Model-attributed daily spend."}
+            : "Model-attributed daily spend."}{" "}
+        ({props.timeZoneMode === "utc" ? "UTC" : "local time"})
       </p>
 
       {props.loading ? (

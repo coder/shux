@@ -18,7 +18,7 @@ import type { Result } from "@/common/types/result";
  *
  * srcBaseDir (base directory for all workspaces):
  *   - Where mux stores ALL workspace directories
- *   - Local: ~/.mux/src (tilde expanded to full path by LocalRuntime)
+ *   - Local: ~/.xum/src (tilde expanded to full path by LocalRuntime)
  *   - SSH: /home/user/workspace (tilde paths are allowed and are resolved before use)
  *
  * Workspace Path Computation:
@@ -31,7 +31,7 @@ import type { Result } from "@/common/types/result";
  *     Example: "feature-123" or "main"
  *
  * Full Example (Local):
- *   srcBaseDir:    ~/.mux/src (expanded to /home/user/.mux/src)
+ *   srcBaseDir:    ~/.xum/src (expanded to /home/user/.mux/src)
  *   projectPath:   /Users/me/git/my-project (local git repo)
  *   projectName:   my-project (extracted)
  *   workspaceName: feature-123
@@ -53,6 +53,8 @@ export interface ExecOptions {
   cwd: string;
   /** Environment variables to inject */
   env?: Record<string, string>;
+  /** Host-namespace paths to translate before exposing them as environment variables. */
+  pathEnv?: Record<string, string>;
   /**
    * Timeout in seconds.
    *
@@ -68,6 +70,10 @@ export interface ExecOptions {
   /** Force PTY allocation (SSH only - adds -t flag) */
   forcePTY?: boolean;
 }
+
+export type BackgroundMonitorProbeResult<T> =
+  | { success: true; value: T }
+  | { success: false; error: string };
 
 /**
  * Handle to a background process.
@@ -86,6 +92,9 @@ export interface BackgroundHandle {
    * Async because SSH needs to read remote exit_code file.
    */
   getExitCode(): Promise<number | null>;
+
+  /** Strict exit-code probe used only by monitor polling. */
+  getExitCodeForMonitor?(): Promise<BackgroundMonitorProbeResult<number | null>>;
 
   /**
    * Terminate the process (SIGTERM → wait → SIGKILL).
@@ -114,6 +123,11 @@ export interface BackgroundHandle {
    * Works on both local and SSH runtimes by using runtime.exec() internally.
    */
   readOutput(offset: number): Promise<{ content: string; newOffset: number }>;
+
+  /** Strict output probe used only by monitor polling. */
+  readOutputForMonitor?(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>>;
 }
 
 /**
@@ -222,7 +236,7 @@ export interface WorkspaceInitParams {
   env?: Record<string, string>;
 
   /**
-   * When true, skip running the project's .mux/init hook.
+   * When true, skip running the project's .xum/init hook.
    *
    * NOTE: This skips only hook execution, not runtime provisioning.
    */
@@ -361,7 +375,8 @@ export interface Runtime {
    */
   readonly createFlags?: RuntimeCreateFlags;
   /**
-   * Execute a bash command with streaming I/O
+   * Execute a bash command with streaming I/O.
+   * cwd and pathEnv values are host-namespace paths translated by the adapter.
    * @param command The bash script to execute
    * @param options Execution options (cwd, env, timeout, etc.)
    * @returns Promise that resolves to streaming handles for stdin/stdout/stderr and completion promises
@@ -370,7 +385,7 @@ export interface Runtime {
   exec(command: string, options: ExecOptions): Promise<ExecStream>;
 
   /**
-   * Read file contents as a stream
+   * Read file contents as a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Readable stream of file contents
@@ -379,7 +394,7 @@ export interface Runtime {
   readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
 
   /**
-   * Write file contents atomically from a stream
+   * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Writable stream for file contents
@@ -388,7 +403,7 @@ export interface Runtime {
   writeFile(path: string, abortSignal?: AbortSignal): WritableStream<Uint8Array>;
 
   /**
-   * Get file statistics
+   * Get file statistics. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file/directory
    * @param abortSignal Optional abort signal for cancellation
    * @returns File statistics
@@ -397,7 +412,7 @@ export interface Runtime {
   stat(path: string, abortSignal?: AbortSignal): Promise<FileStat>;
 
   /**
-   * Ensure a directory exists (mkdir -p semantics).
+   * Ensure a directory exists (mkdir -p semantics). Adapters canonicalize tilde and relative paths.
    *
    * This intentionally lives on the Runtime abstraction so local runtimes can use
    * Node fs APIs (Windows-safe) while remote runtimes can use shell commands.
@@ -615,10 +630,10 @@ export interface Runtime {
   /**
    * Get the mux home directory for this runtime.
    * Used for storing plan files and other mux-specific data.
-   * - LocalRuntime/SSHRuntime: ~/.mux (tilde expanded by runtime)
+   * - LocalRuntime/SSHRuntime: ~/.xum (tilde expanded by runtime)
    * - DockerRuntime: /var/mux (world-readable, avoids /root permission issues)
    */
-  getMuxHome(): string;
+  getXumHome(): string;
 
   /**
    * Env vars that should be forwarded into container processes.
@@ -635,9 +650,16 @@ export class RuntimeError extends Error {
   constructor(
     message: string,
     public readonly type: "exec" | "file_io" | "network" | "unknown",
-    public readonly cause?: Error
+    cause?: unknown
   ) {
-    super(message);
+    // The wrapped original error travels through the NATIVE Error options bag
+    // and is typed `unknown` (matching Error.cause), NOT an `Error`-typed
+    // parameter property: wrap sites catch errors from Node builtins, which
+    // under jest's vm sandbox come from another realm where `instanceof
+    // Error` is false — an Error-typed cause forces wrap sites into
+    // `err instanceof Error ? err : undefined` filters that silently drop
+    // the fs error (and its ENOENT/EACCES code) that unwrapping checks need.
+    super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
 }

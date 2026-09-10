@@ -20,12 +20,14 @@ export function generateGitStatusScript(baseRef?: string): string {
   return `
 # Determine primary branch to compare against
 PRIMARY_BRANCH=""
+PRIMARY_REF=""
 PREFERRED_BRANCH=${shellSafePreferredBranch}
 
 # Try preferred branch first if specified
 if [ -n "$PREFERRED_BRANCH" ]; then
   if git rev-parse --verify "refs/remotes/origin/$PREFERRED_BRANCH" >/dev/null 2>&1; then
     PRIMARY_BRANCH="$PREFERRED_BRANCH"
+    PRIMARY_REF="origin/$PREFERRED_BRANCH"
   fi
 fi
 
@@ -33,15 +35,24 @@ fi
 if [ -z "$PRIMARY_BRANCH" ]; then
   # Method 1: symbolic-ref (fastest)
   PRIMARY_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+  if [ -n "$PRIMARY_BRANCH" ]; then PRIMARY_REF="origin/$PRIMARY_BRANCH"; fi
 
   # Method 2: remote show origin (fallback)
   if [ -z "$PRIMARY_BRANCH" ]; then
     PRIMARY_BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | cut -d' ' -f5)
+    if [ -n "$PRIMARY_BRANCH" ]; then PRIMARY_REF="origin/$PRIMARY_BRANCH"; fi
   fi
 
   # Method 3: check for main or master
   if [ -z "$PRIMARY_BRANCH" ]; then
     PRIMARY_BRANCH=$(git branch -r 2>/dev/null | grep -E 'origin/(main|master)$' | head -1 | sed 's@^.*origin/@@')
+    if [ -n "$PRIMARY_BRANCH" ]; then PRIMARY_REF="origin/$PRIMARY_BRANCH"; fi
+  fi
+
+  # Method 4: use a local primary branch when no remote exists
+  if [ -z "$PRIMARY_BRANCH" ]; then
+    PRIMARY_BRANCH=$(git branch --format='%(refname:short)' 2>/dev/null | grep -E '^(main|master)$' | head -1)
+    PRIMARY_REF="$PRIMARY_BRANCH"
   fi
 fi
 
@@ -63,7 +74,7 @@ if [ -n "$GIT_DIR" ]; then
 fi
 
 # Stable ahead/behind counts (rev-list is format-stable across git versions)
-AHEAD_BEHIND=$(git rev-list --left-right --count HEAD..."origin/$PRIMARY_BRANCH" 2>/dev/null || echo "")
+AHEAD_BEHIND=$(git rev-list --left-right --count HEAD..."$PRIMARY_REF" 2>/dev/null || echo "")
 if [ -z "$AHEAD_BEHIND" ]; then
   AHEAD_BEHIND="0 0"
 fi
@@ -71,10 +82,10 @@ fi
 # Check for dirty (uncommitted changes)
 DIRTY_COUNT=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
 
-# Compute line deltas (additions/deletions) vs merge-base with origin's primary branch.
+# Compute line deltas (additions/deletions) vs merge-base with the primary ref.
 #
 # We emit *only* totals to keep output tiny (avoid output truncation in large repos).
-MERGE_BASE=$(git merge-base HEAD "origin/$PRIMARY_BRANCH" 2>/dev/null || echo "")
+MERGE_BASE=$(git merge-base HEAD "$PRIMARY_REF" 2>/dev/null || echo "")
 
 # Outgoing: local changes vs merge-base (working tree vs base, includes uncommitted changes)
 OUTGOING_STATS="0 0"
@@ -85,10 +96,10 @@ if [ -n "$MERGE_BASE" ]; then
   fi
 fi
 
-# Incoming: remote primary branch changes vs merge-base
+# Primary branch changes vs merge-base
 INCOMING_STATS="0 0"
 if [ -n "$MERGE_BASE" ]; then
-  INCOMING_STATS=$(git diff --numstat "$MERGE_BASE" "origin/$PRIMARY_BRANCH" 2>/dev/null | awk '{ if ($1 == "-" || $2 == "-") next; add += $1; del += $2 } END { printf "%d %d", add+0, del+0 }')
+  INCOMING_STATS=$(git diff --numstat "$MERGE_BASE" "$PRIMARY_REF" 2>/dev/null | awk '{ if ($1 == "-" || $2 == "-") next; add += $1; del += $2 } END { printf "%d %d", add+0, del+0 }')
   if [ -z "$INCOMING_STATS" ]; then
     INCOMING_STATS="0 0"
   fi
@@ -112,12 +123,7 @@ echo "$OUTGOING_STATS $INCOMING_STATS"
 }
 
 /**
- * Bash script to get git status for a workspace (auto-detects primary branch).
- */
-export const GIT_STATUS_SCRIPT = generateGitStatusScript();
-
-/**
- * Parse the output from GIT_STATUS_SCRIPT.
+ * Parse the output of the script produced by generateGitStatusScript.
  * Frontend-safe parsing function.
  */
 export interface ParsedGitStatusOutput {

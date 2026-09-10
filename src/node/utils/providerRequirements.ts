@@ -12,19 +12,20 @@ import os from "node:os";
 import path from "node:path";
 
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { isOpReference } from "@/common/utils/opRef";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type {
   BaseProviderConfig,
   BedrockProviderConfig,
+  CoderProviderConfig,
   MuxGatewayProviderConfig,
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
-import type { ExternalSecretResolver } from "@/common/types/secrets";
 import type { ProviderConfig, ProvidersConfig } from "@/node/config";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
+import { normalizeCoderDeploymentUrl } from "@/common/constants/coderOAuth";
 
 // ============================================================================
 // Environment variable mappings - single source of truth
@@ -68,6 +69,9 @@ export const PROVIDER_ENV_VARS: Partial<
   moonshotai: {
     apiKey: ["MOONSHOT_API_KEY"],
   },
+  zai: {
+    apiKey: ["ZAI_API_KEY"],
+  },
   "github-copilot": {
     apiKey: ["GITHUB_COPILOT_TOKEN"],
   },
@@ -92,6 +96,27 @@ export const BEDROCK_AUTH_ENV_VARS = {
   bearerToken: "AWS_BEARER_TOKEN_BEDROCK",
   profile: "AWS_PROFILE",
 } as const;
+
+/**
+ * Secret-bearing provider env var names (API keys / auth tokens plus AWS
+ * credential material). Consumed by repo-automation-off git executions
+ * (gitNoHooksEnv) to blank provider secrets so repo-controlled processes
+ * cannot exfiltrate them. Excludes non-secret vars (base URLs, org IDs,
+ * regions), which unrelated tooling legitimately reads.
+ */
+export function providerSecretEnvVarNames(): string[] {
+  const names = new Set<string>();
+  for (const mapping of Object.values(PROVIDER_ENV_VARS)) {
+    for (const key of mapping.apiKey ?? []) {
+      names.add(key);
+    }
+  }
+  names.add(AZURE_OPENAI_ENV_VARS.apiKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.accessKeyId);
+  names.add(BEDROCK_AUTH_ENV_VARS.secretAccessKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.bearerToken);
+  return [...names];
+}
 
 /** Resolve first non-empty env var from a list of candidates */
 function resolveEnv(
@@ -123,7 +148,11 @@ type ProviderSpecificCredentialFields = Partial<
     "region" | "profile" | "bearerToken" | "accessKeyId" | "secretAccessKey"
   > &
     Pick<MuxGatewayProviderConfig, "couponCode" | "voucher"> &
-    Pick<OpenAIProviderConfig, "organization">
+    Pick<OpenAIProviderConfig, "organization"> &
+    Pick<CoderProviderConfig, "deploymentUrl"> & {
+      // Wider than the schema type: callers pass raw (unvalidated) config.
+      coderOauth?: unknown;
+    }
 >;
 
 // Raw provider config as read from disk — before validation.
@@ -139,12 +168,13 @@ export type ProviderConfigRaw = Omit<ProviderConfig, "enabled" | "models"> & {
 export interface ResolvedCredentials {
   isConfigured: boolean;
   /** What's missing, if not configured (for error messages) */
-  missingRequirement?: "api_key" | "region" | "coupon_code";
+  missingRequirement?: "api_key" | "region" | "coupon_code" | "coder_login";
 
   // Resolved credential values - aiService uses these directly
   apiKey?: string; // anthropic, openai, etc.
   region?: string; // bedrock
   couponCode?: string; // mux-gateway
+  deploymentUrl?: string; // coder
   baseUrl?: string; // runtime value from config or env when API-key auth is active
   baseUrlResolved?: string; // display-only metadata, including when API key auth is missing
   organization?: string; // openai
@@ -169,14 +199,9 @@ export type ProviderRequirementError =
       code: "api_key_file_unreadable";
       path: string;
       reason: "missing" | "not_file" | "too_large" | "empty" | "read_failed";
-    }
-  | {
-      code: "op_resolution_failed";
-      ref: string;
-      reason: "unavailable" | "unresolved" | "threw";
     };
 
-export type CustomProviderCredentialSource = "inline" | "file" | "op" | "none";
+export type CustomProviderCredentialSource = "inline" | "file" | "none";
 
 export type ResolvedCustomProviderCredentials =
   | {
@@ -268,6 +293,17 @@ function resolveApiKeyFileDetailed(filePath: unknown): ApiKeyFileResolution {
   }
 }
 
+/**
+ * Legacy 1Password `op://` references. The integration was removed; stored
+ * references are preserved on disk for downgrade compatibility but are
+ * unusable at runtime, so credential resolution and UI status must treat
+ * them as absent (falling back to key files / env vars) instead of sending
+ * the raw reference to a provider as a bearer token.
+ */
+export function isLegacyOpApiKey(value: unknown): value is string {
+  return typeof value === "string" && value.startsWith("op://");
+}
+
 function resolveApiKeyCandidate(
   config: { apiKey?: unknown; apiKeyFile?: unknown },
   options: {
@@ -277,7 +313,11 @@ function resolveApiKeyCandidate(
   }
 ): ResolvedApiKeyCandidate {
   const configKey =
-    typeof config.apiKey === "string" && config.apiKey.trim().length > 0 ? config.apiKey : null;
+    typeof config.apiKey === "string" &&
+    config.apiKey.trim().length > 0 &&
+    !isLegacyOpApiKey(config.apiKey)
+      ? config.apiKey
+      : null;
   if (configKey) {
     return { kind: "resolved", apiKey: configKey, source: "config" };
   }
@@ -324,12 +364,28 @@ export function resolveProviderCredentials(
       : { isConfigured: false, missingRequirement: "region" };
   }
 
-  // Mux Gateway: coupon code required (no env var support)
+  // Xum Gateway: coupon code required (no env var support)
   if (provider === "mux-gateway") {
     const couponCode = config.couponCode ?? config.voucher;
     return couponCode
       ? { isConfigured: true, couponCode }
       : { isConfigured: false, missingRequirement: "coupon_code" };
+  }
+
+  // Coder: deployment URL + OAuth tokens from "Login with Coder" required
+  if (provider === "coder") {
+    const deploymentUrl =
+      typeof config.deploymentUrl === "string"
+        ? normalizeCoderDeploymentUrl(config.deploymentUrl)
+        : null;
+    // Tokens are issuer-bound: an OAuth blob only counts when it was minted by
+    // the currently configured deployment, so changing the URL never routes an
+    // old deployment's bearer token to the new host.
+    const oauth = parseCoderOauthAuth(config.coderOauth);
+    const hasMatchingOauth = oauth !== null && oauth.deploymentUrl === deploymentUrl;
+    return deploymentUrl && hasMatchingOauth
+      ? { isConfigured: true, deploymentUrl }
+      : { isConfigured: false, missingRequirement: "coder_login" };
   }
 
   // Keyless providers (e.g., ollama): require explicit opt-in via baseUrl/baseURL or models
@@ -380,11 +436,10 @@ function customCredentialSourceFromApiKeySource(
   return source === "file" ? "file" : "inline";
 }
 
-export async function resolveCustomProviderCredentials(
+export function resolveCustomProviderCredentials(
   providerId: string,
-  providerConfig: BaseProviderConfig,
-  opResolver?: ExternalSecretResolver
-): Promise<ResolvedCustomProviderCredentials> {
+  providerConfig: BaseProviderConfig
+): ResolvedCustomProviderCredentials {
   const baseURL = resolveConfigBaseUrl(providerConfig);
   if (!baseURL) {
     return {
@@ -411,50 +466,12 @@ export async function resolveCustomProviderCredentials(
     return { ok: true, baseURL, resolvedFrom: "none" };
   }
 
-  const rawApiKey = apiKeyResult.apiKey;
-  if (!isOpReference(rawApiKey)) {
-    return {
-      ok: true,
-      apiKey: rawApiKey,
-      baseURL,
-      resolvedFrom: customCredentialSourceFromApiKeySource(apiKeyResult.source),
-    };
-  }
-
-  if (!opResolver) {
-    return {
-      ok: false,
-      baseURL,
-      resolvedFrom: "op",
-      error: { code: "op_resolution_failed", ref: rawApiKey, reason: "unavailable" },
-    };
-  }
-
-  try {
-    const resolvedApiKey = await opResolver(rawApiKey);
-    if (!hasNonEmptyString(resolvedApiKey)) {
-      return {
-        ok: false,
-        baseURL,
-        resolvedFrom: "op",
-        error: { code: "op_resolution_failed", ref: rawApiKey, reason: "unresolved" },
-      };
-    }
-
-    return {
-      ok: true,
-      apiKey: resolvedApiKey,
-      baseURL,
-      resolvedFrom: "op",
-    };
-  } catch {
-    return {
-      ok: false,
-      baseURL,
-      resolvedFrom: "op",
-      error: { code: "op_resolution_failed", ref: rawApiKey, reason: "threw" },
-    };
-  }
+  return {
+    ok: true,
+    apiKey: apiKeyResult.apiKey,
+    baseURL,
+    resolvedFrom: customCredentialSourceFromApiKeySource(apiKeyResult.source),
+  };
 }
 
 /**
@@ -601,7 +618,7 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
 
     if (!(providerKey in PROVIDER_DEFINITIONS)) {
       if (
-        isCustomOpenAICompatibleProviderConfig(rawConfig) &&
+        isCustomProviderConfig(rawConfig) &&
         !isProviderDisabledInConfig(rawConfig) &&
         resolveConfigBaseUrl(rawConfig) !== undefined
       ) {

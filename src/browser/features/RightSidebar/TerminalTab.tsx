@@ -1,5 +1,6 @@
 import React from "react";
 import { TerminalView } from "@/browser/components/TerminalView/TerminalView";
+import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { getTerminalSessionId } from "@/browser/types/rightSidebar";
 
@@ -8,6 +9,10 @@ interface TerminalTabProps {
   /** The tab type (e.g., "terminal:ws-123-1704567890") */
   tabType: TabType;
   visible: boolean;
+  /** Display name for this tab (OSC title or "Terminal N" fallback), shown by the badge overlay. */
+  tabName: string;
+  /** 0-based position among the tabset's terminal tabs, for the badge's {index} token. */
+  tabIndex: number;
   /** Called when terminal title changes (from shell OSC sequences) */
   onTitleChange?: (title: string) => void;
   /** Whether to auto-focus the terminal when it becomes visible (e.g., when opened via keybind) */
@@ -28,6 +33,7 @@ interface TerminalTabProps {
 export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
   // Extract session ID from tab type - must exist (sessions created before tab added)
   const sessionId = getTerminalSessionId(props.tabType);
+  const metadata = useWorkspaceMetadata().workspaceMetadata.get(props.workspaceId);
 
   if (!sessionId) {
     // This should never happen - RightSidebar creates session before adding tab
@@ -48,6 +54,10 @@ export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
       onAutoFocusConsumed={props.onAutoFocusConsumed}
       autoFocus={props.autoFocus ?? false}
       onExit={props.onExit}
+      workspaceName={metadata?.name ?? ""}
+      projectName={metadata?.projectName ?? ""}
+      tabName={props.tabName}
+      tabIndex={props.tabIndex}
     />
   );
 };

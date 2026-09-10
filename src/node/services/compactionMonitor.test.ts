@@ -111,6 +111,42 @@ describe("CompactionMonitor", () => {
     expect(statusEvents).toHaveLength(1);
   });
 
+  test("checkMidStream applies the request wire format to the Codex OAuth cap", () => {
+    // API key + OAuth preferred: Responses requests route OAuth (272K cap), while a
+    // request-level Chat Completions selection falls back to the API key (1.05M).
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        codexOauthDefaultAuth: "oauth",
+      },
+    };
+    const usage = createMidStreamUsage(260_000);
+
+    const { monitor: oauthMonitor } = createMonitor();
+    expect(
+      oauthMonitor.checkMidStream({
+        model: "openai:gpt-5.5",
+        usage,
+        use1MContext: false,
+        providersConfig,
+      })
+    ).toBe(true);
+
+    const { monitor: apiKeyMonitor } = createMonitor();
+    expect(
+      apiKeyMonitor.checkMidStream({
+        model: "openai:gpt-5.5",
+        usage,
+        use1MContext: false,
+        providersConfig,
+        openaiWireFormat: "chatCompletions",
+      })
+    ).toBe(false);
+  });
+
   test("checkMidStream stays disabled when threshold is set to 1.0", () => {
     const { monitor, statusEvents } = createMonitor();
     monitor.setThreshold(1);

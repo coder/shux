@@ -6,7 +6,7 @@ const BASH_TASK_ID_PREFIX = "bash:";
 export const WORKFLOW_RUN_TASK_ID_PREFIX = "wfr_";
 
 /**
- * Workflow run IDs are accepted by the task tools (task_await/task_list/task_terminate)
+ * Workflow run IDs are accepted by the task tools (task_await/task_list/task_stop)
  * alongside agent-task and bash task IDs; the prefix is the discriminator.
  *
  * The predicate narrows to the template-literal type (not plain `string`) so negated uses on

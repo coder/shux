@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -23,7 +23,7 @@ export interface SessionFileWriteOptions {
  * Provides consistent file locking, error handling, and path resolution.
  *
  * Used by HistoryService partial persistence, InitStateManager, and other services that need
- * to persist state to ~/.mux/sessions/{workspaceId}/.
+ * to persist state to ~/.xum/sessions/{workspaceId}/.
  */
 export class SessionFileManager<T> {
   private readonly config: Config;
@@ -36,7 +36,7 @@ export class SessionFileManager<T> {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.fileName);
+    return path.join(this.config.sessionsDir, workspaceId, this.fileName);
   }
 
   /**
@@ -76,7 +76,7 @@ export class SessionFileManager<T> {
           return Ok(undefined);
         }
 
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         await fs.mkdir(sessionDir, { recursive: true });
         const filePath = this.getFilePath(workspaceId);
         // Atomic write prevents corruption if app crashes mid-write

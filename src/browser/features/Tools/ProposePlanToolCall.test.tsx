@@ -45,7 +45,6 @@ interface GetConfigResult {
     proposePlanImplementReplacesChatHistory?: boolean;
   };
   agentAiDefaults: Record<string, unknown>;
-  subagentAiDefaults: Record<string, unknown>;
 }
 
 interface MockApi {
@@ -189,7 +188,6 @@ const PLAN_CONTENT = "# My Plan\n\nDo the thing.";
 const DEFAULT_CONFIG: GetConfigResult = {
   taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
   agentAiDefaults: {},
-  subagentAiDefaults: {},
 };
 
 function createTestAgent(

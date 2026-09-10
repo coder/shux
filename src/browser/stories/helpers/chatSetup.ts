@@ -7,7 +7,9 @@ import type {
 } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { APIClient } from "@/browser/contexts/API";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -15,6 +17,7 @@ import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import type { MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -48,6 +51,8 @@ export interface SimpleChatSetupOptions {
   projectName?: string;
   projectPath?: string;
   messages: ChatMuxMessage[];
+  /** Additional child workspaces that should appear alongside the selected chat workspace. */
+  additionalWorkspaces?: FrontendWorkspaceMetadata[];
   gitStatus?: GitStatusFixture;
   /** Git diff output for Review tab */
   gitDiff?: GitDiffFixture;
@@ -64,6 +69,8 @@ export interface SimpleChatSetupOptions {
   >;
   /** Optional custom chat handler for emitting additional events (e.g., queued-message-changed) */
   onChat?: (workspaceId: string, emit: (msg: WorkspaceChatMessage) => void) => void;
+  /** Override for workspace.sendMessage (default: immediate success) */
+  onSendMessage?: MockORPCClientOptions["onSendMessage"];
   /** Idle compaction hours for context meter (null = disabled) */
   idleCompactionHours?: number | null;
   /** Route priority for routing-aware stories */
@@ -90,6 +97,8 @@ export interface SimpleChatSetupOptions {
   clearLogsResult?: { success: boolean; error?: string | null };
   /** Full-width transcript preference returned by the mock config API. */
   chatTranscriptFullWidth?: boolean;
+  /** Timeline events served by the mock workspace.timeline endpoints. */
+  timelineEvents?: TimelineEvent[];
 }
 
 /**
@@ -107,6 +116,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       projectName,
       projectPath,
     }),
+    ...(opts.additionalWorkspaces ?? []),
   ];
 
   const chatHandlers = new Map([[workspaceId, createStaticChatHandler(opts.messages)]]);
@@ -166,6 +176,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     projects: groupWorkspacesByProject(workspaces),
     workspaces,
     onChat,
+    onSendMessage: opts.onSendMessage,
     executeBash,
     providersConfig: opts.providersConfig,
     agentAiDefaults: opts.agentAiDefaults,
@@ -180,6 +191,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     logEntries: opts.logEntries,
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
+    timelineEvents: opts.timelineEvents,
   });
 }
 

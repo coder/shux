@@ -15,7 +15,11 @@ describe("TokenizerService", () => {
     sessionUsageService = {
       setTokenStatsCache: () => Promise.resolve(),
     } as unknown as SessionUsageService;
-    service = new TokenizerService(sessionUsageService);
+    service = new TokenizerService(
+      sessionUsageService,
+      { getWorkspaceMetadata: () => Promise.resolve({ success: false, error: "not found" }) },
+      { getConfig: () => ({}) }
+    );
   });
 
   describe("countTokens", () => {

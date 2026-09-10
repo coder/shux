@@ -10,6 +10,15 @@ function normalizePath(path: string | null | undefined): string {
   return path?.replaceAll("\\", "/").trim() ?? "";
 }
 
+/**
+ * Git file paths may legitimately begin or end with whitespace (e.g. a file named
+ * ".env "), so file-path normalization must not trim; trimming belongs only to
+ * config-controlled project paths.
+ */
+function normalizeFilePath(path: string | null | undefined): string {
+  return path?.replaceAll("\\", "/") ?? "";
+}
+
 function matchesRepoRootProjectPath(
   projectPath: string | null | undefined,
   normalizedRepoRootProjectPath: string
@@ -26,7 +35,7 @@ function resolveWorkspaceRelativeProjectMatch(
     return undefined;
   }
 
-  const normalizedPath = normalizePath(workspaceRelativePath);
+  const normalizedPath = normalizeFilePath(workspaceRelativePath);
   if (!normalizedPath) {
     return undefined;
   }
@@ -43,10 +52,10 @@ function resolveWorkspaceRelativeProjectMatch(
     return undefined;
   }
 
+  // No trim: the repo-relative remainder is a git file path whose edge whitespace
+  // is significant.
   const repoRelativePath =
-    firstSlashIndex === -1
-      ? undefined
-      : normalizedPath.slice(firstSlashIndex + 1).trim() || undefined;
+    firstSlashIndex === -1 ? undefined : normalizedPath.slice(firstSlashIndex + 1) || undefined;
 
   return {
     normalizedPath,
@@ -94,7 +103,7 @@ export function normalizeRepoRootFilePath(
   const normalizedRepoRootProjectPath = normalizePath(repoRootProjectPath);
   const match = resolveWorkspaceRelativeProjectMatch(workspaceMetadata, workspaceRelativePath);
   if (!normalizedRepoRootProjectPath || !match) {
-    return normalizePath(workspaceRelativePath);
+    return normalizeFilePath(workspaceRelativePath);
   }
 
   return matchesRepoRootProjectPath(match.projectPath, normalizedRepoRootProjectPath)
@@ -112,7 +121,7 @@ export function reprojectRepoRootFilePath(
   repoRelativePath: string | null | undefined,
   repoRootProjectPath?: string | null
 ): string {
-  const normalizedPath = normalizePath(repoRelativePath);
+  const normalizedPath = normalizeFilePath(repoRelativePath);
   const normalizedRepoRootProjectPath = normalizePath(repoRootProjectPath);
   const projectName = resolveProjectNameForRepoRoot(
     workspaceMetadata,

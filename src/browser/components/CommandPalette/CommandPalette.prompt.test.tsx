@@ -56,6 +56,33 @@ describe("CommandPalette inline goal prompts", () => {
     cleanupDom = null;
   });
 
+  test("guest Escape leaves the host palette open", async () => {
+    const view = renderPalette({
+      id: "test-action",
+      title: "Test action",
+      section: "Tests",
+      run: () => undefined,
+    });
+    fireEvent.click(view.getByRole("button", { name: "Open palette" }));
+    const input = await view.findByRole("combobox");
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByRole("combobox")).toBe(input);
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+  });
+
   test("Goal: Set objective traps focus and restores it on dismissal", async () => {
     const action: CommandAction = {
       id: "goal:set-objective",

@@ -1,8 +1,10 @@
+import { SUPPORTED_XUM_PROTOCOL_SCHEMES } from "@/common/compat/legacyMux";
+
 /**
  * CLI environment detection for correct argv parsing across:
  * - bun/node direct invocation
  * - Electron dev mode (electron .)
- * - Packaged Electron app (./mux.AppImage)
+ * - Packaged Electron app (./xum.AppImage)
  */
 
 export interface CliEnvironment {
@@ -92,8 +94,13 @@ export function isElectronLaunchArg(
   if (!env.isElectron) return false;
 
   // In packaged Electron, Windows/Linux deep links are passed in argv.
-  // Treat them as desktop launch args instead of unknown CLI subcommands.
-  if (subcommand?.startsWith("mux://") === true) return true;
+  // Treat canonical xum:// and legacy mux:// as desktop launch args.
+  if (
+    subcommand != null &&
+    SUPPORTED_XUM_PROTOCOL_SCHEMES.some((scheme) => subcommand.startsWith(`${scheme}://`))
+  ) {
+    return true;
+  }
 
   if (env.isPackagedElectron) {
     // In packaged: flags that aren't CLI flags should launch desktop

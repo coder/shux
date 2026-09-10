@@ -41,7 +41,12 @@ const PROVIDER_KEY_ALIASES: Record<string, string> = {
   "github-copilot": "github_copilot",
 };
 
-function parseNum(value: unknown): number | null {
+/**
+ * Runtime numeric semantics for raw catalog values (accepts numeric strings
+ * with comma separators). Exported so update-models validation compares
+ * magnitudes exactly as getModelStats would parse them.
+ */
+export function parseNum(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
@@ -70,9 +75,10 @@ function hasTieredPricing(data: RawModelData): boolean {
 }
 
 /**
- * Validates raw model data has required fields
+ * Whether raw model metadata is usable for stats resolution. Exported so the
+ * update-models validation applies the same bar as getModelStats.
  */
-function isValidModelData(data: RawModelData): boolean {
+export function hasUsableTokenLimits(data: RawModelData): boolean {
   const maxInputTokens = parseNum(data.max_input_tokens);
   return maxInputTokens != null && maxInputTokens > 0;
 }
@@ -135,10 +141,13 @@ function stripLatestSuffix(modelName: string): string {
 }
 
 /**
- * Generates lookup keys for a model string with multiple naming patterns
- * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model"
+ * Generates lookup keys for a model string with multiple naming patterns.
+ * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model".
+ * Exported so capability resolution shares the exact same key preference:
+ * provider-scoped entries must win over bare-name entries in both lookups,
+ * otherwise a model can inherit stats and capabilities from different entries.
  */
-function generateLookupKeys(modelString: string): string[] {
+export function generateModelLookupKeys(modelString: string): string[] {
   const colonIndex = modelString.indexOf(":");
   const provider = colonIndex !== -1 ? modelString.slice(0, colonIndex) : "";
   const modelName = colonIndex !== -1 ? modelString.slice(colonIndex + 1) : modelString;
@@ -222,32 +231,49 @@ function generateLookupKeys(modelString: string): string[] {
   return keys;
 }
 
+export interface ResolvedRawModelEntry {
+  /** The models-extra/models.json key the stats actually come from. */
+  key: string;
+  data: RawModelData;
+}
+
 /**
- * Gets model statistics for a given Vercel AI SDK model string
- * @param modelString - Format: "provider:model-name" (e.g., "anthropic:claude-opus-4-1", "ollama:gpt-oss:20b")
- * @returns ModelStats or null if model not found
+ * Resolves the raw override/catalog entry backing a model string, preserving
+ * getModelStats' precedence: models-extra across every lookup key first, then
+ * models.json. Exported so the Treat-as catalog can exclude ids whose stats
+ * would resolve from a different entry than the row represents.
  */
-export function getModelStats(modelString: string): ModelStats | null {
+export function resolveRawModelEntry(modelString: string): ResolvedRawModelEntry | null {
   const normalized = normalizeToCanonical(modelString);
-  const lookupKeys = generateLookupKeys(normalized);
+  const lookupKeys = generateModelLookupKeys(normalized);
 
   // Check models-extra.ts first (overrides for models with incorrect upstream data)
   for (const key of lookupKeys) {
     const data = (modelsExtra as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
     }
   }
 
   // Fall back to main models.json
   for (const key of lookupKeys) {
     const data = (modelsData as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
     }
   }
 
   return null;
+}
+
+/**
+ * Gets model statistics for a given Vercel AI SDK model string
+ * @param modelString - Format: "provider:model-name" (e.g., "anthropic:claude-opus-4-1", "ollama:gpt-oss:20b")
+ * @returns ModelStats or null if model not found
+ */
+export function getModelStats(modelString: string): ModelStats | null {
+  const entry = resolveRawModelEntry(modelString);
+  return entry === null ? null : extractModelStats(entry.data);
 }
 
 export function getModelStatsResolved(

@@ -1,9 +1,17 @@
+import { z } from "zod";
 import { isWorkspaceArchived } from "./archive";
 
-export interface ProjectWorkspaceCounts {
-  activeCount: number;
-  archivedCount: number;
-}
+/**
+ * Single source of truth for removal blocker counts: the projects.getRemovalBlockers
+ * IPC output validates against this schema, so service return type and runtime
+ * validation cannot drift.
+ */
+export const ProjectWorkspaceCountsSchema = z.object({
+  activeCount: z.number().int().nonnegative(),
+  archivedCount: z.number().int().nonnegative(),
+});
+
+export type ProjectWorkspaceCounts = z.infer<typeof ProjectWorkspaceCountsSchema>;
 
 /**
  * Compute active vs archived workspace counts from a project's workspace config entries.

@@ -4,6 +4,8 @@ import { BookOpen, Play, Workflow } from "lucide-react";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import type { AvailableWorkflow, WorkflowArgSummary } from "@/common/types/workflow";
 
+import { WorkflowPhaseFlow, phaseFlowNodesFromManifest } from "./WorkflowPhaseFlow";
+
 import { WorkflowScopeBadge } from "./WorkflowBadges";
 import { stringifyWorkflowArgValue } from "./projectWorkflowRun";
 
@@ -203,6 +205,21 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
                       {!script.descriptor.executable && script.descriptor.blockedReason != null && (
                         <div className="text-danger mt-0.5 text-[11px]">
                           {script.descriptor.blockedReason}
+                        </div>
+                      )}
+                      {/* Pre-run phase preview: the declared/inferred rail with all
+                          phases pending, so the flow is visible before any run exists. */}
+                      {script.descriptor.phaseManifest != null && (
+                        <WorkflowPhaseFlow
+                          className="mt-1.5"
+                          nodes={phaseFlowNodesFromManifest(script.descriptor.phaseManifest)}
+                          provenance={script.descriptor.phaseManifest.provenance}
+                        />
+                      )}
+                      {script.phaseManifestWarning != null && (
+                        <div className="text-warning mt-0.5 min-w-0 text-[11px] break-words">
+                          Invalid meta.phases declaration — runs will be rejected:{" "}
+                          {script.phaseManifestWarning}
                         </div>
                       )}
                     </div>

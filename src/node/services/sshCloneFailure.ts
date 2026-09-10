@@ -41,6 +41,23 @@ export function classifySshCloneFailure(ctx: CloneFailureContext): CloneErrorCod
 }
 
 /**
+ * GitHub may answer a clone/fetch with "Write access to repository not granted."
+ * when the credential cannot read the repository. Clarify that cloning needs
+ * only read access instead of surfacing the misleading message alone.
+ */
+export function withCloneReadAccessHint(errorMessage: string, stderr: string): string {
+  if (!/write access to repository not granted/i.test(stderr)) {
+    return errorMessage;
+  }
+  return (
+    `${errorMessage}\n` +
+    "Cloning needs only read access. GitHub sends this misleading error when the " +
+    "credential Git presented cannot read the repository (often a fine-grained or " +
+    "under-scoped token). Check which credential Git is using, or clone via a different protocol."
+  );
+}
+
+/**
  * Return the last few meaningful stderr lines as a compact summary.
  * Preserves enough context for actionable diagnostics without dumping
  * the entire output into the UI.

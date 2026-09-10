@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 /**
- * `mux trust` - Headless project trust management.
+ * `xum trust` - Headless project trust management.
  *
  * Trust gates all repo-controlled automation (project workflows, hooks, and
  * .mux configuration), so it lives at the top level of the CLI rather than
  * under any single feature's subcommand. The desktop app records trust in
- * ~/.mux/config.json via Settings → Security; this command writes the same
+ * ~/.xum/config.json via Settings → Security; this command writes the same
  * entry directly so headless environments (no desktop app or server running,
  * project possibly never added to mux) can grant or revoke trust. A running
  * desktop instance picks the change up through its config-file watcher.
@@ -19,7 +19,7 @@ import { promisify } from "node:util";
 import { Command } from "commander";
 
 import { getErrorMessage } from "@/common/utils/errors";
-import { Config } from "@/node/config";
+import { Config, type ProjectConfig } from "@/node/config";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
@@ -61,10 +61,19 @@ async function ensureDirectory(dirPath: string): Promise<void> {
   }
 }
 
+// git prints exactly one trailing LF after a path; strip only that
+// terminator, because the path itself may legitimately end in whitespace,
+// including a carriage return on Unix, where "\r" is a valid path byte and
+// must survive. Windows filenames cannot contain "\r", so a CRLF pair there
+// is always a line terminator and strips as a unit.
+function stripTrailingNewline(stdout: string): string {
+  return process.platform === "win32" ? stdout.replace(/\r?\n$/, "") : stdout.replace(/\n$/, "");
+}
+
 export async function findGitRoot(cwd: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
-    const gitRoot = stdout.trim();
+    const gitRoot = stripTrailingNewline(stdout);
     return gitRoot.length > 0 ? gitRoot : null;
   } catch {
     return null;
@@ -75,13 +84,18 @@ export async function findGitRoot(cwd: string): Promise<string | null> {
  * For a linked git worktree, returns the main repository working directory (the
  * parent of the common `.git` dir). Returns null for the main checkout itself,
  * bare repos, and non-git directories.
+ *
+ * The common dir alone is spoofable: a crafted `.git` *file* can point gitdir
+ * at an arbitrary repository's .git, which would let an unregistered checkout
+ * inherit that repository's trust (and run its .xum automation). Only
+ * checkouts the main repository itself registers (git worktree list) count.
  */
 export async function findMainRepoDir(projectDir: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], {
       cwd: projectDir,
     });
-    const commonDir = stdout.trim();
+    const commonDir = stripTrailingNewline(stdout);
     if (commonDir.length === 0) {
       return null;
     }
@@ -92,16 +106,53 @@ export async function findMainRepoDir(projectDir: string): Promise<string | null
       return null;
     }
     const mainRepoDir = path.dirname(absoluteCommonDir);
-    return mainRepoDir === projectDir ? null : mainRepoDir;
+    if (mainRepoDir === projectDir) {
+      return null;
+    }
+    // Registration lists checkout roots, so resolve a nested projectDir to its
+    // git toplevel before comparing; otherwise subdirectories of registered
+    // worktrees would lose the main-repo trust fallback.
+    const checkoutRoot = (await findGitRoot(projectDir)) ?? projectDir;
+    return (await isRegisteredWorktreeOf(mainRepoDir, checkoutRoot)) ? mainRepoDir : null;
   } catch {
     return null;
+  }
+}
+
+async function isRegisteredWorktreeOf(mainRepoDir: string, projectDir: string): Promise<boolean> {
+  // -z terminates each porcelain record with NUL, so paths containing
+  // newlines or trailing whitespace survive parsing verbatim; trimming here
+  // previously rejected genuine worktrees whose paths end in whitespace.
+  const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], {
+    cwd: mainRepoDir,
+  });
+  const projectReal = await realpathOrResolve(projectDir);
+  for (const record of stdout.split("\0")) {
+    if (!record.startsWith("worktree ")) {
+      continue;
+    }
+    const listed = record.slice("worktree ".length);
+    if ((await realpathOrResolve(listed)) === projectReal) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// git prints physical paths (macOS /var -> /private/var), so compare realpaths;
+// fall back to plain resolution when a listed path no longer exists on disk.
+async function realpathOrResolve(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return path.resolve(target);
   }
 }
 
 /**
  * Resolve project trust for repo-controlled automation. Trust is keyed in
  * config.json by the registered project path, so linked git worktrees (e.g. mux
- * workspaces under ~/.mux/src/<project>/<branch>) miss a direct lookup of their own
+ * workspaces under ~/.xum/src/<project>/<branch>) miss a direct lookup of their own
  * checkout path. Mirror the desktop app, which scans the workspace checkout but
  * resolves trust against the registered project path (resolveWorkflowContext in
  * src/node/orpc/router.ts), by also accepting trust granted to the main repository.
@@ -115,6 +166,54 @@ export async function resolveProjectTrusted(
   }
   const mainRepoDir = await findMainRepoDir(projectDir);
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
+}
+
+/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
+export async function replaceRunTrustProjects(
+  realConfig: Config,
+  targetConfig: Config
+): Promise<void> {
+  const trustOnlyProjects = new Map<string, ProjectConfig>();
+  for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
+    if (projectConfig.trusted === undefined) {
+      continue;
+    }
+
+    trustOnlyProjects.set(projectPath, {
+      workspaces: [],
+      trusted: projectConfig.trusted,
+    });
+  }
+
+  await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
+}
+
+/**
+ * Copy effective trust onto the target path because the task-spawn gate uses exact lookups.
+ */
+export async function materializeResolvedTrust(
+  realConfig: Config,
+  targetConfig: Config,
+  projectDir: string
+): Promise<boolean> {
+  const trusted = await resolveProjectTrusted(realConfig, projectDir);
+  if (!trusted) {
+    return false;
+  }
+  await targetConfig.editConfig((config) => {
+    let project = config.projects.get(projectDir);
+    if (!project) {
+      project = { workspaces: [] };
+      config.projects.set(projectDir, project);
+    }
+    project.trusted = true;
+    return config;
+  });
+  // Config.saveConfig swallows write errors, so verify the exact-path entry before continuing.
+  if (targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted !== true) {
+    throw new Error(`Failed to persist resolved trust for ${projectDir}`);
+  }
+  return true;
 }
 
 async function runTrust(options: TrustCLIOptions): Promise<number> {
@@ -205,7 +304,7 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
 export async function main(): Promise<number> {
   const program = new Command();
   program
-    .name("mux trust")
+    .name("xum trust")
     .description(
       "Trust the project in the current directory (or --dir) so repo-controlled automation (project workflows, hooks, .mux configuration) can run"
     )

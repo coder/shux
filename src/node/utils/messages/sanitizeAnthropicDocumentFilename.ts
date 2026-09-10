@@ -44,7 +44,7 @@ export function sanitizeAnthropicDocumentFilename(
  * "The document file name can only contain alphanumeric characters, whitespace characters,
  * hyphens, parentheses, and square brackets."
  *
- * @param messages - MuxMessage array to process
+ * @param messages - XumMessage array to process
  * @returns New array with sanitized PDF filenames (does not mutate input)
  */
 export function sanitizeAnthropicPdfFilenames(messages: MuxMessage[]): MuxMessage[] {

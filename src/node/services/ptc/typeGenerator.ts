@@ -14,7 +14,25 @@ import { createHash } from "crypto";
 import { z } from "zod";
 import { compile } from "json-schema-to-typescript";
 import type { Tool } from "ai";
-import { RESULT_SCHEMAS, type BridgeableToolName } from "@/common/utils/tools/toolDefinitions";
+import { getToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
+
+/** Options for mux type generation. */
+export interface XumTypesOptions {
+  /**
+   * RLM kernel mode (persistent mount): declare the fire-and-forget spawn +
+   * host-event drain members. RLM off => these never enter the generated
+   * types, keeping non-kernel provider requests byte-identical.
+   */
+  kernel?: boolean;
+  /**
+   * mux.load available (kernel mode + a host file loader + file_read
+   * bridged): declare the bulk-ingestion member. Kept separate from `kernel`
+   * because load has an extra availability requirement (workspace file
+   * context) that task_spawn/events do not.
+   */
+  load?: boolean;
+}
 
 /**
  * MCP result type - protocol-defined, same for all MCP tools.
@@ -73,16 +91,22 @@ function hashToolDefinitions(tools: Record<string, Tool>): string {
 }
 
 /**
- * Get cached mux types or generate new ones if tool definitions changed.
+ * Get cached xum types or generate new ones if tool definitions changed.
  */
-export async function getCachedMuxTypes(tools: Record<string, Tool>): Promise<string> {
-  const hash = hashToolDefinitions(tools);
+export async function getCachedXumTypes(
+  tools: Record<string, Tool>,
+  options?: XumTypesOptions
+): Promise<string> {
+  // Kernel mode changes the generated declarations, so it is part of the
+  // cache identity — one workspace with RLM on must not serve another's
+  // RLM-off types (or vice versa).
+  const hash = `${hashToolDefinitions(tools)}|kernel=${options?.kernel === true}|load=${options?.load === true}`;
   const cached = cache.fullTypes.get(hash);
   if (cached) {
     return cached;
   }
 
-  const types = await generateMuxTypes(tools);
+  const types = await generateXumTypes(tools, options);
   cache.fullTypes.set(hash, types);
   return types;
 }
@@ -180,11 +204,8 @@ async function getResultTypeString(toolName: string): Promise<string | null> {
     return cache.resultTypes.get(toolName)!;
   }
 
-  // Check if this is a bridgeable tool with a known result schema
-  if (!(toolName in RESULT_SCHEMAS)) {
-    return null;
-  }
-  const schema = RESULT_SCHEMAS[toolName as BridgeableToolName];
+  const schema = getToolResultSchema(toolName);
+  if (!schema) return null;
 
   // Convert Zod → JSON Schema → TypeScript
   const jsonSchema = z.toJSONSchema(schema);
@@ -222,8 +243,11 @@ async function getResultTypeString(toolName: string): Promise<string | null> {
  * @param tools Record of tool name to Tool, already filtered to bridgeable tools only
  * @returns `.d.ts` content as a string
  */
-export async function generateMuxTypes(tools: Record<string, Tool>): Promise<string> {
-  const lines: string[] = ["declare namespace mux {"];
+export async function generateXumTypes(
+  tools: Record<string, Tool>,
+  options?: XumTypesOptions
+): Promise<string> {
+  const lines: string[] = ["declare namespace xum {"];
   let mcpToolsPresent = false;
 
   // Sort tool names for deterministic output
@@ -285,6 +309,48 @@ export async function generateMuxTypes(tools: Record<string, Tool>): Promise<str
     lines.push(""); // Blank line between tools
   }
 
+  // RLM kernel members. Hand-authored declarations (no backing Zod tool
+  // schema): task_spawn wraps the task tool host-side and events drains the
+  // mount's host event queue — keep in sync with ToolBridge.addKernelMethods
+  // and SandboxHostService.postTaskTerminalEvent.
+  if (options?.kernel === true) {
+    // task_spawn reuses TaskArgs, so it is only declarable when the task tool
+    // itself is bridged (grant-denied task => no task_spawn either).
+    if ("task" in tools) {
+      lines.push(
+        "  /** Fire-and-forget spawn: same args as mux.task but returns as soon as the child is admitted — it never waits for completion. The terminal report is delivered to the host event queue; drain with mux.events() in a later call. */"
+      );
+      lines.push(
+        '  type TaskSpawnResult = { taskId: string; status: "spawned" } | { taskIds: string[]; status: "spawned" };'
+      );
+      lines.push("  function task_spawn(args: TaskArgs): TaskSpawnResult;");
+      lines.push("");
+    }
+    lines.push(
+      "  /** Drain queued host→guest events (spawned-task terminal reports). Synchronous — safe to call anywhere. Best-effort: an app restart drops undrained events, but every report still reaches the parent via the top-level task wake. Oversized reports arrive as reportHandle (full text at that vars handle) instead of reportMarkdown — or, when the kernel was busy at completion time, as a bounded reportMarkdown preview (full report still available at top level). */"
+    );
+    lines.push(
+      `  type HostEvent = { type: "${TASK_TERMINAL_EVENT_TYPE}"; taskId: string; status: "completed"; reportMarkdown?: string; reportHandle?: { handle: string; preview: string; size: number } };`
+    );
+    lines.push("  function events(): HostEvent[];");
+    lines.push("");
+    // mux.load: bulk file ingestion — keep in sync with
+    // ToolBridge.addKernelMethods and createKernelFileLoader.
+    if (options.load === true) {
+      lines.push(
+        "  /** Bulk file ingestion: reads the WHOLE file host-side into vars[key] as a string (no 16KB/1000-line pagination cap) and returns only this bounded summary — the content itself never enters your context. Same path resolution and capability grant as file_read. hookResult is present only when a repo tool hook or plugin middleware annotated the read (warnings, notices). */"
+      );
+      // r58: hookResult must be declared — kernel programs are TypeScript-
+      // analyzed before execution, so an undeclared runtime property is
+      // unreachable to guest code (keep in sync with ToolBridge's load record).
+      lines.push(
+        "  type LoadResult = { key: string; bytes: number; lines: number; preview: string; hookResult?: unknown };"
+      );
+      lines.push("  function load(args: { path: string; key: string }): LoadResult;");
+      lines.push("");
+    }
+  }
+
   // Add MCP result type if any MCP tools are present
   if (mcpToolsPresent) {
     lines.push(indent(MCP_RESULT_TYPE, 2));
@@ -292,6 +358,10 @@ export async function generateMuxTypes(tools: Record<string, Tool>): Promise<str
   }
 
   lines.push("}");
+  lines.push("");
+
+  // Keep the old scripting namespace as a type-compatible alias for saved snippets.
+  lines.push("declare const mux: typeof xum;");
   lines.push("");
 
   // Add console global declaration

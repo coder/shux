@@ -13,11 +13,13 @@ import {
   ChevronLeft,
   ChevronRight,
   Circle,
+  Copy,
   MessageSquare,
   Sparkles,
   ThumbsDown,
   ThumbsUp,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { SelectableDiffRenderer } from "../../Shared/DiffRenderer";
@@ -48,13 +50,23 @@ import {
   sortHunksInFileOrder,
 } from "@/browser/utils/review/navigation";
 import {
+  formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { copyToClipboard } from "@/browser/utils/clipboard";
+import {
+  buildReadFileScript,
+  decodeBase64Utf8,
+  EXIT_CODE_TOO_LARGE,
+  MAX_COPY_FILE_SIZE_BYTES,
+  processFileContents,
+} from "@/browser/utils/fileRead";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { getReviewSelectedHunkKey } from "@/common/constants/storage";
 import {
@@ -63,7 +75,7 @@ import {
   type Review,
   type ReviewNoteData,
 } from "@/common/types/review";
-import type { FileTreeNode } from "@/common/utils/git/numstatParser";
+import type { FileStats, FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { ReviewActionCallbacks } from "../../Shared/InlineReviewNote";
 
 interface ImmersiveReviewViewProps {
@@ -112,6 +124,12 @@ interface ImmersiveReviewViewProps {
   assistedCount?: number;
   /** Agent-flagged hunks still unread (mirrors the control bar's count). */
   assistedUnreadCount?: number;
+  /**
+   * Multi-project workspaces reproject hunk paths onto the shared container root,
+   * which is default script mode's cwd; single-project (incl. subproject) workspaces
+   * keep repo-root-relative paths and need repo-root execution for file reads.
+   */
+  isMultiProjectWorkspace?: boolean;
 }
 
 interface InlineComposerRequest {
@@ -222,6 +240,23 @@ export function shouldPreserveImmersiveContextCursor(input: {
     input.cursorLineIndex < input.previousRange.startIndex ||
     input.cursorLineIndex > input.previousRange.endIndex
   );
+}
+
+/** Find the numstat entry for a file leaf; carries change status even for hunk-less files. */
+function findFileTreeStats(node: FileTreeNode | null, filePath: string): FileStats | undefined {
+  if (!node) {
+    return undefined;
+  }
+  if (!node.isDirectory && node.path === filePath) {
+    return node.stats;
+  }
+  for (const child of node.children) {
+    const found = findFileTreeStats(child, filePath);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
 }
 
 /** Resolve the hunk that contains a given overlay line index using the lineHunkIds lookup. */
@@ -492,6 +527,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     selectedHunk,
     theme,
     fileContentVersion: activeFileContentVersion,
+    isMultiProjectWorkspace: props.isMultiProjectWorkspace,
     onRevealPending: setHunkJumpScroll,
   });
 
@@ -1351,6 +1387,176 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
   }, [resetViewCursorForHunk]);
 
+  const [copyFileFeedback, setCopyFileFeedback] = useState<{
+    kind: "copied" | "failed";
+    filePath: string;
+    contentVersion: string;
+    /** Failure-specific user-facing message; falls back to the generic copy for other failures. */
+    message?: string;
+  } | null>(null);
+  const copyFileRequestIdRef = useRef(0);
+  const pendingCopyFilePathRef = useRef<string | null>(null);
+  // Both refs update during render so isStale() sees path AND content-version
+  // changes before passive effects run; a resolved read's microtask can otherwise
+  // beat the invalidation effect after a same-path refresh commits.
+  const activeFilePathRef = useRef(activeFilePath);
+  activeFilePathRef.current = activeFilePath;
+  const activeFileContentVersionRef = useRef(activeFileContentVersion);
+  activeFileContentVersionRef.current = activeFileContentVersion;
+
+  useEffect(() => {
+    return () => {
+      // Invalidate any in-flight copy so a read that resolves after unmount cannot
+      // write to the clipboard (isStale() sees the bumped request id).
+      copyFileRequestIdRef.current += 1;
+    };
+  }, []);
+
+  // File navigation and in-place edits (same path, new diff content) invalidate
+  // in-flight copies and free the pending slot. The request-id bump also covers the
+  // A -> B -> A case, where the path check alone would wrongly treat the stale read
+  // for A as current again.
+  useEffect(() => {
+    copyFileRequestIdRef.current += 1;
+    pendingCopyFilePathRef.current = null;
+  }, [activeFilePath, activeFileContentVersion]);
+
+  // Feedback persists until a deterministic event (file navigation, an in-place edit,
+  // or the next copy) instead of a wall-clock timer, and never shows against content
+  // the copy did not target. Render-time adjustment per the React docs pattern.
+  if (
+    copyFileFeedback &&
+    (copyFileFeedback.filePath !== activeFilePath ||
+      copyFileFeedback.contentVersion !== activeFileContentVersion)
+  ) {
+    setCopyFileFeedback(null);
+  }
+
+  const showCopyFileFeedback = (
+    kind: "copied" | "failed",
+    filePath: string,
+    contentVersion: string,
+    extra?: { message?: string }
+  ) => {
+    setCopyFileFeedback({ kind, filePath, contentVersion, message: extra?.message });
+  };
+
+  // Deleted files no longer exist on disk, so a copy read would always fail;
+  // hide the affordance instead of offering a broken action. The file tree keeps
+  // deletion status even when the file contributes no hunks (empty/binary files),
+  // and the UNFILTERED hunk set covers trees without status while search/assisted
+  // filters empty the visible hunk list.
+  const isActiveFileDeleted =
+    activeFilePath != null &&
+    (findFileTreeStats(props.fileTree, activeFilePath)?.changeType === "deleted" ||
+      getFileHunks(allHunks, activeFilePath)[0]?.changeType === "deleted");
+
+  // Copy the entire on-disk file, not the overlay content: the overlay may hold only
+  // compact diff hunks (large files) or prefixed diff rows rather than raw file text.
+  const handleCopyFile = async () => {
+    const filePath = activeFilePath;
+    const contentVersion = activeFileContentVersion;
+    if (!filePath || isActiveFileDeleted) {
+      return;
+    }
+    // The API union supplies api: null while connecting/reconnecting/errored; the
+    // already-rendered view keeps its copy affordance, so fail visibly, not silently.
+    if (!api) {
+      showCopyFileFeedback("failed", filePath, contentVersion, {
+        message: "Copy failed: backend connection unavailable",
+      });
+      return;
+    }
+    // Serialize same-file copies so key repeat or double-clicks cannot fan out
+    // concurrent reads; navigating to another file still supersedes normally.
+    if (pendingCopyFilePathRef.current === filePath) {
+      return;
+    }
+    const requestId = ++copyFileRequestIdRef.current;
+    pendingCopyFilePathRef.current = filePath;
+    // Clear the previous result so a slow re-copy cannot keep advertising success
+    // for clipboard contents this operation is about to replace.
+    setCopyFileFeedback(null);
+    // Discard stale completions: the user may have navigated away, an edit may have
+    // changed the file in place, or a newer copy may have started while this read
+    // was in flight. Path and content version are read from render-updated refs so
+    // staleness is visible even before the invalidation effect runs.
+    const isStale = () =>
+      requestId !== copyFileRequestIdRef.current ||
+      activeFilePathRef.current !== filePath ||
+      activeFileContentVersionRef.current !== contentVersion;
+    try {
+      const result = await api.workspace.executeBash({
+        workspaceId: props.workspaceId,
+        script: buildReadFileScript(filePath, {
+          // The IPC bash channel truncates output beyond 1MiB, so cap copies at what
+          // fits after base64 expansion and fail deterministically with a clear
+          // message instead of surfacing an opaque truncation.
+          maxSizeBytes: MAX_COPY_FILE_SIZE_BYTES,
+          // Hunk paths are container-root-relative in multi-project workspaces, where
+          // project entries are symlinks that containment must anchor to.
+          ...(props.isMultiProjectWorkspace ? { containmentAnchor: "first-segment" as const } : {}),
+        }),
+        // Multi-project default mode runs from the container root matching those
+        // paths; single-project hunk paths are repo-root-relative, where default
+        // mode would run from a subproject cwd and miss the file.
+        options: props.isMultiProjectWorkspace ? undefined : { cwdMode: "repo-root" },
+      });
+      if (isStale()) {
+        return;
+      }
+      // Any unsuccessful script exit (budget/containment codes or partial failures
+      // like base64 dying after stat) means the output cannot be trusted as the
+      // full file; the IPC truncation marker likewise signals a partial payload.
+      if (!result.success || !result.data.success || result.data.truncated) {
+        const isTooLarge = result.success && result.data.exitCode === EXIT_CODE_TOO_LARGE;
+        showCopyFileFeedback("failed", filePath, contentVersion, {
+          message: isTooLarge
+            ? `Copy failed: file is larger than ${Math.floor(MAX_COPY_FILE_SIZE_BYTES / 1024)} KB`
+            : undefined,
+        });
+        return;
+      }
+      const contents = processFileContents(result.data.output ?? "", result.data.exitCode);
+      // SVGs are classified as images for preview purposes, but they are text
+      // source and this action promises the file's contents; copy the markup.
+      const text =
+        contents.type === "text"
+          ? contents.content
+          : contents.type === "image" && contents.mimeType === "image/svg+xml"
+            ? decodeBase64Utf8(contents.base64)
+            : null;
+      if (text == null) {
+        showCopyFileFeedback("failed", filePath, contentVersion);
+        return;
+      }
+      await copyToClipboard(text);
+      if (!isStale()) {
+        showCopyFileFeedback("copied", filePath, contentVersion);
+      }
+    } catch (error) {
+      console.error("Failed to copy file contents:", error);
+      if (!isStale()) {
+        showCopyFileFeedback("failed", filePath, contentVersion);
+      }
+    } finally {
+      // A superseding request owns the pending slot; only the current one releases it.
+      if (
+        pendingCopyFilePathRef.current === filePath &&
+        copyFileRequestIdRef.current === requestId
+      ) {
+        pendingCopyFilePathRef.current = null;
+      }
+    }
+  };
+
+  // Keyboard handling reads the handler through a ref (matching onToggleReadRef) so the
+  // effect does not depend on a per-render function identity.
+  const handleCopyFileRef = useRef(handleCopyFile);
+  handleCopyFileRef.current = handleCopyFile;
+
+  const activeCopyFileFeedback = copyFileFeedback?.kind ?? null;
+
   const handleLineIndexSelect = useCallback(
     (lineIndex: number, shiftKey: boolean) => {
       const resolvedHunk = findHunkAtLine(lineIndex, overlayData, currentFileHunks);
@@ -1425,6 +1631,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       // Tab: toggle between diff and notes panels.
       if (matchesKeybind(e, KEYBINDS.REVIEW_FOCUS_NOTES)) {
         // Keep normal tab behavior when typing in inline note editors.
@@ -1603,7 +1810,6 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         return;
       }
 
-      // Toggle hunk read
       if (matchesKeybind(e, KEYBINDS.TOGGLE_HUNK_READ)) {
         e.preventDefault();
         if (selectedHunkId) handleToggleReadWithUndo(selectedHunkId);
@@ -1614,6 +1820,16 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       if (matchesKeybind(e, KEYBINDS.MARK_HUNK_UNREAD)) {
         e.preventDefault();
         handleUndoLastRead();
+        return;
+      }
+
+      // Copy the active file's full contents to the clipboard. Ignore OS key
+      // repeat so holding the key cannot fan out repeated backend reads.
+      if (matchesKeybind(e, KEYBINDS.REVIEW_COPY_FILE)) {
+        e.preventDefault();
+        if (!e.repeat) {
+          void handleCopyFileRef.current();
+        }
         return;
       }
     };
@@ -1900,6 +2116,59 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           >
             <ChevronRight className="h-4 w-4" />
           </button>
+          {!isReviewComplete && activeFilePath && !isActiveFileDeleted && (
+            <TooltipIfPresent
+              tooltip={
+                activeCopyFileFeedback === "copied" ? (
+                  "Copied!"
+                ) : activeCopyFileFeedback === "failed" ? (
+                  (copyFileFeedback?.message ?? "Copy failed: not a copyable text file")
+                ) : (
+                  <span>
+                    Copy file{" "}
+                    <span className="mobile-hide-shortcut-hints">
+                      ({formatKeybind(KEYBINDS.REVIEW_COPY_FILE)})
+                    </span>
+                  </span>
+                )
+              }
+              side="bottom"
+              align="start"
+            >
+              <button
+                onClick={() => void handleCopyFile()}
+                className={cn(
+                  "flex shrink-0 cursor-pointer items-center border-none bg-transparent p-0 transition-colors",
+                  activeCopyFileFeedback === "copied"
+                    ? "text-read"
+                    : activeCopyFileFeedback === "failed"
+                      ? "text-danger-soft"
+                      : "text-muted hover:text-foreground"
+                )}
+                aria-label="Copy file contents"
+                data-copy-file-feedback={activeCopyFileFeedback ?? undefined}
+              >
+                {activeCopyFileFeedback === "copied" ? (
+                  <Check aria-hidden="true" className="h-3.5 w-3.5" />
+                ) : activeCopyFileFeedback === "failed" ? (
+                  <TriangleAlert aria-hidden="true" className="h-3.5 w-3.5" />
+                ) : (
+                  <Copy aria-hidden="true" className="h-3.5 w-3.5" />
+                )}
+              </button>
+            </TooltipIfPresent>
+          )}
+          {/* The keyboard shortcut never focuses the button, so announce copy
+              outcomes through a live region. Rendered as a SIBLING: a button is an
+              accessibility leaf whose aria-label replaces descendant text, so a
+              nested status would not be exposed. */}
+          <span className="sr-only" role="status">
+            {activeCopyFileFeedback === "copied"
+              ? "File copied to clipboard"
+              : activeCopyFileFeedback === "failed"
+                ? (copyFileFeedback?.message ?? "Copy failed: not a copyable text file")
+                : ""}
+          </span>
         </div>
 
         <div className="bg-border-light hidden h-4 w-px shrink-0 sm:block" />

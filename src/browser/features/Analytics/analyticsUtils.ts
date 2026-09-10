@@ -50,6 +50,51 @@ const compactNumberFormatter = new Intl.NumberFormat("en-US", {
 });
 
 const BUCKET_TIME_COMPONENT_PATTERN = /(?:^|[ T])\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?/;
+const BUCKET_DATE_TIME_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?/;
+
+function parseBucketWallTime(bucket: string): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+} | null {
+  const match = BUCKET_DATE_TIME_PATTERN.exec(bucket);
+  if (!match) {
+    return null;
+  }
+
+  const [, year, month, day, hour, minute] = match;
+  return {
+    year: Number(year),
+    month: Number(month),
+    day: Number(day),
+    hour: Number(hour),
+    minute: Number(minute),
+  };
+}
+
+function formatBucketWallTime(bucket: string): string | null {
+  const parts = parseBucketWallTime(bucket);
+  if (!parts) {
+    return null;
+  }
+
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  if (!Number.isFinite(date.getTime())) {
+    return null;
+  }
+
+  return (
+    date.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    }) +
+    `, ${parts.hour % 12 || 12}:${String(parts.minute).padStart(2, "0")} ${parts.hour >= 12 ? "PM" : "AM"}`
+  );
+}
 
 export function formatUsd(amount: number): string {
   if (!Number.isFinite(amount)) {
@@ -81,18 +126,14 @@ export function formatProjectDisplayName(projectPath: string): string {
 }
 
 export function formatBucketLabel(bucket: string): string {
+  const includesTime = BUCKET_TIME_COMPONENT_PATTERN.test(bucket);
+  if (includesTime) {
+    return formatBucketWallTime(bucket) ?? bucket;
+  }
+
   const parsedDate = new Date(bucket);
   if (!Number.isFinite(parsedDate.getTime())) {
     return bucket;
-  }
-
-  const includesTime = BUCKET_TIME_COMPONENT_PATTERN.test(bucket);
-  if (includesTime) {
-    return parsedDate.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-    });
   }
 
   // Date-only buckets (YYYY-MM-DD) are UTC midnight. Render with

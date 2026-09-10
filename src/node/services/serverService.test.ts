@@ -81,17 +81,17 @@ describe("ServerService.startServer", () => {
   test("cleans up server when lockfile acquisition fails", async () => {
     const service = new ServerService();
 
-    // Make muxHome a *file* (not a directory) so lockfile.acquire() fails reliably,
+    // Make xumHome a *file* (not a directory) so lockfile.acquire() fails reliably,
     // even when tests run as root (chmod-based tests don't fail for root).
-    const muxHomeFile = path.join(tempDir, "muxHome-not-a-dir");
-    await fs.writeFile(muxHomeFile, "not a directory");
+    const xumHomeFile = path.join(tempDir, "xumHome-not-a-dir");
+    await fs.writeFile(xumHomeFile, "not a directory");
 
     let thrownError: unknown = null;
 
     try {
       // Start server - this should fail when trying to write lockfile
       await service.startServer({
-        muxHome: muxHomeFile,
+        xumHome: xumHomeFile,
         context: stubContext,
         authToken: "test-token",
         port: 0, // random port
@@ -129,7 +129,7 @@ describe("ServerService.startServer", () => {
     let thrownError: Error | null = null;
     try {
       await service.startServer({
-        muxHome: tempDir,
+        xumHome: tempDir,
         context: stubContext,
         authToken: "test-token",
         port: 0,
@@ -155,7 +155,7 @@ describe("ServerService.startServer", () => {
     const service = new ServerService();
 
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "test-token",
       port: 0,
@@ -193,7 +193,7 @@ test("supports non-CLI allow-http-origin opt-in via MUX_SERVER_ALLOW_HTTP_ORIGIN
 
   try {
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "",
       port: 0,

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Smoke test for mux npm package
-# Tests that the package can be installed and the server starts correctly
+# Smoke test for the canonical @coder/xum npm package and legacy mux binary alias.
+# Tests that the package can be installed and the server starts correctly.
 
 set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Colors for output
 RED='\033[0;31m'
@@ -95,14 +97,14 @@ cd "$TEST_DIR"
 # Initialize a minimal package.json to avoid npm warnings
 cat >package.json <<EOF
 {
-  "name": "mux-smoke-test",
+  "name": "xum-smoke-test",
   "version": "1.0.0",
   "private": true
 }
 EOF
 
 # Optionally strip shrinkwrap to simulate `bun x` / lockfile-free resolution.
-# When a user runs `bun x mux@latest`, bun ignores npm-shrinkwrap.json and resolves
+# When a user runs `bun x @coder/xum@latest`, bun ignores npm-shrinkwrap.json and resolves
 # dependencies from scratch. This can resolve to different (potentially broken) versions
 # than what the shrinkwrap locks to. Testing without shrinkwrap catches these mismatches.
 if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
@@ -115,41 +117,47 @@ if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
   else
     log_warning "No npm-shrinkwrap.json found in package (nothing to strip)"
   fi
-  STRIPPED_TARBALL="$REPACK_DIR/mux-no-shrinkwrap.tgz"
+  STRIPPED_TARBALL="$REPACK_DIR/xum-no-shrinkwrap.tgz"
   tar -czf "$STRIPPED_TARBALL" -C "$REPACK_DIR" package
   PACKAGE_TARBALL="$STRIPPED_TARBALL"
   log_info "Repacked tarball without shrinkwrap: $PACKAGE_TARBALL"
 fi
 
-# Install the package
+# Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
 log_info "Installing package..."
-if ! npm install --no-save "$PACKAGE_TARBALL"; then
+if ! "$SCRIPT_DIR/retry.sh" 5 60 npm install --no-save "$PACKAGE_TARBALL"; then
   log_error "Failed to install package"
   exit 1
 fi
 
 log_info "✅ Package installed successfully"
 
-# Verify the binary is available
-if [[ ! -f "node_modules/.bin/mux" ]]; then
-  log_error "mux binary not found in node_modules/.bin/"
+# Verify both the canonical binary and downgrade-compatible alias are available.
+for binary in xum mux; do
+  if [[ ! -f "node_modules/.bin/$binary" ]]; then
+    log_error "$binary binary not found in node_modules/.bin/"
+    exit 1
+  fi
+done
+
+log_info "✅ xum and mux binaries found"
+
+# Test the canonical command and the legacy alias against the same ESM bundle.
+log_info "Testing xum api subcommand and mux compatibility alias..."
+if ! node_modules/.bin/xum api --help >/dev/null 2>&1; then
+  log_error "xum api --help failed - ESM bundle (api.mjs) may be missing from package"
+  exit 1
+fi
+if ! node_modules/.bin/mux --help >/dev/null 2>&1; then
+  log_error "legacy mux --help alias failed"
   exit 1
 fi
 
-log_info "✅ mux binary found"
-
-# Test that mux api subcommand works (requires ESM bundle api.mjs)
-log_info "Testing mux api subcommand (ESM bundle)..."
-if ! node_modules/.bin/mux api --help >/dev/null 2>&1; then
-  log_error "mux api --help failed - ESM bundle (api.mjs) may be missing from package"
-  exit 1
-fi
-
-log_info "✅ mux api subcommand works"
+log_info "✅ canonical and legacy CLI entry points work"
 
 # Start the server in background
-log_info "Starting mux server on $SERVER_HOST:$SERVER_PORT..."
-node_modules/.bin/mux server --host "$SERVER_HOST" --port "$SERVER_PORT" --auth-token "$AUTH_TOKEN" >server.log 2>&1 &
+log_info "Starting xum server on $SERVER_HOST:$SERVER_PORT..."
+node_modules/.bin/xum server --host "$SERVER_HOST" --port "$SERVER_PORT" --auth-token "$AUTH_TOKEN" >server.log 2>&1 &
 SERVER_PID=$!
 
 log_info "Server started with PID: $SERVER_PID"
@@ -225,22 +233,24 @@ touch "$PROJECT_DIR/README.md"
 git -C "$PROJECT_DIR" add .
 git -C "$PROJECT_DIR" commit -m "Initial commit" >/dev/null 2>&1
 
-# Run oRPC tests via Node.js using the installed mux package's dependencies
-# The mux package includes @orpc/client which we can use
+# Run oRPC tests via Node.js using the installed xum package's dependencies.
+# The xum package includes @orpc/client which we can use.
 node -e "
 const { RPCLink } = require('@orpc/client/fetch');
 const { createORPCClient } = require('@orpc/client');
 const WebSocket = require('ws');
 
-const ORPC_URL = 'http://${SERVER_HOST}:${SERVER_PORT}/orpc';
+const ORPC_ORIGIN = 'http://${SERVER_HOST}:${SERVER_PORT}';
 const WS_URL = 'ws://${SERVER_HOST}:${SERVER_PORT}/orpc/ws';
 const PROJECT_DIR = '$PROJECT_DIR';
 
 async function runTests() {
   // Test 1: HTTP oRPC client - create project
   console.log('Testing oRPC project creation via HTTP...');
+  // oRPC >=1.14 splits the request URL into origin + path-only url.
   const httpLink = new RPCLink({
-    url: ORPC_URL,
+    origin: ORPC_ORIGIN,
+    url: '/orpc',
     headers: { 'Authorization': 'Bearer ${AUTH_TOKEN}' }
   });
   const client = createORPCClient(httpLink);
