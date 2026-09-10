@@ -452,6 +452,45 @@ describe("workspaceRemoval", () => {
     expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
   });
 
+  test("a sealed removal republishes its own tombstone over a foreign attempt's marker", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const sessionDir = path.join(tmp.path, "sessions", "ws-sealed");
+    const workspaceId = "ws-sealed";
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const tombstonePath = workspaceRemovalTombstonePath(rootDir, workspaceId);
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    // Two backends sealed the same sub-agent; B's marker overwrote A's.
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId, removedAt: Date.now(), attemptId: "attempt-B" })
+    );
+    // A's deletion must not rely on B's marker (B's rollback may delete it):
+    // it republishes its own before deleting the session.
+    await removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "attempt-A",
+      tombstoneSealed: true,
+    });
+    expect(
+      (JSON.parse(await fsPromises.readFile(tombstonePath, "utf-8")) as { attemptId: string })
+        .attemptId
+    ).toBe("attempt-A");
+    // B's compensating rollback now leaves A's marker alone.
+    expect(
+      await rollbackRemovalTombstoneIfOwned({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "attempt-B",
+        workspaceStillRegistered: () => true,
+      })
+    ).toBe(false);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+  });
+
   test("startup heal reclaims old tombstones only for still-registered workspaces (r63)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");

@@ -196,13 +196,17 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   );
   assert(args.attemptId.length > 0, "removeSessionDirUnderMemoryLocks requires an attemptId");
   let tombstonePublishedUnderLocks = args.tombstoneSealed === true;
-  // A sealed tombstone is not rewritten: the redundant write could fail
-  // (storage read-only/full after the checkout deletion) and would then abort
-  // a removal whose durable marker is already in place.
+  // A sealed tombstone is not rewritten while it is still THIS attempt's: the
+  // redundant write could fail (storage read-only/full after the checkout
+  // deletion) and would then abort a removal whose durable marker is already
+  // in place. It IS republished when another attempt's marker sits there
+  // (two backends sealing the same sub-agent): relying on a foreign marker
+  // would let that attempt's compensating rollback delete the only tombstone
+  // while this one proceeds to delete the session and deregister.
   const publish = async (): Promise<void> => {
     if (
       args.tombstoneSealed === true &&
-      (await isWorkspaceRemovalTombstoned(args.rootDir, args.workspaceId))
+      (await readRemovalTombstoneAttemptId(args.rootDir, args.workspaceId)) === args.attemptId
     ) {
       return;
     }
@@ -277,6 +281,21 @@ export async function sealSubAgentForRemovalUnderMemoryLocks(args: {
     });
   } catch (error) {
     throw new SharedMemoryRemovalAbortedError(args.workspaceId, { cause: error });
+  }
+}
+
+/** The attempt ID stamped in the tombstone, or null when missing, unreadable or malformed. */
+async function readRemovalTombstoneAttemptId(
+  rootDir: string,
+  workspaceId: string
+): Promise<string | null> {
+  try {
+    const parsed = JSON.parse(
+      await fsPromises.readFile(workspaceRemovalTombstonePath(rootDir, workspaceId), "utf-8")
+    ) as { attemptId?: unknown };
+    return typeof parsed.attemptId === "string" ? parsed.attemptId : null;
+  } catch {
+    return null;
   }
 }
 

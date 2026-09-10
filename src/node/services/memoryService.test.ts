@@ -2209,6 +2209,47 @@ describe("MemoryService", () => {
       expect(readopted["note.md"].deleted).toBeUndefined();
     });
 
+    it("recovers an interrupted in-place replacement without duplicating the note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The downgraded build edits the note; the replacement pass crashed
+      // after recording its pending state but before writing the bytes —
+      // the on-disk state that leaves: the PRIOR record marked pending, the
+      // owner copy still holding the old bytes.
+      const manifestPath = path.join(legacyRoot, ".adopted-into-shared-store.json");
+      const prior = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          { content: string; sidecar: string; target: string; created?: boolean }
+        >
+      )["note.md"];
+      expect(prior).toMatchObject({ target: "note.md", created: true });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v2");
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({ "note.md": { ...prior, pending: true } })
+      );
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+      // The retry recognizes the surviving old bytes as this adoption's copy
+      // and replaces them in place — no imported/ duplicate, provenance kept.
+      const restarted = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      await restarted.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v2");
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-child", "note.md"))).toBe(false);
+      const manifest = JSON.parse(
+        await fsPromises.readFile(path.join(legacyRoot, ".adopted-into-shared-store.json"), "utf-8")
+      ) as Record<string, { target: string; created?: boolean; pending?: boolean }>;
+      expect(Object.keys(manifest)).toEqual(["note.md"]);
+      expect(manifest["note.md"]).toMatchObject({ target: "note.md", created: true });
+      expect(manifest["note.md"].pending).toBeUndefined();
+    });
+
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

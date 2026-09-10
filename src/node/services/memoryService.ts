@@ -1419,12 +1419,16 @@ export class MemoryService extends EventEmitter {
           // already identical and takes the no-write path — without this
           // record it would read as the owner's own note, and a legacy
           // deletion could then never follow it out of the shared store.
-          adopted.set(relPath, {
-            ...record,
-            target: target.relPath,
-            created: true,
-            pending: true,
-          });
+          // A replacement keeps the PRIOR record (old hash, same target)
+          // while pending: interrupted before the write, the retry must still
+          // recognize the surviving old bytes as this adoption's copy and
+          // replace them, not import the new bytes elsewhere.
+          adopted.set(
+            relPath,
+            target.replaces === true && previous !== undefined
+              ? { ...previous, pending: true }
+              : { ...record, target: target.relPath, created: true, pending: true }
+          );
           await writeManifest();
           await store.writeFile(target.relPath, content);
           if (target.replaces !== true) remainingCapacity--;
