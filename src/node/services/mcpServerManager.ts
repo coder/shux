@@ -1,3 +1,4 @@
+import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
@@ -1138,6 +1139,8 @@ interface MCPToolsForWorkspaceResult {
   enablementDerivedFrom?: MCPWorkspaceRequestOptions;
 }
 interface WorkspaceServers {
+  /** Removed selections are detached immediately, but leased calls keep their client alive. */
+  retiredPluginInstances?: Set<MCPServerInstance>;
   configSignature: string;
   instances: Map<string, MCPServerInstance>;
   /** Filters prompts while leased restarts can leave disabled clients cached. */
@@ -1193,6 +1196,8 @@ export interface MCPServerManagerOptions {
   pluginInvalidation?: {
     keyPrefix: string;
     readToken: () => Promise<string | undefined>;
+    /** Atomic plugins.json content, independent of tree replacement and override epochs. */
+    readComponentPolicy?: () => Promise<PluginMcpPolicy>;
     /**
      * Disk-authoritative workspace override read. A sibling's uninstall also
      * pruned plugin keys from workspace override FILES; the sweep uses this
@@ -1311,6 +1316,13 @@ export class MCPServerManager {
   private readonly prefixInvalidations = new Map<string, number>();
   /** See MCPServerManagerOptions.pluginInvalidation. */
   private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
+  private componentPolicy: PluginMcpPolicy | undefined;
+  private componentPolicyRevision = 0;
+  private readonly managedPluginServers = new Map<string, NonNullable<MCPServerInfo["plugin"]>>();
+  private readonly managedPluginInstances = new Map<
+    string,
+    NonNullable<NonNullable<MCPServerInfo["plugin"]>["componentPolicy"]>
+  >();
   private pluginInvalidationTokenSeen = false;
   private lastPluginInvalidationToken: string | undefined;
   private lastOverridesEpochToken: string | undefined;
@@ -1351,6 +1363,86 @@ export class MCPServerManager {
     this.pluginInvalidation = options?.pluginInvalidation;
   }
 
+  /** Call after the atomic selection write and after releasing the install lock. */
+  async reconcilePluginComponents(): Promise<void> {
+    await this.retireCrossProcessPluginInstances();
+  }
+
+  private componentAllowed(
+    name: string,
+    info?: MCPServerInfo,
+    policy = this.componentPolicy
+  ): boolean {
+    if (this.pluginInvalidation?.readComponentPolicy === undefined) return true;
+    return isPluginMcpServerAllowed(this.managedPluginServers.get(name) ?? info?.plugin, policy);
+  }
+
+  private async readComponentPolicy(): Promise<PluginMcpPolicy | undefined> {
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    if (read === undefined) return undefined;
+    try {
+      const result = await raceWithAbortAndTimeout(read(), { timeoutMs: CALL_GATE_TIMEOUT_MS });
+      if (result.kind === "ok") return result.value;
+    } catch (error) {
+      log.debug("MCP component policy unavailable", { error });
+    }
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+  }
+
+  private async refreshComponentPolicy(): Promise<void> {
+    const previous = this.componentPolicy;
+    const policy = await this.readComponentPolicy();
+    if (JSON.stringify(policy) !== JSON.stringify(this.componentPolicy)) {
+      this.componentPolicy = policy;
+      this.componentPolicyRevision++;
+    }
+    for (const [workspaceId, entry] of this.workspaceServers) {
+      const readded = [...this.managedPluginServers.keys()].filter(
+        (name) =>
+          !this.componentAllowed(name, undefined, previous) &&
+          this.componentAllowed(name) &&
+          !entry.instances.has(name) &&
+          Object.hasOwn(JSON.parse(entry.configSignature) as object, name)
+      );
+      this.markServersForRetry(entry, readded);
+      const denied = new Set(
+        [...entry.enabledServerNames, ...entry.instances.keys()].filter(
+          (name) => !this.componentAllowed(name, entry.enabledServers[name])
+        )
+      );
+      for (const name of denied) {
+        entry.enabledServerNames.delete(name);
+        delete entry.enabledServers[name];
+        entry.retryingTimedOutServerNames?.delete(name);
+      }
+      entry.timedOutServerNames =
+        entry.timedOutServerNames?.filter((name) => this.componentAllowed(name)) ?? [];
+      entry.stats = this.createWorkspaceStats(
+        entry.enabledServerNames.size,
+        new Map([...entry.instances].filter(([name]) => entry.enabledServerNames.has(name))),
+        entry.stats.failedServerNames.filter((name) => this.componentAllowed(name))
+      );
+      for (const name of denied) {
+        const instance = entry.instances.get(name);
+        if (!instance) continue;
+        entry.instances.delete(name);
+        (entry.retiredPluginInstances ??= new Set()).add(instance);
+      }
+      // Keep admitted leased calls alive without letting a readd overwrite
+      // their retired client. Only active instances participate in retention.
+      if (this.getLeaseCount(workspaceId) > 0) continue;
+      const retired = entry.retiredPluginInstances;
+      delete entry.retiredPluginInstances;
+      for (const instance of retired ?? []) {
+        try {
+          await instance.close();
+        } catch (error) {
+          log.warn("Failed to close removed plugin component", { name: instance.name, error });
+        }
+      }
+    }
+  }
+
   /**
    * Retire cached plugin instances when a SIBLING process mutated a plugin
    * (see MCPServerManagerOptions.pluginInvalidation). Runs before every
@@ -1372,6 +1464,7 @@ export class MCPServerManager {
     // published token and proceed; a failed sweep leaves the token
     // unpublished so the next serve retries it.
     const run = async (): Promise<void> => {
+      if (invalidation.readComponentPolicy !== undefined) await this.refreshComponentPolicy();
       const [token, overridesEpoch] = await Promise.all([
         invalidation.readToken(),
         invalidation.readOverridesEpoch?.(),
@@ -1858,6 +1951,14 @@ export class MCPServerManager {
 
     if (current === 1) {
       this.workspaceLeases.delete(workspaceId);
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined) {
+        this.reconcilePluginComponents().catch((error: unknown) => {
+          log.warn("Failed to reconcile plugin components after lease release", {
+            workspaceId,
+            error,
+          });
+        });
+      }
       return;
     }
 
@@ -1961,7 +2062,21 @@ export class MCPServerManager {
     for (const [name, command] of Object.entries(this.inlineServers)) {
       inlineAsInfo[name] = { transport: "stdio", command, disabled: false };
     }
-    return { ...configServers, ...inlineAsInfo };
+    const servers = { ...configServers, ...inlineAsInfo };
+    for (const [name, info] of Object.entries(servers)) {
+      const plugin = info.plugin;
+      if (plugin === undefined) continue;
+      // The logical instance prefix includes scope/alias identity. Remember
+      // the installation, so a vanished row cannot expose previously hidden siblings.
+      const instanceKey = name.slice(0, -plugin.serverName.length);
+      const owner = plugin.componentPolicy ?? this.managedPluginInstances.get(instanceKey);
+      if (owner === undefined) continue;
+      this.managedPluginInstances.set(instanceKey, { ...owner });
+      this.managedPluginServers.set(name, { ...plugin, componentPolicy: { ...owner } });
+    }
+    return Object.fromEntries(
+      Object.entries(servers).filter(([name, info]) => this.componentAllowed(name, info))
+    );
   }
 
   /**
@@ -1984,6 +2099,8 @@ export class MCPServerManager {
     trusted = false,
     agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<MCPServerMap> {
+    if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+      await this.reconcilePluginComponents();
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
     const enabled = this.applyServerOverrides(allServers, overrides);
     return this.filterServersByPolicy(enabled);
@@ -2127,6 +2244,8 @@ export class MCPServerManager {
       // advance the live baseline while this operation is still in flight —
       // the live field would then match the fresh read and accept a result
       // derived from pre-eviction state.
+      const componentPolicyUsed = JSON.stringify(this.componentPolicy);
+      const componentRevisionUsed = this.componentPolicyRevision;
       const pluginTokenUsed = this.lastPluginInvalidationToken;
       const overridesEpochUsed = this.lastOverridesEpochToken;
       const result = await operation();
@@ -2143,9 +2262,15 @@ export class MCPServerManager {
       // accepted — a parallel read could capture the old epoch while the
       // slower token read settles, accepting a pair a sibling revocation
       // completed in between.
+      const componentPolicy =
+        this.pluginInvalidation.readComponentPolicy !== undefined
+          ? await this.readComponentPolicy()
+          : undefined;
       const token = await this.pluginInvalidation.readToken();
       const overridesEpoch = await this.pluginInvalidation.readOverridesEpoch?.();
       if (
+        componentPolicyUsed === JSON.stringify(componentPolicy) &&
+        componentRevisionUsed === this.componentPolicyRevision &&
         token === pluginTokenUsed &&
         overridesEpoch === overridesEpochUsed &&
         !isWorkspaceOverridesEpochUnreadable(overridesEpoch)
@@ -2668,7 +2793,7 @@ export class MCPServerManager {
     }
 
     const additiveServerNames = existing
-      ? this.getAdditiveServerNames(existing, signatureEntries)
+      ? this.getRetainableServerAdditions(existing, signatureEntries)
       : undefined;
 
     // If a stream is actively running, avoid closing MCP clients out from under it.
@@ -2922,7 +3047,7 @@ export class MCPServerManager {
       }
 
       const addedServerNames = current
-        ? this.getAdditiveServerNames(current, signatureEntries)
+        ? this.getRetainableServerAdditions(current, signatureEntries)
         : undefined;
       if (additiveServerNames !== undefined && addedServerNames === undefined) {
         // A newer additive request may have won the lock. Never roll it back
@@ -3304,21 +3429,27 @@ export class MCPServerManager {
     return descriptors;
   }
 
-  private getAdditiveServerNames(
+  private getRetainableServerAdditions(
     entry: WorkspaceServers,
     next: Record<string, unknown>
   ): string[] | undefined {
     if ([...entry.instances.values()].some((instance) => instance.isClosed)) return undefined;
     // Signatures are in-process JSON of launch settings, including resolved secrets.
     const previous = JSON.parse(entry.configSignature) as Record<string, unknown>;
-    if (Object.keys(next).length <= Object.keys(previous).length) return undefined;
+    const added = Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
+    const removed = Object.keys(previous).filter((name) => !Object.hasOwn(next, name));
+    if (added.length === 0 && removed.length === 0) return undefined;
+    // Only selection removals are non-disruptive. Unrelated configuration
+    // changes retain the existing full-restart/deferred-restart behavior.
+    if (removed.some((name) => this.componentAllowed(name))) return undefined;
     if (
       Object.keys(previous).some(
-        (name) => JSON.stringify(previous[name]) !== JSON.stringify(next[name])
+        (name) =>
+          Object.hasOwn(next, name) && JSON.stringify(previous[name]) !== JSON.stringify(next[name])
       )
     )
       return undefined;
-    return Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
+    return added;
   }
 
   private async computeSignatureEntries(
@@ -3799,6 +3930,12 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
+            const policy =
+              this.pluginInvalidation?.readComponentPolicy !== undefined
+                ? await this.readComponentPolicy()
+                : undefined;
+            if (!this.componentAllowed(serverName, undefined, policy))
+              throw new Error(`MCP server '${serverName}' is disabled`);
             pending = dispatch();
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
@@ -3829,6 +3966,12 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
+              const policy =
+                this.pluginInvalidation?.readComponentPolicy !== undefined
+                  ? await this.readComponentPolicy()
+                  : undefined;
+              if (!this.componentAllowed(serverName, undefined, policy))
+                throw new Error(`MCP server '${serverName}' is disabled`);
               pending = dispatch();
             } finally {
               await release();
@@ -4028,7 +4171,24 @@ export class MCPServerManager {
     publish: (invalidatedKeys: string[]) => void
   ): Promise<void> {
     const invalidatedKeys: string[] = [];
+    const removedComponents: string[] = [];
     for (;;) {
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+        await this.reconcilePluginComponents();
+      for (const [name, instance] of instances) {
+        if (this.componentAllowed(name)) continue;
+        instances.delete(name);
+        removedComponents.push(name);
+        // Even remove->readd during awaited cleanup requires a fresh startup;
+        // equality of the final content snapshot alone cannot detect that ABA.
+        this.componentPolicyRevision++;
+        try {
+          await instance.close();
+        } catch (error) {
+          log.warn("Failed to close removed plugin startup", { name, error });
+        }
+      }
+      if (removedComponents.length > 0) await this.reconcilePluginComponents();
       const clockBeforeScan = this.prefixInvalidationClock;
       invalidatedKeys.push(
         ...(await this.closeInvalidatedInstances(instances, startedAtEpoch, workspaceId))
@@ -4036,7 +4196,9 @@ export class MCPServerManager {
       // Terminates: the clock only advances on stopServersWithKeyPrefix
       // calls, which are finite user-driven plugin update/uninstall events.
       if (this.prefixInvalidationClock === clockBeforeScan) {
-        publish(invalidatedKeys);
+        publish(
+          [...invalidatedKeys, ...removedComponents].filter((name) => this.componentAllowed(name))
+        );
         return;
       }
     }
@@ -4062,7 +4224,7 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of entry.instances.values()) {
+    for (const instance of [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])]) {
       try {
         await instance.close();
       } catch (error) {
@@ -4682,6 +4844,12 @@ export class MCPServerManager {
             }
             return "dispatch";
           };
+          const componentPolicy =
+            this.pluginInvalidation?.readComponentPolicy !== undefined
+              ? await bounded(this.readComponentPolicy())
+              : undefined;
+          if (!this.componentAllowed(serverName, servedInfo, componentPolicy))
+            throw revoked(`server '${serverName}'`);
           if (decide() === "retry") {
             continue;
           }
@@ -4733,6 +4901,12 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
+            const componentPolicy =
+              this.pluginInvalidation?.readComponentPolicy !== undefined
+                ? await bounded(this.readComponentPolicy())
+                : undefined;
+            if (!this.componentAllowed(serverName, servedInfo, componentPolicy))
+              throw revoked(`server '${serverName}'`);
             // Process-local state may have moved during the two awaits above.
             if (decide() === "retry") {
               continue;

@@ -19,6 +19,8 @@ export interface MCPServerPluginProvenance {
    * .agents), so the UI needs this discriminator to tell instances apart.
    */
   sourceLocation: string;
+  /** Canonical managed owner; retained even if its registry row later disappears. */
+  componentPolicy?: { registryPath: string; name: string };
 }
 
 export interface MCPServerBaseInfo {

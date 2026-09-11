@@ -1,8 +1,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { readPluginComponentImports } from "./registry";
+import { readPluginComponentImports, readPluginMcpPolicy } from "./registry";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
 const legacy = createTestPluginInstallEntry("demo");
@@ -84,5 +84,59 @@ describe("readPluginComponentImports", () => {
     const recovered = await readRows(registryPath, [selective]);
     expect(recovered.hasUnidentifiedEntries).toBe(false);
     expect(recovered.byName.get("demo")).toEqual(selective.importedComponents);
+  });
+});
+
+describe("readPluginMcpPolicy", () => {
+  test("canonical snapshot ignores skills, metadata, ordering, and duplicate selected names", async () => {
+    using tmp = new DisposableTempDir("mcp-policy-content");
+    await fs.mkdir(path.join(tmp.path, "plugins"));
+    const registryPath = path.join(tmp.path, "plugins.json");
+    await readRows(registryPath, [
+      legacy,
+      createTestPluginInstallEntry("other", { skills: [], mcpServers: ["b", "a", "a"] }),
+    ]);
+    const before = await readPluginMcpPolicy(registryPath);
+    await readRows(registryPath, [
+      createTestPluginInstallEntry("other", { skills: ["new"], mcpServers: ["a", "b"] }),
+      { ...legacy, lockedSha: "new" },
+    ]);
+    expect(await readPluginMcpPolicy(registryPath)).toEqual(before);
+    await readRows(registryPath, [
+      legacy,
+      createTestPluginInstallEntry("other", { skills: [], mcpServers: ["b"] }),
+    ]);
+    expect(await readPluginMcpPolicy(registryPath)).not.toEqual(before);
+  });
+
+  test("owner retarget during the registry read cannot authorize the old canonical owner", async () => {
+    using tmp = new DisposableTempDir("mcp-policy-owner");
+    const a = path.join(tmp.path, "a");
+    const b = path.join(tmp.path, "b");
+    const alias = path.join(tmp.path, "alias");
+    for (const home of [a, b]) {
+      await fs.mkdir(path.join(home, "plugins"), { recursive: true });
+      await readRows(path.join(home, "plugins.json"), [legacy]);
+    }
+    await fs.symlink(a, alias, "dir");
+    const original = fs.readFile;
+    const read = spyOn(fs, "readFile").mockImplementation(
+      // The forwarding wrapper preserves readFile's encoding-dependent overloads.
+      (async (...args: Parameters<typeof fs.readFile>) => {
+        const value = await original(...args);
+        await fs.unlink(alias);
+        await fs.symlink(b, alias, "dir");
+        return value;
+      }) as typeof fs.readFile
+    );
+    try {
+      expect((await readPluginMcpPolicy(path.join(alias, "plugins.json"))).imports).toBeNull();
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      read.mockRestore();
+    }
+    expect((await readPluginMcpPolicy(path.join(alias, "plugins.json"))).registryPath).toBe(
+      path.join(b, "plugins.json")
+    );
   });
 });

@@ -161,6 +161,7 @@ export interface AgentPluginContainer {
 export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */
   importedComponents?: AgentPluginImportedComponents;
+  componentPolicy?: { registryPath: string; name: string };
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -868,6 +869,10 @@ export async function discoverAgentPlugins(
         snapshot.plugins.set(entryName, plugin);
         if (plugin) {
           const imports = snapshot.imports;
+          const registryPath = groups.get(canonicalPath)?.registryPath;
+          if (registryPath !== undefined && imports?.byName.has(entryName)) {
+            plugin.componentPolicy = { registryPath, name: entryName };
+          }
           plugin.importedComponents =
             imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))
               ? { skills: [], mcpServers: [] }

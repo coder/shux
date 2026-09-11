@@ -36,6 +36,7 @@ export const MCPServerPluginProvenanceSchema = z.object({
   sourceScope: z.enum(["project", "global"]),
   /** Installation location discriminator, e.g. ".xum/plugins/demo" (same-name plugins can sit in sibling containers). */
   sourceLocation: z.string(),
+  componentPolicy: z.object({ registryPath: z.string(), name: z.string() }).optional(),
 });
 
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
