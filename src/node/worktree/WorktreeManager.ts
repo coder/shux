@@ -189,6 +189,7 @@ export class WorktreeManager {
       );
       const addResult = await addProc.result;
       createdBranch = !branchExists;
+      worktreeCreated = true;
       for (const line of addResult.stdout.split(/[\r\n]/)) {
         if (line) initLogger.logStdout(line);
       }
@@ -216,23 +217,9 @@ export class WorktreeManager {
         for (const line of stdout.split(/[\r\n]/)) {
           if (line) initLogger.logStdout(line);
         }
-      } catch (error) {
-        try {
-          await this.rollbackFailedWorkspaceCreation({
-            projectPath,
-            workspacePath,
-            branchName,
-            createdBranch,
-            trusted: params.trusted,
-          });
-        } catch {
-          // Preserve the checkout error even when best-effort cleanup fails.
-        }
-        throw error;
       } finally {
         progress.flush();
       }
-      worktreeCreated = true;
 
       initLogger.logStep("Worktree created successfully");
 

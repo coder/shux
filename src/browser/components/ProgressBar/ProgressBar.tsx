@@ -16,10 +16,7 @@ export function ProgressBar(props: ProgressBarProps) {
       aria-label={props["aria-label"]}
       className={cn("bg-init-output-bg h-1.5 overflow-hidden rounded-full", props.className)}
     >
-      <div
-        className="bg-accent h-full rounded-full transition-[width] duration-150"
-        style={{ width: `${props.value}%` }}
-      />
+      <div className="bg-accent h-full rounded-full" style={{ width: `${props.value}%` }} />
     </div>
   );
 }
