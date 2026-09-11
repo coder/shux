@@ -1490,7 +1490,7 @@ test("plugin component action is gated and only targets present managed installs
   expect(
     mk({ onOpenSettings: openSettings })
       .flatMap((source) => source())
-      .find((action) => action.id === CommandIds.pluginsAddComponents())
+      .find((action) => action.id === CommandIds.pluginsManageComponents())
   ).toBeUndefined();
   const api = createMockORPCClient({
     agentPlugins: {
@@ -1525,22 +1525,25 @@ test("plugin component action is gated and only targets present managed installs
   const mutation = mock(() =>
     Promise.resolve({ success: false as const, error: "Must use the chooser" })
   );
-  api.agentPlugins.addComponents = mutation;
+  api.agentPlugins.setComponents = mutation;
   const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
     .flatMap((source) => source())
-    .find((action) => action.id === CommandIds.pluginsAddComponents());
+    .find((action) => action.id === CommandIds.pluginsManageComponents());
   const field = action?.prompt?.fields[0];
   if (field?.type !== "select" || !action?.prompt)
     throw new Error("Expected component plugin picker");
   expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
   consumePendingPluginsSectionIntent();
   await action.prompt.onSubmit({ pluginName: "managed" });
-  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "add-components", name: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({
+    type: "manage-components",
+    name: "managed",
+  });
   const received: PluginsSectionIntent[] = [];
   const unsubscribe = subscribePluginsSectionIntents((intent) => received.push(intent));
   try {
     await action.prompt.onSubmit({ pluginName: "managed" });
-    expect(received).toEqual([{ type: "add-components", name: "managed" }]);
+    expect(received).toEqual([{ type: "manage-components", name: "managed" }]);
     expect(consumePendingPluginsSectionIntent()).toBeNull();
     expect(mutation).not.toHaveBeenCalled();
     expect(openSettings).toHaveBeenCalledWith("plugins");

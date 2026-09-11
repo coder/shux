@@ -1774,8 +1774,9 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.getComponents(args));
   }
 
-  addComponentsResult(args: Parameters<AgentPluginInstallService["addComponents"]>[0]) {
-    return this.captureResult(() => this.addComponents(args));
+  async setComponentsResult(args: Parameters<AgentPluginInstallService["setComponents"]>[0]) {
+    const result = await this.captureResult(() => this.setComponents(args));
+    return result.success ? { success: true as const, ...result.data } : result;
   }
 
   listResult() {
@@ -2722,15 +2723,22 @@ export class AgentPluginInstallService {
     });
   }
 
-  async addComponents(
-    args: AgentPluginImportedComponents & {
-      name: string;
-      expectedLockedSha: string;
-      expectedContentHash: string;
-    }
-  ): Promise<AgentPluginInstallEntry> {
+  async setComponents(args: {
+    name: string;
+    expectedLockedSha: string;
+    expectedContentHash: string;
+    expectedImportedComponents: AgentPluginImportedComponents | null;
+    importedComponents: AgentPluginImportedComponents;
+  }): Promise<{ data: AgentPluginInstallEntry; cleanupWarning?: string }> {
     this.assertEnabled();
-    return this.runExclusive(async () => {
+    const selectionKey = (selection: AgentPluginImportedComponents | null) =>
+      selection === null
+        ? null
+        : JSON.stringify([
+            [...new Set(selection.skills)].sort(),
+            [...new Set(selection.mcpServers)].sort(),
+          ]);
+    const data = await this.runExclusive(async () => {
       const { envelope, rawEntries } = await this.readRegistryDocument("strict");
       const entry = this.parseRegistryEntries(rawEntries, "strict").find(
         (entry) => entry.name === args.name
@@ -2738,23 +2746,26 @@ export class AgentPluginInstallService {
       if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
       if (entry.lockedSha !== args.expectedLockedSha)
         throw new Error("Plugin changed since component review. Refresh the component inventory.");
+      if (
+        selectionKey(entry.importedComponents ?? null) !==
+        selectionKey(args.expectedImportedComponents)
+      )
+        throw new Error(
+          "Plugin selection changed since component review. Refresh the component inventory."
+        );
       const inventory = await this.readInstalledComponents(entry);
       if (inventory.contentHash !== args.expectedContentHash) {
         throw new Error(
           "Plugin files changed since component review. Refresh the component inventory."
         );
       }
-      const added = this.validateComponentImports(args, inventory);
-      // Legacy installs already import everything; do not silently convert their update behavior.
-      if (entry.importedComponents === undefined) return entry;
-      const importedComponents = {
-        skills: [...new Set([...entry.importedComponents.skills, ...added.skills])].sort(),
-        mcpServers: [
-          ...new Set([...entry.importedComponents.mcpServers, ...added.mcpServers]),
-        ].sort(),
+      const importedComponents = this.validateComponentImports(args.importedComponents, inventory);
+      // An unchanged legacy import-all selection must keep following future package inventory.
+      const previous = entry.importedComponents ?? {
+        skills: inventory.skills.map((skill) => skill.name),
+        mcpServers: inventory.mcpServers.map((server) => server.serverName),
       };
-      if (JSON.stringify(importedComponents) === JSON.stringify(entry.importedComponents))
-        return entry;
+      if (selectionKey(importedComponents) === selectionKey(previous)) return entry;
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) => {
@@ -2769,10 +2780,18 @@ export class AgentPluginInstallService {
           };
         })
       );
-      // Fresh discovery reads publish these additive imports. Do NOT bump the tree mutation
-      // epoch: it recycles every plugin server. An overlapping scan sees only a safe older subset.
       return { ...entry, importedComponents };
     });
+    // Persist first and release the mutation lock: reconciliation rediscovers current policy.
+    // Never recycle the tree or prune workspace preferences for reversible selections.
+    try {
+      await this.deps.mcpServerManager?.reconcilePluginComponents();
+      return { data };
+    } catch (error) {
+      const cleanupWarning = `Components saved, but MCP cleanup needs retry: ${getErrorMessage(error)}`;
+      log.warn(cleanupWarning, { name: args.name });
+      return { data, cleanupWarning };
+    }
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */

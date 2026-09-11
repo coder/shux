@@ -64,7 +64,7 @@ function unwrap<T>(result: Result<T, string>): T {
     if (remote) await cleanupTempGitRepo(remote);
   });
 
-  it("imports a subset, adds offline, and requires new consent after an update", async () => {
+  it("imports a subset, replaces offline, and requires new consent after an update", async () => {
     const preview = unwrap(
       await env.orpc.agentPlugins.preview({ input: pathToFileURL(remote).href })
     );
@@ -108,12 +108,12 @@ function unwrap<T>(result: Result<T, string>): T {
 
     expect(
       (
-        await env.orpc.agentPlugins.addComponents({
+        await env.orpc.agentPlugins.setComponents({
           name,
           expectedLockedSha: "outdated",
           expectedContentHash: inventory.contentHash,
-          skills: ["selective-second"],
-          mcpServers: ["selective-second"],
+          expectedImportedComponents: selection,
+          importedComponents: { skills: ["selective-second"], mcpServers: ["selective-second"] },
         })
       ).success
     ).toBe(false);
@@ -121,7 +121,7 @@ function unwrap<T>(result: Result<T, string>): T {
       selection
     );
 
-    // No remote is available: additions must use the installed tree, not clone or fetch.
+    // No remote is available: selections must use the installed tree, not clone or fetch.
     const offlineRemote = `${remote}-offline`;
     await fs.rename(remote, offlineRemote);
     try {
@@ -129,23 +129,35 @@ function unwrap<T>(result: Result<T, string>): T {
         name,
         expectedLockedSha: inventory.lockedSha,
         expectedContentHash: inventory.contentHash,
-        skills: ["selective-second", "selective-second"],
-        mcpServers: ["selective-second"],
+        expectedImportedComponents: selection,
+        importedComponents: {
+          skills: ["selective-second", "selective-second"],
+          mcpServers: ["selective-second"],
+        },
       };
-      const added = unwrap(await env.orpc.agentPlugins.addComponents(addition));
-      expect(added.importedComponents?.skills.sort()).toEqual([
-        "selective-first",
-        "selective-second",
-      ]);
-      expect(unwrap(await env.orpc.agentPlugins.addComponents(addition))).toEqual(added);
+      const added = unwrap(await env.orpc.agentPlugins.setComponents(addition));
+      expect(added.importedComponents?.skills.sort()).toEqual(["selective-second"]);
+      expect(
+        unwrap(
+          await env.orpc.agentPlugins.setComponents({
+            ...addition,
+            expectedImportedComponents: added.importedComponents ?? null,
+          })
+        )
+      ).toEqual(added);
     } finally {
       await fs.rename(offlineRemote, remote);
     }
     const serversAfter = await env.orpc.projects.mcp.list({ projectPath: remote });
-    for (const [key, server] of Object.entries(serversBefore)) {
-      expect(serversAfter[key]).toEqual(server);
-    }
-    expect(Object.values(serversAfter).filter((server) => server.plugin)).toHaveLength(2);
+    expect(
+      Object.values(serversAfter)
+        .filter((server) => server.plugin)
+        .map((server) => server.plugin?.serverName)
+    ).toEqual(["selective-second"]);
+    expect(Object.values(serversAfter).filter((server) => server.plugin)[0].disabled).toBe(true);
+    await expect(
+      env.orpc.agentSkills.get({ projectPath: remote, skillName: "selective-first" })
+    ).rejects.toThrow();
     expect(
       (await env.orpc.agentSkills.list({ projectPath: remote })).some(
         (skill) => skill.name === "selective-second"
@@ -170,23 +182,23 @@ function unwrap<T>(result: Result<T, string>): T {
     ).toBe(false);
     expect(
       (
-        await env.orpc.agentPlugins.addComponents({
+        await env.orpc.agentPlugins.setComponents({
           name,
           expectedLockedSha: inventory.lockedSha,
           expectedContentHash: inventory.contentHash,
-          skills: ["selective-third"],
-          mcpServers: [],
+          expectedImportedComponents: selection,
+          importedComponents: { skills: ["selective-third"], mcpServers: [] },
         })
       ).success
     ).toBe(false);
     unwrap(
-      await env.orpc.agentPlugins.addComponents({
+      await env.orpc.agentPlugins.setComponents({
         name,
         expectedLockedSha: updated.lockedSha,
         expectedContentHash: unwrap(await env.orpc.agentPlugins.getComponents({ name }))
           .contentHash,
-        skills: ["selective-third"],
-        mcpServers: [],
+        expectedImportedComponents: updated.importedComponents ?? null,
+        importedComponents: { skills: ["selective-third"], mcpServers: [] },
       })
     );
     expect(

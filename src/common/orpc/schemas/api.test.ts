@@ -4,6 +4,7 @@ import {
   ProviderConfigInfoSchema,
   ProvidersConfigMapSchema,
   config,
+  agentPlugins,
   workspace,
 } from "./api";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
@@ -288,5 +289,23 @@ describe("config.saveConfig schema", () => {
     });
 
     expect(result.success).toBe(true);
+  });
+});
+
+describe("agentPlugins.setComponents schema", () => {
+  it("requires a baseline and distinguishes legacy absence from an explicit empty selection", () => {
+    const request = {
+      name: "plugin",
+      expectedLockedSha: "sha",
+      expectedContentHash: "receipt",
+      importedComponents: { skills: [], mcpServers: [] },
+    };
+    expect(agentPlugins.setComponents.input.safeParse(request).success).toBe(false);
+    for (const expectedImportedComponents of [null, { skills: [], mcpServers: [] }]) {
+      expect(
+        agentPlugins.setComponents.input.parse({ ...request, expectedImportedComponents })
+          .expectedImportedComponents
+      ).toEqual(expectedImportedComponents);
+    }
   });
 });

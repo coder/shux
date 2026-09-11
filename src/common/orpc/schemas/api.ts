@@ -1083,13 +1083,22 @@ export const agentPlugins = {
     input: z.object({ name: z.string() }),
     output: ResultSchema(AgentPluginComponentsSchema, z.string()),
   },
-  addComponents: {
-    input: AgentPluginImportedComponentsSchema.extend({
+  setComponents: {
+    input: z.object({
       name: z.string(),
       expectedLockedSha: z.string(),
       expectedContentHash: z.string(),
+      expectedImportedComponents: AgentPluginImportedComponentsSchema.nullable(),
+      importedComponents: AgentPluginImportedComponentsSchema,
     }),
-    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+    output: z.discriminatedUnion("success", [
+      z.object({
+        success: z.literal(true),
+        data: AgentPluginInstallEntrySchema,
+        cleanupWarning: z.string().optional(),
+      }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
   },
   /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
   containerLocation: {

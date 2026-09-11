@@ -1140,6 +1140,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     agentPlugins: {
       list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
       containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      getComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component inventory configured in this story",
+        }),
+      setComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component selection configured in this story",
+        }),
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: () =>

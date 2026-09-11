@@ -1059,11 +1059,11 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.getComponentsResult(input)
         ),
-      addComponents: t
-        .input(schemas.agentPlugins.addComponents.input)
-        .output(schemas.agentPlugins.addComponents.output)
+      setComponents: t
+        .input(schemas.agentPlugins.setComponents.input)
+        .output(schemas.agentPlugins.setComponents.output)
         .handler(({ context, input }) =>
-          context.agentPluginInstallService.addComponentsResult(input)
+          context.agentPluginInstallService.setComponentsResult(input)
         ),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
