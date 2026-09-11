@@ -7455,7 +7455,7 @@ describe("wrapMCPTools", () => {
             assignee_id: { type: "string" },
             search: { type: "string" },
             labels: { type: "array" },
-            milestone: { type: "string" },
+            milestone: { type: ["string", "null"] },
           },
           required,
           additionalProperties: false,
@@ -7473,7 +7473,7 @@ describe("wrapMCPTools", () => {
       );
 
       expect(executeMock).toHaveBeenCalledTimes(1);
-      // null and [] pass through untouched; only optional "" is dropped.
+      // A server-declared nullable null and [] pass through; optional "" is dropped.
       expect(executeMock.mock.calls[0][0]).toEqual({
         project_id: "42332",
         labels: [],
@@ -7490,14 +7490,113 @@ describe("wrapMCPTools", () => {
       expect(executeMock.mock.calls[0][0]).toEqual({ project_id: "" });
     });
 
-    test("passes args through unchanged when no empty strings are present", async () => {
+    test("passes args through unchanged when nothing needs stripping", async () => {
       const executeMock = makeExecuteMock();
       const wrapped = wrapMCPTools({ myTool: makeTool(executeMock) });
 
       const args = { project_id: "42332", search: "bug" };
       await wrapped.myTool.execute!(args, {} as never);
 
-      expect(executeMock.mock.calls[0][0]).toBe(args);
+      expect(executeMock.mock.calls[0][0]).toEqual(args);
+    });
+
+    test("drops null for optional params whose schema does not accept null", async () => {
+      // schemaSanitizer widens optional MCP properties to nullable for OpenAI
+      // strict mode; the model then sends null for parameters it would have
+      // omitted. That null is xum's artifact, so it never reaches the server.
+      const executeMock = makeExecuteMock();
+      const tool = {
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            statusUpdateType: { type: "string", enum: ["onTrack", "atRisk"] },
+            assigneeId: { type: ["string", "null"] },
+            dueDate: { anyOf: [{ type: "string" }, { type: "null" }] },
+            priority: { type: "integer" },
+          },
+          required: ["title", "priority"],
+          additionalProperties: false,
+        }),
+        execute: executeMock,
+      } as unknown as Tool;
+      const wrapped = wrapMCPTools({ myTool: tool });
+
+      await wrapped.myTool.execute!(
+        { title: "Fix", statusUpdateType: null, assigneeId: null, dueDate: null, priority: null },
+        {} as never
+      );
+
+      expect(executeMock.mock.calls[0][0]).toEqual({
+        title: "Fix",
+        // Server-declared nullable: null passes through ("clear this field").
+        assigneeId: null,
+        dueDate: null,
+        // Required: never dropped, even when null.
+        priority: null,
+      });
+    });
+
+    test("keeps null when the tool has no readable schema or the key is undeclared", async () => {
+      const executeMock = makeExecuteMock();
+      const wrapped = wrapMCPTools({
+        noSchema: { execute: executeMock } as unknown as Tool,
+        withSchema: makeTool(executeMock),
+      });
+
+      await wrapped.noSchema.execute!({ search: null }, {} as never);
+      await wrapped.withSchema.execute!({ undeclared: null }, {} as never);
+
+      expect(executeMock.mock.calls[0][0]).toEqual({ search: null });
+      expect(executeMock.mock.calls[1][0]).toEqual({ undeclared: null });
+    });
+
+    test("strips nested optional nulls and empty strings alongside the schema", async () => {
+      const executeMock = makeExecuteMock();
+      const tool = {
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: {
+            project: {
+              type: "object",
+              properties: { id: { type: "string" }, slug: { type: "string" } },
+              required: ["id"],
+            },
+            labels: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { name: { type: "string" }, color: { type: "string" } },
+                required: ["name"],
+              },
+            },
+            meta: { type: "object" },
+          },
+          required: ["project"],
+          additionalProperties: false,
+        }),
+        execute: executeMock,
+      } as unknown as Tool;
+      const wrapped = wrapMCPTools({ myTool: tool });
+
+      await wrapped.myTool.execute!(
+        {
+          project: { id: "", slug: null },
+          labels: [
+            { name: "bug", color: null },
+            { name: "", color: "" },
+          ],
+          // Declared without properties: values below it are not touched.
+          meta: { note: null, tag: "" },
+        },
+        {} as never
+      );
+
+      expect(executeMock.mock.calls[0][0]).toEqual({
+        project: { id: "" },
+        labels: [{ name: "bug" }, { name: "" }],
+        meta: { note: null, tag: "" },
+      });
     });
 
     test("strips empty strings when the tool has no readable schema", async () => {

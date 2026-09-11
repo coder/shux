@@ -32,6 +32,7 @@ describe("schemaSanitizer", () => {
           properties: {
             content: { type: "string", minLength: 1 },
           },
+          required: ["content"],
         },
       } as unknown as Tool;
 
@@ -51,6 +52,7 @@ describe("schemaSanitizer", () => {
             name: { type: "string", minLength: 1, maxLength: 100, pattern: "^[a-z]+$" },
             age: { type: "number", minimum: 0, maximum: 150, default: 25 },
           },
+          required: ["name", "age"],
         },
       } as unknown as Tool;
 
@@ -72,8 +74,10 @@ describe("schemaSanitizer", () => {
               properties: {
                 email: { type: "string", format: "email", minLength: 5 },
               },
+              required: ["email"],
             },
           },
+          required: ["user"],
         },
       } as unknown as Tool;
 
@@ -149,6 +153,89 @@ describe("schemaSanitizer", () => {
       expect(params.required).toEqual(["content"]);
     });
 
+    it("widens optional properties to nullable so strict mode can omit them", () => {
+      // Linear-style: statusUpdateType is an optional enum. Without a null
+      // option, OpenAI strict mode forces the model to invent a member.
+      const tool = {
+        description: "Test tool",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            statusUpdateType: { type: "string", enum: ["onTrack", "atRisk", "offTrack"] },
+            priority: { type: "integer", description: "1-4" },
+            assignee: { type: ["string", "null"] },
+            labels: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { name: { type: "string" }, color: { type: "string" } },
+                required: ["name"],
+              },
+            },
+            project: {
+              type: "object",
+              properties: { id: { type: "string" }, slug: { type: "string" } },
+              required: ["id"],
+            },
+            filter: {
+              anyOf: [{ type: "string" }, { type: "number" }],
+            },
+            either: {
+              anyOf: [
+                { type: "object", properties: { a: { type: "string" } } },
+                { type: "string" },
+              ],
+            },
+          },
+          required: ["title"],
+        },
+      } as unknown as Tool;
+
+      const params = getParams(sanitizeToolSchemaForOpenAI(tool));
+
+      expect(params.required).toEqual(["title"]);
+      expect(params.properties.title).toEqual({ type: "string" });
+      expect(params.properties.statusUpdateType).toEqual({
+        type: ["string", "null"],
+        enum: ["onTrack", "atRisk", "offTrack", null],
+      });
+      expect(params.properties.priority).toEqual({ type: ["integer", "null"], description: "1-4" });
+      // Already nullable: unchanged, no duplicate "null".
+      expect(params.properties.assignee).toEqual({ type: ["string", "null"] });
+      // Nested object properties and array item properties get the same treatment.
+      expect(params.properties.labels.items.properties).toEqual({
+        name: { type: "string" },
+        color: { type: ["string", "null"] },
+      });
+      expect(params.properties.project.properties).toEqual({
+        id: { type: "string" },
+        slug: { type: ["string", "null"] },
+      });
+      expect(params.properties.filter).toEqual({
+        anyOf: [{ type: "string" }, { type: "number" }, { type: "null" }],
+      });
+      // Properties inside composition branches are left alone: the argument
+      // strip could not tell which branch the model chose.
+      expect(params.properties.either.anyOf[0].properties.a).toEqual({ type: "string" });
+    });
+
+    it("treats properties required via allOf as required when widening", () => {
+      const tool = {
+        description: "Test tool",
+        parameters: {
+          type: "object",
+          properties: { a: { type: "string" }, b: { type: "string" } },
+          allOf: [{ required: ["a"] }],
+        },
+      } as unknown as Tool;
+
+      const params = getParams(sanitizeToolSchemaForOpenAI(tool));
+
+      expect(params.properties.a).toEqual({ type: "string" });
+      expect(params.properties.b).toEqual({ type: ["string", "null"] });
+    });
+
     it("should return tool as-is if no parameters", () => {
       const tool = {
         description: "Test tool",
@@ -185,7 +272,7 @@ describe("schemaSanitizer", () => {
           content: { type: "string", minLength: 1, maxLength: 100 },
           count: { type: "number", minimum: 0, maximum: 10 },
         },
-        required: ["content"],
+        required: ["content", "count"],
       };
 
       const mcpTool = {
@@ -208,7 +295,7 @@ describe("schemaSanitizer", () => {
       expect(schema.properties.count).toEqual({ type: "number" });
       // Supported properties should be preserved
       expect(schema.type).toBe("object");
-      expect(schema.required).toEqual(["content"]);
+      expect(schema.required).toEqual(["content", "count"]);
     });
 
     it("should not mutate the original MCP tool inputSchema", () => {
@@ -303,6 +390,7 @@ describe("schemaSanitizer", () => {
             properties: {
               content: { type: "string", minLength: 1 },
             },
+            required: ["content"],
           },
         },
         tool2: {
@@ -312,6 +400,7 @@ describe("schemaSanitizer", () => {
             properties: {
               count: { type: "number", minimum: 0 },
             },
+            required: ["count"],
           },
         },
       } as unknown as Record<string, Tool>;

@@ -176,11 +176,13 @@ describe("buildToolsetManifest", () => {
     const unsanitized: JSONSchema7 = {
       type: "object",
       properties: { count: { type: "number", minimum: 1 } },
+      required: ["count"],
       additionalProperties: false,
     };
     const stripped: JSONSchema7 = {
       type: "object",
       properties: { count: { type: "number" } },
+      required: ["count"],
       additionalProperties: false,
     };
 
