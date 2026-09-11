@@ -4298,8 +4298,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       {
         kind: "workspace-inits",
         // Controllers exist from the start of provisioning; settlements from init start onward.
-        count: new Set([...this.initAbortControllers.keys(), ...this.initSettlementPromises.keys()])
-          .size,
+        // logComplete queues the final status write without awaiting it, so the in-memory
+        // running state outlives both until that write lands.
+        count: new Set([
+          ...this.initAbortControllers.keys(),
+          ...this.initSettlementPromises.keys(),
+          ...this.initStateManager.runningInitWorkspaceIds(),
+        ]).size,
       },
       {
         kind: "workspace-lifecycle",

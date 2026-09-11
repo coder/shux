@@ -192,6 +192,38 @@ describe("InitStateManager", () => {
       expect((events[3] as { exitCode: number }).exitCode).toBe(1);
     });
 
+    it("counts an init as running until its final status write has landed", async () => {
+      const workspaceId = "test-workspace";
+      expect(manager.runningInitWorkspaceIds()).toEqual([]);
+      manager.startInit(workspaceId, "/path/to/hook");
+      expect(manager.runningInitWorkspaceIds()).toEqual([workspaceId]);
+
+      // Hold the workspace file lock so endInit's write stays queued behind it.
+      let releaseLock: (() => void) | undefined;
+      let lockAcquired: () => void;
+      const lockAcquiredPromise = new Promise<void>((resolve) => {
+        lockAcquired = resolve;
+      });
+      const lockHeld = workspaceFileLocks.withLock(workspaceId, async () => {
+        lockAcquired();
+        await new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+      });
+      await lockAcquiredPromise;
+
+      const endInitPromise = manager.endInit(workspaceId, 0);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await manager.readInitStatus(workspaceId))?.status).toBe("running");
+      expect(manager.runningInitWorkspaceIds()).toEqual([workspaceId]);
+
+      releaseLock!();
+      await lockHeld;
+      await endInitPromise;
+      expect((await manager.readInitStatus(workspaceId))?.status).toBe("success");
+      expect(manager.runningInitWorkspaceIds()).toEqual([]);
+    });
+
     it("finalizes an init left running by an earlier process as a failed creation on replay", async () => {
       const workspaceId = "test-workspace";
       const events: Array<WorkspaceInitEvent & { workspaceId: string }> = [];

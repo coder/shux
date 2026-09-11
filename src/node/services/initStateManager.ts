@@ -44,7 +44,7 @@ type InitHookState = InitStatus;
 
 /** Appended when replay finds a creation record that no live init owns (the app exited mid-way). */
 const INTERRUPTED_INIT_LINE =
-  "Workspace creation was interrupted: Xum exited before it finished. Delete and recreate this workspace.";
+  "Workspace creation was interrupted: Xum exited before it finished. Check the checkout before using it, or recreate the workspace.";
 
 /**
  * InitStateManager - Manages init hook lifecycle with persistence and replay.
@@ -369,6 +369,17 @@ export class InitStateManager extends EventEmitter {
    */
   getInitState(workspaceId: string): InitHookState | undefined {
     return this.store.getState(workspaceId);
+  }
+
+  /**
+   * Workspaces whose init is still running in memory. endInit turns the in-memory status final
+   * only after the status write lands, so these are exactly the inits a restart would replay
+   * as interrupted.
+   */
+  runningInitWorkspaceIds(): string[] {
+    return this.store
+      .getActiveWorkspaceIds()
+      .filter((workspaceId) => this.store.getState(workspaceId)?.status === "running");
   }
 
   /**

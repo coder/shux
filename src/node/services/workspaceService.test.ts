@@ -16571,6 +16571,7 @@ describe("WorkspaceService archive init cancellation", () => {
       on: mock(() => undefined as unknown as InitStateManager),
       getInitState: mock((id: string) => initStates.get(id)),
       clearInMemoryState: clearInMemoryStateMock,
+      deleteInitStatus: mock(() => Promise.resolve()),
     };
 
     let configState: ProjectsConfig = {
@@ -18445,6 +18446,7 @@ describe("WorkspaceService init cancellation", () => {
         })
       ),
       clearInMemoryState: clearInMemoryStateMock,
+      deleteInitStatus: mock(() => Promise.resolve()),
     };
     const workspaceService = createWorkspaceServiceForTest({
       config: mockConfig,

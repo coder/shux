@@ -495,6 +495,8 @@ describe("ServiceContainer", () => {
       workspace.initSettlementPromises.set("initializing", new Promise<void>(() => undefined));
       workspace.initAbortControllers.set("initializing", new AbortController());
       workspace.initAbortControllers.set("provisioning", new AbortController());
+      // Controller and settlement already released; the final status write has not landed.
+      services.initStateManager.startInit("finishing", "/tmp/finishing/.xum/init");
       workspace.removingWorkspaces.add("removing");
       workspace.archivingWorkspaces.add("archiving");
       workspace.archivingWorkspaces.add("removing");
@@ -512,7 +514,7 @@ describe("ServiceContainer", () => {
       workspace.preflightExecCounts.set("executing", 1);
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
-        { kind: "workspace-inits", count: 2 },
+        { kind: "workspace-inits", count: 3 },
         { kind: "workspace-lifecycle", count: 3 },
         { kind: "background-processes", count: 3 },
         { kind: "active-streams", count: 1 },
@@ -529,6 +531,7 @@ describe("ServiceContainer", () => {
       workspace.preflightExecCounts.clear();
       workspace.initSettlementPromises.clear();
       workspace.initAbortControllers.clear();
+      services.initStateManager.clearInMemoryState("finishing");
       workspace.removingWorkspaces.clear();
       workspace.archivingWorkspaces.clear();
       workspace.renamingWorkspaces.clear();
