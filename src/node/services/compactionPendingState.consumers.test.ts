@@ -237,6 +237,30 @@ describe("inactive pending consumer contracts", () => {
     }
   );
 
+  it("uses the same authenticated fallback receipt for admission and restored ownership", async () => {
+    const a = await publish("A");
+    assert(a.result.success && a.result.data);
+    const receipt = a.result.data;
+    const { summary } = await publish("B", true);
+    const admitted = new Set<CompactionPendingReceipt>();
+    let restored: CompactionPendingReceipt | undefined;
+    expect(
+      await rollback(summary, store, {
+        canRestorePrevious: (previous) => {
+          expect(store.isSameReceipt(receipt, previous)).toBe(true);
+          admitted.add(previous);
+          return true;
+        },
+        onRestored: (previous) => {
+          restored = previous;
+        },
+      })
+    ).toMatchObject({ success: true, data: { outcome: "applied" } });
+    expect(admitted.size).toBe(1);
+    expect(restored && admitted.has(restored)).toBe(true);
+    expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/A.ts"]);
+  });
+
   it.each(["failed successor", "committed successor", "reset", "late error"] as const)(
     "records exact cleanup before a delayed return and preserves %s",
     async (scenario) => {
@@ -412,12 +436,22 @@ describe("inactive pending consumer contracts", () => {
     }
   });
 
-  it.each(["consume", "load", "discard", "restore", "pending", "carryover"] as const)(
+  it.each([
+    "consume",
+    "load",
+    "discard",
+    "restore",
+    "restore-read-failure",
+    "observe",
+    "pending",
+    "carryover",
+  ] as const)(
     "lost physical authority during %s cannot affect successor bytes",
     async (operation) => {
       const a = await publish("A");
       assert(a.result.success && a.result.data);
-      const heartbeat = operation === "restore" ? await publish("B", true) : undefined;
+      const heartbeat = operation.startsWith("restore") ? await publish("B", true) : undefined;
+      const reconciled = mock(() => undefined);
       if (operation === "discard")
         await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
       const entered = Promise.withResolvers<void>();
@@ -426,22 +460,25 @@ describe("inactive pending consumer contracts", () => {
       let reads = 0;
       spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
         const contents = await read(...args);
-        if (args[0] === pendingPath && ++reads === (operation === "restore" ? 2 : 1)) {
+        if (args[0] === pendingPath && ++reads === 1) {
           entered.resolve();
           await release.promise;
+          if (operation === "restore-read-failure") throw new Error("Read failed after lease loss");
         }
         return contents;
       }) as typeof fs.readFile);
       const task = (
         heartbeat
-          ? rollback(heartbeat.summary)
+          ? rollback(heartbeat.summary, store, { onReconciled: reconciled })
           : operation === "consume"
             ? store.consume(a.result.data)
             : operation === "load"
               ? store.load(() => true)
-              : operation === "pending" || operation === "carryover"
-                ? store.isCurrent(a.result.data, operation, () => true)
-                : store.discardAfterBoundary()
+              : operation === "observe"
+                ? store.observe([], () => true)
+                : operation === "pending" || operation === "carryover"
+                  ? store.isCurrent(a.result.data, operation, () => true)
+                  : store.discardAfterBoundary()
       ).catch((error: unknown) => error);
       try {
         await entered.promise;
@@ -458,17 +495,102 @@ describe("inactive pending consumer contracts", () => {
         await fs.writeFile(pendingPath, future);
         release.resolve();
         const result = await task;
-        if (operation === "restore")
+        if (operation.startsWith("restore"))
           expect(result).toEqual({
             success: true,
             data: { outcome: "applied", restored: undefined },
           });
         else expect(result).toBeInstanceOf(Error);
+        expect(reconciled).not.toHaveBeenCalled();
         expect(await bytes()).toBe(future);
         await successor.assertStillOwned();
       } finally {
         release.resolve();
         await task;
+      }
+    }
+  );
+  it("finishes locked reconciliation after admission changes at the history commit", async () => {
+    await publish("A");
+    const b = await publish("B", true);
+    let current = true;
+    const reconciled = mock(() => undefined);
+    const result = await rollback(b.summary, store, {
+      isCurrent: () => current,
+      onCommitted: () => {
+        current = false;
+      },
+      isRetired: () => true,
+      onReconciled: reconciled,
+    });
+    expect(result).toMatchObject({ success: true, data: { outcome: "applied" } });
+    expect(reconciled).toHaveBeenCalledTimes(1);
+    expect(await restart().load(() => true)).toBeUndefined();
+  });
+  it.each([false, true])(
+    "preserves a successor when the lease is reclaimed while staging retirement (checkpoint=%s)",
+    async (checkpoint) => {
+      await publish("A");
+      const b = await publish("B", true);
+      const unlink = fs.unlink;
+      spyOn(fs, "unlink").mockImplementation(async (file) => {
+        if (file === pendingPath) throw new Error("Unlink unavailable");
+        return unlink(file);
+      });
+      assert(b.result.success && b.result.data);
+      const receipt = b.result.data;
+      if (checkpoint)
+        expect(await store.consume(receipt).catch((error: unknown) => error)).toBeInstanceOf(Error);
+      const atomic = atomicWrite.default;
+      const future = '{"version":9,"owner":"successor"}\n';
+      let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
+      spyOn(atomicWrite, "default").mockImplementation(
+        new Proxy(atomic, {
+          async apply(target, receiver, args: Parameters<typeof atomic>) {
+            const result = await Reflect.apply(target, receiver, args);
+            if (String(args[0]).startsWith(`${pendingPath}.continuous-`)) {
+              const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+              const token = await fs.readFile(lockPath, "utf8");
+              await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
+              await fs.utimes(lockPath, new Date(0), new Date(0));
+              successor = await acquireProcessFileLock({
+                lockPath,
+                timeoutMs: 1000,
+                label: "retirement successor",
+              });
+              await fs.writeFile(pendingPath, future);
+            }
+            return result;
+          },
+        })
+      );
+      try {
+        const result = await rollback(b.summary, store, {
+          canRestorePrevious: () => false,
+          isRetiredBeforeRollback: checkpoint
+            ? (candidate) => store.isSameReceipt(candidate, receipt)
+            : undefined,
+        });
+        expect(result).toMatchObject(
+          checkpoint ? { success: false } : { success: true, data: { outcome: "applied" } }
+        );
+        if (checkpoint) {
+          const chat = await fs.readFile(
+            path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
+            "utf8"
+          );
+          expect(
+            chat
+              .trim()
+              .split("\n")
+              .map((line) => (JSON.parse(line) as MuxMessage).id)
+          ).toContain("B");
+        }
+        assert(successor);
+        expect(await bytes()).toBe(future);
+        await successor.assertStillOwned();
+      } finally {
+        await successor?.[Symbol.asyncDispose]();
       }
     }
   );

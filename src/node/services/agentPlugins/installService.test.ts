@@ -1696,6 +1696,8 @@ describe("AgentPluginInstallService", () => {
           { dir, maxBytes: 1024, maxFiles: 10_000, pollMs: 10 },
           async (signal) => {
             await fsPromises.writeFile(path.join(dir, "pack"), "x".repeat(8192));
+            // The watchdog can abort while filesystem work is still pending.
+            signal.throwIfAborted();
             await new Promise((_resolve, reject) => {
               signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
             });
@@ -1707,31 +1709,42 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("withDiskQuotaWatchdog aborts on entry count independently of bytes", async () => {
-    // Empty files and directories consume inodes and allocation metadata
-    // without moving the byte total, so the in-flight watchdog must enforce
-    // maxFiles DURING checkout too — the post-clone count only runs after
-    // git returns. Directories must charge the count like files.
-    const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-files-"));
-    try {
-      await expect(
-        withDiskQuotaWatchdog(
-          { dir, maxBytes: 1024 * 1024, maxFiles: 8, pollMs: 10 },
-          async (signal) => {
-            for (let i = 0; i < 10; i += 1) {
-              await fsPromises.writeFile(path.join(dir, `empty-${i}`), "");
-              await fsPromises.mkdir(path.join(dir, `dir-${i}`));
+  test.each([false, true])(
+    "withDiskQuotaWatchdog aborts on entry count independently of bytes (during writes=%s)",
+    async (abortDuringWrites) => {
+      // Empty files and directories consume inodes and allocation metadata
+      // without moving the byte total, so the in-flight watchdog must enforce
+      // maxFiles DURING checkout too — the post-clone count only runs after
+      // git returns. Directories must charge the count like files.
+      const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "quota-watchdog-files-"));
+      try {
+        await expect(
+          withDiskQuotaWatchdog(
+            { dir, maxBytes: 1024 * 1024, maxFiles: 8, pollMs: 10 },
+            async (signal) => {
+              for (let i = 0; i < 10; i += 1) {
+                await fsPromises.writeFile(path.join(dir, `empty-${i}`), "");
+                await fsPromises.mkdir(path.join(dir, `dir-${i}`));
+                if (abortDuringWrites && i === 5 && !signal.aborted) {
+                  // Hold an in-flight checkout past the quota notification without relying on load.
+                  await new Promise<void>((resolve) => {
+                    signal.addEventListener("abort", () => resolve(), { once: true });
+                  });
+                }
+              }
+              // The watchdog can abort while filesystem work is still pending.
+              signal.throwIfAborted();
+              await new Promise((_resolve, reject) => {
+                signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
+              });
             }
-            await new Promise((_resolve, reject) => {
-              signal.addEventListener("abort", () => reject(new Error("killed")), { once: true });
-            });
-          }
-        )
-      ).rejects.toThrow(/too large to install/);
-    } finally {
-      await fsPromises.rm(dir, { recursive: true, force: true });
+          )
+        ).rejects.toThrow(/too large to install/);
+      } finally {
+        await fsPromises.rm(dir, { recursive: true, force: true });
+      }
     }
-  });
+  );
 
   test("stale staging reclamation ages trash by embedded stamp and spares owned dirs", async () => {
     const staging = stagingDir();

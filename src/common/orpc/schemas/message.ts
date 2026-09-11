@@ -196,6 +196,7 @@ export const MuxMessageSchema = z.object({
       compactionEpoch: CompactionEpochSchema,
       // Durable boundary marker for compaction summaries.
       compactionBoundary: z.boolean().optional(),
+      compactionPublicationId: z.string().min(1).optional().catch(undefined),
       contextBoundaryKind: z.literal(CONTEXT_BOUNDARY_KINDS.RESET).optional(),
       toolPolicy: z.any().optional(),
       disableWorkspaceAgents: z.boolean().optional(),
