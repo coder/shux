@@ -23,6 +23,7 @@ import {
   type PreparedStreamMessage,
   type PreparedTurnRequest,
   type TurnRequestBuildContext,
+  WORKSPACE_MEMORY_POLICY_PERSIST_ERROR,
 } from "./turnRequestBuilder";
 export { replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -245,6 +246,23 @@ export class AIService extends EventEmitter {
    */
   isExperimentEnabled(experimentId: ExperimentId): boolean {
     return this.experimentsService?.isExperimentEnabled(experimentId) === true;
+  }
+
+  /**
+   * Re-check who owns this workspace's `/memories/workspace` store and return
+   * that store's revision token. Ownership is memoized and stamp-validated in
+   * MemoryService (one stat), the token is one small read; when another
+   * backend removed the owner since the last turn, the resulting
+   * `ownersInvalidated` event clears the affected sessions' cached context
+   * synchronously, and when another backend WROTE the shared store (no
+   * in-process change event) the token differs from the one recorded with the
+   * cached context. AgentSession calls this BEFORE consulting its cache so the
+   * current request, not the next one, rebuilds from the right, current store.
+   */
+  async probeMemoryStore(workspaceId: string): Promise<string | undefined> {
+    return await this.turnRequestBuilderBindings.memoryService?.workspaceMemoryRevision(
+      workspaceId
+    );
   }
 
   /**
@@ -1009,6 +1027,20 @@ export class AIService extends EventEmitter {
           startupState.pendingRunMetadataId = null;
         }
         buildOutcome.logStartOutcome("stream_start_failed", streamResult.error.type);
+        // No stream ran for this turn: discard its placeholder like an
+        // aborted startup's (TurnRequestBuilder denies the epoch when the row
+        // cannot be removed), so the never-started turn stays excluded from
+        // the harvest until a retry actually runs it. When neither could be
+        // made durable, that failure — not the startup error — is the result:
+        // the stamped row is still there, vouching for a batch no model saw.
+        if (!(await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId))) {
+          return Err({
+            type: "unknown",
+            raw: `${WORKSPACE_MEMORY_POLICY_PERSIST_ERROR} (stream startup failed first: ${
+              streamResult.error.type
+            })`,
+          });
+        }
         return Err(streamResult.error);
       }
 
@@ -1017,7 +1049,13 @@ export class AIService extends EventEmitter {
           this.clearTrackedPendingDevToolsRunMetadata(buildOutcome.assistantMessageId);
           startupState.pendingRunMetadataId = null;
         }
-        await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId);
+        if (!(await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId))) {
+          return Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR });
+        }
+      } else {
+        // The stream is live: durable effects gated on "actually started"
+        // (memory harvest grant) may land now.
+        await buildOutcome.onStreamStarted?.();
       }
 
       buildOutcome.logStartOutcome("started");

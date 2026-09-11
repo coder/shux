@@ -9,7 +9,10 @@ import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import {
+  compactionClosingPolicyEpoch,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
@@ -111,6 +114,17 @@ import {
 } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import {
+  setWorkspaceMemoryWritableForEpoch,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
+import {
+  carryWorkspaceMemoryDenyMarker,
+  clearWorkspaceMemoryDenyMarker,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -697,6 +711,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
+  probeMemoryStore?(workspaceId: string): Promise<string | undefined>;
   buildMemorySessionContext?(
     workspaceId: string,
     modelString: string,
@@ -749,7 +764,7 @@ interface AgentSessionOptions {
     runtimeConfig: RuntimeConfig | undefined;
   }) => Promise<string | undefined>;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
-  onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void | Promise<void>;
   /** Called with the terminal outcome of an idle compaction (persisted success / post-stream failure) */
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
@@ -771,6 +786,8 @@ interface CachedMemoryContext {
   tokenBudgetActive: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
+  /** Owner store revision (AIService.probeMemoryStore) the context was built from. */
+  storeRevision: string | undefined;
 }
 
 interface SendMessageInternalOptions {
@@ -1064,6 +1081,205 @@ export class AgentSession {
    * prompt-cache-stable bytes without preserving stale files forever.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+
+  /**
+   * Drop the cached memory context so the next stream rebuilds the index and
+   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
+   * entry point is for writes by OTHER sessions to a store this session also
+   * reads (a sub-agent editing the task tree's shared workspace notes).
+   */
+  invalidateMemoryContext(): void {
+    this.memoryContextByModelString.clear();
+    // A build already awaiting buildMemorySessionContext read the pre-write
+    // files; bumping the generation stops it from repopulating the cache.
+    this.memoryContextGeneration++;
+  }
+
+  private memoryContextGeneration = 0;
+
+  /**
+   * Workspace-memory write policy accumulated over the current compaction
+   * epoch, mirrored from the DURABLE accumulator in config.json
+   * (WorkspaceService.recordWorkspaceMemoryWritable performs the fail-closed
+   * AND against the persisted value, so backends sharing one chat.jsonl —
+   * XUM_ALLOW_MULTIPLE_INSTANCES — and a restarted process all contribute to
+   * one conjunction). Attached to compaction completions so the memory
+   * harvest — which writes to the (possibly shared) workspace store on this
+   * agent's behalf — honors a read-only turn anywhere in the epoch: the
+   * harvest reads EVERY message of the epoch. Both copies restart at a
+   * context boundary (compaction without a preserved tail, /clear, context
+   * reset, destructive history replace) via resetWorkspaceMemoryWritable.
+   */
+  private workspaceMemoryWritable: { epoch: number; writable: boolean } | undefined;
+
+  /**
+   * Record the mirror for `epoch` (the policy epoch the turn was recorded
+   * under). Keyed like the durable records: with several backends over one
+   * chat.jsonl, another backend's no-tail compaction or destructive clear
+   * opens a new epoch without any callback here, so an unkeyed mirror would
+   * carry the previous epoch's value into the new one — a stale deny would
+   * pin its first writable turn, a stale grant would keep the unknown-history
+   * rule from failing closed.
+   */
+  recordWorkspaceMemoryWritable(effective: boolean, epoch: number): void {
+    assert(Number.isInteger(epoch), "workspace memory policy mirror epoch must be an integer");
+    this.workspaceMemoryWritable = { epoch, writable: effective };
+  }
+
+  /**
+   * The mirror for `epoch`, for WorkspaceService's conjunction and the
+   * completion observation: undefined until a turn of THAT epoch recorded
+   * (a value recorded for another epoch says nothing about this one).
+   */
+  workspaceMemoryWritableMirror(epoch: number): boolean | undefined {
+    return this.workspaceMemoryWritable?.epoch === epoch
+      ? this.workspaceMemoryWritable.writable
+      : undefined;
+  }
+
+  /** In-flight durable epoch reset started by a no-tail compaction (see the completion callback). */
+  private workspaceMemoryEpochReset: Promise<void> | undefined;
+
+  /**
+   * Resolves once the durable epoch reset of the last no-tail compaction (if
+   * any is still running) has settled, so a policy record for the new epoch
+   * never reads the closing epoch's accumulator or deny marker.
+   */
+  async settleWorkspaceMemoryPolicyEpoch(): Promise<void> {
+    await this.workspaceMemoryEpochReset;
+  }
+
+  /**
+   * Destructive boundary (/clear, context reset, history replace): the
+   * in-memory mirror and every durable epoch record forget the discarded
+   * transcript. The new segment's epoch identities never recur (a full clear
+   * continues history sequences above the cleared segment, so neither a
+   * boundary's sequence nor the boundary-less `-(segmentStart + 1)` is
+   * reused; workspaceMemoryPolicyEpochOf), so the discarded records are
+   * inert to the new segment's readers — dropping them is hygiene, kept
+   * durable-or-throw like the other boundary invalidations so a reported
+   * success never leaves stale state behind. Nothing to do when the field is
+   * already absent.
+   *
+   * A COMPACTION boundary clears nothing durable (r77): its closing epoch's
+   * record and deny marker stay until the next destructive boundary. Two
+   * backends can each commit a boundary closing the same epoch, and each
+   * completion observes that epoch's verdict — the first observer consuming
+   * the record would leave the second reading only its own stale mirror and
+   * harvesting a read-only turn. Readers key by epoch and epoch keys never
+   * recur before a destructive boundary, so retained records are inert; the
+   * cost is one boolean per compaction epoch in config.json until then.
+   */
+  private async resetWorkspaceMemoryWritable(): Promise<void> {
+    // The mirror is forgotten only once the durable clear below completed —
+    // a reset that reports success while the persisted `-1` deny survives
+    // would pin the whole new segment to the stored-false fast path.
+    await clearWorkspaceMemoryDenyMarker(
+      this.config.rootDir,
+      path.join(this.config.sessionsDir, this.workspaceId)
+    );
+    // Strict load: an unreadable — or transiently ABSENT — config.json would
+    // read as the empty default, in which this workspace has no records to
+    // clear; the reset would report success and leave the stale records
+    // behind. Throwing makes the boundary a retryable partial failure
+    // instead; a registered workspace always has a config.
+    const entry = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
+    if (entry?.workspace.workspaceMemoryWritableByEpoch === undefined) {
+      this.workspaceMemoryWritable = undefined;
+      return;
+    }
+    await this.config.editConfig((cfg) => {
+      const current = findWorkspaceEntry(cfg, this.workspaceId);
+      if (current === null) return cfg;
+      delete current.workspace.workspaceMemoryWritableByEpoch;
+      return cfg;
+    });
+    // Verified read-back: Config.saveConfig swallows write failures, so the
+    // awaited edit alone does not prove the clear landed.
+    const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
+    if (after?.workspace.workspaceMemoryWritableByEpoch !== undefined) {
+      throw new Error(
+        `Workspace memory policy reset did not persist for ${this.workspaceId} (config write swallowed?)`
+      );
+    }
+    this.workspaceMemoryWritable = undefined;
+  }
+
+  /**
+   * Preserved-tail compaction: the tail copies were produced under the
+   * closing epoch's policy, so its accumulator carries into the new epoch —
+   * durably, by re-binding the config value and the deny marker recorded for
+   * `closingEpoch` to `nextEpoch` (another backend's first turn of the new
+   * epoch reads by epoch and would otherwise see nothing). The closing
+   * epoch's value is copied, never consumed (see resetWorkspaceMemoryWritable):
+   * another backend's boundary closing the same epoch observes it too.
+   */
+  private async carryWorkspaceMemoryWritable(
+    closingEpoch: number,
+    nextEpoch: number
+  ): Promise<void> {
+    const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
+    await carryWorkspaceMemoryDenyMarker(this.config.rootDir, sessionDir, closingEpoch, nextEpoch);
+    // Fail closed: the carry must be PROVEN, not assumed. A tolerant load
+    // would read a transiently unreadable config.json as "no closing record"
+    // and skip the carry; Config.saveConfig swallows write failures, so the
+    // awaited edit does not prove the new-epoch record landed either. Tail
+    // copies are excluded from the prior-turn check by design, so a fresh or
+    // foreign backend's first turn of the new epoch would then grant, and
+    // output conditioned on the read-only tail would become harvestable.
+    // When a DENY cannot be shown to have reached the new epoch, the
+    // session-dir marker (the same fallback recordWorkspaceMemoryWritable
+    // takes for an unwritable config) denies the new epoch instead.
+    let carried: boolean | undefined;
+    let failure: string | undefined;
+    try {
+      const entry = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
+      const closingBefore =
+        entry === null ? undefined : workspaceMemoryWritableForEpoch(entry.workspace, closingEpoch);
+      if (closingBefore === undefined) return;
+      await this.config.editConfig((cfg) => {
+        const current = findWorkspaceEntry(cfg, this.workspaceId);
+        if (current === null) return cfg;
+        const closing = workspaceMemoryWritableForEpoch(current.workspace, closingEpoch);
+        if (closing === undefined) return cfg;
+        // ANDed into a record another backend's first turn of the new epoch
+        // may already have made (its own conjunction could not see the closing
+        // value under the new key), never overwriting it.
+        const next = workspaceMemoryWritableForEpoch(current.workspace, nextEpoch);
+        carried = next === undefined ? closing : next && closing;
+        setWorkspaceMemoryWritableForEpoch(current.workspace, nextEpoch, carried);
+        return cfg;
+      });
+      // Gone meanwhile (a destructive boundary): nothing to carry.
+      if (carried === undefined) return;
+      const after = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), this.workspaceId);
+      if (
+        after === null ||
+        workspaceMemoryWritableForEpoch(after.workspace, nextEpoch) !== carried
+      ) {
+        failure = "config write swallowed";
+      }
+    } catch (error: unknown) {
+      failure = getErrorMessage(error);
+    }
+    // A grant that failed to persist leaves the new epoch without a record,
+    // which every reader treats as "grants normally" — nothing to fail
+    // closed on. A deny (or an unknown value) must be made durable somewhere.
+    if (failure === undefined || carried === true) return;
+    log.warn("Workspace memory policy carry not durable in config; recording a deny marker", {
+      workspaceId: this.workspaceId,
+      closingEpoch,
+      nextEpoch,
+      failure,
+    });
+    // Same gate as WorkspaceService.denyDurableFallback: the marker's mkdir
+    // must not recreate a session dir a concurrent remover already deleted.
+    await withTargetMutationLock(this.config.rootDir, sessionDir, async () => {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, this.workspaceId)) return;
+      await writeWorkspaceMemoryDenyMarker(sessionDir, nextEpoch);
+    });
+  }
+
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
@@ -1228,7 +1444,52 @@ export class AgentSession {
         this.coordinator.recordCompactionSummary(
           (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
         );
-        onCompactionComplete?.(metadata);
+        const closingEpoch = compactionClosingPolicyEpoch(metadata);
+        const closing = this.workspaceMemoryWritableMirror(closingEpoch);
+        const observed = Promise.resolve(
+          onCompactionComplete?.({
+            ...metadata,
+            ...(closing !== undefined ? { workspaceMemoryWritable: closing } : {}),
+          })
+        );
+        // New epoch. A preserved tail copies messages produced under this
+        // epoch's policy into the next one, so the fail-closed accumulator
+        // carries over with them (copied to the new epoch key, durably);
+        // otherwise the next normal turn restarts it. The mirror forgets the
+        // closing epoch right here, synchronously; the durable carry runs
+        // AFTER the completion observation settled (it reads the closing
+        // epoch's marker/config) and is awaited by this session's next turn
+        // (settleWorkspaceMemoryPolicyEpoch). The closing epoch's durable
+        // records are left in place (resetWorkspaceMemoryWritable explains
+        // why); every durable value is bound to its epoch, so they are
+        // invisible to the new epoch's turns on any backend.
+        const preservedTail = (metadata.preservedTailMessageCount ?? 0) > 0;
+        // The mirror follows the durable carry: a preserved tail re-binds the
+        // closing epoch's value to the new epoch (the copies were produced
+        // under it); otherwise the new epoch starts without one.
+        this.workspaceMemoryWritable =
+          preservedTail && closing !== undefined
+            ? { epoch: metadata.summaryHistorySequence, writable: closing }
+            : undefined;
+        const reset = observed
+          .catch(() => undefined)
+          .then(() =>
+            preservedTail
+              ? this.carryWorkspaceMemoryWritable(closingEpoch, metadata.summaryHistorySequence)
+              : undefined
+          )
+          .catch((error: unknown) => {
+            log.warn("Failed to reset the workspace memory policy epoch", {
+              workspaceId: this.workspaceId,
+              error,
+            });
+          })
+          .finally(() => {
+            if (this.workspaceMemoryEpochReset === reset) {
+              this.workspaceMemoryEpochReset = undefined;
+            }
+          });
+        this.workspaceMemoryEpochReset = reset;
       },
       onIdleCompactionOutcome,
     });
@@ -4381,32 +4642,49 @@ export class AgentSession {
         );
       }
       if (await cancelBeforeAcceptance()) return Ok(undefined);
-    } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
-        ...internal.preTurnMessages,
-        userMessage,
-      ]);
-      if (!batchAppendResult.success) {
-        await rollbackPersistedTurnRows();
-        return Err(createUnknownSendMessageError(batchAppendResult.error));
-      }
-      persistedCancelableMessageIds.push(
-        ...internal.preTurnMessages.map((message) => message.id),
-        userMessage.id
-      );
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
     } else if (!autoCompactionMessage) {
       // When on-send compaction triggers, the user message is NOT persisted to
       // history (it's sent as follow-up after compaction). Otherwise, persist
-      // normally.
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
-      if (!appendResult.success) {
-        await rollbackPersistedTurnRows();
-        return Err(createUnknownSendMessageError(appendResult.error));
+      // normally. The snapshot rows appended above and the pre-turn payloads
+      // are this turn's request prelude; recorded on the user row exactly as
+      // the token-budget path does, so the post-compaction harvest gate can
+      // tell the turn's own batch from a row another backend interleaved
+      // (epochHasUncoveredUserRows matches prelude rows by id, never by
+      // adjacency) and the builder's unknown-history rule does not count the
+      // turn's own snapshots as turns nobody recorded.
+      const requestPreludeMessageIds = [
+        ...(snapshotResult?.snapshotMessage ? [snapshotResult.snapshotMessage] : []),
+        ...skillSnapshotMessages,
+        ...mcpPromptSnapshotMessages,
+        ...(internal?.preTurnMessages ?? []),
+      ].map((row) => row.id);
+      if (requestPreludeMessageIds.length > 0) {
+        userMessage.metadata = { ...userMessage.metadata, requestPreludeMessageIds };
       }
-      persistedCancelableMessageIds.push(userMessage.id);
+      if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+        const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
+          ...internal.preTurnMessages,
+          userMessage,
+        ]);
+        if (!batchAppendResult.success) {
+          await rollbackPersistedTurnRows();
+          return Err(createUnknownSendMessageError(batchAppendResult.error));
+        }
+        persistedCancelableMessageIds.push(
+          ...internal.preTurnMessages.map((message) => message.id),
+          userMessage.id
+        );
+      } else {
+        const appendResult = await this.historyService.appendToHistory(
+          this.workspaceId,
+          userMessage
+        );
+        if (!appendResult.success) {
+          await rollbackPersistedTurnRows();
+          return Err(createUnknownSendMessageError(appendResult.error));
+        }
+        persistedCancelableMessageIds.push(userMessage.id);
+      }
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -10306,6 +10584,10 @@ export class AgentSession {
     this.postCompactionLoadedSkills = [];
     this.postCompactionReadFilePaths = [];
     this.pendingPostCompactionStateToAcknowledge = null;
+    // A destructive context boundary (/clear, reset, history replace) starts
+    // a new harvest epoch: the fail-closed policy of the discarded transcript
+    // must not keep denying the new one.
+    await this.resetWorkspaceMemoryWritable();
     // Durable-or-throw: a swallowed unlink failure would leave the stale
     // post-compaction.json to re-inject pre-boundary carryover after a
     // restart while the boundary caller reports success — the same
@@ -10357,33 +10639,64 @@ export class AgentSession {
       this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
-    const cached = cache.get(modelString);
-    // Policy changes must not retain a previously injected extra (including index-only lookups).
-    if (
-      cached?.tokenBudgetActive === tokenBudgetActive &&
-      cached.memoryEnabled === memoryEnabled &&
-      cached.hotSetEnabled === hotSetEnabled &&
-      (cached.includesHotMemories || !includeHotMemories)
-    ) {
-      return cached.context ?? undefined;
-    }
+    const probe = async (): Promise<string | undefined> =>
+      memoryEnabled && typeof this.aiService.probeMemoryStore === "function"
+        ? await this.aiService.probeMemoryStore(this.workspaceId)
+        : undefined;
+    // Bounded: each retry means the store changed underneath the build; a
+    // store that will not hold still yields no memory context for this
+    // request rather than a snapshot of unknown provenance.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // Store probe first: a removed owner invalidates this cache synchronously
+      // (see AIService.probeMemoryStore), so the lookup below never serves an
+      // index built from a store this workspace no longer reads; and a store
+      // revision advanced by ANOTHER backend process (no in-process change
+      // event) fails the comparison below.
+      const storeRevision = await probe();
+      const cached = cache.get(modelString);
+      // Policy changes must not retain a previously injected extra (including index-only lookups).
+      if (
+        cached?.tokenBudgetActive === tokenBudgetActive &&
+        cached.memoryEnabled === memoryEnabled &&
+        cached.hotSetEnabled === hotSetEnabled &&
+        cached.storeRevision === storeRevision &&
+        (cached.includesHotMemories || !includeHotMemories)
+      ) {
+        return cached.context ?? undefined;
+      }
 
-    // Guard for test mocks that may not implement buildMemorySessionContext.
-    const context =
-      typeof this.aiService.buildMemorySessionContext === "function"
-        ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-            includeHotMemories,
-            tokenBudgetActive,
-          })
-        : null;
-    cache.set(modelString, {
-      context,
-      includesHotMemories: includeHotMemories,
-      tokenBudgetActive,
-      memoryEnabled,
-      hotSetEnabled,
+      const generation = this.memoryContextGeneration;
+      // Guard for test mocks that may not implement buildMemorySessionContext.
+      const context =
+        typeof this.aiService.buildMemorySessionContext === "function"
+          ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
+              includeHotMemories,
+              tokenBudgetActive,
+            })
+          : null;
+      // Invalidated mid-build — by an in-process change (generation) or by a
+      // store the build cannot observe changing under it: a removal in
+      // ANOTHER backend revokes access ("revoked") without any local event,
+      // and the readability check ran before the hot-file reads. Such a
+      // snapshot is never served: the next attempt re-probes and rebuilds
+      // (a revoked store then lists nothing).
+      if (generation !== this.memoryContextGeneration || (await probe()) !== storeRevision) {
+        continue;
+      }
+      cache.set(modelString, {
+        context,
+        includesHotMemories: includeHotMemories,
+        tokenBudgetActive,
+        memoryEnabled,
+        hotSetEnabled,
+        storeRevision,
+      });
+      return context ?? undefined;
+    }
+    log.debug("[AgentSession] memory context kept changing during its build; omitting it", {
+      workspaceId: this.workspaceId,
     });
-    return context ?? undefined;
+    return undefined;
   }
 
   /**

@@ -15,7 +15,7 @@ import {
 } from "@/node/services/memoryService";
 
 /** Safe default: without an explicit policy, every scope is read-only. */
-const READ_ONLY_ACCESS: MemoryScopeAccess = {
+export const READ_ONLY_ACCESS: MemoryScopeAccess = {
   global: "read",
   project: "read",
   workspace: "read",
@@ -257,6 +257,13 @@ export async function executeMemoryCommand(
      * I/O unblocks. Ignored by reads.
      */
     abortSignal?: AbortSignal;
+    /**
+     * Consolidation's pin protection (pinned files are editable but never
+     * deleted/renamed), enforced by MemoryService INSIDE its target mutation
+     * lock against the owner the command's store is bound to — see
+     * MemoryService.assertNotPinnedForRemoval. Ignored by other commands.
+     */
+    rejectPinned?: boolean;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -336,7 +343,8 @@ export async function executeMemoryCommand(
             "agent",
             toolCallId,
             options?.expectedTargetFingerprint,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectPinned: options?.rejectPinned }
           ))
         );
       }
@@ -355,7 +363,8 @@ export async function executeMemoryCommand(
             input.new_path,
             "agent",
             toolCallId,
-            options?.abortSignal
+            options?.abortSignal,
+            { rejectPinned: options?.rejectPinned }
           ))
         );
       }

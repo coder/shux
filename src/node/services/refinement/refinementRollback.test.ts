@@ -6,6 +6,12 @@ import * as path from "node:path";
 import { REFINEMENT_INVERSE_BLOB_QUOTA_BYTES } from "@/common/types/refinement";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  adoptionTargetStamp,
+  legacyAdoptionManifestPath,
+  readLegacyAdoptionManifest,
+  type LegacyAdoptionRecord,
+} from "@/node/services/memoryLegacyAdoption";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService, type MemoryScopeContext } from "@/node/services/memoryService";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
@@ -871,6 +877,459 @@ describe("refinementRollback", () => {
     const oldPath = path.join(fixture.muxHome, "memory", "global", "old.md");
     expect(await fsPromises.readFile(oldPath, "utf-8")).toBe("v1\n");
     expect(await pathExists(path.join(fixture.muxHome, "memory", "global", "new.md"))).toBe(false);
+  });
+
+  it("retargets pre-sharing workspace rows to the adopted owner copy, refusing unadopted ones", async () => {
+    using fixture = await createFixture();
+    // Rows journaled while the workspace owned its store address
+    // <sessionDir>/memory (the legacy private notebook after an upgrade).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/note.md", "v1\n", "agent");
+    const createRow = await lastRow(fixture.sessionDir);
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/workspace/note.md",
+      "v1",
+      "v2",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    await fixture.service.create(fixture.ctx, "/memories/workspace/orphan.md", "o1\n", "agent");
+    const orphanRow = await lastRow(fixture.sessionDir);
+    // The upgrade folded note.md into the task-tree owner's store (adoption
+    // manifest beside the legacy files); orphan.md could not be placed.
+    const ownerSessionDir = path.join(path.dirname(fixture.sessionDir), "ws-owner");
+    const ownerRoot = path.join(ownerSessionDir, "memory");
+    // Created records carry the generation of the copy the adoption wrote
+    // (LegacyAdoptionRecord.targetStamp); stamped from the file as it is now.
+    const writeManifest = async (records: Record<string, LegacyAdoptionRecord>) => {
+      for (const record of Object.values(records)) {
+        if (
+          record.created === true &&
+          record.deleted !== true &&
+          record.targetStamp === undefined
+        ) {
+          record.targetStamp =
+            (await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")))) ??
+            undefined;
+        }
+      }
+      await fsPromises.writeFile(
+        legacyAdoptionManifestPath(fixture.sessionDir),
+        JSON.stringify(records)
+      );
+    };
+    await fsPromises.mkdir(path.join(ownerRoot, "sub"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "sub", "note.md"), "v2\n");
+    await writeManifest({
+      "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+    });
+    // The retargeted row was journaled against this session's private clock:
+    // against an overlapping row of the OWNER's journal its order is unknown,
+    // so the rollback is refused unless forced.
+    await sharedDurableEventJournal(ownerSessionDir).append({
+      workspaceId: "ws-owner",
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/workspace/sub/note.md" },
+        inverse: {
+          op: "restore-files",
+          files: [{ path: path.join(ownerSessionDir, "memory", "sub", "note.md"), text: "v2\n" }],
+        },
+        sourceTs: 1,
+      },
+    });
+    const unordered = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      listSharedWorkspaceMemoryPeerSessionDirs: () => [ownerSessionDir],
+    });
+    expect(unordered.success).toBe(false);
+    expect(unordered.success ? "" : unordered.error).toContain(
+      "order relative to this row is unknown"
+    );
+    const result = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(result.success).toBe(true);
+    // The note the shared notebook serves is reverted; the hidden legacy file
+    // is left alone (it must keep matching the manifest, or the next adoption
+    // pass would re-import it as a conflicting duplicate).
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "sub", "note.md"), "utf-8")
+    ).toBe("v1\n");
+    expect(
+      await fsPromises.readFile(path.join(fixture.sessionDir, "memory", "note.md"), "utf-8")
+    ).toBe("v2\n");
+    // The rewrite is this lineage's own: the record is re-stamped to the new
+    // generation (r74), so the child's create row still maps onto the copy...
+    const restamped = (
+      await readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir))
+    ).get("note.md")!;
+    expect(restamped.targetStamp).toBe(
+      (await adoptionTargetStamp(path.join(ownerRoot, "sub", "note.md"))) ?? undefined
+    );
+    // ...but not after the owner replaced the copy outside the child's rows
+    // (a Memory-tab save is unjournaled and may keep the very same bytes):
+    // the file is the owner's now, and the create's delete-files is refused.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await fsPromises.rm(path.join(ownerRoot, "sub", "note.md"));
+    await fsPromises.writeFile(path.join(ownerRoot, "sub", "note.md"), "v1\n");
+    const replaced = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: createRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(replaced.success).toBe(false);
+    expect(replaced.success ? "" : replaced.error).toContain("since replaced");
+    expect(await fsPromises.readFile(path.join(ownerRoot, "sub", "note.md"), "utf-8")).toBe("v1\n");
+    const refused = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: orphanRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(refused.success).toBe(false);
+    expect(refused.success ? "" : refused.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    expect(await pathExists(path.join(fixture.sessionDir, "memory", "orphan.md"))).toBe(true);
+    // A note the owner already had (adoption created nothing, `created`
+    // unset): the child's create row must not delete the owner's own file.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/same.md", "same\n", "agent");
+    const sameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "same.md"), "same\n");
+    await writeManifest({
+      "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+      "same.md": { content: "x", sidecar: "", target: "same.md" },
+    });
+    const ownerOwned = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: sameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(ownerOwned.success).toBe(false);
+    expect(ownerOwned.success ? "" : ownerOwned.error).toContain("owner's own note");
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "same.md"))).toBe(true);
+    // A note deleted on the downgraded build and reconciled out of the shared
+    // store keeps a tombstoned record: the child's pre-sharing delete row
+    // still maps, and rolling it back restores the note in the shared store.
+    await fixture.service.create(fixture.ctx, "/memories/workspace/gone.md", "g1\n", "agent");
+    const goneCreateRow = await lastRow(fixture.sessionDir);
+    await fixture.service.deletePath(fixture.ctx, "/memories/workspace/gone.md", "agent");
+    const deleteRow = await lastRow(fixture.sessionDir);
+    await writeManifest({
+      "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+      "same.md": { content: "x", sidecar: "", target: "same.md" },
+      "gone.md": { content: "x", sidecar: "", target: "gone.md", created: true, deleted: true },
+    });
+    const restoredDelete = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: deleteRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(restoredDelete.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "gone.md"), "utf-8")
+    ).toBe("g1\n");
+    // The recreated copy is stamped onto the tombstoned record, so the child's
+    // history over that note keeps unwinding: the create row now maps too.
+    expect(
+      (await readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir))).get(
+        "gone.md"
+      )!.targetStamp
+    ).toBe((await adoptionTargetStamp(path.join(ownerRoot, "gone.md"))) ?? undefined);
+    const undoneGoneCreate = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: goneCreateRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneGoneCreate.success).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "gone.md"))).toBe(false);
+    // A pre-sharing DIRECTORY rename: the manifest records files only, so the
+    // directory endpoints map through their adopted descendants (all landed
+    // at their own relPath as this adoption's copies).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/olddir/a.md", "a\n", "agent");
+    const olddirCreateRow = await lastRow(fixture.sessionDir);
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/olddir",
+      "/memories/workspace/newdir",
+      "agent"
+    );
+    const dirRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerSessionDir, "memory", "newdir"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "newdir", "a.md"), "a\n");
+    await writeManifest({
+      "note.md": { content: "x", sidecar: "", target: "sub/note.md", created: true },
+      "same.md": { content: "x", sidecar: "", target: "same.md" },
+      "gone.md": { content: "x", sidecar: "", target: "gone.md", created: true, deleted: true },
+      "newdir/a.md": { content: "x", sidecar: "", target: "newdir/a.md", created: true },
+      "olddir/a.md": {
+        content: "x",
+        sidecar: "",
+        target: "olddir/a.md",
+        created: true,
+        deleted: true,
+      },
+    });
+    // An owner note added beside the adopted copies (no refinement row of
+    // its own) would travel with a structural rename: refused until the
+    // subtree is exactly the adopted descendants again.
+    await fsPromises.writeFile(path.join(ownerSessionDir, "memory", "newdir", "owner.md"), "o\n");
+    const extraFile = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(extraFile.success).toBe(false);
+    expect(extraFile.success ? "" : extraFile.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    await fsPromises.rm(path.join(ownerSessionDir, "memory", "newdir", "owner.md"));
+    // The same note landing while the rollback waits for the target lock:
+    // the plan-time directory proof is re-derived under the lock.
+    const lateExtraFile = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      testOnlyBeforeTargetLock: async () => {
+        await fsPromises.writeFile(
+          path.join(ownerSessionDir, "memory", "newdir", "late.md"),
+          "l\n"
+        );
+      },
+    });
+    expect(lateExtraFile.success).toBe(false);
+    expect(lateExtraFile.success ? "" : lateExtraFile.error).toContain(
+      "not folded into the shared workspace store"
+    );
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "newdir", "late.md"))).toBe(true);
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "olddir"))).toBe(false);
+    await fsPromises.rm(path.join(ownerSessionDir, "memory", "newdir", "late.md"));
+    const undoneRename = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dirRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneRename.success).toBe(true);
+    expect(
+      await fsPromises.readFile(path.join(ownerSessionDir, "memory", "olddir", "a.md"), "utf-8")
+    ).toBe("a\n");
+    expect(await pathExists(path.join(ownerSessionDir, "memory", "newdir"))).toBe(false);
+    // The generation moved with the file (r75): the vacated side's record
+    // loses its stamp, the tombstoned source record takes the moved file's —
+    // so the child's older rows at the restored name still map.
+    const afterRename = await readLegacyAdoptionManifest(
+      legacyAdoptionManifestPath(fixture.sessionDir)
+    );
+    expect(afterRename.get("newdir/a.md")!.targetStamp).toBeUndefined();
+    expect(afterRename.get("olddir/a.md")!.targetStamp).toBe(
+      (await adoptionTargetStamp(path.join(ownerRoot, "olddir", "a.md"))) ?? undefined
+    );
+    const undoneOlddirCreate = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: olddirCreateRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneOlddirCreate.success).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "olddir", "a.md"))).toBe(false);
+    // A rename made BEFORE the first upgrade: adoption recorded only the
+    // post-rename names, so the inverse's destination (the vacated name) has
+    // no record — it still maps beside the adopted copies (r75).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/dir2/b.md", "b\n", "agent");
+    const dir2CreateRow = await lastRow(fixture.sessionDir);
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/dir2",
+      "/memories/workspace/dir3",
+      "agent"
+    );
+    const firstUpgradeRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerRoot, "dir3"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "dir3", "b.md"), "b\n");
+    await writeManifest({
+      "dir3/b.md": { content: "x", sidecar: "", target: "dir3/b.md", created: true },
+    });
+    const undoneFirstUpgradeRename = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: firstUpgradeRenameRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneFirstUpgradeRename.success).toBe(true);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "dir2", "b.md"), "utf-8")).toBe("b\n");
+    expect(await pathExists(path.join(ownerRoot, "dir3"))).toBe(false);
+    // The restored side had no record: the moved copy gets a tombstoned one
+    // (r76) carrying its generation, so the child's older rows there map.
+    const manifest = () =>
+      readLegacyAdoptionManifest(legacyAdoptionManifestPath(fixture.sessionDir));
+    expect((await manifest()).get("dir3/b.md")!.targetStamp).toBeUndefined();
+    const dir2Stamp =
+      (await adoptionTargetStamp(path.join(ownerRoot, "dir2", "b.md"))) ?? undefined;
+    expect((await manifest()).get("dir2/b.md")).toEqual({
+      content: "x",
+      sidecar: "",
+      target: "dir2/b.md",
+      created: true,
+      deleted: true,
+      targetStamp: dir2Stamp,
+    });
+    // Re-applying the rename through its rollback row (owner paths, no
+    // retargeting) moves the generation back; undoing that again restores it.
+    const renameRollbackRow = await lastRow(fixture.sessionDir);
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: renameRollbackRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect((await manifest()).get("dir3/b.md")!.targetStamp).toBe(dir2Stamp);
+    expect((await manifest()).get("dir2/b.md")!.targetStamp).toBeUndefined();
+    const reapplyRow = await lastRow(fixture.sessionDir);
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: reapplyRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect((await manifest()).get("dir2/b.md")!.targetStamp).toBe(dir2Stamp);
+    const undoneDir2Create = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: dir2CreateRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+    });
+    expect(undoneDir2Create.success).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "dir2", "b.md"))).toBe(false);
+    // Same for a lone file whose adopted copy is a conflict import under
+    // imported/<child>/ (the owner already had different content at the
+    // post-rename name): the moved copy gets its tombstoned record too (r77).
+    await fixture.service.create(fixture.ctx, "/memories/workspace/c.md", "c\n", "agent");
+    const cCreateRow = await lastRow(fixture.sessionDir);
+    await fixture.service.rename(
+      fixture.ctx,
+      "/memories/workspace/c.md",
+      "/memories/workspace/d.md",
+      "agent"
+    );
+    const fileRenameRow = await lastRow(fixture.sessionDir);
+    await fsPromises.mkdir(path.join(ownerRoot, "imported", "child"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "imported", "child", "d.md"), "c\n");
+    await fsPromises.writeFile(path.join(ownerRoot, "d.md"), "owner's own d\n");
+    await writeManifest({
+      "d.md": { content: "x", sidecar: "", target: "imported/child/d.md", created: true },
+    });
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: fileRenameRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "c.md"), "utf-8")).toBe("c\n");
+    expect(await pathExists(path.join(ownerRoot, "imported", "child", "d.md"))).toBe(false);
+    expect(await fsPromises.readFile(path.join(ownerRoot, "d.md"), "utf-8")).toBe(
+      "owner's own d\n"
+    );
+    expect((await manifest()).get("c.md")).toMatchObject({
+      target: "c.md",
+      created: true,
+      deleted: true,
+      targetStamp: (await adoptionTargetStamp(path.join(ownerRoot, "c.md"))) ?? undefined,
+    });
+    expect(
+      (
+        await rollbackRefinement({
+          sessionDir: fixture.sessionDir,
+          id: cCreateRow.id,
+          evidence: EVIDENCE,
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+        })
+      ).success
+    ).toBe(true);
+    expect(await pathExists(path.join(ownerRoot, "c.md"))).toBe(false);
+  });
+
+  it("keeps a retargeted row order-unknown against a peer row whose workspaceId is corrupted to its own", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/workspace/note.md", "v1\n", "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/workspace/note.md",
+      "v1",
+      "v2",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    const ownerSessionDir = path.join(path.dirname(fixture.sessionDir), "ws-owner");
+    const ownerRoot = path.join(ownerSessionDir, "memory");
+    await fsPromises.mkdir(path.join(ownerRoot, "sub"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "sub", "note.md"), "v2\n");
+    const record: LegacyAdoptionRecord = {
+      content: "x",
+      sidecar: "",
+      target: "sub/note.md",
+      created: true,
+      targetStamp: (await adoptionTargetStamp(path.join(ownerRoot, "sub", "note.md"))) ?? undefined,
+    };
+    await fsPromises.writeFile(
+      legacyAdoptionManifestPath(fixture.sessionDir),
+      JSON.stringify({ "note.md": record })
+    );
+    // The owner's row persisted with THIS workspace's id (corruption): it is
+    // still another journal's row, with the shared store's clock — a
+    // comparison of that clock against the retargeted row's private one
+    // would order the peer edit "earlier" and let the rollback overwrite it.
+    await sharedDurableEventJournal(ownerSessionDir).append({
+      workspaceId: path.basename(fixture.sessionDir),
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/workspace/sub/note.md" },
+        inverse: {
+          op: "restore-files",
+          files: [{ path: path.join(ownerSessionDir, "memory", "sub", "note.md"), text: "v2\n" }],
+        },
+        sourceTs: 1,
+      },
+    });
+    const unordered = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      listSharedWorkspaceMemoryPeerSessionDirs: () => [ownerSessionDir],
+    });
+    expect(unordered.success).toBe(false);
+    expect(unordered.success ? "" : unordered.error).toContain(
+      "order relative to this row is unknown"
+    );
+    expect(await fsPromises.readFile(path.join(ownerRoot, "sub", "note.md"), "utf-8")).toBe("v2\n");
   });
 
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {

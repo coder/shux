@@ -88,6 +88,16 @@ export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
 }
 
 /**
+ * Whether the effective policy strips the `memory` tool. The persisted
+ * post-compaction harvest permission must reflect the FINAL toolset, not just
+ * the agent class: an editing-capable sub-agent whose policy denies memory
+ * must not have its transcript harvested into the (shared) workspace notebook.
+ */
+export function isMemoryToolDisabled(policy?: ToolPolicy): boolean {
+  return applyToolPolicyToNames(["memory"], policy).length === 0;
+}
+
+/**
  * Caller policy for a context-budget final-flush turn: the memory-only ceiling is appended
  * last so it wins regardless of the caller's or agent's own rules, while `memory` keeps
  * whatever verdict the inherited policy gave it.

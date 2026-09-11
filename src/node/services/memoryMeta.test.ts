@@ -1,9 +1,9 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
+import { MemoryMetaService, MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
 
 describe("memoryLogicalKey", () => {
@@ -45,6 +45,82 @@ describe("memoryLogicalKey", () => {
 });
 
 describe("MemoryMetaService", () => {
+  it("does not cache an empty view taken while the sidecar was unreadable", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    await service.setPinned("global:prefs.md", true);
+    // Transient read failure (EACCES interval) with the file's stamp unchanged:
+    // this read heals to empty, but the next one must retry the file — not
+    // serve the empty view and then write it back over the real pins.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const reloaded = new MemoryMetaService(tempDir.path);
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set());
+    reader.mockRestore();
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set(["global:prefs.md"]));
+    await reloaded.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
+  it("refuses a mutation whose read of the sidecar failed instead of overwriting it", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    await new MemoryMetaService(tempDir.path).setPinned("global:prefs.md", true);
+    // The mutating call itself hits the transient failure: its healed empty
+    // view must not become the file, or every existing pin is erased.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const fresh = new MemoryMetaService(tempDir.path);
+    try {
+      const failure = await fresh.setPinned("workspace:ws-1:scratch.md", true).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(MemoryMetaWriteError);
+      expect((failure as MemoryMetaWriteError).reason).toContain("could not be read");
+    } finally {
+      reader.mockRestore();
+    }
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md"])
+    );
+    // Once readable again the same instance mutates normally.
+    await fresh.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
+  it("does not serve a cached first-run view when the sidecar stat itself fails", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    // Cached "missing" (normal first run in this process)...
+    expect(await service.getPinnedKeys()).toEqual(new Set());
+    // ...then another backend creates the sidecar.
+    await new MemoryMetaService(tempDir.path).setPinned("global:prefs.md", true);
+    // A transient stat failure must not read as "still missing": the stale
+    // empty cache would otherwise be written over the foreign pins.
+    const stat = spyOn(fsPromises, "stat").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+    try {
+      const failure = await service.setPinned("workspace:ws-1:scratch.md", true).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(MemoryMetaWriteError);
+    } finally {
+      stat.mockRestore();
+    }
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md"])
+    );
+    await service.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
   it("persists pins across instances via the sidecar file", async () => {
     using tempDir = new TestTempDir("test-memory-meta");
     const service = new MemoryMetaService(tempDir.path);
@@ -62,6 +138,22 @@ describe("MemoryMetaService", () => {
     expect(await reloaded.getPinnedKeys()).toEqual(
       new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
     );
+  });
+
+  it("sees another backend's sidecar writes and never overwrites them from a stale cache", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    // Two services over one Xum root stand in for two backend processes
+    // (XUM_ALLOW_MULTIPLE_INSTANCES): neither sees the other's in-memory cache.
+    const a = new MemoryMetaService(tempDir.path);
+    const b = new MemoryMetaService(tempDir.path);
+    await b.getEntries(); // B caches the (empty) sidecar
+    await a.setPinned("workspace:ws-owner:notes.md", true);
+    // B's stamp-validated load picks up A's write...
+    expect(await b.getPinnedKeys()).toEqual(new Set(["workspace:ws-owner:notes.md"]));
+    // ...and B's own mutation starts from the current file, keeping A's pin.
+    await b.recordAccess("global:other.md", { write: false });
+    expect(await a.getPinnedKeys()).toEqual(new Set(["workspace:ws-owner:notes.md"]));
+    expect((await a.getEntries()).has("global:other.md")).toBe(true);
   });
 
   it("unpinning removes the key", async () => {

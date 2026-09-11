@@ -29,7 +29,11 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
-import type { DurableEvent } from "@/common/types/durableEvent";
+import {
+  isValidSourceClock,
+  refinementRowOrigin,
+  type DurableEvent,
+} from "@/common/types/durableEvent";
 import {
   MemoryRefinementActionSchema,
   RefinementInverseSchema,
@@ -53,15 +57,55 @@ import {
   type RefinementInverseDraft,
 } from "./refinementJournal";
 import { withTargetMutationLocks } from "./targetMutationLocks";
+import { advanceWorkspaceMemoryRevision } from "./workspaceMemoryRevision";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import {
+  createLegacyPathRemapper,
+  LegacyPathNotAdoptedError,
+  refreshLegacyAdoptionTargetStamps,
+} from "@/node/services/memoryLegacyAdoption";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
+
+/**
+ * A rollback row the engine (and shared-memory row migration) may trust for
+ * lineage: `rollbackOf` set AND a parseable rollback action AND a parseable
+ * inverse (r78). Persisted rows are raw JSON, so a row can name a target while
+ * its payload is corrupt; counting such a row as "target rolled back" would
+ * hide a mutation that is still live on disk (its rollback row cannot itself
+ * be rolled back or copied), so it is treated like no rollback at all —
+ * conflict detection then sees the original as live (fail closed).
+ */
+export function isUsableRollbackRow(row: RefinementEvent): boolean {
+  if (row.data.rollbackOf === undefined) return false;
+  const action = RollbackRefinementActionSchema.safeParse(row.data.action);
+  // The two lineage fields must agree (r79): a row whose action names one
+  // target while `rollbackOf` names another is corrupt, and trusting either
+  // side would hide a live mutation behind the other.
+  return (
+    action.success &&
+    action.data.of === row.data.rollbackOf &&
+    RefinementInverseSchema.safeParse(row.data.inverse).success
+  );
+}
 
 /** All refinement rows in the session journal (byId-deduped, seq order). */
 export async function listRefinements(sessionDir: string): Promise<RefinementEvent[]> {
   assert(sessionDir.length > 0, "listRefinements requires a session dir");
   const events = await sharedDurableEventJournal(sessionDir).read();
-  return events.filter((event): event is RefinementEvent => event.kind === "refinement");
+  const rows = events.filter((event): event is RefinementEvent => event.kind === "refinement");
+  const journalWorkspaceId = path.basename(path.resolve(sessionDir));
+  for (const row of rows) journalOfRow.set(row, journalWorkspaceId);
+  return rows;
 }
+
+/**
+ * The journal (session workspace id) each row object was read from, recorded
+ * by listRefinements: origin comparisons (sameOriginOrder) must not trust a
+ * row's persisted `workspaceId` for that (r79). Rows obtained any other way
+ * have no known journal and compare as order-unknown.
+ */
+const journalOfRow = new WeakMap<RefinementEvent, string>();
 
 export interface RollbackRefinementOptions {
   sessionDir: string;
@@ -69,6 +113,23 @@ export interface RollbackRefinementOptions {
   id: string;
   /** Apply despite detected divergence. Confinement is NEVER overridable. */
   force?: boolean;
+  /**
+   * Session dir of the task-tree owner whose <sessionDir>/memory backs this
+   * session's `/memories/workspace` (sub-agents only; omit when the session
+   * owns its store). Admits that one extra memory root for confinement.
+   */
+  sharedWorkspaceMemorySessionDir?: string;
+  /**
+   * Session dirs of the OTHER live task-tree members sharing this session's
+   * `/memories/workspace` store (owner, siblings, descendants), resolved at
+   * rollback time. Each member journals only its own mutations of the shared
+   * store, so their rows are merged into divergence detection: a child's
+   * later edit under a path the owner renamed must surface as a conflict
+   * when the owner rolls the rename back. Omit when the store is private.
+   * MUST throw when membership cannot be established (unreadable config);
+   * the rollback is then refused instead of assuming an empty tree.
+   */
+  listSharedWorkspaceMemoryPeerSessionDirs?: () => string[];
   /** Attribution for the emitted rollback row. */
   evidence: { toolName: string; toolCallId?: string; actor?: string };
   /** Caller-supplied justification, recorded in the rollback row's action. */
@@ -244,7 +305,8 @@ function inferMemoryLayout(sessionDir: string): { muxRoot: string; sessionsDir: 
 function resolveConfinementRoot(
   sessionDir: string,
   kind: "memory" | "skill",
-  filePath: string
+  filePath: string,
+  sharedWorkspaceMemorySessionDir?: string
 ): string {
   if (!path.isAbsolute(filePath)) {
     throw new RollbackError(`Refusing rollback: inverse path is not absolute: '${filePath}'`);
@@ -307,20 +369,52 @@ function resolveConfinementRoot(
   }
   // <sessionDir>/memory/<file...> (workspace scope). Constrained to exactly
   // THIS session's memory subdir so a corrupted inverse can never touch other
-  // workspaces' memory or session artifacts (chat.jsonl, journals).
-  const workspaceMemoryRoot = path.join(path.resolve(sessionDir), "memory");
-  const relToWorkspaceMemory = path.relative(workspaceMemoryRoot, resolved);
-  if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
-    if (relToWorkspaceMemory.length > 0) {
-      return workspaceMemoryRoot;
-    }
-    throw new RollbackError(
-      `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+  // workspaces' memory or session artifacts (chat.jsonl, journals). The one
+  // sanctioned second root is the task-tree owner's memory subdir, supplied
+  // by the CALLER (never read from the row): a sub-agent's workspace-scope
+  // writes physically land there (MemoryService.resolveWorkspaceMemoryOwnerId)
+  // while the row stays in the sub-agent's own journal.
+  const workspaceMemoryRoots = [path.join(path.resolve(sessionDir), "memory")];
+  if (sharedWorkspaceMemorySessionDir !== undefined) {
+    const sharedSessionDir = path.resolve(sharedWorkspaceMemorySessionDir);
+    assert(
+      path.dirname(sharedSessionDir) === layout.sessionsDir,
+      "sharedWorkspaceMemorySessionDir must be a sibling session dir"
     );
+    workspaceMemoryRoots.push(path.join(sharedSessionDir, "memory"));
+  }
+  for (const workspaceMemoryRoot of workspaceMemoryRoots) {
+    const relToWorkspaceMemory = path.relative(workspaceMemoryRoot, resolved);
+    if (!relToWorkspaceMemory.startsWith("..") && !path.isAbsolute(relToWorkspaceMemory)) {
+      if (relToWorkspaceMemory.length > 0) {
+        return workspaceMemoryRoot;
+      }
+      throw new RollbackError(
+        `Refusing rollback: path targets a memory scope root, not a file inside it: '${filePath}'`
+      );
+    }
   }
   throw new RollbackError(
     `Refusing rollback: path is outside every memory scope root: '${filePath}'`
   );
+}
+
+/**
+ * Whether `root` (a confinement root from resolveConfinementRoot) is a
+ * workspace memory root — this session's own or the sanctioned owner's. Its
+ * parent is then the session dir that carries the store's clock
+ * (workspaceMemoryRevision.ts).
+ */
+function isWorkspaceMemoryRoot(
+  sessionDir: string,
+  root: string,
+  sharedWorkspaceMemorySessionDir: string | undefined
+): boolean {
+  const candidates = [path.join(path.resolve(sessionDir), "memory")];
+  if (sharedWorkspaceMemorySessionDir !== undefined) {
+    candidates.push(path.join(path.resolve(sharedWorkspaceMemorySessionDir), "memory"));
+  }
+  return candidates.includes(path.resolve(root));
 }
 
 /**
@@ -472,11 +566,231 @@ interface InverseContentReader {
  * Collect divergence complaints for rolling back `target` given the current
  * filesystem + journal state. Empty array = safe to apply.
  */
+/**
+ * Two rows first appended to the same journal (a copy at its source position,
+ * see refinementRowOrigin): that store's mutation lock serialized clock and
+ * append, so the origin sequence is their mutation order whatever their clock
+ * values — pre-sharing history and clock-failed rows included. A copy without
+ * a carried origin has none (r73). Equal positions under distinct ids can
+ * only be corruption — no order evidence either.
+ */
+function sameOriginOrder(
+  row: RefinementEvent,
+  other: RefinementEvent
+): { rowAfter: boolean } | null {
+  const rowOrigin = refinementRowOrigin(row, journalOfRow.get(row));
+  const otherOrigin = refinementRowOrigin(other, journalOfRow.get(other));
+  if (rowOrigin === null || otherOrigin === null || rowOrigin.journal !== otherOrigin.journal) {
+    return null;
+  }
+  if (rowOrigin.seq === otherOrigin.seq) return null;
+  return { rowAfter: rowOrigin.seq > otherOrigin.seq };
+}
+
+/**
+ * Journal order for conflict detection. Rows copied from a removed sub-agent's
+ * journal (sharedMemoryRowMigration.ts) were appended later than they
+ * happened; their `sourceTs` restores the mutation's real position relative
+ * to the owner's own rows. Same-instant ties fall back to append sequence.
+ * Rows of one origin order by that origin's sequence (sameOriginOrder).
+ */
+function isAfter(row: RefinementEvent, other: RefinementEvent): boolean {
+  const sameOrigin = sameOriginOrder(row, other);
+  if (sameOrigin !== null) return sameOrigin.rowAfter;
+  const rowTs = isValidSourceClock(row.data.sourceTs) ? row.data.sourceTs : row.ts;
+  const otherTs = isValidSourceClock(other.data.sourceTs) ? other.data.sourceTs : other.ts;
+  return rowTs > otherTs || (rowTs === otherTs && row.seq > other.seq);
+}
+
+/**
+ * A persisted `sourceTs` outside the clock's domain (zero, negative, a
+ * fraction, an unsafe integer): corruption, never order evidence — trusted,
+ * a later mutation corrupted to `-1` would sort before an older rename target
+ * and its file would move silently.
+ */
+function hasMalformedSourceClock(row: RefinementEvent): boolean {
+  return row.data.sourceTs !== undefined && !isValidSourceClock(row.data.sourceTs);
+}
+
+/**
+ * Whether the order of two rows cannot be established: a row journaled while
+ * the shared store's clock write failed (`orderUnknown`) has only
+ * journal-local `ts`/`seq`, incomparable with other journals' rows — as does
+ * a row whose clock value is malformed. Callers fail closed — such a pair
+ * conflicts in either direction (force overrides). Rows of one origin are
+ * always ordered (sameOriginOrder), whatever their clock values.
+ */
+function orderUnknown(
+  row: RefinementEvent,
+  target: RefinementEvent,
+  targetRetargeted: boolean
+): boolean {
+  if (sameOriginOrder(row, target) !== null) return false;
+  if (row.data.orderUnknown === true || target.data.orderUnknown === true) return true;
+  if (hasMalformedSourceClock(row) || hasMalformedSourceClock(target)) return true;
+  // A retargeted target (see wasRetargeted) vs. any row not proven to share
+  // its origin: the target's clock is a private store's, so no other clock
+  // orders it. Not decided by persisted `workspaceId`s (r79): a peer row's
+  // corrupted to the target's would otherwise be ordered by clock and a
+  // later peer mutation overwritten by the rollback.
+  return targetRetargeted;
+}
+
+/**
+ * Memory rows from the other task-tree members' journals that touched the
+ * shared workspace store (owner's <sessionDir>/memory). Read without their
+ * session locks: journals are append-only and self-healing on read, and a
+ * row landing after this read is caught by the fs-level checks like any
+ * other concurrent writer.
+ */
+async function readSharedMemoryPeerRows(
+  opts: RollbackRefinementOptions
+): Promise<RefinementEvent[]> {
+  // Membership must be established, not guessed: a resolver that cannot read
+  // the topology (config.json missing/malformed) throws, and the rollback is
+  // refused rather than proceeding with no peer journals — an owner would
+  // otherwise move a child's later edit without warning.
+  let peerDirs: string[];
+  try {
+    peerDirs = opts.listSharedWorkspaceMemoryPeerSessionDirs?.() ?? [];
+  } catch (error) {
+    throw new RollbackError(
+      `Refusing rollback of '${opts.id}': the task tree sharing this workspace's memory store could not be resolved (${getErrorMessage(error)})`
+    );
+  }
+  if (peerDirs.length === 0) return [];
+  const sharedRoot = path.join(
+    path.resolve(opts.sharedWorkspaceMemorySessionDir ?? opts.sessionDir),
+    "memory"
+  );
+  const ownerSessionDir = path.dirname(sharedRoot);
+  const actingWorkspaceId = path.basename(path.resolve(opts.sessionDir));
+  // The same duplicate seen from the other side: a removal that aborted after
+  // its pre-teardown pass leaves THIS (owner) journal holding copies of a
+  // still-registered child's rows. Read as that child's peer rows, the
+  // originals would count as separate later mutations of the very notes the
+  // copies describe — and a retargeted original is `orderUnknown`, so the
+  // copy could never be rolled back until the removal finally succeeds.
+  // Only a copy that still REPRESENTS its source stands in for it: a copy
+  // whose inverse is unparseable contributes nothing to divergence
+  // (collectDivergence skips it), so suppressing its intact original would
+  // let this rollback overwrite the peer mutation that original records.
+  const migratedHere = new Set<string>();
+  for (const row of await listRefinements(opts.sessionDir)) {
+    if (
+      row.data.migratedFrom !== undefined &&
+      row.data.kind === "memory" &&
+      RefinementInverseSchema.safeParse(row.data.inverse).success
+    ) {
+      migratedHere.add(row.data.migratedFrom);
+    }
+  }
+  const peerRows: RefinementEvent[] = [];
+  for (const peerDir of peerDirs) {
+    assert(
+      path.resolve(peerDir) !== path.resolve(opts.sessionDir),
+      "peer session dirs exclude the acting session"
+    );
+    // A peer sub-agent's pre-sharing rows address ITS legacy private
+    // notebook; the notes live in the shared store now (adoption manifest
+    // in the peer's session dir). Retarget them through that peer's manifest
+    // before the overlap test — the peer's later edit of an adopted note must
+    // surface against the owner's rollback like any shared-store row. The
+    // remapped inverse replaces the recorded one on the returned row, so the
+    // acting session's later checks (its own remapper is a no-op for owner
+    // paths) compare the paths the note actually lives at. Legacy paths the
+    // shared store never took address invisible files and are dropped.
+    // Strict: an unreadable peer manifest must refuse the rollback, not read
+    // as "nothing adopted" and silently drop that peer's later mutations.
+    let remap: RecordedPathRemapper;
+    if (path.resolve(peerDir) === path.resolve(ownerSessionDir)) {
+      remap = identityRemapper;
+    } else {
+      try {
+        remap = await createLegacyPathRemapper({
+          childSessionDir: peerDir,
+          ownerSessionDir,
+          strict: true,
+        });
+      } catch (error) {
+        throw new RollbackError(
+          `Refusing rollback of '${opts.id}': a tree member's adoption manifest could not be read (${getErrorMessage(error)})`
+        );
+      }
+    }
+    const peerWorkspaceId = path.basename(path.resolve(peerDir));
+    for (const row of await listRefinements(peerDir)) {
+      if (row.data.kind !== "memory") continue;
+      // A removal that aborted after its pre-teardown pass leaves the owner
+      // journal holding COPIES of this session's rows (migratedFrom =
+      // "<this workspace>:<row id>") while this session lives on. They are
+      // this journal's rows seen twice, not later peer edits.
+      if (row.data.migratedFrom?.startsWith(`${actingWorkspaceId}:`) === true) continue;
+      // ...and the originals of copies this journal already holds (above).
+      if (migratedHere.has(`${peerWorkspaceId}:${row.id}`)) continue;
+      const original = RefinementInverseSchema.safeParse(row.data.inverse);
+      const parsed = parseRemappedInverse(row, remap);
+      if (parsed === null || !original.success) continue;
+      if (!inversePaths(parsed).some((p) => pathsOverlap(p, sharedRoot))) continue;
+      // A retargeted peer row carries its private clock: order unknown.
+      peerRows.push({
+        ...row,
+        data: {
+          ...row.data,
+          inverse: parsed,
+          ...(wasRetargeted(original.data, parsed) ? { orderUnknown: true as const } : {}),
+        },
+      });
+    }
+  }
+  return peerRows;
+}
+
+/**
+ * Path retargeting applied to every recorded path of the acting session's
+ * journal before it is compared or applied (see createLegacyPathRemapper):
+ * identity for a session that owns its store. Rows whose paths cannot be
+ * mapped (a legacy note the shared store never took) contribute nothing to
+ * divergence — they address an invisible file the target cannot overlap.
+ */
+interface RecordedPathRemapper {
+  path(filePath: string): string;
+  inverse(inverse: RefinementInverse): RefinementInverse;
+}
+const identityRemapper: RecordedPathRemapper = {
+  path: (filePath) => filePath,
+  inverse: (inverse) => inverse,
+};
+function parseRemappedInverse(
+  row: RefinementEvent,
+  remap: RecordedPathRemapper
+): RefinementInverse | null {
+  const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
+  if (!parsed.success) return null;
+  try {
+    return remap.inverse(parsed.data);
+  } catch (error) {
+    if (error instanceof LegacyPathNotAdoptedError) return null;
+    throw error;
+  }
+}
+
+/**
+ * Whether retargeting changed the inverse's paths: such a row was journaled
+ * against a PRIVATE store (pre-sharing), so its `ts`/`sourceTs` belong to
+ * that store's clock and are incomparable with the shared store's rows.
+ */
+function wasRetargeted(original: RefinementInverse, remapped: RefinementInverse): boolean {
+  return JSON.stringify(inversePaths(original)) !== JSON.stringify(inversePaths(remapped));
+}
+
 async function collectDivergence(
   rows: RefinementEvent[],
   target: RefinementEvent,
   inverse: RefinementInverse,
-  readContent: InverseContentReader
+  readContent: InverseContentReader,
+  remap: RecordedPathRemapper,
+  targetRetargeted: boolean
 ): Promise<string[]> {
   const complaints: string[] = [];
   const targetPaths = inversePaths(inverse);
@@ -488,19 +802,22 @@ async function collectDivergence(
   // live rollback chain only conflicts when its net effect differs from the
   // state the target left behind (see liveRowConflictsWithTarget).
   const rolledBackIds = new Set(
-    rows.map((row) => row.data.rollbackOf).filter((id): id is string => id !== undefined)
+    rows.filter(isUsableRollbackRow).map((row) => row.data.rollbackOf!)
   );
   for (const row of rows) {
-    if (row.seq <= target.seq) continue;
+    if (row.id === target.id) continue;
+    if (!isAfter(row, target) && !orderUnknown(row, target, targetRetargeted)) continue;
     if (rolledBackIds.has(row.id)) continue; // Effect undone by a later rollback row.
-    if (!liveRowConflictsWithTarget(rows, row, target)) continue;
-    const parsed = RefinementInverseSchema.safeParse(row.data.inverse);
-    if (!parsed.success) continue;
-    const overlap = inversePaths(parsed.data).some((p) =>
-      targetPaths.some((t) => pathsOverlap(p, t))
-    );
+    if (!liveRowConflictsWithTarget(rows, row, target, targetRetargeted)) continue;
+    const parsed = parseRemappedInverse(row, remap);
+    if (parsed === null) continue;
+    const overlap = inversePaths(parsed).some((p) => targetPaths.some((t) => pathsOverlap(p, t)));
     if (overlap) {
-      complaints.push(`later refinement row ${row.id} (seq ${row.seq}) touched the same paths`);
+      complaints.push(
+        orderUnknown(row, target, targetRetargeted)
+          ? `refinement row ${row.id} (seq ${row.seq}) touched the same paths and its order relative to this row is unknown (its store clock write failed)`
+          : `later refinement row ${row.id} (seq ${row.seq}) touched the same paths`
+      );
     }
   }
 
@@ -530,7 +847,7 @@ async function collectDivergence(
         // so the current state must still match that applied inverse —
         // content-exact where the original restored files.
         complaints.push(
-          ...(await collectRollbackTargetDivergence(rows, rollbackAction.data, readContent))
+          ...(await collectRollbackTargetDivergence(rows, rollbackAction.data, readContent, remap))
         );
         break;
       }
@@ -559,7 +876,7 @@ async function collectDivergence(
   // Content-exact check via the row's recorded post-action hashes: a manual
   // or cross-workspace edit after the target row never appears in this
   // session's journal, so the seq-based scan above cannot see it.
-  complaints.push(...(await collectPostStateDivergence(target)));
+  complaints.push(...(await collectPostStateDivergence(target, remap)));
 
   return complaints;
 }
@@ -571,22 +888,27 @@ async function collectDivergence(
  * complaints — their expected post-edit contents cannot be reconstructed from
  * the journal, so the presence-only checks above are the best we can do.
  */
-async function collectPostStateDivergence(target: RefinementEvent): Promise<string[]> {
+async function collectPostStateDivergence(
+  target: RefinementEvent,
+  remap: RecordedPathRemapper
+): Promise<string[]> {
   const postState = RefinementPostStateSchema.safeParse(target.data.postState);
   if (!postState.success) {
     return [];
   }
   const complaints: string[] = [];
   for (const file of postState.data.files) {
+    let filePath: string;
     let current: string;
     try {
-      current = await fsPromises.readFile(file.path, "utf-8");
+      filePath = remap.path(file.path);
+      current = await fsPromises.readFile(filePath, "utf-8");
     } catch {
-      continue; // Missing files are already reported by the presence checks.
+      continue; // Missing (or unmappable) files are already reported by the presence checks.
     }
     if (sha256Hex(current) !== file.sha256) {
       complaints.push(
-        `'${file.path}' was modified after the target refinement (current content no longer matches the state it left behind)`
+        `'${filePath}' was modified after the target refinement (current content no longer matches the state it left behind)`
       );
     }
   }
@@ -607,7 +929,8 @@ async function collectPostStateDivergence(target: RefinementEvent): Promise<stri
 function liveRowConflictsWithTarget(
   rows: RefinementEvent[],
   row: RefinementEvent,
-  target: RefinementEvent
+  target: RefinementEvent,
+  targetRetargeted: boolean
 ): boolean {
   if (row.data.rollbackOf === undefined) {
     return true; // Plain later row: its edit is live on disk.
@@ -616,6 +939,9 @@ function liveRowConflictsWithTarget(
   let current: RefinementEvent = row;
   const seen = new Set<string>([row.id]);
   while (current.data.rollbackOf !== undefined) {
+    // A corrupt rollback row anywhere in the chain (isUsableRollbackRow): the
+    // chain's net effect cannot be established — assume conflict.
+    if (!isUsableRollbackRow(current)) return true;
     const original = rows.find((r) => r.id === current.data.rollbackOf);
     if (original === undefined || seen.has(original.id)) {
       return true; // Corrupt chain (missing root or cycle): assume conflict.
@@ -627,7 +953,9 @@ function liveRowConflictsWithTarget(
   if (rollbackCount % 2 === 0) {
     return true; // Even chain: the root row's edit was re-applied.
   }
-  return current.seq <= target.seq; // Odd chain: rewound to just before root.
+  // Odd chain: rewound to just before root — a conflict unless the root is
+  // provably after the target.
+  return !isAfter(current, target) || orderUnknown(current, target, targetRetargeted);
 }
 
 async function dirExists(target: string): Promise<boolean> {
@@ -648,20 +976,21 @@ async function dirExists(target: string): Promise<boolean> {
 async function collectRollbackTargetDivergence(
   rows: RefinementEvent[],
   action: RollbackRefinementAction,
-  readContent: InverseContentReader
+  readContent: InverseContentReader,
+  remap: RecordedPathRemapper
 ): Promise<string[]> {
   const original = rows.find((row) => row.id === action.of);
   if (original === undefined) {
     return [`the original row '${action.of}' this rollback applied is missing from the journal`];
   }
-  const applied = RefinementInverseSchema.safeParse(original.data.inverse);
-  if (!applied.success) {
-    return [`the original row '${action.of}' has an unparseable inverse`];
+  const applied = parseRemappedInverse(original, remap);
+  if (applied === null) {
+    return [`the original row '${action.of}' has an unparseable or unmappable inverse`];
   }
   const complaints: string[] = [];
-  switch (applied.data.op) {
+  switch (applied.op) {
     case "delete-files":
-      for (const p of applied.data.paths) {
+      for (const p of applied.paths) {
         if (await fileExists(p)) {
           complaints.push(
             `expected '${p}' to be absent (the rollback deleted it), but it was recreated since`
@@ -670,7 +999,7 @@ async function collectRollbackTargetDivergence(
       }
       break;
     case "restore-files":
-      for (const file of applied.data.files) {
+      for (const file of applied.files) {
         if (!(await fileExists(file.path))) {
           complaints.push(
             `expected '${file.path}' to exist (the rollback restored it), but it was deleted since`
@@ -685,7 +1014,7 @@ async function collectRollbackTargetDivergence(
       }
       // Mixed force-apply inverse (r67): the rollback also deleted these
       // paths, so their recreation since is divergence too.
-      for (const p of applied.data.deletePaths ?? []) {
+      for (const p of applied.deletePaths ?? []) {
         if (await fileExists(p)) {
           complaints.push(
             `expected '${p}' to be absent (the rollback deleted it), but it was recreated since`
@@ -748,7 +1077,13 @@ export async function rollbackRefinement(
         `Row '${opts.id}' was produced by a remote (SSH/Docker) workspace runtime; its paths are not addressable on this host. Remote skill rollbacks are not supported.`
       );
     }
-    const existingRollback = rows.find((row) => row.data.rollbackOf === opts.id);
+    // Same predicate as liveness (isUsableRollbackRow): a corrupt rollback
+    // row cannot be rolled back "instead", and lineage treats its target as
+    // still live — so the target itself stays rollbackable (the divergence
+    // checks below decide whether the tree still matches its inverse).
+    const existingRollback = rows.find(
+      (row) => row.data.rollbackOf === opts.id && isUsableRollbackRow(row)
+    );
     if (existingRollback !== undefined) {
       throw new RollbackError(
         `Row '${opts.id}' was already rolled back by row '${existingRollback.id}'. Roll back that row instead to re-apply.`
@@ -761,7 +1096,35 @@ export async function rollbackRefinement(
         `Row '${opts.id}' has an unparseable inverse payload: ${parsedInverse.error.message}`
       );
     }
-    const inverse = parsedInverse.data;
+    // Sub-agent whose `/memories/workspace` is the owner's store: rows
+    // journaled before sharing address its own <sessionDir>/memory, whose
+    // notes were since folded into the owner's store (memoryLegacyAdoption).
+    // Every recorded path of this journal — the target's inverse, later rows
+    // for overlap, post-state hashes, a rollback chain's root — is retargeted
+    // to the adopted copy, so the rollback reverts the note the shared
+    // notebook serves. Mapped BEFORE confinement: the manifest's targets are
+    // checked like any other recorded path.
+    const remap: RecordedPathRemapper =
+      kind === "memory" &&
+      opts.sharedWorkspaceMemorySessionDir !== undefined &&
+      path.resolve(opts.sharedWorkspaceMemorySessionDir) !== path.resolve(opts.sessionDir)
+        ? await createLegacyPathRemapper({
+            childSessionDir: opts.sessionDir,
+            ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
+          })
+        : identityRemapper;
+    let inverse: RefinementInverse;
+    try {
+      inverse = remap.inverse(parsedInverse.data);
+    } catch (error) {
+      if (!(error instanceof LegacyPathNotAdoptedError)) throw error;
+      throw new RollbackError(`Refusing rollback of '${opts.id}': ${error.message}`);
+    }
+    // A retargeted target was journaled against this session's private
+    // clock: its order relative to OTHER journals' rows is unknown, so those
+    // are compared as order-unknown (conflict unless forced). Same-journal
+    // rows still order by their shared sequence.
+    const targetRetargeted = wasRetargeted(parsedInverse.data, inverse);
 
     // Confinement first — never overridable. A corrupted inverse must never
     // write outside the memory/skill roots (repo AGENTS.md, built-in skills,
@@ -770,7 +1133,10 @@ export async function rollbackRefinement(
     // repo revision to swap a root for a symlink in the meantime.
     const roots = new Map<string, string>();
     for (const p of inversePaths(inverse)) {
-      roots.set(p, resolveConfinementRoot(opts.sessionDir, kind, p));
+      roots.set(
+        p,
+        resolveConfinementRoot(opts.sessionDir, kind, p, opts.sharedWorkspaceMemorySessionDir)
+      );
     }
     const assertConfinement = async (): Promise<void> => {
       for (const [p, root] of roots) {
@@ -800,7 +1166,19 @@ export async function rollbackRefinement(
       },
     };
 
-    const divergence = await collectDivergence(rows, target, inverse, readContent);
+    // Conflict detection sees this journal plus every live tree member's
+    // shared-store rows (see listSharedWorkspaceMemoryPeerSessionDirs); the
+    // store clock (`sourceTs`) orders rows across journals. Target lookup,
+    // rollbackOf checks and the appended row stay on this session's journal.
+    // Re-read under the target locks below before the apply.
+    const divergence = await collectDivergence(
+      kind === "memory" ? [...rows, ...(await readSharedMemoryPeerRows(opts))] : rows,
+      target,
+      inverse,
+      readContent,
+      remap,
+      targetRetargeted
+    );
     if (divergence.length > 0 && opts.force !== true) {
       throw new RollbackError(
         `Refusing rollback of '${opts.id}': current state diverges from what the inverse expects:\n` +
@@ -827,16 +1205,82 @@ export async function rollbackRefinement(
     // targetMutationLocks.ts.
     const targetLockRoot = inferMemoryLayout(opts.sessionDir)?.muxRoot ?? null;
     const applied = await withTargetMutationLocks(targetLockRoot, lockKeys, async () => {
+      // Teardown gates (r61), same tombstone MemoryService checks pre-commit,
+      // same lock. Acting workspace: removal's fail-closed orphan path leaves
+      // the journal on disk but the workspace tombstoned, and a rollback from
+      // it must not mutate anything nor append into the retained session.
+      // Shared-store owner: a delete inverse expects its target absent, so
+      // divergence alone would let a rollback that was waiting on this lock
+      // recreate the removed owner's <sessionDir>/memory.
+      if (targetLockRoot !== null) {
+        const actingSessionDir = path.resolve(opts.sessionDir);
+        if (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(actingSessionDir))) {
+          throw new RollbackError(`Refusing rollback of '${opts.id}': this workspace was removed`);
+        }
+        if (opts.sharedWorkspaceMemorySessionDir !== undefined) {
+          const ownerSessionDir = path.resolve(opts.sharedWorkspaceMemorySessionDir);
+          const ownerMemoryRoot = path.join(ownerSessionDir, "memory");
+          if (
+            lockKeys.includes(ownerMemoryRoot) &&
+            (await isWorkspaceRemovalTombstoned(targetLockRoot, path.basename(ownerSessionDir)))
+          ) {
+            throw new RollbackError(
+              `Refusing rollback of '${opts.id}': the workspace owning the shared memory store was removed`
+            );
+          }
+        }
+      }
+      // The remapper's directory proof (an adopted directory maps only while
+      // the owner's subtree is EXACTLY the adopted descendants) was computed
+      // before this lock: an owner note added beside the copies while the
+      // rollback waited would travel along with a legacy directory rename.
+      // Re-derive the mapping under the lock and require it to be identical;
+      // a mapping that no longer holds refuses like at plan time.
+      if (remap !== identityRemapper) {
+        assert(
+          opts.sharedWorkspaceMemorySessionDir !== undefined,
+          "a legacy remapper exists only for a sub-agent sharing its notebook"
+        );
+        let relocked: RefinementInverse;
+        try {
+          relocked = (
+            await createLegacyPathRemapper({
+              childSessionDir: opts.sessionDir,
+              ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
+            })
+          ).inverse(parsedInverse.data);
+        } catch (error) {
+          if (!(error instanceof LegacyPathNotAdoptedError)) throw error;
+          throw new RollbackError(`Refusing rollback of '${opts.id}': ${error.message}`);
+        }
+        if (JSON.stringify(inversePaths(relocked)) !== JSON.stringify(inversePaths(inverse))) {
+          throw new RollbackError(
+            `Refusing rollback of '${opts.id}': the shared-store mapping of its recorded paths changed while waiting for the target lock`
+          );
+        }
+      }
       // Re-verify INSIDE the lock, immediately before mutating: a writer that
       // won the lock first has already landed, and its change must surface as
-      // divergence rather than be overwritten. `rows` is intentionally the
-      // pre-lock read — the fs-level checks (postState hashes, presence) are
-      // what detect concurrent mutations; force skips this exactly like the
-      // plan-time check. Cross-process residual: a writer in ANOTHER process
-      // (live app vs. debug CLI) does not contend on this in-process lock, so
-      // this re-verify narrows but cannot fully close that window.
+      // divergence rather than be overwritten. The journals are re-read here
+      // too: a rename row carries no post-state hash, so a tree member's edit
+      // beneath the renamed destination that journaled between the plan-time
+      // scan and this lock is visible only as its (now committed) row. Force
+      // skips this exactly like the plan-time check. Cross-process residual:
+      // a writer in ANOTHER process (live app vs. debug CLI) does not contend
+      // on this in-process lock, so this re-verify narrows but cannot fully
+      // close that window.
       if (opts.force !== true) {
-        const raced = await collectDivergence(rows, target, inverse, readContent);
+        const lockedRows = await listRefinements(opts.sessionDir);
+        const raced = await collectDivergence(
+          kind === "memory"
+            ? [...lockedRows, ...(await readSharedMemoryPeerRows(opts))]
+            : lockedRows,
+          target,
+          inverse,
+          readContent,
+          remap,
+          targetRetargeted
+        );
         if (raced.length > 0) {
           throw new RollbackError(
             `Refusing rollback of '${opts.id}': a concurrent mutation landed before the apply:\n` +
@@ -866,6 +1310,38 @@ export async function rollbackRefinement(
       // partial rollback behind (no rollbackOf row, and a retry refuses on the
       // resulting divergence).
       const applied: RollbackApplied = { rollbackRowId: null, restored: [], deleted: [] };
+      // A sub-agent's apply on the shared store (r74): the adopted copies
+      // rewritten, removed or — after a failed apply — compensated are new
+      // generations of the files; re-stamp them so the child's remaining rows
+      // over the same notes still map (createLegacyPathRemapper refuses a copy
+      // that is no longer the recorded generation). A rename keeps inode and
+      // mtime but moves the generation to the other endpoint's records (r75).
+      // Not only retargeted inverses: the child's own rollback rows carry
+      // owner paths already, and re-applying one is the same lineage acting.
+      // Still under the owner-store lock.
+      const restampAdoptedCopies = async (): Promise<void> => {
+        if (
+          kind !== "memory" ||
+          opts.sharedWorkspaceMemorySessionDir === undefined ||
+          path.resolve(opts.sharedWorkspaceMemorySessionDir) === path.resolve(opts.sessionDir)
+        ) {
+          return;
+        }
+        try {
+          await refreshLegacyAdoptionTargetStamps({
+            childSessionDir: opts.sessionDir,
+            ownerSessionDir: opts.sharedWorkspaceMemorySessionDir,
+            paths: [...applied.restored, ...applied.deleted],
+            ...(applied.renamed === undefined ? {} : { renamed: applied.renamed }),
+          });
+        } catch (error) {
+          // Stale stamps only refuse later rollbacks (force overrides).
+          log.warn("[refinement] failed to re-stamp adopted legacy copies after a rollback", {
+            id: opts.id,
+            error,
+          });
+        }
+      };
       switch (inverse.op) {
         case "delete-files":
           try {
@@ -875,6 +1351,7 @@ export async function rollbackRefinement(
             }
           } catch (error) {
             await compensatePartialApply(applied.deleted, newInverse);
+            await restampAdoptedCopies();
             throw error;
           }
           break;
@@ -908,6 +1385,7 @@ export async function rollbackRefinement(
             }
           } catch (error) {
             await compensatePartialApply([...applied.restored, ...applied.deleted], newInverse);
+            await restampAdoptedCopies();
             throw error;
           }
           break;
@@ -919,6 +1397,7 @@ export async function rollbackRefinement(
           applied.renamed = { from: inverse.from, to: inverse.to };
           break;
       }
+      await restampAdoptedCopies();
 
       // Commit point: even if two processes double-entered the critical section
       // (theoretically possible — plain POSIX files cannot make the guard's
@@ -932,6 +1411,10 @@ export async function rollbackRefinement(
         await fileLock.assertStillOwned();
       } catch (error) {
         await compensateApplied(applied, newInverse);
+        // The stamps above described the applied state; the compensated
+        // files are new generations again (r77). A reversed rename re-stamps
+        // both endpoints (nothing is synthesized: the restored side is empty).
+        await restampAdoptedCopies();
         throw error;
       }
       if (opts.testOnlyBeforeRollbackJournal !== undefined) {
@@ -958,6 +1441,27 @@ export async function rollbackRefinement(
         // Inverse blob puts + the append referencing them run under the
         // journal blob lock: a concurrent reclamation pass must never
         // observe the put→append window (see withBlobLock).
+        // A workspace-memory rollback is a store mutation like any other:
+        // advance the owner store's clock (under the target lock held here)
+        // for this row's cross-journal order AND as the cross-process change
+        // signal — the debug CLI reaches this engine without MemoryService,
+        // so nothing else would tell other backends' caches and Memory tabs.
+        const workspaceMemoryRoot = [...new Set(roots.values())].find((root) =>
+          isWorkspaceMemoryRoot(opts.sessionDir, root, opts.sharedWorkspaceMemorySessionDir)
+        );
+        let sourceTs: number | undefined;
+        let orderUnknownRow = false;
+        if (kind === "memory" && workspaceMemoryRoot !== undefined) {
+          try {
+            sourceTs = await advanceWorkspaceMemoryRevision(path.dirname(workspaceMemoryRoot));
+          } catch (error) {
+            // The inverse is already applied, so the row must still be
+            // journaled — as order-unknown (see MemoryService.journalRefinement):
+            // its journal-local `ts` is incomparable with other journals' rows.
+            log.debug("[refinement] failed to advance workspace memory revision", { error });
+            orderUnknownRow = true;
+          }
+        }
         let publishedBlobs: BlobQuotaEntry[] = [];
         const row = await journal.withBlobLock(async () => {
           const resolved = await resolveRefinementInverse(journal.blobs, newInverse);
@@ -978,6 +1482,8 @@ export async function rollbackRefinement(
                 ...(opts.evidence.actor !== undefined ? { actor: opts.evidence.actor } : {}),
               },
               rollbackOf: opts.id,
+              ...(sourceTs !== undefined ? { sourceTs } : {}),
+              ...(orderUnknownRow ? { orderUnknown: true as const } : {}),
             },
           });
         });
@@ -1060,6 +1566,8 @@ async function compensatePartialApply(
           ? preState.files.find((file) => file.path === p)
           : undefined;
       if (prior !== undefined) {
+        // Captured from disk moments ago; only migrated rows carry bare references.
+        assert("content" in prior, "pre-rollback capture carries file contents");
         await fsPromises.mkdir(path.dirname(p), { recursive: true });
         await writeFileAtomic(p, prior.content, { encoding: "utf-8" });
       } else {

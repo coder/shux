@@ -8,8 +8,10 @@ import * as path from "node:path";
 
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
+import { Err } from "@/common/types/result";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
+import { WORKSPACE_MEMORY_POLICY_PERSIST_ERROR } from "./turnRequestBuilder";
 import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
@@ -2501,6 +2503,102 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const initialMetadata = initialMetadataFromStartStreamCall(startStreamCall);
     expect(initialMetadata.routeProvider).toBe("openrouter");
+  });
+
+  it("removes the assistant placeholder when stream startup fails", async () => {
+    using xumHome = new DisposableTempDir("ai-service-startup-failure-placeholder");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-startup-failure-placeholder";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const internals = harness.service as unknown as {
+      historyService: HistoryService;
+      streamManager: StreamManager;
+    };
+    const deleted: string[] = [];
+    spyOn(internals.historyService, "deleteMessage").mockImplementation((_workspaceId, id) => {
+      deleted.push(id);
+      return Promise.resolve({ success: true, data: undefined });
+    });
+    spyOn(internals.streamManager, "startStream").mockResolvedValue(
+      Err({ type: "unknown", raw: "temp dir creation failed" })
+    );
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "medium",
+    });
+
+    expect(result.success).toBe(false);
+    // The placeholder carried the request bound and policy epoch stamp of a
+    // turn that never ran; left behind it would vouch for the user batch at
+    // the harvest gate (epochHarvestRefusal).
+    const appended = (internals.historyService.appendToHistory as ReturnType<typeof mock>).mock
+      .calls as unknown as Array<[string, { id: string; role: string }]>;
+    const placeholder = appended.find(([, message]) => message.role === "assistant")?.[1];
+    if (!placeholder) throw new Error("Expected an appended assistant placeholder");
+    expect(deleted).toEqual([placeholder.id]);
+  });
+
+  it("denies the epoch when a failed turn's placeholder cannot be removed, and surfaces a lost deny", async () => {
+    using xumHome = new DisposableTempDir("ai-service-startup-failure-undeletable");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-startup-failure-undeletable";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const internals = harness.service as unknown as {
+      historyService: HistoryService;
+      streamManager: StreamManager;
+    };
+    // The harness runs without a memory tool, so start() already records a
+    // deny for the turn; the discard adds a second one. `outcomes` scripts
+    // the sink's durability per call.
+    const recorded: boolean[] = [];
+    let outcomes: boolean[] = [];
+    harness.service.turnRequestBuilderBindings.workspaceMemoryPolicySink = {
+      recordWorkspaceMemoryWritable: (_workspaceId, writable) => {
+        recorded.push(writable);
+        return Promise.resolve(outcomes.shift() ?? true);
+      },
+    };
+    spyOn(internals.historyService, "deleteMessage").mockResolvedValue(Err("concurrent rewrite"));
+    spyOn(internals.streamManager, "startStream").mockResolvedValue(
+      Err({ type: "unknown", raw: "temp dir creation failed" })
+    );
+    const stream = () =>
+      harness.service.streamMessage({
+        messages: [createMuxMessage("latest-user", "user", "continue")],
+        workspaceId,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "medium",
+      });
+
+    // The stamped placeholder stays behind: the epoch is denied instead, and
+    // the startup error is still the result.
+    const denied = await stream();
+    expect(denied.success).toBe(false);
+    if (!denied.success)
+      expect(denied.error).toEqual({ type: "unknown", raw: "temp dir creation failed" });
+    expect(recorded).toEqual([false, false]);
+
+    // Neither removal nor deny durable: that failure is the result, not the
+    // startup error — the row is vouching for a batch no model saw.
+    outcomes = [true, false];
+    const lost = await stream();
+    expect(recorded).toEqual([false, false, false, false]);
+    expect(lost.success).toBe(false);
+    if (!lost.success) {
+      expect(lost.error.type).toBe("unknown");
+      expect(lost.error.type === "unknown" ? lost.error.raw : "").toContain(
+        WORKSPACE_MEMORY_POLICY_PERSIST_ERROR
+      );
+    }
   });
 
   it("passes muxMetadata into initial stream metadata", async () => {

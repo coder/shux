@@ -38,6 +38,11 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
+import {
+  epochHasPriorTurnRows,
+  workspaceMemoryPolicyEpochOf,
+} from "@/common/utils/messages/compactionBoundary";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -124,8 +129,10 @@ import {
   type MCPWorkspaceStats,
 } from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
+import { resolveSharedWorkspaceMemoryTopology } from "@/node/services/memoryWorkspaceOwner";
+import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
+import { READ_ONLY_ACCESS, resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -259,7 +266,11 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { withContextBudgetFlushToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  isMemoryToolDisabled,
+  withContextBudgetFlushToolPolicy,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -541,8 +552,21 @@ type TurnRequestBuildOutcome =
       type: "ready";
       turnExecutionOptions: TurnExecutionOptions;
       assistantMessageId: string;
-      deleteAbortedPlaceholder: (messageId: string) => Promise<void>;
+      /**
+       * Remove the never-run turn's stamped placeholder, or deny its epoch
+       * when that fails; false when neither could be made durable — the
+       * caller must report WORKSPACE_MEMORY_POLICY_PERSIST_ERROR instead of
+       * its own outcome.
+       */
+      deleteAbortedPlaceholder: (messageId: string) => Promise<boolean>;
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
+      /**
+       * Durable side effects that must only land once the stream has actually
+       * started (a granted memory harvest permission): every earlier exit —
+       * append failure, late abort, thinking rebuild, stream start failure —
+       * then leaves nothing behind. Awaited by the caller after startStream.
+       */
+      onStreamStarted?: () => Promise<void>;
     };
 
 export interface PreparedStreamMessage extends AsyncDisposable {
@@ -552,6 +576,10 @@ export interface PreparedStreamMessage extends AsyncDisposable {
 export interface PreparedTurnRequest extends AsyncDisposable {
   start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
 }
+
+/** Turn refused because a memory-policy DENY could not be made durable (see persistWorkspaceMemoryWritable). */
+export const WORKSPACE_MEMORY_POLICY_PERSIST_ERROR =
+  "Could not persist this workspace's read-only memory policy; refusing to start the turn so a restart cannot fall back to a stale write permission. Retry once the config directory is writable.";
 
 type PreparedTurnRequestOutcome =
   | Extract<TurnRequestBuildOutcome, { type: "finished" }>
@@ -567,6 +595,23 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
+  /**
+   * Receives each normal turn's workspace-memory write policy and persists it
+   * (see WorkspaceService.recordWorkspaceMemoryWritable); resolves false when
+   * the value could not be confirmed durable.
+   */
+  workspaceMemoryPolicySink?: {
+    recordWorkspaceMemoryWritable(
+      workspaceId: string,
+      writable: boolean,
+      options: {
+        epochHasPriorTurns: boolean;
+        policyEpoch: number;
+        carriedPolicyEpochs?: number[];
+        carriedPolicyUnknown?: boolean;
+      }
+    ): Promise<boolean>;
+  };
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
 }
@@ -896,7 +941,7 @@ export class TurnRequestBuilder {
     const recordStartupPhaseTiming = context.recordStartupPhaseTiming;
     let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
 
-    const deleteAbortedPlaceholder = async (messageId: string): Promise<void> => {
+    const deleteAbortedPlaceholder = async (messageId: string): Promise<boolean> => {
       const deleteResult = await this.dependencies.historyService.deleteMessage(
         workspaceId,
         messageId
@@ -909,6 +954,7 @@ export class TurnRequestBuilder {
             deleteResult.error
         );
       }
+      return deleteResult.success;
     };
     // Mode (plan|exec|compact) is derived from the selected agent definition.
     const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
@@ -1474,6 +1520,125 @@ export class TurnRequestBuilder {
     const memoryAccess: MemoryScopeAccess = contextBudgetFlushTurn
       ? { global: "read", project: "read", workspace: agentMemoryAccess.workspace }
       : agentMemoryAccess;
+    // Post-compaction harvest writes to /memories/workspace on the agent's
+    // behalf; it must honor exactly what the memory tool enforces: the scope
+    // access AND the tool's presence in the final toolset. The tool exists
+    // only with the experiment + service (tools.ts) and survives only if the
+    // effective policy keeps it (applied later in tool assembly, mirrored
+    // here); request.assemble middleware can still strip it, so the FINAL
+    // check happens against the toolset of the request actually started (see
+    // persistWorkspaceMemoryWritable). The compaction turn itself runs the
+    // "compact" agent, so only normal turns record their policy (the session
+    // attaches it to the compaction completion).
+    const workspaceMemoryWritable =
+      memoryAccess.workspace === "readwrite" &&
+      memoryExperimentEnabled &&
+      this.dependencies.bindings.memoryService !== undefined &&
+      !isMemoryToolDisabled(effectiveToolPolicy);
+    // Persisting the harvest permission is asymmetric because the two values
+    // fail differently when the turn then never streams: a stale DENY only
+    // fails closed (the preceding transcript is not harvested), a stale GRANT
+    // would let the preceding read-only transcript harvest into the (shared)
+    // workspace notebook after a restart. So a deny is persisted inside
+    // `start` before anything else (and refuses the turn when it cannot be
+    // made durable), while a grant is persisted only once the stream has
+    // actually started (onStreamStarted) — never at preparation time, where
+    // an admission-only candidate (prepareStreamMessage) may be rejected or
+    // disposed without running. Awaited (a config write happens only when
+    // the value changes). Returns false when a deny could not be persisted.
+    // Whether the active context already holds turns whose policy this
+    // process never recorded (see the unknown-history rule in
+    // WorkspaceService.recordWorkspaceMemoryWritable). The turn being started
+    // is its last user row plus that row's prelude snapshots; compaction
+    // request rows open an epoch rather than belong to one.
+    const epochHasPriorTurns = epochHasPriorTurnRows(activeContextMessages, {
+      userMessageId: latestUserMessage?.id,
+      preludeMessageIds: new Set(
+        getRequestPreludeMessageIds(latestUserMessage?.metadata?.requestPreludeMessageIds)
+      ),
+    });
+    // The compaction epoch this turn's policy accumulates over: the latest
+    // durable boundary's history sequence (any kind), else the history
+    // segment's boundary-less identity — never reused across full clears
+    // (see workspaceMemoryPolicyEpochOf) — the same identity compaction
+    // completion reports as closingPolicyEpoch, so the completion-side
+    // observation and every backend's turn records agree on which epoch a
+    // value belongs to.
+    const policyEpoch = workspaceMemoryPolicyEpochOf(messages);
+    // A preserved-tail boundary (RLM keep-recent copies follow it) re-appends
+    // rows produced under EARLIER epochs' policies: those accumulators are
+    // part of this epoch. The compacting session re-binds the closing one to
+    // this epoch durably (AgentSession.carryWorkspaceMemoryWritable), but
+    // asynchronously — another backend's first turn here can precede that
+    // carry. Naming the carried epochs lets the sink AND their values
+    // directly (under whichever key each currently sits), so no window exists
+    // in which a read-only tail reads as writable. Each copy records the
+    // epoch it was originally produced under (compactionHandler stamps it; a
+    // copy of a copy keeps the first), so a chain of tail compactions names
+    // every epoch involved — `messages` here holds only the active epoch, so
+    // nothing about earlier boundaries can be derived from it.
+    const tailCopies = activeContextMessages.filter(
+      (message) => message.metadata?.rlmPreservedTailCopy === true
+    );
+    // A usable source epoch is an integer below policyEpoch — a segment's
+    // boundary-less identity (negative), else a boundary's history sequence,
+    // both earlier than this epoch's (persisted history is unvalidated). A
+    // copy without one — persisted by a build
+    // before the field, a re-copy of such a copy, or a malformed value —
+    // carries a policy nobody can look up: it is excluded from the prior-turn
+    // check like every copy, so without this the epoch would grant on the
+    // strength of the turns it can see. Unknown fails closed — the epoch is
+    // denied until a no-tail boundary (or the tail turning over) leaves no
+    // such copy in the active context.
+    const usableSourceEpoch = (message: MuxMessage): number | undefined => {
+      const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
+      return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch < policyEpoch
+        ? epoch
+        : undefined;
+    };
+    const carriedPolicyEpochs = [
+      ...new Set(
+        tailCopies.flatMap((message) => {
+          const epoch = usableSourceEpoch(message);
+          return epoch === undefined ? [] : [epoch];
+        })
+      ),
+    ].sort((a, b) => a - b);
+    const carriedPolicyUnknown = tailCopies.some(
+      (message) => usableSourceEpoch(message) === undefined
+    );
+    const persistWorkspaceMemoryWritable = async (writable: boolean): Promise<boolean> => {
+      const sink = this.dependencies.bindings.workspaceMemoryPolicySink;
+      if (isCompactionRequest || !sink) return true;
+      if (
+        await sink.recordWorkspaceMemoryWritable(workspaceId, writable, {
+          epochHasPriorTurns,
+          policyEpoch,
+          ...(carriedPolicyEpochs.length === 0 ? {} : { carriedPolicyEpochs }),
+          ...(carriedPolicyUnknown ? { carriedPolicyUnknown } : {}),
+        })
+      ) {
+        return true;
+      }
+      if (!writable) return false;
+      log.warn("Workspace memory write policy could not be persisted; harvests will fail closed", {
+        workspaceId,
+      });
+      return true;
+    };
+    // Placeholder of a turn that never ran (startup aborted or failed): it
+    // carries the request bound and the policy stamp the finalized row needs,
+    // so left behind it would present the user batch to the harvest gate as
+    // covered by a turn. When its removal fails (I/O, a concurrent rewrite)
+    // the epoch is denied instead — fail closed rather than trust a row
+    // nobody can confirm is gone.
+    // Returns false only when neither the deletion nor the deny could be made
+    // durable: the caller must then surface that instead of its own outcome,
+    // since a stamped placeholder nobody could remove or deny stays behind.
+    const discardPlaceholder = async (messageId: string): Promise<boolean> => {
+      if (await deleteAbortedPlaceholder(messageId)) return true;
+      return persistWorkspaceMemoryWritable(false);
+    };
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
@@ -2471,6 +2636,32 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
         }
 
+        // A sub-agent's workspace-scope memory rows point into its task-tree
+        // owner's session dir; rollback must admit that root (and only that),
+        // and announce its direct-to-disk writes through MemoryService so the
+        // shared store's readers refresh. Resolved per rollback (not per
+        // turn): tree membership changes as sub-agents are spawned and removed
+        // while the tool instance lives; a topology that cannot be proven
+        // refuses the rollback (see resolveSharedWorkspaceMemoryTopology).
+        const memoryService = this.dependencies.bindings.memoryService;
+        const sessionsDir = this.dependencies.config.sessionsDir;
+        const sharedWorkspaceMemory =
+          memoryService === undefined
+            ? undefined
+            : () => resolveSharedWorkspaceMemoryTopology(this.dependencies.config, workspaceId);
+        // Built anew for EVERY attempt (prepareModelRequest runs per primary /
+        // fallback request) from the never-mutated policy: refinement_rollback
+        // reads it by reference, and the request.assemble demotion below only
+        // touches this attempt's object, so a fallback whose middleware keeps
+        // `memory` starts writable again.
+        const attemptSandboxMemory =
+          memoryService === undefined
+            ? undefined
+            : {
+                service: memoryService,
+                ctx: memoryScopeContextFromToolConfig(toolsForModelConfig),
+                access: memoryAccess,
+              };
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
           allTools: this.dependencies.wrapToolsForDelegation(
@@ -2484,7 +2675,9 @@ export class TurnRequestBuilder {
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+            sessionDir: path.join(sessionsDir, workspaceId),
+            sharedWorkspaceMemory,
+            memory: attemptSandboxMemory,
             kernelFileLoader,
           },
         });
@@ -2582,6 +2775,13 @@ export class TurnRequestBuilder {
           // recall or leave its private memory reader available without memory.
           if (!intuitionToolAvailable || attemptTools.memory === undefined) {
             delete attemptTools.intuition;
+          }
+          // Nor may it leave refinement_rollback (RLM) as a side door into the
+          // notebook once `memory` is gone: the tool reads its memory policy
+          // from this per-attempt object by reference, so demote it to
+          // view-only the same way tool assembly does for policy-denied memory.
+          if (attemptTools.memory === undefined && attemptSandboxMemory !== undefined) {
+            attemptSandboxMemory.access = READ_ONLY_ACCESS;
           }
           if (attemptTools.intuition === undefined) {
             assembleCtx.systemMessage = removeIntuitionGuidance(
@@ -2831,8 +3031,40 @@ export class TurnRequestBuilder {
             this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
           ),
         };
+      // Final toolset of the request being started: request.assemble
+      // middleware ran inside prepareModelRequest, and `memory` is a built-in
+      // that tool search never defers and PTC never bridges (ptcExcluded in
+      // toolDefinitions: its top-level presence keys the memory index / hot
+      // set), so its absence means denied. The deny lands now; the grant
+      // waits for onStreamStarted (see persistWorkspaceMemoryWritable).
+      const finalWorkspaceMemoryWritable = workspaceMemoryWritable && tools.memory !== undefined;
+      if (!finalWorkspaceMemoryWritable && !(await persistWorkspaceMemoryWritable(false))) {
+        const errorEvent = createErrorEvent(workspaceId, {
+          messageId: createAssistantMessageId(),
+          error: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR,
+          errorType: "unknown",
+          acpPromptId,
+        });
+        if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+        onPreStartError?.(errorEvent);
+        return {
+          type: "finished",
+          result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+        };
+      }
+      // Proof for the harvest gate that this turn's policy was recorded
+      // (above, or the grant at onStreamStarted) and for which epoch: a build
+      // without the sink — or an older build after a downgrade — leaves it
+      // unset and its turns' user rows stay unaccounted for. Carried by the
+      // placeholder AND the stream's initialMetadata below: StreamManager
+      // builds the final assistant row from the latter, not the placeholder.
+      const workspaceMemoryPolicyStamp =
+        !isCompactionRequest && this.dependencies.bindings.workspaceMemoryPolicySink
+          ? { workspaceMemoryPolicyEpoch: policyEpoch }
+          : {};
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+        ...workspaceMemoryPolicyStamp,
         timestamp: Date.now(),
         model: canonicalModelString,
         routedThroughGateway,
@@ -2954,7 +3186,12 @@ export class TurnRequestBuilder {
       }
 
       if (combinedAbortSignal.aborted) {
-        await deleteAbortedPlaceholder(assistantMessageId);
+        if (!(await discardPlaceholder(assistantMessageId))) {
+          return {
+            type: "finished",
+            result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+          };
+        }
         return {
           type: "finished",
           result: Ok(
@@ -3082,6 +3319,19 @@ export class TurnRequestBuilder {
                   if (error instanceof ContextBudgetExceededError) return Err(error.details);
                   throw error;
                 }
+                // The fallback runs its own request.assemble pass, which may
+                // strip or keep `memory` independently of the primary; the
+                // persisted harvest permission must follow the request
+                // actually streamed, in both directions. The stream is
+                // already running here, so a grant may land immediately.
+                if (
+                  !(await persistWorkspaceMemoryWritable(
+                    workspaceMemoryWritable && nextRequest.tools.memory !== undefined
+                  ))
+                ) {
+                  runLanguageModelCleanup(nextRequest.model);
+                  return Err(WORKSPACE_MEMORY_POLICY_PERSIST_ERROR);
+                }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
                   nextHeaders = {
@@ -3163,7 +3413,12 @@ export class TurnRequestBuilder {
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);
-            await deleteAbortedPlaceholder(assistantMessageId);
+            if (!(await discardPlaceholder(assistantMessageId))) {
+              return {
+                type: "finished",
+                result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+              };
+            }
             return { type: "finished", result: Err(error.details) };
           }
           throw error;
@@ -3196,6 +3451,7 @@ export class TurnRequestBuilder {
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          ...workspaceMemoryPolicyStamp,
           systemMessageTokens,
           timestamp: Date.now(),
           agentId: effectiveAgentId,
@@ -3261,8 +3517,18 @@ export class TurnRequestBuilder {
         type: "ready",
         turnExecutionOptions,
         assistantMessageId,
-        deleteAbortedPlaceholder,
+        deleteAbortedPlaceholder: discardPlaceholder,
         logStartOutcome,
+        ...(finalWorkspaceMemoryWritable
+          ? {
+              // Best-effort once streaming: the turn really runs with a
+              // writable memory tool, so an unpersisted grant only fails the
+              // harvest closed (persistWorkspaceMemoryWritable warns).
+              onStreamStarted: async () => {
+                await persistWorkspaceMemoryWritable(true);
+              },
+            }
+          : {}),
       };
     };
     retained = true;

@@ -2511,7 +2511,7 @@ export const TOOL_DEFINITIONS = {
       "Scopes (all paths are virtual):\n" +
       "- /memories/global/... — personal, permanent, shared across all projects\n" +
       "- /memories/project/... — private notes about this project; host-local, never committed to the repo (included in the settings backup only when the user opts in), survives workspaces\n" +
-      "- /memories/workspace/... — scratch state for this workspace; deleted with the workspace\n" +
+      "- /memories/workspace/... — scratch state for this workspace, shared with its sub-agents (a sub-agent reads and writes its parent's workspace notes); deleted with the owning workspace\n" +
       "Commands:\n" +
       "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
       "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +

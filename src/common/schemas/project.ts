@@ -105,6 +105,14 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
   }),
+  workspaceMemoryWritableByEpoch: z.record(z.string(), z.boolean()).optional().meta({
+    description:
+      "Whether this workspace's agent may write /memories/workspace, accumulated (fail-closed AND over its normal turns) per compaction epoch — keyed by the history sequence of the durable context boundary that opened the epoch (-1 before any boundary); only the newest few epochs are kept. Persisted so a post-compaction memory harvest that resumes in a fresh session (restart, recovery) or observes a closing epoch while another backend already records the next one still knows the policy; harvest fails closed when unknown.",
+  }),
+  memoryOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Memory owner pinned when an intermediate ancestor was removed while this descendant stayed alive: the parentWorkspaceId chain no longer reaches the task-tree root, so this keeps /memories/workspace bound to the root's store (memoryWorkspaceOwner.ts). Set only by workspace removal.",
+  }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
   }),

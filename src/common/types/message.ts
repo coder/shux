@@ -963,7 +963,31 @@ export interface ContextBudgetRejectedMessage {
 export interface MuxMetadata {
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
+  /**
+   * The compaction epoch (opening boundary's history sequence, -1 before any
+   * boundary) under which the turn that produced this assistant row recorded
+   * its workspace-memory write policy, before the row was appended
+   * (TurnRequestBuilder start()). The post-compaction harvest accepts a turn
+   * only when this matches the epoch being harvested: a turn started before
+   * a destructive reset but appended after the new boundary carries the old
+   * epoch, whose deny the reset discarded. Builds that do not maintain the
+   * policy (older ones, after a downgrade) leave it unset, so their turns'
+   * user rows are never taken as accounted for (memoryConsolidationService.ts).
+   */
+  workspaceMemoryPolicyEpoch?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
+  /**
+   * Start sequence of the history segment this row was appended in
+   * (HistoryService, `history-segment.json`). A full clear opens a new
+   * segment whose sequences continue above every sequence the cleared
+   * history ever used, so a boundary's history sequence — and the
+   * boundary-less epoch identity `-(segmentStart + 1)` derived from this
+   * stamp (workspaceMemoryPolicyEpochOf) — never recurs across destructive
+   * clears: a turn started before a clear cannot be mistaken for one of the
+   * segment that replaced it. Omitted in the first segment (start 0), which
+   * legacy rows without the stamp belong to as well.
+   */
+  historySegment?: number;
   /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
   stepStartPartIndices?: number[];
   duration?: number;
@@ -1080,6 +1104,18 @@ export interface MuxMetadata {
    * usage rebuilds never double-count them.
    */
   rlmPreservedTailCopy?: boolean;
+
+  /**
+   * Compaction epoch (opening boundary's history sequence, -1 before any) the
+   * copied row was ORIGINALLY produced under — carried unchanged through
+   * repeated copies, so a copy of a copy still names the first epoch. The
+   * workspace-memory write policy of that epoch applies to the copy
+   * (TurnRequestBuilder → WorkspaceService.recordWorkspaceMemoryWritable):
+   * derived from history it would be wrong whenever the active-epoch read
+   * holds only the newest boundary. Absent on copies written before the
+   * field existed, whose source epochs never had a policy record either.
+   */
+  rlmPreservedTailSourcePolicyEpoch?: number;
 
   /**
    * @file mention snapshot token(s) this message provides content for.

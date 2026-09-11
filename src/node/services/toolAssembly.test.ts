@@ -1,5 +1,9 @@
 import { resolveToolPolicyForAgent } from "./agentDefinitions/resolveToolPolicy";
-import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import {
+  isMemoryToolDisabled,
+  isSessionHistoryDisabled,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import { resolveAgentFrontmatter } from "./agentDefinitions/agentDefinitionsService";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { ToolBridge } from "./ptc/toolBridge";
@@ -15,6 +19,7 @@ import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
 import { listRefinements } from "@/node/services/refinement/refinementRollback";
+import type { MemoryService } from "@/node/services/memoryService";
 
 function executableTool(description: string): Tool {
   return {
@@ -318,6 +323,75 @@ describe("persistent kernel graduation (RLM mode)", () => {
     }
   });
 
+  test("refinement_rollback refuses memory rows when policy denies the memory tool", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-rlm-rollback-memory-policy");
+    const scopeKey = "ws-tool-assembly-rlm-rollback-memory-policy";
+    const sessionDir = path.join(tmp.path, "sessions", scopeKey);
+    const noteFile = path.join(sessionDir, "memory", "note.md");
+    const notified: string[][] = [];
+    // Stand-in MemoryService: classifies every path as the workspace scope and
+    // records rollback announcements; the row's inverse deletes a note.
+    const memoryService = {
+      scopeOfPhysicalPath: () => "workspace" as const,
+      notifyExternalMutation: (_ctx: unknown, paths: string[]) => {
+        notified.push(paths);
+        return Promise.resolve();
+      },
+    } as unknown as MemoryService;
+    const memory = {
+      service: memoryService,
+      ctx: { runtime: null, checkoutCwd: "", workspaceId: scopeKey, projectPath: "" },
+      // Exec-like class: read-write everywhere — the class alone must not decide.
+      access: { global: "readwrite", project: "readwrite", workspace: "readwrite" } as const,
+    };
+    const assemble = (policy: ToolPolicy | undefined): Promise<Record<string, Tool>> =>
+      applyToolPolicyAndExperiments({
+        allTools: { memory: executableTool("Memory"), file_read: executableTool("Read a file") },
+        effectiveToolPolicy: policy,
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir, memory },
+      });
+    const seedRow = async () => {
+      await fsPromises.mkdir(path.dirname(noteFile), { recursive: true });
+      await fsPromises.writeFile(noteFile, "note", "utf-8");
+      await appendRefinementEvent({
+        sessionDir,
+        workspaceId: scopeKey,
+        kind: "memory",
+        action: { op: "create", path: "/memories/workspace/note.md" },
+        inverse: { op: "delete-files", paths: [noteFile] },
+        evidence: { toolName: "memory" },
+      });
+      return (await listRefinements(sessionDir)).at(-1)!.id;
+    };
+    const rollback = async (tools: Record<string, Tool>, id: string) =>
+      (await tools.refinement_rollback.execute!(
+        { id, reason: "test" },
+        { toolCallId: "test-call-id", messages: [], context: undefined }
+      )) as { success: boolean; error?: string };
+    try {
+      // Policy strips `memory` but leaves the rollback surface: a memory-row
+      // rollback is a memory write, so it is refused like a read-only scope.
+      const denied = await assemble([{ regex_match: "memory", action: "disable" }]);
+      expect(denied.memory).toBeUndefined();
+      expect(denied.refinement_rollback).toBeDefined();
+      const refused = await rollback(denied, await seedRow());
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain("read-only");
+      expect(await fsPromises.readFile(noteFile, "utf-8")).toBe("note");
+      expect(notified).toEqual([]);
+
+      // With the memory tool allowed, the same rollback proceeds and announces.
+      const allowed = await assemble(undefined);
+      const rolledBack = await rollback(allowed, await seedRow());
+      expect(rolledBack.success).toBe(true);
+      expect(notified).toEqual([[noteFile]]);
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
+  });
+
   test("MUX_SANDBOX_PERSISTENT_MOUNTS=1 still opts in without the rlm experiment", async () => {
     using tmp = new DisposableTempDir("tool-assembly-env-mounts");
     const scopeKey = "ws-tool-assembly-env-mounts";
@@ -549,6 +623,30 @@ describe("resolveBackendGatedPtcExperiments", () => {
 });
 
 describe("token budget history policy", () => {
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["memory"], allowed: true },
+    { add: ["mem.*"], allowed: true },
+    { add: [".*"], allowed: true },
+  ])("harvest permission mirrors the assembled memory tool: $add", async ({ add, allowed }) => {
+    // The persisted workspaceMemoryWritable bit is derived from the policy
+    // before tool assembly; it must agree with whether `memory` survives it.
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add } }],
+      isSubagent: true,
+      disableTaskToolsForDepth: false,
+    });
+    const memory = executableTool("Memory");
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { memory, file_read: executableTool("Read") },
+      effectiveToolPolicy: policy,
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(isMemoryToolDisabled(policy)).toBe(!allowed);
+    expect(result.memory === undefined).toBe(!allowed);
+  });
+
   test.each([
     { add: [], allowed: false },
     { add: ["file_read"], allowed: false },

@@ -1,3 +1,20 @@
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  clearWorkspaceMemoryDenyMarker,
+  readWorkspaceMemoryDenyMarker,
+  readWorkspaceMemoryDenyMarkerForEpochs,
+  workspaceMemoryDenyMarkerPath,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
+import {
+  workspaceRemovalTombstonePath,
+  isWorkspaceRemovalTombstoned,
+} from "@/node/services/workspaceRemoval";
+import {
+  setWorkspaceMemoryWritableForEpoch,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -206,6 +223,23 @@ function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   } as unknown as AIService;
 }
 
+/**
+ * Mock configs model no file on disk. Production requires an EXISTING
+ * config.json for removal's shared-memory handover and the memory policy
+ * accumulator (Config.loadExistingConfigOrThrow); for a mock that only
+ * provides loadConfigOrDefault, treat that snapshot as the existing file.
+ */
+function withExistingConfigLoader<T extends Partial<Config>>(config: T): T {
+  if (
+    typeof config.loadExistingConfigOrThrow !== "function" &&
+    typeof config.loadConfigOrDefault === "function"
+  ) {
+    const load = config.loadConfigOrDefault.bind(config);
+    return { ...config, loadExistingConfigOrThrow: () => load({ throwOnError: true }) };
+  }
+  return config;
+}
+
 function createWorkspaceServiceForTest(options: {
   config:
     | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
@@ -227,7 +261,7 @@ function createWorkspaceServiceForTest(options: {
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   const defaultHistoryService: HistoryService = {} as HistoryService;
   return new WorkspaceService(
-    options.config as Config,
+    withExistingConfigLoader(options.config as Partial<Config>) as Config,
     options.historyService ?? defaultHistoryService,
     options.aiService ?? createMockAIService(),
     options.initStateManager ?? (mockInitStateManager as InitStateManager),
@@ -7369,7 +7403,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       getInitState: mock(() => null),
     } as unknown as InitStateManager;
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       aiService,
       initStateManager,
@@ -7530,8 +7564,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   });
 
   test("destructive clear waits for startup monitor recovery discovery", async () => {
-    const { historyService, workspaceService, cleanup } = await createServices();
+    const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "clear-waits-for-monitor-recovery";
+    // A destructive clear proves its policy reset against an EXISTING
+    // config.json (an absent one is a transient state, not the empty default).
+    await config.editConfig((cfg) => cfg);
     const recovery = createDeferred<void>();
     const internal = workspaceService as unknown as {
       bashMonitorRecoveryPromise: Promise<void>;
@@ -9289,6 +9326,568 @@ describe("WorkspaceService initialize", () => {
     try {
       await service.initialize();
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("accumulates the workspace memory write policy fail-closed in config across an epoch", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const scratchDir = path.join(realConfig.rootDir, "scratch", "policy-scratch");
+    await fsPromises.mkdir(scratchDir, { recursive: true });
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: scratchDir,
+            id: "policy-scratch",
+            name: "scratch-policy-scratch",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        projectKind: "system",
+        trusted: true,
+      });
+      return cfg;
+    });
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const persistedFor = (epoch: number) =>
+      findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")?.workspace
+        .workspaceMemoryWritableByEpoch?.[String(epoch)];
+    const persisted = () => persistedFor(-1);
+    const EPOCH0 = { epochHasPriorTurns: false, policyEpoch: -1 };
+    try {
+      // The durable bit is the epoch accumulator: the harvest reads every
+      // message of the epoch, so a read-only turn denies the epoch even when
+      // a writable turn follows — across restarts and backends, since the
+      // conjunction lives in config.json rather than in one process.
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
+
+      // New epoch (field cleared at the boundary), then ANOTHER backend records
+      // a read-only turn straight into config: this backend's next grant must
+      // not publish false→true.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(true);
+      await realConfig.editConfig((cfg) => {
+        findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritableByEpoch = {
+          "-1": false,
+        };
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
+
+      // New epoch again, and now config.json cannot take the deny: the turn's
+      // user row is already durable, so the deny falls back to the session
+      // dir (same durability domain) and the record still succeeds. A later
+      // writable turn — even from a fresh process with no mirror — stays
+      // denied by that marker, and it is ANDed into the compaction
+      // observation as well.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      const sessionDir = path.join(realConfig.sessionsDir, "policy-scratch");
+      spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
+        Promise.reject(new Error("disk full"))
+      );
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
+      // Malformed marker still denies; only a DESTRUCTIVE boundary heals it
+      // (a compaction boundary clears nothing: another backend's boundary
+      // closing the same epoch must still find every entry).
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      // Another backend's new-epoch deny write must not heal the malformed
+      // marker away (it may be the only evidence of a read-only turn in the
+      // closing epoch): the deny is carried as a wildcard, denying every
+      // epoch, until the destructive boundary.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 3)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "not json");
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      // A present but non-boolean wildcard is corruption, not "false": read as
+      // malformed (deny for every epoch) rather than dropping the only
+      // surviving deny of an epoch the list does not name.
+      await fsPromises.writeFile(
+        workspaceMemoryDenyMarkerPath(sessionDir),
+        JSON.stringify({ epochs: [3], wildcard: "true" })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
+      await fsPromises.writeFile(
+        workspaceMemoryDenyMarkerPath(sessionDir),
+        JSON.stringify({ epochs: [3] })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      // Unreadable is not malformed: a marker that cannot be read may hold
+      // denies, so the clear refuses instead of deleting it.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 9);
+      const unreadableMarker = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+        Promise.reject(Object.assign(new Error("EIO"), { code: "EIO" }))) as never);
+      const refusedClear = await clearWorkspaceMemoryDenyMarker(
+        realConfig.rootDir,
+        sessionDir
+      ).then(
+        () => null,
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+      expect(refusedClear).toContain("unreadable");
+      unreadableMarker.mockRestore();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 9)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      await fsPromises.writeFile(workspaceMemoryDenyMarkerPath(sessionDir), "{}");
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(true);
+      // Entries of several epochs coexist; readers of any other epoch ignore
+      // each, and all of them go together at the destructive boundary.
+      await writeWorkspaceMemoryDenyMarker(sessionDir, -1);
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 7);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, -1)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 7)).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+
+      // The durable bit is bound to its epoch too: the closing epoch's
+      // `false` is invisible to the first turn of the next epoch on ANOTHER
+      // backend (which cannot await this backend's boundary reset), so it
+      // grants under its own epoch's record — WITHOUT displacing the closing
+      // epoch's deny, which the compacting backend's completion observation
+      // may not have read yet (a single slot would let its writable mirror
+      // grant the harvest of the read-only turn).
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": false };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 12,
+        })
+      ).toBe(true);
+      expect(persistedFor(12)).toBe(true);
+      expect(persisted()).toBe(false);
+      // A PRESERVED-TAIL epoch names the epoch its tail was copied out of:
+      // that epoch's deny is ANDed in directly, under whichever key it sits —
+      // the closing key (compacting backend's carry not landed yet), the new
+      // key (carry landed), or the session-dir marker — so no window exists
+      // in which the read-only tail reads as writable to another backend.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": false };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 14,
+          carriedPolicyEpochs: [-1],
+        })
+      ).toBe(true);
+      expect(persistedFor(14)).toBe(false);
+      expect(persisted()).toBe(false);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "16": true };
+        return cfg;
+      });
+      await writeWorkspaceMemoryDenyMarker(sessionDir, 12);
+      // One snapshot answers for every epoch consulted (a carry re-stamping
+      // 12 → 16 between two separate reads could hide the entry from both).
+      expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1, 12])).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [16, -1])).toBe(false);
+      // Epochs outside the integer domain (a segment's negative boundary-less
+      // identity or a history sequence) are corruption: the marker reads as
+      // malformed, a deny for every epoch.
+      const markerPath = workspaceMemoryDenyMarkerPath(sessionDir);
+      const savedMarker = await fsPromises.readFile(markerPath, "utf-8");
+      await fsPromises.writeFile(
+        markerPath,
+        JSON.stringify({ deniedAt: Date.now(), epochs: [2.5], wildcard: false })
+      );
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir, 16)).toBe(true);
+      await fsPromises.writeFile(markerPath, savedMarker);
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 16,
+          carriedPolicyEpochs: [-1, 12],
+        })
+      ).toBe(true);
+      expect(persistedFor(16)).toBe(false);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      // A carried grant (or no carried record at all) changes nothing.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": true };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 18,
+          carriedPolicyEpochs: [-1],
+        })
+      ).toBe(true);
+      expect(persistedFor(18)).toBe(true);
+      // A carried epoch with no record anywhere (no carried key, nothing under
+      // this epoch, no marker — e.g. the first tail compaction after an
+      // upgrade) is unknown history: denied.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        delete entry.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 24,
+          carriedPolicyEpochs: [-1],
+        })
+      ).toBe(true);
+      expect(persistedFor(24)).toBe(false);
+      // A chain of tail compactions names several epochs: one recorded grant
+      // does not vouch for a sibling epoch with no record anywhere.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": true };
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 26,
+          carriedPolicyEpochs: [-1, 5],
+        })
+      ).toBe(true);
+      expect(persistedFor(26)).toBe(false);
+      // A tail copy whose source epoch is unknown (persisted before the field
+      // existed) carries a policy nobody can look up: denied, like unknown
+      // history, even for an otherwise writable first turn.
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: 22,
+          carriedPolicyUnknown: true,
+        })
+      ).toBe(true);
+      expect(persistedFor(22)).toBe(false);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        entry.workspaceMemoryWritableByEpoch = { "-1": false, "12": true };
+        return cfg;
+      });
+      // ...while a turn of the closing epoch itself still sees its deny.
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBe(false);
+      expect(persistedFor(12)).toBe(true);
+      // Records are never pruned by count: a suspended compacting backend
+      // must still find its closing epoch's record however many epochs
+      // others opened meanwhile.
+      for (const policyEpoch of [20, 30, 40]) {
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch,
+          })
+        ).toBe(true);
+      }
+      expect(
+        Object.keys(
+          findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!.workspace
+            .workspaceMemoryWritableByEpoch!
+        ).sort()
+      ).toEqual(["-1", "12", "20", "30", "40"]);
+      // Raw config is not schema-validated: a corrupted non-boolean record
+      // reads as a deny, never as a grant.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace;
+        (entry.workspaceMemoryWritableByEpoch as Record<string, unknown>)["50"] = "false";
+        (entry.workspaceMemoryWritableByEpoch as Record<string, unknown>)["51"] = null;
+        return cfg;
+      });
+      for (const policyEpoch of [50, 51]) {
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch,
+          })
+        ).toBe(true);
+        // The deny stands (no grant written over the corrupted value)...
+        expect(persistedFor(policyEpoch)).not.toBe(true);
+        // ...and every reader sees it as false.
+        expect(
+          workspaceMemoryWritableForEpoch(
+            findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!.workspace,
+            policyEpoch
+          )
+        ).toBe(false);
+      }
+      // A corrupted CONTAINER (null, array, string) must not throw out of
+      // every turn start; it reads as a deny for every epoch and is healed
+      // (replaced, not spread) by the next write.
+      for (const container of [null, "false", ["-1"]]) {
+        await realConfig.editConfig((cfg) => {
+          const entry = findWorkspaceEntry(cfg, "policy-scratch")!.workspace as Record<
+            string,
+            unknown
+          >;
+          entry.workspaceMemoryWritableByEpoch = container;
+          return cfg;
+        });
+        const corrupted = findWorkspaceEntry(
+          realConfig.loadConfigOrDefault(),
+          "policy-scratch"
+        )!.workspace;
+        expect(workspaceMemoryWritableForEpoch(corrupted, 60)).toBe(false);
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch: 60,
+          })
+        ).toBe(true);
+        expect(persistedFor(60)).not.toBe(true);
+        // Healed on that write (no fast path on a corrupt container's blanket
+        // deny, r83): the container is a plain object again holding this
+        // epoch's deny, and the next epoch's first turn grants normally.
+        const healed = findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!
+          .workspace.workspaceMemoryWritableByEpoch;
+        expect(healed).toEqual({ "60": false });
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch: 62,
+          })
+        ).toBe(true);
+        expect(persistedFor(62)).toBe(true);
+        setWorkspaceMemoryWritableForEpoch(corrupted, 61, true);
+        expect(corrupted.workspaceMemoryWritableByEpoch).toEqual({ "61": true });
+      }
+
+      // Unknown history fails closed: no accumulator, no marker, no mirror
+      // (this service never recorded this epoch), yet the epoch already holds
+      // turns — the record was lost (a deny that could not be made durable
+      // anywhere before a restart, an upgrade mid-epoch). A writable turn
+      // must not grant the whole epoch; the first turn of a fresh epoch does.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: true,
+          policyEpoch: -1,
+        })
+      ).toBe(true);
+      expect(persisted()).toBe(false);
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      expect(
+        await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+          epochHasPriorTurns: false,
+          policyEpoch: -1,
+        })
+      ).toBe(true);
+      expect(persisted()).toBe(true);
+
+      // A record must wait for the session's in-flight epoch reset (a no-tail
+      // compaction clearing the closing epoch's accumulator/marker), or the
+      // first turn of the new epoch would AND itself with the stale deny.
+      let releaseReset!: () => void;
+      const resetInFlight = new Promise<void>((resolve) => (releaseReset = resolve));
+      const fakeSession = {
+        settleWorkspaceMemoryPolicyEpoch: () => resetInFlight,
+        workspaceMemoryWritableMirror: () => undefined,
+        recordWorkspaceMemoryWritable: () => undefined,
+      };
+      (service as unknown as { sessions: Map<string, unknown> }).sessions.set(
+        "policy-scratch",
+        fakeSession
+      );
+      await realConfig.editConfig((cfg) => {
+        findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritableByEpoch = {
+          "-1": false,
+        };
+        return cfg;
+      });
+      let settled = false;
+      const pendingRecord = service
+        .recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)
+        .then((ok) => {
+          settled = true;
+          return ok;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled).toBe(false);
+      // The reset finishes (field cleared) and only then does the record read.
+      await realConfig.editConfig((cfg) => {
+        delete findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      releaseReset();
+      expect(await pendingRecord).toBe(true);
+      expect(persisted()).toBe(true);
+      (service as unknown as { sessions: Map<string, unknown> }).sessions.delete("policy-scratch");
+
+      // An unreadable config.json (missing/malformed while the turn starts)
+      // must not make the still-registered workspace look unregistered: the
+      // deny takes the session-dir fallback instead of being reported durable
+      // without a record anywhere, and a grant is reported unpersisted (the
+      // harvest stays closed) rather than "done".
+      await realConfig.editConfig((cfg) => {
+        delete findWorkspaceEntry(cfg, "policy-scratch")!.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      const unreadable = () => {
+        throw new Error("config.json: unexpected token");
+      };
+      spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+        false
+      );
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
+      spyOn(realConfig, "loadConfigOrDefault").mockImplementationOnce(unreadable);
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
+      expect(persisted()).toBeUndefined();
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      // A MISSING config.json (mid-rewrite by another backend) is not a fresh
+      // install either: strict mode alone would read it as one and take the
+      // "unregistered" shortcut. Same fallback as unreadable.
+      const configFile = path.join(realConfig.rootDir, "config.json");
+      await fsPromises.rename(configFile, `${configFile}.parked`);
+      try {
+        expect(await service.recordWorkspaceMemoryWritable("policy-scratch", true, EPOCH0)).toBe(
+          false
+        );
+        expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+          true
+        );
+        expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(true);
+      } finally {
+        await fsPromises.rename(`${configFile}.parked`, configFile);
+      }
+      await clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir);
+      expect(persisted()).toBeUndefined();
+
+      // A late deny reaching the marker fallback after the workspace was
+      // removed (tombstoned, session dir deleted) must not recreate the
+      // session dir as an orphan; nothing is left to harvest, so it is done.
+      await realConfig.editConfig((cfg) => {
+        const entry = findWorkspaceEntry(cfg, "policy-scratch")!;
+        delete entry.workspace.workspaceMemoryWritableByEpoch;
+        return cfg;
+      });
+      await fsPromises.rm(sessionDir, { recursive: true, force: true });
+      const tombstonePath = workspaceRemovalTombstonePath(realConfig.rootDir, "policy-scratch");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "policy-scratch" }));
+      spyOn(realConfig, "editConfig").mockImplementationOnce(() =>
+        Promise.reject(new Error("disk full"))
+      );
+      expect(await service.recordWorkspaceMemoryWritable("policy-scratch", false, EPOCH0)).toBe(
+        true
+      );
+      expect(
+        await fsPromises.stat(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("the fenced deny-marker clear cannot delete a new-epoch deny written under the lock", async () => {
+    const { config: realConfig, cleanup } = await createTestHistoryService();
+    try {
+      const sessionDir = path.join(realConfig.sessionsDir, "policy-lock");
+      await writeWorkspaceMemoryDenyMarker(sessionDir, -1);
+      // Another backend's deny writer holds the session-dir lock while the
+      // destructive boundary reset starts: the reset must queue behind it
+      // (a write landing between its rm and its verification would read as
+      // a failed removal) and then discard that deny with the rest of the
+      // discarded transcript's entries.
+      let cleared = false;
+      let clear: Promise<void> | undefined;
+      await withTargetMutationLock(realConfig.rootDir, sessionDir, async () => {
+        clear = clearWorkspaceMemoryDenyMarker(realConfig.rootDir, sessionDir).then(() => {
+          cleared = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(cleared).toBe(false);
+        await writeWorkspaceMemoryDenyMarker(sessionDir, 5);
+        expect(await readWorkspaceMemoryDenyMarker(sessionDir, 5)).toBe(true);
+      });
+      await clear;
+      expect(cleared).toBe(true);
+      expect(await readWorkspaceMemoryDenyMarker(sessionDir)).toBe(false);
     } finally {
       await cleanup();
     }
@@ -11348,7 +11947,7 @@ describe("WorkspaceService pending auto-title", () => {
     };
 
     workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -14295,7 +14894,7 @@ describe("WorkspaceService remove timing rollup", () => {
       };
 
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         aiService,
         mockInitStateManager as InitStateManager,
@@ -14319,6 +14918,169 @@ describe("WorkspaceService remove timing rollup", () => {
     } finally {
       stopRelease.resolve();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("WorkspaceService remove sub-agent handover ordering", () => {
+  // A sub-agent's final shared-memory handover + removal tombstone are sealed
+  // under the removal locks BEFORE the checkout is deleted: a handover the
+  // owner store cannot take aborts with the checkout intact, and a refused
+  // checkout deletion rolls the tombstone back.
+  const projectPath = "/tmp/proj-handover";
+  const workspaceId = "child-handover";
+  const ownerId = "owner-handover";
+  const workspacePath = path.join(projectPath, "child-ws");
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  let rootDir: string;
+
+  beforeEach(async () => {
+    rootDir = path.join(tmpdir(), "mux-handover-order", `root-${crypto.randomUUID()}`);
+    await fsPromises.mkdir(path.join(rootDir, "sessions", workspaceId), { recursive: true });
+  });
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  function buildConfig(): Partial<Config> {
+    const topology = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: ownerId,
+                name: "owner",
+                path: path.join(projectPath, "owner-ws"),
+                runtimeConfig,
+              },
+              {
+                id: workspaceId,
+                name: "child",
+                path: workspacePath,
+                runtimeConfig,
+                parentWorkspaceId: ownerId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    return {
+      rootDir,
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(rootDir, "sessions"),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      editConfig: mock((edit: (cfg: typeof topology) => typeof topology) =>
+        Promise.resolve(edit(topology))
+      ),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildAiService(): AIService {
+    return {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: "child",
+            projectPath,
+            projectName: "proj",
+            runtimeConfig,
+            parentWorkspaceId: ownerId,
+          })
+        )
+      ),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+  }
+
+  test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let adoptions = 0;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
+          adoptions++;
+          // The unlocked pre-pass succeeds; the late note appears for the
+          // locked pass, which cannot place it.
+          return options?.locksHeld
+            ? Promise.reject(new Error("1 legacy note could not be folded"))
+            : Promise.resolve();
+        },
+      });
+      const result = await workspaceService.remove(workspaceId);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("could not be folded");
+      expect(adoptions).toBe(2);
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      // force accepts the loss and completes the removal.
+      expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a refused checkout deletion rolls the sealed tombstone back", async () => {
+    let refuse = true;
+    const deleteWorkspace = mock(() =>
+      Promise.resolve(
+        refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath }
+      )
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let sealedTombstone = false;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      deleteWorkspace.mockImplementation(async () => {
+        // Runtime deletion runs with the tombstone already sealed.
+        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
+        return refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath };
+      });
+      const refused = await workspaceService.remove(workspaceId);
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("uncommitted changes");
+      expect(sealedTombstone).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      refuse = false;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+    } finally {
+      createRuntimeSpy.mockRestore();
     }
   });
 });
@@ -14639,6 +15401,82 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     expect(reopened).toEqual([workspaceId]);
   });
 
+  test("remove() lifts the consolidation teardown gate only when it aborts before committing", async () => {
+    const calls: string[] = [];
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => {
+        calls.push("cancel");
+        return Promise.resolve();
+      },
+      releaseRemovalCancellation: () => {
+        calls.push("release");
+      },
+      finalizeHarvestsForRemoval: () => Promise.resolve(),
+    });
+    // Aborted before the point of no return (live descendant tasks): the
+    // workspace stays intact, so any teardown gate is lifted again.
+    let descendants = true;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => descendants })
+    );
+    const aborted = await workspaceService.remove(workspaceId);
+    expect(aborted.success).toBe(false);
+    expect(calls).toEqual(["release"]);
+    // Aborted inside the locked handover (a late legacy note the owner store
+    // cannot take), i.e. after the drain but BEFORE the tombstone: the session
+    // directory survives, so the gate is lifted too.
+    descendants = false;
+    calls.length = 0;
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const topology = {
+      projects: new Map([
+        [
+          "/tmp/src/project",
+          {
+            workspaces: [
+              { path: "/tmp/src/project/owner", id: "ws-owner" },
+              { path: "/tmp/src/project/child", id: workspaceId, parentWorkspaceId: "ws-owner" },
+            ],
+          },
+        ],
+      ]),
+    };
+    // The service holds its own copy of the mock config (createWorkspaceServiceForTest).
+    const config = (workspaceService as unknown as { config: MockWorkspaceConfig }).config;
+    const previousLoad = config.loadConfigOrDefault;
+    const previousLoadExisting = config.loadExistingConfigOrThrow;
+    config.loadConfigOrDefault = (() => topology) as MockWorkspaceConfig["loadConfigOrDefault"];
+    config.loadExistingConfigOrThrow = (() =>
+      topology) as MockWorkspaceConfig["loadExistingConfigOrThrow"];
+    workspaceService.setSharedWorkspaceMemoryStore({
+      adoptLegacyPrivateStoreForRemoval: () =>
+        Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
+    });
+    try {
+      const lockedAbort = await workspaceService.remove(workspaceId);
+      expect(lockedAbort.success).toBe(false);
+      if (!lockedAbort.success) expect(lockedAbort.error).toContain("tombstone could be published");
+      expect(existsSync(sessionDir)).toBe(true);
+      expect(calls).toContain("cancel");
+      expect(calls).toContain("release");
+    } finally {
+      config.loadConfigOrDefault = previousLoad;
+      config.loadExistingConfigOrThrow = previousLoadExisting;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+    }
+    // Committed removal: cancelled (drained) and never released.
+    calls.length = 0;
+    const removed = await workspaceService.remove(workspaceId);
+    expect(removed.success).toBe(true);
+    expect(calls.filter((call) => call === "cancel").length).toBeGreaterThan(0);
+    expect(calls).not.toContain("release");
+  });
+
   test("remove() flushes the timeline before deleting the session directory", async () => {
     const sessionDir = path.join(tempRoot, "sessions", workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
@@ -14722,7 +15560,7 @@ describe("WorkspaceService metadata listeners", () => {
     };
 
     new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -14785,7 +15623,7 @@ describe("WorkspaceService metadata listeners", () => {
     };
 
     new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       aiService,
       mockInitStateManager as InitStateManager,
@@ -16638,7 +17476,7 @@ describe("WorkspaceService archive init cancellation", () => {
     } as unknown as AIService;
 
     const workspaceService = new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -18812,7 +19650,7 @@ describe("WorkspaceService init cancellation", () => {
 
     try {
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -18898,9 +19736,12 @@ describe("WorkspaceService init cancellation", () => {
         sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
+        // The metadata-less removal path resolves the shared-memory owner
+        // strictly from config; an unreadable config aborts the removal.
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager,
@@ -18976,7 +19817,7 @@ describe("WorkspaceService init cancellation", () => {
         findWorkspace: mock(() => null),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager,
@@ -19048,7 +19889,7 @@ describe("WorkspaceService init cancellation", () => {
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -19128,7 +19969,7 @@ describe("WorkspaceService init cancellation", () => {
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -19495,7 +20336,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19625,7 +20466,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19744,7 +20585,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19857,7 +20698,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -19968,7 +20809,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20078,7 +20919,7 @@ describe("WorkspaceService fork", () => {
     };
 
     const workspaceService = new WorkspaceService(
-      config,
+      withExistingConfigLoader(config),
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20424,7 +21265,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     const mockBackgroundProcessManager = {};
     const { historyService } = await createTestHistoryService();
     return new WorkspaceService(
-      mockConfig as Config,
+      withExistingConfigLoader(mockConfig) as Config,
       historyService,
       mockAIService,
       mockInitStateManager as InitStateManager,
@@ -20557,7 +21398,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       };
       const { historyService } = await createTestHistoryService();
       const service = new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -20791,7 +21632,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       const mockExtensionMetadataService = {};
       const mockBackgroundProcessManager = {};
       return new WorkspaceService(
-        mockConfig as Config,
+        withExistingConfigLoader(mockConfig) as Config,
         historyService,
         mockAIService,
         mockInitStateManager as InitStateManager,
@@ -21867,12 +22708,57 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
   });
 });
 
+describe("WorkspaceService phantom removal probes", () => {
+  test("skips teardown only on PROVEN absence; an unreadable probe aborts the removal", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const service = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
+      }),
+    });
+    const workspaceId = "phantom-probe";
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
+    try {
+      // No config.json and no session dir: nothing to tear down (idempotent).
+      expect((await service.remove(workspaceId, true)).success).toBe(true);
+      // (Deregistration wrote config.json; take it away again so the probe
+      // pair is exercised.) The session dir probe now fails for a reason
+      // other than absence: the removal must not deregister on a guess —
+      // abort, retryable.
+      await fsPromises.rm(path.join(config.rootDir, "config.json"), { force: true });
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const unreadable = spyOn(fsPromises, "stat").mockImplementation(((
+        target: Parameters<typeof fsPromises.stat>[0],
+        ...rest: unknown[]
+      ) =>
+        String(target) === sessionDir
+          ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+          : (realStat as (...args: unknown[]) => unknown)(target, ...rest)) as never);
+      try {
+        const aborted = await service.remove(workspaceId, true);
+        expect(aborted.success).toBe(false);
+        expect(aborted.success ? "" : aborted.error).toContain("removal aborted");
+      } finally {
+        unreadable.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService disposal ownership", () => {
   test.each([false, true])(
     "leased cleanup removes real session files without a task-tree self-join (external=%s)",
     async (externalRemoval) => {
       const h = await createAgentSessionHarness({ workspaceId: "leased-removal" });
       const workspaceId = "leased-removal";
+      // Removal requires an EXISTING config.json (an absent one reads as
+      // mid-rewrite, not as a fresh install); this workspace is simply not
+      // registered in it, exercising the phantom (metadata-less) path.
+      await h.config.editConfig((cfg) => cfg);
       const service = createWorkspaceServiceForTest({
         config: h.config,
         historyService: h.historyService,

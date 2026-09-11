@@ -1839,10 +1839,14 @@ describe("CompactionHandler", () => {
         onCompactionComplete,
       });
 
+      // A real turn row: it carries its request bound and the epoch it
+      // recorded the workspace-memory policy under (none before any boundary).
       const tailAssistant = createMuxMessage("a1", "assistant", "tail answer", {
         model: "claude-x",
         usage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
         contextUsage: { inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+        requestHistorySequence: 2,
+        workspaceMemoryPolicyEpoch: -1,
       });
       await seedHistory(
         createMuxMessage("u0", "user", "old head question"),
@@ -1880,12 +1884,117 @@ describe("CompactionHandler", () => {
         expect(copy.metadata?.contextUsage).toBeUndefined();
         // Copies must never masquerade as boundaries.
         expect(copy.metadata?.compactionBoundary).toBeUndefined();
+        // The epoch the turn that covered the row recorded its policy under
+        // (none before this boundary): that policy governs the copy.
+        expect(copy.metadata?.rlmPreservedTailSourcePolicyEpoch).toBe(-1);
       }
       // Informational metadata survives.
       expect(epoch[2].metadata?.model).toBe("claude-x");
 
       const metadata = onCompactionComplete.mock.calls[0]?.[0];
       expect(metadata?.preservedTailMessageCount).toBe(2);
+
+      // A second tail compaction re-copies the copies: they keep their
+      // ORIGINAL epoch (-1) while the new epoch's own rows carry this
+      // boundary's epoch — the chain stays visible to the policy conjunction.
+      const boundarySequence = epoch[0].metadata?.historySequence;
+      if (typeof boundarySequence !== "number") throw new Error("boundary lacks a sequence");
+      // A user row is covered by the assistant TURN row whose request bound
+      // anchors on it (the LAST user row at or below the bound) or that lists
+      // it as a prelude snapshot, and carries THAT turn's recorded epoch: an
+      // OLDER one for a turn that straddled a boundary (p2/u2/a2); none for a
+      // turn row WITHOUT a recorded policy (an older build's, u4/a4) —
+      // unknown, never vouched for; none for an accepted batch no assistant
+      // ever answered (u5: stream never started or crashed first); and none
+      // for another backend's row that landed between a turn's anchor and its
+      // assistant row (ux: the turn never consumed it, so "nearest later
+      // assistant" would vouch for repo-controlled content nobody vetted).
+      // Sequences: the boundary sits at boundarySequence, the two first-epoch
+      // copies at +1/+2, so the rows seeded here start at +3.
+      await seedHistory(
+        createMuxMessage("p2", "user", "prelude snapshot", {
+          synthetic: true,
+          fileAtMentionSnapshot: ["@notes.md"],
+        }),
+        // Listed as a prelude row but of ordinary shape: never stamped through
+        // the listing (r85).
+        createMuxMessage("px", "user", "a real turn's question listed as prelude"),
+        createMuxMessage("u2", "user", "second question", {
+          requestPreludeMessageIds: ["p2", "px"],
+        }),
+        createMuxMessage("a2", "assistant", "second answer", {
+          requestHistorySequence: boundarySequence + 5, // anchors on u2
+          workspaceMemoryPolicyEpoch: -1,
+        }),
+        createMuxMessage("u3", "user", "third question"),
+        createMuxMessage("ux", "user", "foreign backend's batch"),
+        createMuxMessage("a3", "assistant", "third answer", {
+          requestHistorySequence: boundarySequence + 7, // anchors on u3, not ux
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
+        createMuxMessage("u4", "user", "old-build question"),
+        createMuxMessage("a4", "assistant", "old-build answer", {
+          requestHistorySequence: boundarySequence + 10, // anchors on u4
+        }),
+        createMuxMessage("u5", "user", "unanswered question"),
+        // A row that recorded its policy under a foreign epoch but lost its
+        // request bound keeps that stamp (never the closing epoch); a present
+        // but malformed stamp stays unstamped; a synthetic payload row with
+        // neither belongs to the closing epoch.
+        createMuxMessage("a6", "assistant", "foreign-epoch answer without a bound", {
+          workspaceMemoryPolicyEpoch: -1,
+        }),
+        createMuxMessage("a7", "assistant", "corrupted stamp", {
+          workspaceMemoryPolicyEpoch: null as unknown as number,
+        }),
+        createMuxMessage("a8", "assistant", "synthetic payload"),
+        createMuxMessage("a9", "assistant", "old-build turn with a corrupted bound", {
+          requestHistorySequence: null as unknown as number,
+        }),
+        // A stamped turn whose bound is outside the sequence domain covers
+        // nothing (the harvest gate applies the same rule, r79/r80): its
+        // user row stays unstamped, the row itself keeps its stamp.
+        createMuxMessage("u10", "user", "question behind a fractional bound"),
+        createMuxMessage("a10", "assistant", "fractional bound", {
+          requestHistorySequence: boundarySequence + 18.5,
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
+        // An unsafe integer is outside the domain too (r90): the gate refuses
+        // it, so the copy must not read as covered either.
+        createMuxMessage("u11", "user", "question behind an unsafe bound"),
+        createMuxMessage("a11", "assistant", "unsafe bound", {
+          requestHistorySequence: Number.MAX_SAFE_INTEGER + 1,
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
+        createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
+      const secondEpoch = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!secondEpoch.success) throw new Error(secondEpoch.error);
+      expect(
+        secondEpoch.data.slice(1).map((copy) => copy.metadata?.rlmPreservedTailSourcePolicyEpoch)
+      ).toEqual([
+        -1, // copy(u1)
+        -1, // copy(a1)
+        -1, // p2 (prelude of u2)
+        undefined, // px (listed, but no prelude shape)
+        -1, // u2
+        -1, // a2
+        boundarySequence, // u3
+        undefined, // ux
+        boundarySequence, // a3
+        undefined, // u4
+        undefined, // a4
+        undefined, // u5
+        -1, // a6 (recorded stamp kept despite the missing bound)
+        undefined, // a7 (malformed stamp)
+        boundarySequence, // a8 (no stamp, no bound: synthetic payload row)
+        undefined, // a9 (no stamp, malformed bound: not a synthetic row)
+        undefined, // u10 (its turn's bound is fractional: never covered)
+        boundarySequence, // a10 (recorded stamp kept)
+        undefined, // u11 (its turn's bound is an unsafe integer: never covered)
+        boundarySequence, // a11 (recorded stamp kept)
+      ]);
     });
 
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {

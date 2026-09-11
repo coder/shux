@@ -21,7 +21,9 @@ import {
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
   type MuxMessage,
+  isTokenBudgetInternalMessage,
 } from "@/common/types/message";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createCompactionSummaryMessageId } from "@/node/services/utils/messageIds";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import {
@@ -39,7 +41,12 @@ import {
 import {
   isDurableCompactedMarker,
   isDurableContextBoundaryMarker,
+  latestContextBoundaryHistorySequence,
+  duplicateUserMessageIds,
+  isPersistedHistorySequence,
+  isRequestPreludeRow,
   sliceMessagesFromLatestCompactionBoundary,
+  workspaceMemoryPolicyEpochOf,
 } from "@/common/utils/messages/compactionBoundary";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import {
@@ -300,17 +307,6 @@ function coercePersistedPostCompactionState(
 
 function isCompactedSummaryMessage(message: MuxMessage): boolean {
   return isDurableCompactedMarker(message.metadata?.compacted);
-}
-
-function getLatestBoundaryHistorySequence(messages: readonly MuxMessage[]): number | undefined {
-  let latest: number | undefined;
-  for (const message of messages) {
-    if (!isDurableContextBoundaryMarker(message)) continue;
-    const sequence = message.metadata?.historySequence;
-    if (!isNonNegativeInteger(sequence)) continue;
-    if (latest === undefined || sequence > latest) latest = sequence;
-  }
-  return latest;
 }
 
 function getNextCompactionEpoch(messages: MuxMessage[]): number {
@@ -1277,16 +1273,19 @@ export class CompactionHandler {
       }
     );
     const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
-    const copies = params.tail.map((row) => {
-      const copy = this.buildPreservedTailCopy(row, idMap);
-      // Continuous compaction prunes the just-finished answer too. Keep recent pages
-      // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
-      copy.metadata = { ...copy.metadata, uiVisible: true };
-      // User Esc keeps its interrupted marker and next-send continuation sentinel.
-      // Only our internal stop has an explicit durable Continue replacing it.
-      if (params.pendingFollowUp) delete copy.metadata.partial;
-      return copy;
-    });
+    // Same closing epoch the completion metadata reports below.
+    const closingPolicyEpoch = workspaceMemoryPolicyEpochOf(params.messages);
+    const copies = this.buildCoveredTailCopies(params.tail, idMap, closingPolicyEpoch).map(
+      (copy) => {
+        // Continuous compaction prunes the just-finished answer too. Keep recent pages
+        // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
+        copy.metadata = { ...copy.metadata, uiVisible: true };
+        // User Esc keeps its interrupted marker and next-send continuation sentinel.
+        // Only our internal stop has an explicit durable Continue replacing it.
+        if (params.pendingFollowUp) delete copy.metadata.partial;
+        return copy;
+      }
+    );
     return { boundary, copies };
   }
 
@@ -1343,7 +1342,8 @@ export class CompactionHandler {
       summaryMessageId: boundary.id,
       summaryHistorySequence: sequence,
       compactionEpoch: epoch,
-      previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
+      previousBoundaryHistorySequence: latestContextBoundaryHistorySequence(params.messages),
+      closingPolicyEpoch: workspaceMemoryPolicyEpochOf(params.messages),
       compactionRequestMessageId: boundary.id,
       preservedTailMessageCount: copies.length,
     });
@@ -1406,7 +1406,10 @@ export class CompactionHandler {
     const nextCompactionEpoch = getNextCompactionEpoch(messages);
     assert(Number.isInteger(nextCompactionEpoch), "next compaction epoch must be an integer");
 
-    const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(messages);
+    const previousBoundaryHistorySequence = latestContextBoundaryHistorySequence(messages);
+    // The policy epoch the compacted rows belong to: the key their turns
+    // recorded under (TurnRequestBuilder) and the one the harvest reads.
+    const closingPolicyEpoch = workspaceMemoryPolicyEpochOf(messages);
     const maxExistingHistorySequence = this.getMaxExistingHistorySequence(messages);
 
     // For idle compaction, preserve the original recency timestamp so the workspace
@@ -1513,7 +1516,8 @@ export class CompactionHandler {
     const preservedTailCopies = this.buildPreservedTailCopies(
       messages,
       compactionRequestMessageId,
-      summaryMessage.id
+      summaryMessage.id,
+      closingPolicyEpoch
     );
 
     const persistenceResult =
@@ -1582,6 +1586,7 @@ export class CompactionHandler {
       summaryHistorySequence: persistedSequence,
       compactionEpoch: nextCompactionEpoch,
       previousBoundaryHistorySequence,
+      closingPolicyEpoch,
       compactionRequestMessageId,
       preservedTailMessageCount: preservedTailCopies.length,
     });
@@ -1599,7 +1604,8 @@ export class CompactionHandler {
   private buildPreservedTailCopies(
     messages: MuxMessage[],
     compactionRequestMessageId: string,
-    summaryMessageId: string
+    summaryMessageId: string,
+    closingPolicyEpoch: number
   ): MuxMessage[] {
     const requestIndex = messages.findIndex((message) => message.id === compactionRequestMessageId);
     if (requestIndex === -1) {
@@ -1639,7 +1645,109 @@ export class CompactionHandler {
     for (const row of tailRows) {
       idMap.set(row.id, createPreservedTailCopyMessageId());
     }
-    return tailRows.map((row) => this.buildPreservedTailCopy(row, idMap));
+    return this.buildCoveredTailCopies(tailRows, idMap, closingPolicyEpoch);
+  }
+
+  /**
+   * Copies of a whole tail with their policy epochs assigned by request
+   * COVERAGE — the same batch rule as the harvest gate
+   * (memoryConsolidationService epochHarvestRefusal). An assistant TURN row
+   * (it carries `requestHistorySequence`, the last history sequence its
+   * request was built from) consumed exactly one batch under the policy it
+   * recorded: the LAST user row at or below that bound plus the rows that
+   * user row lists in `requestPreludeMessageIds`, matched by exact id. Only
+   * those user rows carry the turn's recorded epoch; the turn row carries it
+   * itself. Not "the nearest later assistant": with several backends on one
+   * chat.jsonl — or a sub-agent report row appended while the parent's
+   * request was preparing — a user row can land between a turn's anchor and
+   * its assistant row without that turn ever having seen it, and stamping it
+   * would present unvetted (model- or repo-controlled) content to the next
+   * epoch as covered. Everything else stays unstamped — a user row no turn
+   * covered (an accepted batch whose stream never started or crashed first),
+   * one answered by a turn without a recorded policy (an older build's) —
+   * which the policy sink reads as unknown (deny). Token-budget control rows
+   * (backend template text, no agent or repository content) need no turn and
+   * belong to the closing epoch, as do assistant rows that carry no policy
+   * stamp and no bound (synthetic payloads, summaries). An assistant row
+   * WITH a recorded stamp keeps it even when its bound is missing or
+   * malformed. Copies of copies keep their original epoch regardless.
+   */
+  private buildCoveredTailCopies(
+    tailRows: MuxMessage[],
+    idMap: Map<string, string>,
+    closingPolicyEpoch: number
+  ): MuxMessage[] {
+    const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
+    const userRowById = new Map<string, MuxMessage>();
+    for (const message of tailRows) {
+      const sequence = message.metadata?.historySequence;
+      if (message.role !== "user") continue;
+      userRowById.set(message.id, message);
+      if (typeof sequence === "number") userRows.push({ message, sequence });
+    }
+    const coveredEpochById = new Map<string, number>();
+    // An id shared by two user rows names no batch: neither copy is stamped
+    // (the harvest gate refuses such an epoch; the copies must not present
+    // either row as covered to the next one).
+    const duplicated = duplicateUserMessageIds(tailRows);
+    for (const message of tailRows) {
+      if (message.role !== "assistant") continue;
+      const bound = message.metadata?.requestHistorySequence;
+      const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
+      // Same domain check as the harvest gate (epochHarvestRefusal, r79 —
+      // the shared predicate, so an unsafe integer is refused alike, r90): a
+      // bound outside the clock's domain covers nothing there, so it must not
+      // stamp a batch here either — the copies would then carry an epoch
+      // without ever having been covered, and the association would grant
+      // in a later epoch what the gate refused in this one.
+      if (typeof policyEpoch !== "number" || !isPersistedHistorySequence(bound)) continue;
+      const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
+      if (anchor === undefined) continue;
+      // Same prelude rule as the harvest gate: a listed id stamps a user row
+      // only when that row has prelude shape.
+      const prelude = getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds).filter(
+        (id) => {
+          const listed = userRowById.get(id);
+          return listed === undefined || isRequestPreludeRow(listed);
+        }
+      );
+      for (const id of [anchor.id, ...prelude]) {
+        if (!coveredEpochById.has(id) && !duplicated.has(id)) {
+          coveredEpochById.set(id, policyEpoch);
+        }
+      }
+    }
+    return tailRows.map((row) => {
+      let epoch: number | undefined;
+      if (row.role === "assistant") {
+        // A recorded stamp is kept whatever the bound: a row that recorded
+        // its policy (possibly a read-only one, under a foreign epoch whose
+        // deny a destructive reset since discarded) but lost or corrupted its
+        // bound must not be reclassified as a synthetic non-turn row and
+        // handed the closing epoch — that would present it to the next epoch
+        // as current-policy content. History is raw JSON: a stamp that is
+        // present but not a number stays unstamped (unknown). Only a row
+        // with no stamp AND no bound at all is a synthetic payload/summary
+        // row (closing epoch); a row with a bound — present in any form,
+        // malformed included: it may be an older build's turn whose policy
+        // was never recorded — stays unstamped (unknown).
+        const stamp: unknown = row.metadata?.workspaceMemoryPolicyEpoch;
+        const bound: unknown = row.metadata?.requestHistorySequence;
+        epoch =
+          stamp !== undefined
+            ? typeof stamp === "number"
+              ? stamp
+              : undefined
+            : bound === undefined
+              ? closingPolicyEpoch
+              : undefined;
+      } else if (row.role !== "user" || isTokenBudgetInternalMessage(row)) {
+        epoch = closingPolicyEpoch;
+      } else {
+        epoch = coveredEpochById.get(row.id);
+      }
+      return this.buildPreservedTailCopy(row, idMap, epoch);
+    });
   }
 
   /**
@@ -1652,7 +1760,11 @@ export class CompactionHandler {
    * original rows remain visible above the boundary; fresh IDs keep UI
    * aggregation from collapsing a hidden copy over its visible original.
    */
-  private buildPreservedTailCopy(row: MuxMessage, idMap: Map<string, string>): MuxMessage {
+  private buildPreservedTailCopy(
+    row: MuxMessage,
+    idMap: Map<string, string>,
+    coveringPolicyEpoch: number | undefined
+  ): MuxMessage {
     // IDs are preassigned for the whole tail (see caller) so forward-pointing
     // references (snapshot row → later invoking user row) rewrite correctly.
     const copyId = idMap.get(row.id);
@@ -1671,12 +1783,28 @@ export class CompactionHandler {
           }
         : source?.mcpPromptSnapshot;
 
+    // The epoch whose workspace-memory write policy governs this row: a copy
+    // of a copy keeps its ORIGINAL epoch (the chain must stay visible to the
+    // policy conjunction; copies from before the field existed carry nothing
+    // forward — no policy record ever existed for their epochs). A first-time
+    // copy carries the epoch buildCoveredTailCopies assigned it: for a turn
+    // row its own recorded epoch — a turn that started before a destructive
+    // reset and landed after the new boundary belongs to the OLD epoch, whose
+    // policy the new one cannot vouch for — and a turn row without a record
+    // (an older build's) stays unstamped, read as unknown (deny).
+    const sourcePolicyEpoch =
+      source?.rlmPreservedTailCopy === true
+        ? source.rlmPreservedTailSourcePolicyEpoch
+        : coveringPolicyEpoch;
     return {
       ...row,
       id: copyId,
       metadata: {
         synthetic: true,
         rlmPreservedTailCopy: true,
+        ...(sourcePolicyEpoch !== undefined
+          ? { rlmPreservedTailSourcePolicyEpoch: sourcePolicyEpoch }
+          : {}),
         ...(source?.timestamp !== undefined ? { timestamp: source.timestamp } : {}),
         ...(source?.model !== undefined ? { model: source.model } : {}),
         ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),

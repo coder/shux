@@ -884,6 +884,11 @@ interface ConfigLoadFailureState {
 // re-log the same corrupt-config error once per instance.
 const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 
+/** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
+export function configFilePath(rootDir: string): string {
+  return path.join(rootDir, "config.json");
+}
+
 function configLoadFailureState(configFile: string): ConfigLoadFailureState {
   let state = configLoadFailureStates.get(configFile);
   if (!state) {
@@ -934,6 +939,21 @@ export class Config {
   readonly sessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
+  /**
+   * Cheap durable change signal for config.json: one stat, no parse. Any
+   * backend's rewrite changes size/mtime (atomic replace also changes the
+   * inode), so a memo built against a previous stamp knows to rebuild —
+   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * missing/unreadable file yields a distinct stamp.
+   */
+  configFileStamp(): string {
+    try {
+      const st = fs.statSync(this.configFile, { bigint: true });
+      return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}`;
+    } catch {
+      return "missing";
+    }
+  }
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly emitter = new EventEmitter();
   /**
@@ -969,7 +989,7 @@ export class Config {
     this.rootDir = sessionLocator.rootDir;
     this.sessionsDir = sessionLocator.sessionsDir;
     this.srcDir = sessionLocator.srcDir;
-    this.configFile = path.join(this.rootDir, "config.json");
+    this.configFile = configFilePath(this.rootDir);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(this.rootDir);
   }
 
@@ -1308,6 +1328,32 @@ export class Config {
       }
     }
     return { ids, hasWorkspaceEntriesWithoutIds };
+  }
+
+  /**
+   * Strict load that additionally REQUIRES config.json to exist. The strict
+   * mode of loadConfigOrDefault still treats ENOENT as a fresh install (an
+   * empty, valid config), which fail-closed callers — workspace removal's
+   * shared-memory handover, the workspace-memory policy accumulator — must
+   * not mistake for "this workspace is not registered" while the file is
+   * merely mid-rewrite. Stat before and after the read, and require the SAME
+   * stamp at both: a file present at both with one stamp is taken as present
+   * and unchanged during the read, while a replacement landing in between
+   * (another backend's atomic rewrite) means the bytes read may belong to
+   * neither snapshot's topology — the caller retries from one stable
+   * snapshot rather than act on a torn view.
+   */
+  loadExistingConfigOrThrow(): ProjectsConfig {
+    const before = this.configFileStamp();
+    const config = this.loadConfigOrDefault({ throwOnError: true });
+    const after = this.configFileStamp();
+    if (before === "missing" || after === "missing") {
+      throw new Error(`config.json is absent at ${this.configFile}`);
+    }
+    if (before !== after) {
+      throw new Error(`config.json at ${this.configFile} was replaced during the read`);
+    }
+    return config;
   }
 
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {

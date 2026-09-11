@@ -140,7 +140,13 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
     rootDir: path.dirname(sessionDir),
     sessionsDir: path.dirname(sessionDir),
     srcDir: "/tmp",
-    loadConfigOrDefault: mock(() => ({})),
+    // A context boundary resets the durable memory-policy accumulator, which
+    // looks this workspace up in the config snapshot (existence-requiring
+    // load; the mock delegates so the strict-mode override below propagates).
+    loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+    loadExistingConfigOrThrow(this: Config) {
+      return this.loadConfigOrDefault({ throwOnError: true });
+    },
   } as unknown as Config;
 
   return new AgentSession({
@@ -248,8 +254,27 @@ describe("AgentSession post-compaction attachments", () => {
       expect(injected).not.toBeNull();
       expect(getReadFilePaths(injected ?? [])).toEqual(["/tmp/pre-boundary-read.ts"]);
 
-      // A new context segment starts (context reset / full history clear):
-      // the reset was meant to discard that context, so...
+      // A new context segment starts (context reset / full history clear).
+      // Its durable policy-epoch reset reads config strictly: an unreadable
+      // config.json must surface as a retryable failure rather than a
+      // "successful" reset that leaves stale per-epoch records behind.
+      const sessionConfig = (session as unknown as { config: Config }).config;
+      const readable = sessionConfig.loadConfigOrDefault.bind(sessionConfig);
+      sessionConfig.loadConfigOrDefault = ((options?: { throwOnError?: boolean }) => {
+        if (options?.throwOnError) throw new Error("config.json: unexpected token");
+        return readable(options);
+      }) as Config["loadConfigOrDefault"];
+      try {
+        expect(
+          await session.clearPostCompactionState().then(
+            () => null,
+            (error: unknown) => (error instanceof Error ? error.message : String(error))
+          )
+        ).toContain("unexpected token");
+      } finally {
+        sessionConfig.loadConfigOrDefault = readable;
+      }
+      // The reset was meant to discard that context, so...
       await session.clearPostCompactionState();
 
       // ...no later turn may re-inject pre-boundary paths — neither

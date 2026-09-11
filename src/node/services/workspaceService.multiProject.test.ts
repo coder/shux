@@ -82,9 +82,25 @@ function createMockAIService(metadata?: WorkspaceMetadata): AIService {
     off: mock(() => undefined),
   } as unknown as AIService;
 }
+/**
+ * Mock configs model no file on disk. Removal's shared-memory handover
+ * requires an EXISTING config.json (Config.loadExistingConfigOrThrow); for a
+ * mock that only provides loadConfigOrDefault, treat that snapshot as the
+ * existing file (same shim as workspaceService.test.ts).
+ */
+function withExistingConfigLoader(config: Partial<Config>): Partial<Config> {
+  if (
+    typeof config.loadExistingConfigOrThrow !== "function" &&
+    typeof config.loadConfigOrDefault === "function"
+  ) {
+    const load = config.loadConfigOrDefault.bind(config);
+    return { ...config, loadExistingConfigOrThrow: () => load({ throwOnError: true }) };
+  }
+  return config;
+}
 function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): WorkspaceService {
   return new WorkspaceService(
-    options.config as Config,
+    withExistingConfigLoader(options.config) as Config,
     options.historyService,
     options.aiService ?? createMockAIService(),
     options.initStateManager ?? createMockInitStateManager(),

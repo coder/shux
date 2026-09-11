@@ -33,7 +33,13 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STOP_UNRECORDED_MESSAGE } from "@/common/constants/workspace";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
+import {
+  ProvidersConfigStore,
+  SecretsStore,
+  configFilePath,
+  type Config,
+  type Workspace as WorkspaceConfigEntry,
+} from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -114,6 +120,7 @@ import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFil
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import {
   CONTEXT_BOUNDARY_KINDS,
+  compactionClosingPolicyEpoch,
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
   sliceMessagesForProviderFromLatestContextBoundary,
@@ -130,12 +137,33 @@ import {
 } from "@/node/services/branchSummary";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
+  isWorkspaceRemovalTombstoned,
   removeSessionDirUnderMemoryLocks,
+  sealSubAgentForRemovalUnderMemoryLocks,
+  SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
   TombstoneNotDurableError,
 } from "@/node/services/workspaceRemoval";
+import {
+  pinDescendantWorkspaceMemoryOwners,
+  resolveWorkspaceMemoryOwnerId,
+} from "@/node/services/memoryWorkspaceOwner";
+import {
+  readWorkspaceMemoryDenyMarkerForEpochs,
+  readWorkspaceMemoryDenyMarker,
+  writeWorkspaceMemoryDenyMarker,
+} from "@/node/services/workspaceMemoryDenyMarker";
+import { migrateSharedMemoryRefinementRows } from "@/node/services/refinement/sharedMemoryRowMigration";
+import type { MemoryService } from "@/node/services/memoryService";
+
+/** MemoryService methods removal needs (see MemoryService.adoptLegacyPrivateStoreForRemoval). */
+type SharedWorkspaceMemoryStoreForRemoval = Pick<
+  MemoryService,
+  "adoptLegacyPrivateStoreForRemoval"
+>;
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -337,6 +365,11 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  setWorkspaceMemoryWritableForEpoch,
+  hasMalformedWorkspaceMemoryPolicyRecords,
+  workspaceMemoryWritableForEpoch,
+} from "@/node/services/workspaceMemoryPolicyEpochs";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -376,6 +409,7 @@ import {
   upsertSubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 /** Maximum number of retry attempts when workspace name collides */
 const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
@@ -2740,7 +2774,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
+  /** Narrow MemoryService surface for removal's shared-memory handover; wired by coreServices. */
+  private sharedWorkspaceMemoryStore?: SharedWorkspaceMemoryStoreForRemoval;
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
@@ -3083,8 +3121,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
+  }
+
+  setSharedWorkspaceMemoryStore(store: SharedWorkspaceMemoryStoreForRemoval): void {
+    this.sharedWorkspaceMemoryStore = store;
   }
 
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
@@ -4198,6 +4242,308 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     for (const session of this.sessions.values()) session.beginShutdown();
   }
 
+  /**
+   * Sub-agents share their task-tree owner's /memories/workspace store, so a
+   * workspace-scope write by one tree member stales the cached memory context
+   * of every live session in that tree, not just the acting one (which already
+   * clears its own cache on tool-call-end). `isAffected` decides membership.
+   */
+  invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
+    // Startup-recovery sessions are live too and may be promoted with their cache.
+    for (const registry of [this.sessions, this.transientStartupRecoverySessions]) {
+      for (const [workspaceId, session] of registry) {
+        if (isAffected(workspaceId)) session.invalidateMemoryContext();
+      }
+    }
+  }
+
+  /**
+   * Config snapshot for resolving a removal's shared-memory owner: strict
+   * load, so a transiently unreadable config.json aborts the removal (the
+   * workspace stays registered and retryable) rather than yielding the
+   * fresh-install default whose empty topology would resolve every sub-agent
+   * to itself.
+   */
+  private loadConfigForRemovalOrAbort(workspaceId: string): ProjectsConfig {
+    try {
+      // Existing file required: strict mode alone reads ENOENT as a fresh
+      // install, which would verify this child as its own owner mid-rewrite.
+      return this.config.loadExistingConfigOrThrow();
+    } catch (error: unknown) {
+      throw new SharedMemoryRemovalAbortedError(workspaceId, { cause: error });
+    }
+  }
+
+  /**
+   * TurnRequestBuilder → session: the agent's workspace-memory write policy
+   * for this turn. Also persisted on the workspace config entry (only when it
+   * changes) so a harvest completing in a fresh session after a restart can
+   * still be gated; see onCompactionComplete. Awaited by the builder and
+   * VERIFIED by reading the config back: Config swallows write failures, and
+   * a stale persisted `true` would let a now read-only agent's transcript
+   * harvest into the shared notebook after a restart. A deny that config.json
+   * cannot hold is recorded in the session dir instead
+   * (workspaceMemoryDenyMarker.ts); resolves false only when the new value
+   * could not be confirmed durable anywhere.
+   */
+  async recordWorkspaceMemoryWritable(
+    workspaceId: string,
+    writable: boolean,
+    options: {
+      epochHasPriorTurns: boolean;
+      policyEpoch: number;
+      carriedPolicyEpochs?: number[];
+      /** The epoch holds tail copies whose source epoch is unknown: denied (see TurnRequestBuilder). */
+      carriedPolicyUnknown?: boolean;
+    }
+  ): Promise<boolean> {
+    // The accumulator (config bit and deny marker alike) is bound to the
+    // compaction epoch it accumulates over — the opening boundary's history
+    // sequence, -1 before any boundary — so a value recorded under another
+    // epoch reads as absent here. Without this, a backend starting the FIRST
+    // turn of a new epoch could read the closing epoch's `false` before the
+    // compacting backend's durable reset landed (the reset is awaited only by
+    // that backend's own session) and carry it, via its mirror, through an
+    // otherwise all-writable epoch.
+    const { policyEpoch } = options;
+    const carriedPolicyEpochs = options.carriedPolicyEpochs ?? [];
+    assert(Number.isInteger(policyEpoch), "policyEpoch must be an integer");
+    assert(
+      carriedPolicyEpochs.every((epoch) => Number.isInteger(epoch) && epoch < policyEpoch),
+      "carriedPolicyEpochs must be earlier epochs"
+    );
+    const session =
+      this.sessions.get(workspaceId) ?? this.transientStartupRecoverySessions.get(workspaceId);
+    // A no-tail compaction's durable epoch reset may still be in flight: read
+    // nothing of the closing epoch (accumulator, marker) before it settled.
+    await session?.settleWorkspaceMemoryPolicyEpoch();
+    const mirror = session?.workspaceMemoryWritableMirror(policyEpoch);
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+    // A deny that config.json cannot hold falls back to the session dir: the
+    // turn's user row is already durable in chat.jsonl there, so the deny
+    // must become durable in the same place or the epoch could later be
+    // harvested as writable after a restart (the mirror is process-local).
+    // `effective` is what the caller computed for the epoch so far; a grant
+    // never takes the fallback (harvest stays closed on the unpersisted bit).
+    let effective = false;
+    const denyDurableFallback = async (cause: string): Promise<boolean> => {
+      if (effective) return false;
+      try {
+        // Late session-dir writer (like headless usage): with several
+        // backends, this turn may reach the fallback after a remover has
+        // tombstoned, deleted and deregistered the workspace — the marker's
+        // mkdir would recreate the session dir as an orphan. Gate + write run
+        // inside the session-dir target lock that removal's tombstone+delete
+        // critical section also holds, so the check cannot go stale. A
+        // removed workspace has nothing left to harvest: recorded as done.
+        const written = await withTargetMutationLock(this.config.rootDir, sessionDir, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return false;
+          await writeWorkspaceMemoryDenyMarker(sessionDir, policyEpoch);
+          return true;
+        });
+        if (!written) {
+          log.debug("Skipping workspace memory deny marker for removed workspace", { workspaceId });
+          session?.recordWorkspaceMemoryWritable(false, policyEpoch);
+          return true;
+        }
+      } catch (markerError: unknown) {
+        log.error("Workspace memory deny could not be made durable anywhere", {
+          workspaceId,
+          cause,
+          error: getErrorMessage(markerError),
+        });
+        // Process-local floor: this session at least keeps refusing until
+        // the next successful persist writes the false it now mirrors.
+        session?.recordWorkspaceMemoryWritable(false, policyEpoch);
+        return false;
+      }
+      session?.recordWorkspaceMemoryWritable(false, policyEpoch);
+      return true;
+    };
+    // Strict load of an EXISTING file: a config.json that is missing (strict
+    // mode alone reads ENOENT as a fresh install) or malformed right now
+    // reads as the fresh-install default, in which this still-registered
+    // workspace is absent — the "unregistered" shortcut below would then
+    // report a deny as durable without persisting anything, while another
+    // backend keeps a prior durable grant. Treat an unreadable config like a
+    // failed config write: the deny takes the session-dir fallback
+    // (tombstone-gated, so a genuinely deregistered workspace still skips), a
+    // grant leaves the harvest closed.
+    let before: ReturnType<typeof findWorkspaceEntry>;
+    try {
+      before = findWorkspaceEntry(this.config.loadExistingConfigOrThrow(), workspaceId);
+    } catch (error: unknown) {
+      log.error("Workspace memory write policy: config unreadable", {
+        workspaceId,
+        writable,
+        error: getErrorMessage(error),
+      });
+      effective = writable;
+      return denyDurableFallback(`config unreadable: ${getErrorMessage(error)}`);
+    }
+    // Unregistered workspace: nothing durable to update and no stale
+    // permission to invalidate (harvests fail closed on the missing value).
+    if (before === null) {
+      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable, policyEpoch);
+      return true;
+    }
+    // The persisted bit is the epoch accumulator, fail-closed: the harvest
+    // reads every message of the compaction epoch, so one read-only turn
+    // denies the whole epoch even if writable turns follow. Durable so it
+    // survives a restart mid-epoch AND so backends sharing one chat.jsonl
+    // (multi-instance) contribute to the same conjunction; it restarts at
+    // context boundaries (AgentSession.resetWorkspaceMemoryWritable). The
+    // conjunction is computed INSIDE the config transaction (registration
+    // lock, cross-process) from the value current at write time — two
+    // backends reading an absent bit concurrently could otherwise publish
+    // false→true. The session additionally contributes its own mirror: a
+    // deny it observed survives even if another backend's boundary reset
+    // removed the durable field underneath it.
+    // A fourth input: the session-dir deny marker, the durable fallback taken
+    // when config.json could not record a deny (denyDurableFallback above).
+    // Preserved-tail epoch: the accumulators of the epochs its tail copies
+    // were produced under are part of this one. The compacting session's
+    // carry moves a record/marker from the carried key to this one
+    // asynchronously; reading EVERY key (records inside the transaction
+    // below, marker entries from ONE snapshot here) makes the conjunction
+    // independent of that carry's timing — a deny is visible under one key
+    // or another at every instant, never under none. One read for all the
+    // epochs: separate reads could straddle the carry's atomic re-stamp and
+    // each miss the entry.
+    const denyMarker = await readWorkspaceMemoryDenyMarkerForEpochs(sessionDir, [
+      policyEpoch,
+      ...carriedPolicyEpochs,
+    ]);
+    // undefined: no carried epoch recorded anything; false: some carried deny.
+    const carriedFor = (entry: WorkspaceConfigEntry): boolean | undefined => {
+      let carried: boolean | undefined;
+      for (const epoch of carriedPolicyEpochs) {
+        const value = workspaceMemoryWritableForEpoch(entry, epoch);
+        if (value === undefined) continue;
+        carried = (carried ?? true) && value;
+      }
+      return carried;
+    };
+    // Unknown history fails closed, like the harvest's own unknown → closed
+    // rule: with no durable accumulator, no marker and no mirror, an epoch
+    // that already holds turns has a policy nobody recorded — the record was
+    // lost (a deny that could not be made durable anywhere before this
+    // process died, an upgrade mid-epoch) — so this epoch's harvest is denied
+    // until the next boundary rather than granted by whichever turn comes
+    // first. The first turn of a fresh epoch has no prior turns and grants
+    // normally.
+    const storedFor = (entry: WorkspaceConfigEntry): boolean | undefined =>
+      workspaceMemoryWritableForEpoch(entry, policyEpoch);
+    const stored = storedFor(before.workspace);
+    // A carried epoch whose policy was never recorded anywhere — no record
+    // under ITS key, none under this epoch's (where a completed carry would
+    // have moved it), no marker — is unknown history too: the tail copies ARE
+    // turns of that epoch (excluded from epochHasPriorTurns by design), e.g.
+    // the first tail compaction after upgrading a chat. EVERY carried epoch
+    // must be represented: with a chain like [-1, 5], a recorded -1 says
+    // nothing about 5, and one recorded grant must not mask the epoch whose
+    // record is missing. (The first turn recording a deny for this reason
+    // persists it under this epoch's key, so a later turn that finds a
+    // record here inherits the verdict rather than re-deriving it.)
+    const carriedUnrecorded =
+      stored === undefined &&
+      !denyMarker &&
+      carriedPolicyEpochs.some(
+        (epoch) => workspaceMemoryWritableForEpoch(before.workspace, epoch) === undefined
+      );
+    const unknownHistory =
+      (stored === undefined && mirror === undefined && options.epochHasPriorTurns) ||
+      options.carriedPolicyUnknown === true ||
+      carriedUnrecorded;
+    const conjunction = (durable: boolean | undefined, carried: boolean | undefined): boolean =>
+      !denyMarker &&
+      !unknownHistory &&
+      (durable ?? true) &&
+      (carried ?? true) &&
+      (mirror ?? true) &&
+      writable;
+    // Fast path (no write): the outcome cannot differ from the stored value —
+    // it is already false, or already true and this turn grants. Not when
+    // the stored "false" is a corrupt container's blanket deny: the write
+    // below replaces the container with a healed record (this epoch stays
+    // denied; later epochs read their own records again).
+    if (
+      !hasMalformedWorkspaceMemoryPolicyRecords(before.workspace) &&
+      (stored === false || (stored === true && conjunction(stored, carriedFor(before.workspace))))
+    ) {
+      session?.recordWorkspaceMemoryWritable(stored, policyEpoch);
+      return true;
+    }
+    effective = conjunction(stored, carriedFor(before.workspace));
+    try {
+      await this.config.editConfig((cfg) => {
+        const current = findWorkspaceEntry(cfg, workspaceId);
+        if (current !== null) {
+          effective = conjunction(storedFor(current.workspace), carriedFor(current.workspace));
+          // Per-epoch record: never overwrites the closing epoch's value,
+          // which the compacting backend may not have observed yet
+          // (workspaceMemoryPolicyEpochs.ts).
+          setWorkspaceMemoryWritableForEpoch(current.workspace, policyEpoch, effective);
+        }
+        return cfg;
+      });
+    } catch (error: unknown) {
+      log.error("Failed to persist workspace memory write policy", {
+        workspaceId,
+        writable,
+        error: getErrorMessage(error),
+      });
+      return denyDurableFallback(getErrorMessage(error));
+    }
+    session?.recordWorkspaceMemoryWritable(effective, policyEpoch);
+    const persistedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const persisted = persistedEntry === null ? undefined : storedFor(persistedEntry.workspace);
+    if (persisted !== effective) {
+      log.error("Workspace memory write policy did not persist (config write swallowed?)", {
+        workspaceId,
+        writable,
+        persisted,
+      });
+      return denyDurableFallback("config write swallowed");
+    }
+    return true;
+  }
+
+  /**
+   * Removal's in-lock shared-memory handover for a sub-agent (owner store's
+   * lock AND the child's own held by the caller): legacy-notebook adoption —
+   * a self-fallback backend's late note into <child>/memory either landed
+   * before this pass or is refused — then the refinement-row delta. Throws
+   * so removal aborts with the session intact; `force` logs and proceeds
+   * instead, accepting the loss (the user asked for the deletion regardless).
+   */
+  private async lockedSharedMemoryHandover(
+    workspaceId: string,
+    ownerWorkspaceId: string,
+    force: boolean
+  ): Promise<void> {
+    try {
+      await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+        workspaceId,
+        ownerWorkspaceId,
+        { locksHeld: true }
+      );
+      await migrateSharedMemoryRefinementRows({
+        childSessionDir: path.join(this.config.sessionsDir, workspaceId),
+        childWorkspaceId: workspaceId,
+        ownerSessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
+        ownerWorkspaceId,
+      });
+    } catch (error) {
+      if (!force) throw error;
+      log.warn("Forced removal: locked shared-memory handover to the owner failed", {
+        workspaceId,
+        ownerWorkspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   /** Transfer destructive cleanup out of a callback that still owns a session lease. */
   deferWorkspaceCleanup(run: () => Promise<void>): void {
     this.trackWorkspaceCleanup(run).catch((error: unknown) =>
@@ -4298,7 +4644,59 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
         // the compacted epoch first, then let Dream sweep/merge the candidates.
-        this.memoryConsolidationService?.triggerHarvestThenSweepInBackground(metadata);
+        // Two observations of the epoch policy — the session's mirror (attached
+        // to the completion) and the durable accumulator (which other backends
+        // sharing this chat.jsonl also write) — and either deny is
+        // authoritative; both unknown (fresh recovery session, field absent) →
+        // the harvest fails closed. The durable value counts only under the
+        // CLOSING epoch's key (see recordWorkspaceMemoryWritable). Strict
+        // load: an unreadable config.json would read as the empty default and
+        // silently drop another backend's persisted deny, letting this
+        // session's own writable mirror grant the harvest — skip it instead
+        // (fail closed; nothing is recorded, the epoch is simply not harvested).
+        const closingEpoch = compactionClosingPolicyEpoch(metadata);
+        let persistedWritable: boolean | undefined;
+        try {
+          const entry = findWorkspaceEntry(
+            this.config.loadExistingConfigOrThrow(),
+            workspaceId
+          )?.workspace;
+          persistedWritable =
+            entry === undefined ? undefined : workspaceMemoryWritableForEpoch(entry, closingEpoch);
+        } catch (error: unknown) {
+          log.warn("Skipping post-compaction memory harvest: config.json unreadable", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+          return;
+        }
+        // Third observation: the session-dir deny marker (fallback taken when
+        // config.json could not record a deny; see recordWorkspaceMemoryWritable).
+        // Returned so the session orders its epoch reset (which clears the
+        // marker) after this observation; the harvest runs in the background.
+        return readWorkspaceMemoryDenyMarker(
+          path.join(this.config.sessionsDir, workspaceId),
+          closingEpoch
+        )
+          .then((denyMarker) => {
+            const observed = [
+              metadata.workspaceMemoryWritable,
+              persistedWritable,
+              ...(denyMarker ? [false] : []),
+            ].filter((value): value is boolean => value !== undefined);
+            this.memoryConsolidationService?.triggerHarvestThenSweepInBackground({
+              ...metadata,
+              ...(observed.length > 0
+                ? { workspaceMemoryWritable: observed.every((value) => value) }
+                : {}),
+            });
+          })
+          .catch((error: unknown) => {
+            log.warn("Skipping post-compaction memory harvest: deny marker unreadable", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
       },
       onIdleCompactionOutcome: (success) => {
         // Reports the *persisted* idle-compaction outcome (success only after the summary
@@ -5822,6 +6220,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       .filter((session): session is AgentSession => session != null)
       .map((session) => session.holdTurnAdmission());
 
+    // Set once removal passes its point of no return (session teardown and
+    // tombstone follow unconditionally); an abort before that leaves the
+    // workspace registered and intact, so the finally lifts the consolidation
+    // teardown gate the drains below installed.
+    let removalCommitted = false;
+    // r66: identifies THIS removal attempt in the durable tombstone so the
+    // compensating rollback below cannot delete a concurrent backend
+    // attempt's marker.
+    const removalAttemptId = crypto.randomUUID();
+    // Sub-agents: the tombstone was published (with the final shared-memory
+    // handover) BEFORE the checkout deletion; an abort between the two rolls
+    // it back so the intact workspace stays usable.
+    let sealedForRemoval = false;
     // Removal deletes the checkout: hold THIS workspace's MCP-overrides lock
     // like rename does (see rename), so a settings save that verified the
     // checkout's existence cannot have its `mkdir -p` recreate the deleted
@@ -5834,6 +6245,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+      // r65: keep renewing the removal tombstone's mtime until this removal
+      // settles so a foreign backend's startup self-heal cannot mistake a
+      // merely SLOW removal (a hung runtime deletion or MCP server close) for
+      // crash residue and delete the marker while removal is live — a healed
+      // marker would readmit child writes after the final shared-memory
+      // handover (sealSubAgentForRemovalUnderMemoryLocks), which the later
+      // republish (tombstoneSealed) does not migrate. Held from before the
+      // earliest publish point: ticks against a not-yet-published marker are
+      // swallowed ENOENTs, as are ticks after a rollback deleted it, and
+      // disposal at scope exit (after deregistration or its rollback) is safe
+      // since a late renewal of a retained terminal marker is meaningless.
+      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is
@@ -5875,6 +6299,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let parentWorkspaceId: string | null = null;
       let childTaskModelString: string | undefined;
       let childTaskThinkingLevel: ThinkingLevel | undefined;
+      // Shared-memory owner as verified by the pre-teardown handover below;
+      // the destructive step reuses it rather than re-resolving (see there).
+      let verifiedSharedMemoryOwnerId: string | null = null;
 
       const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
       if (metadataResult.success) {
@@ -5929,9 +6356,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         //     with no second rollup).
         // Trade-off: a force=false deletion failure below keeps the
         // workspace but its producers were already drained. That loss is
-        // recoverable (rerun /refine, refork); a checkout write racing
-        // deletion is not. Both calls are idempotent; they run again later
-        // for the phantom-metadata path.
+        // recoverable (rerun /refine, refork; the consolidation teardown gate
+        // is lifted again in the finally); a checkout write racing deletion
+        // is not. Both calls are idempotent; they run again later for the
+        // phantom-metadata path.
         // Dream/harvest consolidation is a third producer (r60): its runs
         // ride only a hard timeout, so removal must abort them explicitly or
         // a detached run could mutate memory and journal into the deleted
@@ -5941,6 +6369,90 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
+        // Shared workspace memory (sub-agents write into their task-tree
+        // owner's store). BEFORE any destructive step — so a failure leaves a
+        // fully intact, retryable workspace:
+        //  - pin the owner on surviving descendants (their parent chain is
+        //    about to lose this node), verified by reading the config back
+        //    because Config swallows write failures;
+        //  - hand this workspace's live shared-memory refinement rows over to
+        //    the owner's journal (idempotent via `migratedFrom`). A second,
+        //    delta pass runs under the removal locks below so a write that
+        //    lands in between is captured too; that late pass only has the
+        //    few rows appended since this one, keeping the fallible work at
+        //    the point of no return minimal.
+        // Strict load: a config.json that is missing or malformed right now
+        // would read as the fresh-install default and resolve this child to
+        // ITSELF — dropping the owner-store lock and the row handover at the
+        // destructive step below, which reuses this value. Nothing has been
+        // torn down yet, so aborting here leaves the workspace intact.
+        const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.loadConfigForRemovalOrAbort(workspaceId),
+          workspaceId
+        );
+        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+        if (sharedMemoryOwnerId !== workspaceId) {
+          try {
+            let pinnedOwners = new Map<string, string>();
+            await this.config.editConfig((cfg) => {
+              pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
+              return cfg;
+            });
+            const persisted = this.config.loadConfigOrDefault();
+            for (const [id, owner] of pinnedOwners) {
+              const entry = findWorkspaceEntry(persisted, id);
+              if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
+                throw new Error(`memory owner pin for descendant ${id} did not persist`);
+              }
+            }
+            // A pre-sharing build kept this child's notebook in its OWN
+            // session dir (<sessionsDir>/<child>/memory); access-time adoption
+            // may never have run for a child removed right after the upgrade,
+            // and the deletion below would take those notes with it.
+            await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+              workspaceId,
+              sharedMemoryOwnerId
+            );
+            await migrateSharedMemoryRefinementRows({
+              childSessionDir: path.join(this.config.sessionsDir, workspaceId),
+              childWorkspaceId: workspaceId,
+              ownerSessionDir: path.join(this.config.sessionsDir, sharedMemoryOwnerId),
+              ownerWorkspaceId: sharedMemoryOwnerId,
+            });
+          } catch (error) {
+            if (!force) {
+              return Err(
+                `Failed to hand this sub-agent's shared workspace memory over to its owner (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
+              );
+            }
+            log.warn("Forced removal: shared-memory handover to the owner failed", {
+              workspaceId,
+              sharedMemoryOwnerId,
+              error: getErrorMessage(error),
+            });
+          }
+          // Final handover + tombstone under the removal locks, BEFORE the
+          // checkout is deleted (sealSubAgentForRemovalUnderMemoryLocks): a
+          // late legacy note the owner store cannot take must abort while the
+          // checkout still exists, and once sealed no backend can add
+          // another (they honor the tombstone at their commit points), so the
+          // session-dir deletion after runtime deletion has nothing fallible
+          // left. `force` accepts the loss of notes the handover cannot place.
+          await sealSubAgentForRemovalUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: path.join(
+              this.config.sessionsDir,
+              sharedMemoryOwnerId
+            ),
+            beforeTombstone: () =>
+              this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+          });
+          sealedForRemoval = true;
+        }
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -6237,6 +6749,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       //
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
+      removalCommitted = true;
       this.initStateManager.clearInMemoryState(workspaceId);
 
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
@@ -6246,7 +6759,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Same for in-flight dream/harvest consolidation (r60): abort + drain
       // before the session directory disappears (idempotent; normally
-      // already cancelled before the usage rollup above).
+      // already cancelled before the usage rollup above). Retryable harvest
+      // records are finalized too: their transcript goes with the session.
       await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
 
       // Cancel and drain any background branch-summary writer BEFORE deleting
@@ -6287,11 +6801,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
 
       // Remove session data
-      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      // r66: identifies THIS removal attempt in the durable tombstone so the
-      // compensating rollback below cannot delete a concurrent backend
-      // attempt's marker.
-      const removalAttemptId = crypto.randomUUID();
       try {
         if (parentWorkspaceId) {
           try {
@@ -6321,32 +6830,93 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // directory. Fail-closed on a wedged writer: the catch below keeps
         // the directory as a recoverable orphan instead of deleting it out
         // from under a live commit.
-        await removeSessionDirUnderMemoryLocks({
-          rootDir: this.config.rootDir,
-          sessionDir,
-          workspaceId,
-          attemptId: removalAttemptId,
-        });
+        // A sub-agent's workspace memory lives in its task-tree owner's
+        // session dir; hold that store's lock as well so an admitted child
+        // write cannot slip between this tombstone and its commit check, and
+        // run the delta pass of the refinement-row handover inside those
+        // locks (rows appended since the pre-teardown pass; the phantom,
+        // metadata-less path gets its full pass here). The owner verified by
+        // that earlier pass is retained: a config.json that turns missing or
+        // malformed in between would otherwise resolve the child to ITSELF
+        // here and drop the owner-store lock, letting a foreign child write
+        // admitted under the real owner lock recreate the deleted session dir.
+        // Without an earlier pass, resolve strictly — an unreadable config
+        // aborts the removal (retryable) instead of guessing the topology.
+        // Idempotent no-op short of that: a root whose config.json was never
+        // written (fresh install, nothing registered) and no session dir
+        // means there is no topology to resolve and nothing a tombstone
+        // could protect — removing an unknown id must still succeed.
+        // Proven absence only: a probe that fails for any other reason
+        // (EACCES, EIO) says nothing, and declaring "nothing to tear down"
+        // on it would deregister the workspace without deleting its session
+        // or publishing a tombstone — an orphan foreign writers keep mutating.
+        const provenAbsent = (target: string): Promise<boolean> =>
+          fsPromises.stat(target).then(
+            () => false,
+            (error: unknown) => {
+              if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return true;
+              throw new SharedMemoryRemovalAbortedError(workspaceId, { cause: error });
+            }
+          );
+        const nothingToTearDown =
+          verifiedSharedMemoryOwnerId === null &&
+          (await provenAbsent(configFilePath(this.config.rootDir))) &&
+          (await provenAbsent(sessionDir));
+        if (nothingToTearDown) {
+          log.debug("Skipping session teardown: no config.json and no session dir", {
+            workspaceId,
+          });
+        } else {
+          const memoryOwnerId =
+            verifiedSharedMemoryOwnerId ??
+            resolveWorkspaceMemoryOwnerId(
+              this.loadConfigForRemovalOrAbort(workspaceId),
+              workspaceId
+            );
+          const ownerSessionDir =
+            memoryOwnerId === workspaceId
+              ? undefined
+              : path.join(this.config.sessionsDir, memoryOwnerId);
+          await removeSessionDirUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: ownerSessionDir,
+            tombstoneSealed: sealedForRemoval,
+            // Sealed above (metadata path): handover done and tombstone
+            // published under these locks already. Otherwise (phantom,
+            // metadata-less path) the handover runs here, inside the locks
+            // and right before the tombstone. Throws → removal aborts,
+            // session intact.
+            beforeTombstone:
+              ownerSessionDir === undefined || sealedForRemoval
+                ? undefined
+                : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
+          });
+          // Only once the session (and with it the transcript) is gone are the
+          // retryable harvest records truly unrecoverable; an aborted removal
+          // above must leave them retryable.
+          await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+        }
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the
         // workspace stays registered and retryable) instead of proceeding
         // to deregistration below.
-        if (error instanceof TombstoneNotDurableError) {
+        if (
+          error instanceof TombstoneNotDurableError ||
+          error instanceof SharedMemoryRemovalAbortedError
+        ) {
+          // No durable tombstone was published (the locked handover or the
+          // tombstone write itself failed): the workspace stays registered
+          // with its session directory intact, so the consolidation teardown
+          // gate is lifted again in the finally like any pre-commit abort.
+          removalCommitted = false;
           throw error;
         }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
-      // r65: the tombstone is durable here (both the locked path and the
-      // orphan fallback published it). Keep renewing its mtime until this
-      // removal settles so a foreign backend's startup self-heal cannot
-      // mistake a merely SLOW removal (e.g. a hung MCP server close below)
-      // for crash residue and delete the marker while removal is live.
-      // Disposal at scope exit (after deregistration or its rollback) is
-      // safe: a late renewal of a retained terminal marker is meaningless,
-      // and utimes on a rolled-back (deleted) marker is a swallowed ENOENT.
-      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
-
       // The on-disk devtools.jsonl died with the session directory above; also drop any
       // in-memory DevTools state so stale runs cannot outlive the workspace.
       try {
@@ -6458,6 +7028,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      if (!removalCommitted) {
+        // A sealed sub-agent whose checkout deletion was then refused
+        // (force=false) keeps its session dir and config entry: lift the
+        // tombstone again (ownership-checked, r66) so it stays usable.
+        if (sealedForRemoval) {
+          try {
+            await rollbackRemovalTombstoneIfOwned({
+              rootDir: this.config.rootDir,
+              sessionDir: path.join(this.config.sessionsDir, workspaceId),
+              workspaceId,
+              attemptId: removalAttemptId,
+              workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            });
+          } catch (rollbackError) {
+            log.error(
+              "Failed to roll back the removal tombstone after an aborted removal; " +
+                "the startup self-heal will reclaim it",
+              { workspaceId, rollbackError }
+            );
+          }
+        }
+        this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+      }
       if (releaseOverridesLock !== undefined) {
         try {
           await releaseOverridesLock();

@@ -9,7 +9,8 @@
  *                per-project notes; never committed to the repo, survives
  *                workspaces; carried by the settings backup only when the
  *                user opts into the project bundle)
- * - workspace -> <sessionDir>/memory/ (host-local, deleted with the workspace)
+ * - workspace -> <sessionDir>/memory/ of the task-tree OWNER (host-local, deleted
+ *                with that workspace; sub-agents share their parent's store)
  */
 
 /** Virtual root prefix all memory paths are expressed under. */
@@ -17,6 +18,14 @@ export const MEMORY_VIRTUAL_ROOT = "/memories";
 
 export const MEMORY_SCOPES = ["global", "project", "workspace"] as const;
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
+
+/**
+ * `<sessionsDir>/<owner>/memory.revision`: opaque token rewritten on every
+ * mutation of that owner's shared `/memories/workspace` store. Sessions and
+ * Memory tabs in OTHER backend processes (multi-instance) compare it before
+ * reusing a cached index/hot set — in-process consumers get change events.
+ */
+export const WORKSPACE_MEMORY_REVISION_FILE_NAME = "memory.revision";
 
 export type MemoryAccessLevel = "read" | "readwrite";
 

@@ -24,6 +24,7 @@ import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
 import {
   resolveMemoryProjectIdentity,
+  toVirtualPath,
   type MemoryChangeEvent,
 } from "@/node/services/memoryService";
 
@@ -197,6 +198,9 @@ export function subscribeLogs(
   });
 }
 
+/** How often an open memory subscription re-checks its workspace's memory owner. */
+const MEMORY_OWNERSHIP_PROBE_INTERVAL_MS = 30_000;
+
 export function subscribeMemoryChanges(
   context: ORPCContext,
   workspaceId: string | null,
@@ -207,20 +211,107 @@ export function subscribeMemoryChanges(
     validate?.();
     const metadata = workspaceId ? await context.workspaceService.getInfo(workspaceId) : null;
     const projectPath = metadata ? resolveMemoryProjectIdentity(metadata) : null;
+    // Workspace-scope events carry the memory OWNER (task-tree root), which is
+    // also the store this subscriber's workspace displays. Resolved per event
+    // (memoized, cheap): the owner can change while the tab stays open — a
+    // removed owner makes the child fall back to its own store.
     yield* runtimeSubscription(context, {
       signal,
       subscribe: (emit) => {
+        // Revision token of the displayed workspace store (see
+        // MemoryService.workspaceMemoryRevision), refreshed by every
+        // workspace event this subscription forwards so the probe below only
+        // fires for mutations this process never saw. Reads are async; a
+        // failed refresh leaves the old token, costing at most one redundant
+        // refresh on the next probe.
+        let storeRevision: string | null = null;
+        const rootRefresh = (): MemoryChangeEventPayload => ({
+          scope: "workspace",
+          path: toVirtualPath("workspace", ""),
+          actor: "agent",
+          workspaceId: workspaceId
+            ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+            : "",
+          projectPath: projectPath ?? "",
+        });
+        const refreshStoreRevision = (options?: { announce: boolean }) => {
+          if (!workspaceId) return;
+          context.memoryService.workspaceMemoryRevision(workspaceId).then(
+            (revision) => {
+              storeRevision = revision;
+              if (options?.announce) emit.push(rootRefresh());
+            },
+            () => undefined
+          );
+        };
+        // Baseline handshake: the client's initial listing and this
+        // subscription start independently, so a foreign write landing between
+        // them would be adopted here as the baseline while the listing shows
+        // the old files. Announce the baseline once it is read: the client
+        // refetches, and the listing is then at least as new as the token.
+        refreshStoreRevision({ announce: true });
         const onChange = (event: MemoryChangeEvent) => {
-          if (event.scope === "workspace" && event.workspaceId !== workspaceId) return;
+          if (
+            event.scope === "workspace" &&
+            event.workspaceId !==
+              (workspaceId
+                ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+                : null)
+          )
+            return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
+          // The token read below is asynchronous: it may absorb a foreign
+          // backend's write that landed after the client already refetched for
+          // this event, and the interval probe would then never announce it.
+          // Announcing the token once read (as the baseline handshake does)
+          // orders one more client refresh behind whatever the token saw; the
+          // cost is a redundant listing refetch per local mutation.
+          if (event.scope === "workspace") refreshStoreRevision({ announce: true });
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
           emit.push(event);
+        // Ownership changed for this workspace (its owner was removed; it
+        // now reads its own store). No mutation event accompanies a removal,
+        // so synthesize a root-addressed refresh for the file list and the
+        // consolidation status, both of which described the old store.
+        const onOwnersInvalidated = (workspaceIds: string[]) => {
+          if (!workspaceId || !workspaceIds.includes(workspaceId)) return;
+          emit.push({
+            scope: "workspace",
+            path: toVirtualPath("workspace", ""),
+            actor: "user",
+            workspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
+            projectPath: projectPath ?? "",
+          });
+          emit.push({ kind: "consolidation_status", workspaceId, projectPath: projectPath ?? "" });
+        };
+        // ownersInvalidated is emitted lazily, when something probes ownership.
+        // Another backend (multi-instance) removing the owner — or writing the
+        // shared store — leaves an idle tab with nothing to trigger that probe
+        // and no in-process change event, so probe here: one stat of
+        // config.json plus one small revision read per interval. A foreign
+        // write shows up as a changed token and synthesizes the same
+        // root-addressed refresh an ownership change does.
+        const ownershipProbe = workspaceId
+          ? setInterval(() => {
+              context.memoryService.workspaceMemoryRevision(workspaceId).then(
+                (revision) => {
+                  if (revision === storeRevision) return;
+                  storeRevision = revision;
+                  emit.push(rootRefresh());
+                },
+                () => undefined
+              );
+            }, MEMORY_OWNERSHIP_PROBE_INTERVAL_MS).unref()
+          : undefined;
         context.memoryService.on("change", onChange);
+        context.memoryService.on("ownersInvalidated", onOwnersInvalidated);
         context.memoryConsolidationService.on("statusChange", onStatusChange);
         return () => {
+          if (ownershipProbe !== undefined) clearInterval(ownershipProbe);
           context.memoryService.off("change", onChange);
+          context.memoryService.off("ownersInvalidated", onOwnersInvalidated);
           context.memoryConsolidationService.off("statusChange", onStatusChange);
         };
       },

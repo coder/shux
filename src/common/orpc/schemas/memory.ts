@@ -96,10 +96,12 @@ export type MemoryConsolidationRecordPayload = z.infer<typeof MemoryConsolidatio
 
 export const CompactionCompletionMetadataSchema = z.object({
   workspaceId: z.string(),
+  workspaceMemoryWritable: z.boolean().optional(),
   summaryMessageId: z.string(),
   summaryHistorySequence: z.number(),
   compactionEpoch: z.number(),
   previousBoundaryHistorySequence: z.number().optional(),
+  closingPolicyEpoch: z.number().optional(),
   compactionRequestMessageId: z.string(),
   // RLM keep-recent floor: preserved-tail copies appended after the boundary.
   preservedTailMessageCount: z.number().optional(),
@@ -115,6 +117,12 @@ export const MemoryHarvestRecordSchema = z.object({
   acceptedCandidates: z.number(),
   skippedCandidates: z.number(),
   error: z.string().optional(),
+  /**
+   * Terminal refusal (policy unknown/read-only, or a turn of the epoch never
+   * recorded its policy): unlike an exhausted failure, the epoch's owner
+   * notebook must not be swept on its behalf either.
+   */
+  refused: z.boolean().optional(),
   usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
   completionMetadata: CompactionCompletionMetadataSchema.optional(),
 });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -7,7 +8,10 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
-import type { MemoryConsolidationStatusChangeEventPayload } from "@/common/orpc/schemas/memory";
+import type {
+  MemoryConsolidationStatusChangeEventPayload,
+  MemoryHarvestRecordPayload,
+} from "@/common/orpc/schemas/memory";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -17,6 +21,7 @@ import {
 import { Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  HARVEST_MAX_ATTEMPTS,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
@@ -31,6 +36,7 @@ import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -204,7 +210,10 @@ interface Fixture extends Disposable {
   setEnabled: (enabled: boolean) => void;
   /** When true, scripted runs emit a fatal stream error instead of finishing. */
   setStreamFailing: (failing: boolean) => void;
-  addWorkspace: (id: string, opts?: { archivedAt?: string }) => Promise<void>;
+  addWorkspace: (
+    id: string,
+    opts?: { archivedAt?: string; parentWorkspaceId?: string }
+  ) => Promise<void>;
   addMultiProjectWorkspace: (id: string, opts?: { bucket?: string }) => Promise<void>;
 }
 
@@ -283,6 +292,7 @@ async function createFixture(options?: {
           name: id,
           path: `/projects/demo/${id}`,
           archivedAt: opts?.archivedAt,
+          parentWorkspaceId: opts?.parentWorkspaceId,
         });
         return cfg;
       });
@@ -317,9 +327,17 @@ async function seedCompactionEpoch(
   fixture: Fixture,
   workspaceId = "ws-dream"
 ): Promise<CompactionCompletionMetadata> {
+  const prompt = createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.");
+  await fixture.historyService.appendToHistory(workspaceId, prompt);
+  // The turn ran: its policy was recorded before this reply was appended, and
+  // the reply's request snapshot covers the prompt (uncovered user rows make
+  // the harvest refuse; see below).
   await fixture.historyService.appendToHistory(
     workspaceId,
-    createMuxMessage("pref-1", "user", "Please remember that I prefer concise tests.")
+    createMuxMessage("reply-1", "assistant", "Noted.", {
+      requestHistorySequence: prompt.metadata?.historySequence,
+      workspaceMemoryPolicyEpoch: -1,
+    })
   );
   await fixture.historyService.appendToHistory(
     workspaceId,
@@ -338,6 +356,9 @@ async function seedCompactionEpoch(
   expect(typeof summaryHistorySequence).toBe("number");
   return {
     workspaceId,
+    // A normal editing-capable agent; the read-only / unknown gates are
+    // exercised explicitly where they matter.
+    workspaceMemoryWritable: true,
     summaryMessageId: "summary-1",
     summaryHistorySequence: summaryHistorySequence ?? -1,
     compactionEpoch: 1,
@@ -395,6 +416,30 @@ describe("MemoryConsolidationService", () => {
           },
         }),
     });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const childMetadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [childMetadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: childMetadata.summaryMessageId,
+              compactionEpoch: childMetadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: childMetadata,
+            },
+          },
+        },
+      })
+    );
     const run = fixture.service.maybeRun("ws-dream", "manual");
     await started;
     await fixture.service.cancelInFlightConsolidation("ws-dream");
@@ -405,8 +450,56 @@ describe("MemoryConsolidationService", () => {
     if (!result.success) {
       expect(result.error).toContain("stream failed");
     }
+    // The cancelled owner's continuation must not start recovery of a
+    // sub-agent's retryable harvest (work outside the drained registry).
+    const childRecords = (
+      JSON.parse(
+        await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+      ) as { harvestsByWorkspace: Record<string, Record<string, { attemptCount: number }>> }
+    ).harvestsByWorkspace["ws-sub"];
+    expect(Object.values(childRecords).map((record) => record.attemptCount)).toEqual([1]);
     // Idempotent with nothing in flight (the phantom-metadata removal path).
     await fixture.service.cancelInFlightConsolidation("ws-dream");
+  });
+
+  it("a sub-agent's removal drain aborts the owner-keyed run made on its behalf", async () => {
+    // A child's trigger (and the post-harvest sweep) runs the OWNER's
+    // consolidation; a cancelled child harvest deliberately falls through to
+    // that sweep. The child's removal drain must still reach the owner-keyed
+    // run, or it would keep mutating the shared notebook after removal.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const run = fixture.service.maybeRun("ws-sub", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("stream failed");
+    // Locally cancelled child: neither its own trigger nor an owner run made
+    // on its behalf may start while teardown is under way.
+    const refused = await fixture.service.maybeRun("ws-dream", "manual", {
+      actingWorkspaceId: "ws-sub",
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("being removed");
   });
 
   it("runs, persists the journal record, and reports it via getRecord", async () => {
@@ -1079,6 +1172,766 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(3);
   });
 
+  it("recovers a sub-agent's failed harvest through the owner's run", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+
+    // The child's manual run redirects to the owner; the owner's recovery
+    // must still retry the CHILD's bucket (the launch sweep never visits it).
+    expect((await fixture.service.maybeRun("ws-sub", "manual")).success).toBe(true);
+    const status = await fixture.service.getStatus("ws-sub");
+    expect(status.latestHarvestRecord?.status).toBe("completed");
+    expect(status.latestHarvestRecord?.attemptCount).toBe(2);
+  });
+
+  it("refuses to harvest (and sweep) for an agent whose workspace memory is read-only", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    const metadata = await seedCompactionEpoch(fixture);
+    const refused = await fixture.service.maybeHarvestThenSweep({
+      ...metadata,
+      summaryMessageId: "summary-readonly",
+      workspaceMemoryWritable: false,
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("read-only");
+    expect(fixture.modelCalls).toHaveLength(0);
+    // Recorded as terminal so recovery never retries it, with the reason.
+    const refusedRecord = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(refusedRecord?.status).toBe("failed");
+    expect(refusedRecord?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect(refusedRecord?.error).toContain("read-only");
+
+    // Unknown policy (legacy record / no persisted value) fails closed too.
+    const unknown = await fixture.service.maybeHarvestThenSweep({
+      ...metadata,
+      summaryMessageId: "summary-unknown",
+      workspaceMemoryWritable: undefined,
+    });
+    expect(unknown.success).toBe(false);
+    if (!unknown.success) expect(unknown.error).toContain("unknown");
+    expect(fixture.modelCalls).toHaveLength(0);
+
+    // Explicitly writable harvests as before.
+    const allowed = await fixture.service.maybeHarvestThenSweep(metadata);
+    expect(allowed.success).toBe(true);
+    const harvested = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(harvested?.boundaryKey).toBe(metadata.summaryMessageId);
+    expect(harvested?.status).toBe("completed");
+  });
+
+  it("keys the harvest by the recorded closing epoch, refusing a turn stamped before a clear", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-stale");
+    // A full clear opens a new history segment: the boundary-less identity
+    // becomes -(segmentStart + 1) (workspaceMemoryPolicyEpochOf) and a turn
+    // admitted before the clear, stamped -1, can no longer pass as one of the
+    // new segment even though its row landed after the clear.
+    const seed = async (workspaceId: string, staleStamp: boolean) => {
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-1", "user", "before the clear")
+      );
+      await fixture.historyService.clearHistory(workspaceId);
+      const prompt = createMuxMessage(
+        "pref-1",
+        "user",
+        "Please remember that I prefer concise tests."
+      );
+      await fixture.historyService.appendToHistory(workspaceId, prompt);
+      const segmentStart = prompt.metadata?.historySegment;
+      if (segmentStart === undefined || segmentStart <= 0)
+        throw new Error("expected a new segment");
+      const closingPolicyEpoch = -(segmentStart + 1);
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("reply-1", "assistant", "Noted.", {
+          requestHistorySequence: prompt.metadata?.historySequence,
+          workspaceMemoryPolicyEpoch: staleStamp ? -1 : closingPolicyEpoch,
+        })
+      );
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("compact-request", "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, summary);
+      return fixture.service.maybeHarvestThenSweep({
+        workspaceId,
+        workspaceMemoryWritable: true,
+        summaryMessageId: "summary-1",
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 1,
+        compactionRequestMessageId: "compact-request",
+        closingPolicyEpoch,
+      });
+    };
+    const stale = await seed("ws-stale", true);
+    expect(stale.success).toBe(false);
+    if (!stale.success) expect(stale.error).toContain("another epoch");
+    expect(fixture.modelCalls).toHaveLength(0);
+    const current = await seed("ws-dream", false);
+    expect(current.success).toBe(true);
+    expect(fixture.modelCalls.length).toBeGreaterThan(0);
+  });
+
+  it("refuses to harvest when a prelude listing names an ordinary user turn", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // A read-only backend's prompt was never answered; the next turn's user
+    // row lists it as a "prelude" (raw history). The listed row is not a
+    // synthetic prelude row, so it stays uncovered and the harvest refuses.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("late-1", "user", "Read-only agent's prompt, turn not yet started")
+    );
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests.",
+      {
+        requestPreludeMessageIds: ["late-1"],
+      }
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+        workspaceMemoryPolicyEpoch: -1,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("never recorded");
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
+  it("refuses to harvest an epoch whose user rows share an id", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Coverage is keyed by id: covering the later row would mark the earlier
+    // (never-covered) row covered too, so a duplicated id refuses outright.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("pref-1", "user", "Read-only agent's prompt, never answered")
+    );
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+        workspaceMemoryPolicyEpoch: -1,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("sharing one id");
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
+  it("refuses to harvest an epoch holding user rows no turn's request snapshot covers", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Backend A snapshots its request through pref-1; backend B appends a
+    // read-only turn's user row BEFORE that turn records its policy; A's
+    // assistant row lands above it carrying its snapshot bound; A compacts
+    // with a grant. The later assistant is no proof for B's row.
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("late-1", "user", "Read-only agent's prompt, turn not yet started")
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+        workspaceMemoryPolicyEpoch: -1,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    // Refused end to end: no sweep either (the Dream pass writes the shared
+    // notebook too), and the harvest record is terminal (never completed,
+    // never retried), so recovery cannot replay the grant.
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("never recorded");
+    expect(fixture.modelCalls).toHaveLength(0);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect(record?.error).toContain("never recorded");
+    expect(record?.refused).toBe(true);
+    // A later trigger for the same boundary (recovery, duplicate completion)
+    // finds the terminal refusal and does not fall through to the sweep.
+    const again = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(again.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
+  it("covers only a turn's own batch: a foreign row inside the request snapshot leaves the turn's own row uncovered", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Backend B (read-only) appends late-1 and pauses before its deny lands;
+    // backend A then snapshots THROUGH late-1 (its request's latest user row
+    // is now B's), records writable and replies. A's bound covers late-1 as
+    // A's batch — so pref-1, A's own row, belongs to no turn at all.
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    const foreign = createMuxMessage(
+      "late-1",
+      "user",
+      "Read-only agent's prompt, deny not recorded"
+    );
+    await fixture.historyService.appendToHistory("ws-dream", foreign);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: foreign.metadata?.historySequence,
+        workspaceMemoryPolicyEpoch: -1,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
+  it("refuses a turn whose policy was recorded for another epoch, and ignores preserved-tail copies", async () => {
+    using fixture = await createFixture();
+    await fixture.addWorkspace("ws-clean");
+    await fixture.addWorkspace("ws-corrupt");
+    await fixture.addWorkspace("ws-unbounded");
+    await fixture.addWorkspace("ws-fractional");
+    const seed = async (
+      workspaceId: string,
+      foreignTurn: number | null | undefined,
+      options?: { withoutBound?: boolean; fractionalBound?: boolean }
+    ) => {
+      const reset = createMuxMessage("reset-1", "assistant", "", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, reset);
+      const closingEpoch = reset.metadata?.historySequence ?? -1;
+      // RLM keep-recent copies of the previous epoch's turns: no stamps of
+      // their own, no coverage needed (their originals were judged already),
+      // and not harvested again.
+      for (const [id, role] of [
+        ["copy-user", "user"],
+        ["copy-reply", "assistant"],
+      ] as const) {
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(id, role, "Copied tail row.", {
+            synthetic: true,
+            rlmPreservedTailCopy: true,
+          })
+        );
+      }
+      const prompt = createMuxMessage("pref-1", "user", "Remember I prefer concise tests.");
+      await fixture.historyService.appendToHistory(workspaceId, prompt);
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("reply-1", "assistant", "Noted.", {
+          requestHistorySequence:
+            options?.fractionalBound === true
+              ? (prompt.metadata?.historySequence ?? 0) + 0.5
+              : prompt.metadata?.historySequence,
+          workspaceMemoryPolicyEpoch: closingEpoch,
+        })
+      );
+      if (foreignTurn !== undefined) {
+        // Backend B started a read-only turn under the previous epoch (-1) and
+        // recorded its deny there; backend A then reset the context (the deny
+        // went with the epoch) and B's assistant landed after the new boundary
+        // — without its user row, which the reset removed. Only the epoch
+        // stamp can surface it. A corrupted stamp (raw JSON row) refuses too.
+        await fixture.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("b-reply", "assistant", "Read-only output.", {
+            ...(options?.withoutBound === true ? {} : { requestHistorySequence: closingEpoch - 1 }),
+            // `null` models a corrupted raw-JSON row.
+            workspaceMemoryPolicyEpoch: foreignTurn as unknown as number,
+          })
+        );
+      }
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("compact-request", "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 2,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, summary);
+      return fixture.service.maybeHarvestThenSweep({
+        workspaceId,
+        workspaceMemoryWritable: true,
+        summaryMessageId: "summary-1",
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 2,
+        compactionRequestMessageId: "compact-request",
+        previousBoundaryHistorySequence: closingEpoch,
+      });
+    };
+    const refused = await seed("ws-dream", -1);
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("another epoch");
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect((await fixture.service.getStatus("ws-dream")).latestHarvestRecord?.refused).toBe(true);
+    // `null` is neither "no stamp" nor this epoch's: fail closed.
+    const corrupt = await seed("ws-corrupt", null);
+    expect(corrupt.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    // A foreign stamp refuses even when the row's request bound is missing
+    // or corrupt: its user row may be gone, so nothing else would surface it.
+    const unbounded = await seed("ws-unbounded", -1, { withoutBound: true });
+    expect(unbounded.success).toBe(false);
+    // A bound outside the sequence domain (fractional) covers no user row:
+    // the turn stays uncovered and refuses (r79).
+    const fractional = await seed("ws-fractional", undefined, { fractionalBound: true });
+    expect(fractional.success).toBe(false);
+    if (!fractional.success) expect(fractional.error).toContain("harvest refused");
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect(unbounded.success).toBe(false);
+    if (!unbounded.success) expect(unbounded.error).toContain("another epoch");
+    expect(fixture.modelCalls).toHaveLength(0);
+
+    // Without the foreign turn the copies alone refuse nothing, and the
+    // harvest transcript leaves them out.
+    const granted = await seed("ws-clean", undefined);
+    expect(granted.success).toBe(true);
+    expect(fixture.modelPrompts.length).toBeGreaterThan(0);
+    expect(fixture.modelPrompts[0]).toContain("concise tests");
+    expect(fixture.modelPrompts[0]).not.toContain("Copied tail row");
+  });
+
+  it("takes no coverage from assistant rows of a build that did not record the policy", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // A downgraded build ran a (read-only) turn mid-epoch: its assistant row
+    // carries the request snapshot bound but no policy record, and it left
+    // the durable accumulator's stale grant untouched. The compaction then
+    // completes with that grant.
+    const prompt = createMuxMessage("pref-1", "user", "Read-only turn on the old build.");
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
+  it("refuses an unstamped turn row even when no user row of its own survives", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // An older/downgraded backend started a turn before a destructive reset
+    // and its assistant landed afterwards: the row keeps its request bound
+    // but has no policy stamp, and its user row is gone with the reset — so
+    // no uncovered user row would surface it. The row itself must refuse.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("orphan-reply", "assistant", "Produced under an unknown policy.", {
+        requestHistorySequence: 0,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    const record = (await fixture.service.getStatus("ws-dream")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.error).toContain("never recorded");
+  });
+
+  it("covers a turn's request prelude rows by id, not by adjacency", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    let previousBoundaryHistorySequence: number | undefined;
+    const harvest = async (ids: { listed: string[]; summary: string; leadIn?: boolean }) => {
+      // Two synthetic snapshot rows precede the user row; only the listed
+      // ones are the turn's own prelude. The reply snapshots through the
+      // user row, so every user row lies below its bound.
+      if (ids.leadIn) {
+        // Token-budget control row (backend template text, same durable batch
+        // as the turn): needs no listing.
+        await fixture.historyService.appendToHistory(
+          "ws-dream",
+          createMuxMessage(`${ids.summary}-lead-in`, "user", "A context window rollover started.", {
+            synthetic: true,
+            muxMetadata: { type: "context-window-lead-in", rolloverId: "r1" },
+          })
+        );
+      }
+      const snapshots = [`${ids.summary}-snap-a`, `${ids.summary}-snap-b`].map((id) =>
+        createMuxMessage(id, "user", "Snapshot content", {
+          synthetic: true,
+          fileAtMentionSnapshot: ["@notes.md"],
+        })
+      );
+      for (const snapshot of snapshots) {
+        await fixture.historyService.appendToHistory("ws-dream", snapshot);
+      }
+      const prompt = createMuxMessage(
+        `${ids.summary}-pref`,
+        "user",
+        "Remember I prefer concise tests.",
+        {
+          requestPreludeMessageIds: ids.listed,
+        }
+      );
+      await fixture.historyService.appendToHistory("ws-dream", prompt);
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage(`${ids.summary}-reply`, "assistant", "Noted.", {
+          requestHistorySequence: prompt.metadata?.historySequence,
+          workspaceMemoryPolicyEpoch: previousBoundaryHistorySequence ?? -1,
+        })
+      );
+      await fixture.historyService.appendToHistory(
+        "ws-dream",
+        createMuxMessage(`${ids.summary}-compact`, "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage(ids.summary, "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory("ws-dream", summary);
+      const result = await fixture.service.maybeHarvestThenSweep({
+        workspaceId: "ws-dream",
+        workspaceMemoryWritable: true,
+        summaryMessageId: ids.summary,
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 1,
+        compactionRequestMessageId: `${ids.summary}-compact`,
+        ...(previousBoundaryHistorySequence !== undefined
+          ? { previousBoundaryHistorySequence }
+          : {}),
+      });
+      previousBoundaryHistorySequence = summary.metadata?.historySequence;
+      return {
+        result,
+        record: (await fixture.service.getStatus("ws-dream")).latestHarvestRecord,
+      };
+    };
+    // Only one of the two adjacent snapshot rows is listed: the other is a
+    // foreign row that merely sits next to the batch.
+    const partial = await harvest({ listed: ["s1-snap-a"], summary: "s1" });
+    expect(partial.result.success).toBe(false);
+    expect(fixture.modelCalls).toHaveLength(0);
+    expect(partial.record?.status).toBe("failed");
+    expect(partial.record?.error).toContain("never recorded");
+    // Both listed: the whole batch is the turn's own and harvests.
+    const complete = await harvest({
+      listed: ["s2-snap-a", "s2-snap-b"],
+      summary: "s2",
+      leadIn: true,
+    });
+    expect(complete.result.success).toBe(true);
+    expect(complete.record?.status).toBe("completed");
+  });
+
+  it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const record = (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    // The owner's run no longer sees a retryable child bucket.
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
+  });
+
+  it("keeps a removal-finalized harvest record terminal against residual retryable writes", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    const boundaryKey = metadata.summaryMessageId;
+    const base = {
+      startedAt: Date.now() - 10_000,
+      attemptCount: 1,
+      boundaryKey,
+      compactionEpoch: metadata.compactionEpoch,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+      completionMetadata: metadata,
+    };
+    // Residual runs of the bounded cancellation drain record through the same
+    // path as the live harvest; reach it directly to interleave with finalization.
+    const save = (record: MemoryHarvestRecordPayload) =>
+      Effect.runPromise(
+        (
+          fixture.service as unknown as {
+            saveHarvestRecordEffect: (
+              workspaceId: string,
+              boundaryKey: string,
+              record: MemoryHarvestRecordPayload,
+              projectPath: string
+            ) => Effect.Effect<void>;
+          }
+        ).saveHarvestRecordEffect("ws-sub", boundaryKey, record, "")
+      );
+    await save({ ...base, status: "pending" });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const latest = async () => (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+
+    // A residual retryable failure landing after finalization must not reopen the bucket...
+    await save({ ...base, status: "failed", completedAt: Date.now(), error: "residual failure" });
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect((await latest())?.error).toContain("workspace removed");
+    // ...while a residual completion (its writes really landed) is kept as the truth,
+    // and finalization never demotes a completed record.
+    await save({ ...base, status: "completed", completedAt: Date.now(), acceptedCandidates: 1 });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    expect((await latest())?.status).toBe("completed");
+  });
+
+  it("serializes sidecar harvest writes with other backends through the cross-process lock", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
+    await fsPromises.writeFile(
+      sidecarPath,
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    // Another backend mid read-modify-write: it holds the sidecar's file lock
+    // (the in-process MutexMap cannot see it), so this finalization must wait.
+    const foreignHold = await acquireProcessFileLock({
+      lockPath: `${sidecarPath}.lock`,
+      timeoutMs: 1_000,
+      label: "test foreign backend",
+    });
+    let finalized = false;
+    const finalizing = fixture.service.finalizeHarvestsForRemoval("ws-sub").then(() => {
+      finalized = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(finalized).toBe(false);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(1);
+    await foreignHold[Symbol.asyncDispose]();
+    await finalizing;
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
+  });
+
   it("normalizes stale max-attempt pending harvest records to failed", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
@@ -1278,6 +2131,85 @@ describe("MemoryConsolidationService", () => {
     await fixture.metaService.recordAccess("global:lesson2.md", { write: true });
     await fixture.service.runLaunchSweep(new Map([["ws-dream", now]]));
     expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("redirects a sub-agent's Dream runs and status to the memory owner", async () => {
+    using fixture = await createFixture();
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+
+    // Launch sweep: a child's workspace write is keyed under the owner
+    // (MemoryService resolution), so the idle owner qualifies while the idle
+    // child is skipped even though it is listed.
+    await fixture.memoryService.create(
+      { runtime: null, checkoutCwd: "", workspaceId: "ws-sub", projectPath: "" },
+      "/memories/workspace/from-child.md",
+      "shared lesson",
+      "agent"
+    );
+    const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+    // A recently-used child keeps the whole tree's notebook "not idle": the
+    // owner must not be swept on its own stale recency.
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", Date.now()],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(0);
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", dayAgo],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(1);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
+
+    // Manual/compaction runs from the child consolidate the OWNER's store
+    // under the owner's lock; the record lands on the owner and the child's
+    // status view reports it (the tab shows the shared store).
+    const manual = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(manual.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(2);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect((await fixture.service.getStatus("ws-sub")).workspaceRecord).toEqual(
+      await fixture.service.getRecord("ws-dream")
+    );
+
+    // Archive is the owner's own one-shot promotion pass: a child archive is
+    // refused instead of running it.
+    const archive = await fixture.service.maybeRun("ws-sub", "archive");
+    expect(archive.success).toBe(false);
+    if (!archive.success) expect(archive.error).toContain("owner");
+    expect(fixture.modelCalls).toHaveLength(2);
+
+    // A child mid-teardown must not start an owner run: locally cancelled
+    // (the child's removal drain could never cancel an owner-keyed run) or
+    // tombstoned by another backend.
+    await fixture.addWorkspace("ws-sub-gone", { parentWorkspaceId: "ws-dream" });
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-sub-gone");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-sub-gone", removedAt: Date.now() })
+    );
+    const tombstoned = await fixture.service.maybeRun("ws-sub-gone", "manual");
+    expect(tombstoned.success).toBe(false);
+    if (!tombstoned.success) expect(tombstoned.error).toContain("being removed");
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const cancelled = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(cancelled.success).toBe(false);
+    if (!cancelled.success) expect(cancelled.error).toContain("being removed");
+    expect(fixture.modelCalls).toHaveLength(2);
+
+    // A dangling parent chain resolves to a PRIVATE store (owner == self), so
+    // that workspace consolidates itself rather than being orphaned forever.
+    await fixture.addWorkspace("ws-orphan", { parentWorkspaceId: "ws-gone" });
+    const orphan = await fixture.service.maybeRun("ws-orphan", "manual");
+    expect(orphan.success).toBe(true);
+    expect(await fixture.service.getRecord("ws-orphan")).not.toBeNull();
+    expect(fixture.modelCalls).toHaveLength(3);
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {

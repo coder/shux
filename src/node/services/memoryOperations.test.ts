@@ -198,6 +198,33 @@ describe("memory operations", () => {
     expect(await memoryMetaService.getPinnedKeys()).toEqual(new Set(["global:prefs.md"]));
   });
 
+  test("setPinned broadcasts a change event so other tabs on the same store refetch", async () => {
+    const context = createContext({ enabled: true });
+    await saveMemory(context, {
+      workspaceId: "ws-mem",
+      path: "/memories/workspace/pinned.md",
+      content: "x",
+      expectedSha256: null,
+    });
+    const events: MemoryChangeEvent[] = [];
+    memoryService.on("change", (event: MemoryChangeEvent) => events.push(event));
+    const result = await setMemoryPinned(context, {
+      workspaceId: "ws-mem",
+      path: "/memories/workspace/pinned.md",
+      pinned: true,
+    });
+    expect(result).toEqual({ success: true, data: undefined });
+    expect(events).toEqual([
+      {
+        scope: "workspace",
+        path: "/memories/workspace/pinned.md",
+        actor: "user",
+        workspaceId: "ws-mem",
+        projectPath,
+      },
+    ]);
+  });
+
   test("list exposes usage stats; UI reads do not count as uses", async () => {
     const client = createClient({ enabled: true });
     await client.memory.save({
@@ -246,6 +273,15 @@ describe("memory operations", () => {
     expect(await memoryMetaService.getPinnedKeys()).toEqual(new Set());
   });
 
+  // The subscription announces its store-revision baseline once with a
+  // root-addressed workspace refresh (see subscribeMemoryChanges); tests
+  // about forwarded events skip it.
+  const isBaselineRefresh = (event: MemoryChangeEventPayload): boolean =>
+    !("kind" in event) &&
+    event.scope === "workspace" &&
+    event.path === "/memories/workspace" &&
+    event.actor === "agent";
+
   test("onChange streams change events from UI saves", async () => {
     const client = createClient({ enabled: true });
     const controller = new AbortController();
@@ -256,6 +292,7 @@ describe("memory operations", () => {
 
     const firstEvent = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         return event;
       }
       return null;
@@ -409,6 +446,7 @@ describe("memory operations", () => {
     const received: MemoryChangeEventPayload[] = [];
     const consumer = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         received.push(event);
         if (received.length >= 3) break;
       }
@@ -481,6 +519,7 @@ describe("memory operations", () => {
     const received: MemoryChangeEventPayload[] = [];
     const consumer = (async () => {
       for await (const event of iterator) {
+        if (isBaselineRefresh(event)) continue;
         received.push(event);
         break;
       }

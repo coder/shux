@@ -87,6 +87,45 @@ export const RefinementDataSchema = z.object({
   evidence: JsonValueSchema.optional(),
   /** Envelope `id` of the entry this one rolls back. */
   rollbackOf: z.string().optional(),
+  /**
+   * Stable source identity (`<workspaceId>:<row id>`) when this row was
+   * copied from a removed sub-agent's journal into its memory owner's
+   * (sharedMemoryRowMigration.ts); lets a retried migration skip it.
+   */
+  migratedFrom: z.string().optional(),
+  /**
+   * Where a migrated row was ORIGINALLY appended: the journal (workspace id)
+   * whose append sequence positions it, and its `seq` there. Two rows of one
+   * origin were serialized by that store's mutation lock (clock + append run
+   * inside it), so their origin sequence IS their mutation order — even when
+   * neither carries a usable clock value (pre-sharing history, a failed clock
+   * write). Copies are appended to the owner journal later than they happened
+   * and in migration order, so their own `seq` is no order evidence; a
+   * copy-of-copy keeps the first origin. Absent on a copy (older builds,
+   * corruption) = order unknown, never the copying journal's position.
+   * Native rows need no fields: their origin is (`workspaceId`, `seq`).
+   */
+  originJournal: z.string().optional(),
+  originSeq: z.number().optional(),
+  /**
+   * Cross-session order key for rollback conflict detection (`sourceTs ?? ts`):
+   * a shared workspace store's monotonic clock, advanced under the store's
+   * mutation lock by every mutation (workspaceMemoryRevision.ts), so rows in
+   * an owner's and its sub-agents' journals — whose `ts`/`seq` are not
+   * comparable — still order totally; migrated rows keep their source value.
+   * Persisted rows are raw JSON: only a value isValidSourceClock accepts is
+   * order evidence; a present value outside that domain reads as order
+   * unknown (refinementRollback.ts), never as "earlier than everything".
+   */
+  sourceTs: z.number().optional(),
+  /**
+   * The mutation landed but the shared store's clock write failed, so this
+   * row has NO defensible position relative to other rows (its `ts`/`seq`
+   * are journal-local). Rollback conflict detection treats such a row as
+   * conflicting with every overlapping row in either direction (force
+   * overrides), instead of ordering it by an incomparable timestamp.
+   */
+  orderUnknown: z.literal(true).optional(),
   /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
   postState: JsonValueSchema.optional(),
   /**
@@ -176,3 +215,52 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 export type DurableEventDraft = DistributiveOmit<DurableEvent, "v" | "seq" | "id" | "ts"> & {
   id?: string;
 };
+
+/**
+ * A usable shared-store clock value: the clock is `max(Date.now(), prev + 1)`
+ * (workspaceMemoryRevision.ts), so a genuine value is a positive safe integer.
+ * Zero, negatives, fractions, unsafe integers and non-numbers are corruption.
+ */
+export function isValidSourceClock(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** Where a refinement row was originally appended (see `originJournal`). */
+export interface RefinementRowOrigin {
+  journal: string;
+  seq: number;
+}
+
+/**
+ * The journal position that orders a refinement row against rows of the same
+ * origin (RefinementDataSchema.originJournal). A native row is positioned by
+ * the journal it was READ from (`journalWorkspaceId`, the session's workspace
+ * id — the caller's knowledge, never the row's own `workspaceId`, which is
+ * persisted data a corrupt row could carry equal to another journal's; r79)
+ * and only while the row agrees with it. A migrated copy is positioned only
+ * by a carried, well-formed origin. Anything else is no order evidence (null).
+ */
+export function refinementRowOrigin(
+  row: {
+    workspaceId: string;
+    seq: number;
+    data: { migratedFrom?: string; originJournal?: unknown; originSeq?: unknown };
+  },
+  journalWorkspaceId: string | undefined
+): RefinementRowOrigin | null {
+  if (row.data.migratedFrom === undefined) {
+    if (journalWorkspaceId === undefined || row.workspaceId !== journalWorkspaceId) return null;
+    return { journal: journalWorkspaceId, seq: row.seq };
+  }
+  const { originJournal, originSeq } = row.data;
+  if (
+    typeof originJournal !== "string" ||
+    originJournal === "" ||
+    typeof originSeq !== "number" ||
+    !Number.isSafeInteger(originSeq) ||
+    originSeq < 0
+  ) {
+    return null;
+  }
+  return { journal: originJournal, seq: originSeq };
+}
