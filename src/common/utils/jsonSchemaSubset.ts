@@ -2,6 +2,8 @@ import Ajv, { type AnySchema, type ErrorObject, type ValidateFunction } from "aj
 import Ajv2019 from "ajv/dist/2019";
 import Ajv2020 from "ajv/dist/2020";
 import type AjvCore from "ajv/dist/core";
+import type { RegExpEngine } from "ajv/dist/types";
+import { RE2JS } from "re2js";
 
 export interface JsonSchemaValidationError {
   path: string;
@@ -51,10 +53,88 @@ const DIALECT_BY_SCHEMA_URI = new Map<string, Dialect>([
   ["json-schema.org/draft/2020-12/schema", "2020-12"],
 ]);
 
+/** A least-recently-used cache of at most `maxEntries` values. */
+class LruCache<V> {
+  private readonly entries = new Map<string, V>();
+
+  constructor(private readonly maxEntries: number) {}
+
+  get(key: string): V | undefined {
+    const value = this.entries.get(key);
+    if (value !== undefined) {
+      // Re-insert so Map iteration order doubles as recency order.
+      this.entries.delete(key);
+      this.entries.set(key, value);
+    }
+    return value;
+  }
+
+  set(key: string, value: V): void {
+    this.entries.set(key, value);
+    if (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest != null) {
+        this.entries.delete(oldest);
+      }
+    }
+  }
+}
+
+// Patterns come from third-party schemas and are evaluated on model output
+// (`pattern` on strings, `patternProperties` on keys), so they run on RE2,
+// which matches in time linear in the input: with a backtracking engine, a
+// server-authored pattern and a model-chosen key could hold the main process
+// for minutes. A pattern outside RE2's syntax (backreferences, lookarounds,
+// which JSON Schema itself recommends against) does not compile, so a schema
+// that carries one is outside the subset. Compiled patterns are cached like
+// compiled schemas: the walk in the contract layer matches every key of a
+// dictionary against every pattern.
+const PATTERN_CACHE_MAX_ENTRIES = 512;
+const patternCache = new LruCache<RE2JS>(PATTERN_CACHE_MAX_ENTRIES);
+
+function compilePattern(pattern: string): RE2JS {
+  const cached = patternCache.get(pattern);
+  if (cached != null) {
+    return cached;
+  }
+  const compiled = RE2JS.compile(pattern);
+  patternCache.set(pattern, compiled);
+  return compiled;
+}
+
+/**
+ * Whether `text` matches a JSON Schema pattern, by the validator's own engine.
+ * A pattern the validator cannot compile matches nothing.
+ */
+export function matchesJsonSchemaPattern(pattern: string, text: string): boolean {
+  try {
+    return compilePattern(pattern).matcher(text).find();
+  } catch {
+    return false;
+  }
+}
+
+// Ajv keys each compiled pattern by `toString()` within one compilation.
+// `code` is only emitted into standalone validator source, which this module
+// never generates.
+const linearRegExp: RegExpEngine = Object.assign(
+  (pattern: string) => {
+    const compiled = compilePattern(pattern);
+    return { test: (text: string) => compiled.matcher(text).find(), toString: () => pattern };
+  },
+  { code: "linearRegExp" }
+);
+
 // Ajv compiles schemas for this module; it is not their registry
 // (`addUsedSchema: false`). Compiled validators are looked up by schema text
 // below, never by `$id`.
-const AJV_OPTIONS = { allErrors: true, strict: false, validateSchema: true, addUsedSchema: false };
+const AJV_OPTIONS = {
+  allErrors: true,
+  strict: false,
+  validateSchema: true,
+  addUsedSchema: false,
+  code: { regExp: linearRegExp },
+};
 const validators: Record<Dialect, AjvCore> = {
   "draft-07": new Ajv(AJV_OPTIONS),
   "2019-09": new Ajv2019(AJV_OPTIONS),
@@ -102,7 +182,7 @@ function toValidatorTarget(schema: Record<string, unknown>): ValidatorTarget | n
 // is bounded: least-recently-used entries are evicted, and Ajv's own per-object
 // cache is released right after compilation so only this map retains code.
 const VALIDATOR_CACHE_MAX_ENTRIES = 512;
-const validatorCache = new Map<string, ValidateFunction>();
+const validatorCache = new LruCache<ValidateFunction>(VALIDATOR_CACHE_MAX_ENTRIES);
 
 type CompiledJsonSchema =
   | { success: true; validate: ValidateFunction }
@@ -201,9 +281,6 @@ function compileSchema(target: ValidatorTarget): ValidateFunction {
   const key = `${target.dialect}\n${JSON.stringify(target.schema)}`;
   const cached = validatorCache.get(key);
   if (cached != null) {
-    // Re-insert so Map iteration order doubles as recency order.
-    validatorCache.delete(key);
-    validatorCache.set(key, cached);
     return cached;
   }
   let validate: ValidateFunction;
@@ -215,12 +292,6 @@ function compileSchema(target: ValidatorTarget): ValidateFunction {
     target.ajv.removeSchema(target.schema as AnySchema);
   }
   validatorCache.set(key, validate);
-  if (validatorCache.size > VALIDATOR_CACHE_MAX_ENTRIES) {
-    const oldest = validatorCache.keys().next().value;
-    if (oldest != null) {
-      validatorCache.delete(oldest);
-    }
-  }
   return validate;
 }
 

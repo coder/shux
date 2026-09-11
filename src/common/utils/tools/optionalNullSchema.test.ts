@@ -278,6 +278,22 @@ describe("optional null JSON Schema contract", () => {
     });
   });
 
+  test("matches dictionary keys with the validator's pattern engine", () => {
+    // Patterns run on a linear-time engine because the key is model-chosen and
+    // the restore hook runs before any tool deadline. A pattern that engine
+    // cannot compile puts the schema outside the subset and governs nothing.
+    const entry = { type: "object", properties: { note: { type: "string" } } };
+    const source = {
+      type: "object",
+      patternProperties: { "^(?=x)x-": entry, "^y-": entry },
+    };
+
+    expect(restoreMcp(source, { "x-a": { note: "" }, "y-a": { note: "" } })).toEqual({
+      "x-a": { note: "" },
+      "y-a": {},
+    });
+  });
+
   test("restores placeholders in tuple items past the prefix", () => {
     const tail = { type: "object", properties: { note: { type: "string" } } };
     const rows = ["head", { note: "" }, { note: null }];

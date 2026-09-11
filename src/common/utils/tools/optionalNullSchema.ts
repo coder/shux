@@ -2,6 +2,7 @@ import { OPTIONAL_PLACEHOLDER_MAX_JUDGED } from "@/common/constants/toolLimits";
 import {
   JSON_SCHEMA_SUBSET_MAX_DEPTH,
   compileJsonSchemaSubset,
+  matchesJsonSchemaPattern,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "@/common/utils/jsonSchemaSubset";
@@ -212,15 +213,6 @@ function getStaticRequired(schema: unknown): Set<string> {
   return isRecord(schema) ? getRequiredProperties(schema) : new Set<string>();
 }
 
-function matchesPattern(pattern: string, name: string): boolean {
-  try {
-    // The flag Ajv compiles `patternProperties` with.
-    return new RegExp(pattern, "u").test(name);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The sub-schemas of `schema` that govern the property `name`, as JSON Schema
  * defines them: `properties[name]` and every matching `patternProperties`
@@ -233,7 +225,7 @@ function getPropertySchemas(schema: Record<string, unknown>, name: string): unkn
   }
   if (isRecord(schema.patternProperties)) {
     for (const [pattern, patternSchema] of Object.entries(schema.patternProperties)) {
-      if (matchesPattern(pattern, name)) {
+      if (matchesJsonSchemaPattern(pattern, name)) {
         governing.push(patternSchema);
       }
     }

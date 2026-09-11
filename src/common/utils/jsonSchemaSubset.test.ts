@@ -311,6 +311,32 @@ describe("validateJsonSchemaSubset", () => {
     }
   });
 
+  test("matches patterns in time linear in the input", () => {
+    // A backtracking engine backtracks exponentially to reject this input; the
+    // pattern is server-authored and the key is model-chosen.
+    const key = "a".repeat(44);
+    const dictionary = {
+      type: "object",
+      patternProperties: { "^(a*)*$": { type: "string" } },
+      additionalProperties: false,
+    };
+    expect(validateJsonSchemaSubset(dictionary, { [key]: "x" })).toEqual({ success: true });
+
+    const start = performance.now();
+    expect(validateJsonSchemaSubset(dictionary, { [`${key}!`]: "x" }).success).toBe(false);
+    expect(performance.now() - start).toBeLessThan(250);
+  });
+
+  test("rejects a pattern outside the linear engine's syntax", () => {
+    // JSON Schema recommends against lookarounds and backreferences; RE2 has neither.
+    for (const pattern of ["(?=a)a", "(a)\\1"]) {
+      expect(validateJsonSchemaSubsetSchema({ type: "string", pattern }).success).toBe(false);
+    }
+    expect(validateJsonSchemaSubsetSchema({ type: "string", pattern: "^(?:a|b)+$" })).toEqual({
+      success: true,
+    });
+  });
+
   test("keeps schemas of different dialects apart in the validator cache", () => {
     const structure = { type: "array", prefixItems: [{ type: "string" }] };
     expect(validateJsonSchemaSubset(structure, [1])).toEqual({ success: true });
