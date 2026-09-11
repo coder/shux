@@ -1446,6 +1446,33 @@ export class MemoryService extends EventEmitter {
       const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       const adopted = await this.readOrQuarantineAdoptionManifest(manifestPath, childId);
       const sidecarEntries = await this.metaService.getEntriesOrThrow();
+      // An adoption-created copy belongs to exactly ONE descendant: a second
+      // descendant whose note is byte-identical never reuses a sibling's
+      // copy (one child's in-place replacement would rewrite bytes the
+      // other still represents, one child's source deletion would remove a
+      // copy the other still needs, and their pins would collide on one
+      // file) — it gets its own under imported/<child>/. Ownership is by
+      // LIVE generation: a sibling's settled `created` record naming the
+      // path whose receipt (targetStamp, or replacementStamp on the far side
+      // of an interrupted replacement) equals the stamp of the file on disk.
+      // A path plus flags alone would read an owner-edited or recreated copy
+      // as the sibling's. The sibling manifests are read strictly, once per
+      // pass and only when a candidate is identical: an unreadable or
+      // malformed one cannot answer, and the note waits (transient skip)
+      // rather than reuse — or clear the pins of — a copy that may be a
+      // sibling's.
+      let siblingRecords: LegacyAdoptionRecord[] | null = null;
+      const siblingOwns = async (targetRelPath: string, liveStamp: string | null) => {
+        if (liveStamp === null) return false;
+        siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
+        return siblingRecords.some(
+          (record) =>
+            record.target === targetRelPath &&
+            record.created === true &&
+            record.deleted !== true &&
+            (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
+        );
+      };
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
       // combined notebook cannot exceed it — an over-full scope is silently
@@ -1593,7 +1620,25 @@ export class MemoryService extends EventEmitter {
             previous.created === true &&
             currentStamp !== undefined &&
             (currentStamp === previous.targetStamp || currentStamp === previous.replacementStamp);
-          if (priorContent === content) {
+          // A recorded target that is not ours may be a sibling's copy (an
+          // earlier build reused identical bytes across descendants, or the
+          // owner's replacement was itself a sibling's fresh adoption): then
+          // it is not this note's to reuse, and the note is placed anew.
+          let siblings = false;
+          if (!ours && priorContent === content) {
+            try {
+              siblings = await siblingOwns(previous.target, currentStamp ?? null);
+            } catch (error) {
+              log.warn(
+                "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
+                { childId, owner, relPath, target: previous.target, error }
+              );
+              skipped++;
+              transientSkips++;
+              continue;
+            }
+          }
+          if (priorContent === content && !siblings) {
             target = { relPath: previous.target, write: false };
             record.created = ours;
             record.targetStamp = ours ? currentStamp : undefined;
@@ -1621,7 +1666,7 @@ export class MemoryService extends EventEmitter {
           // its lstat or read) is neither free nor different: the note waits
           // for the next pass with no copy made and no record written.
           try {
-            target = await this.legacyImportTarget(store, childId, relPath, content);
+            target = await this.legacyImportTarget(store, childId, relPath, content, siblingOwns);
           } catch (error) {
             log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
               childId,
@@ -2032,15 +2077,19 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Where a legacy file lands in the owner store: its own relPath when free
-   * (write) or already identical (no write); the per-child import directory
-   * when the owner has different content there; null when even that slot is
-   * taken by different content (the file stays only in the legacy directory).
+   * (write) or already identical and the owner's own (no write); the
+   * per-child import directory when the owner has different content there
+   * or the identical file is another descendant's adoption-created copy;
+   * null when even that slot is taken by different content (the file stays
+   * only in the legacy directory). Throws when a sibling manifest the
+   * decision needs cannot be read (callers skip the note transiently).
    */
   private async legacyImportTarget(
     store: MemoryStore,
     childId: string,
     relPath: string,
-    content: string
+    content: string,
+    siblingOwns: (targetRelPath: string, liveStamp: string | null) => Promise<boolean>
   ): Promise<{ relPath: string; write: boolean } | null> {
     for (const candidate of [
       relPath,
@@ -2054,9 +2103,45 @@ export class MemoryService extends EventEmitter {
       if (!contained) continue;
       const destination = await this.inspectAdoptionDestination(store, candidate);
       if (destination === "free") return { relPath: candidate, write: true };
-      if (destination.content === content) return { relPath: candidate, write: false };
+      // Identical: the owner's own note is reused (no slot, the owner's pin
+      // stands); another descendant's adoption-created copy is not — this
+      // note gets its own copy at the next candidate.
+      if (
+        destination.content === content &&
+        !(await siblingOwns(candidate, await adoptionTargetStamp(store.physicalPath(candidate))))
+      ) {
+        return { relPath: candidate, write: false };
+      }
     }
     return null;
+  }
+
+  /**
+   * The settled adoption records of the owner's OTHER descendants, read
+   * strictly: the pass decides on their authority whether an identical owner
+   * file may be reused, so an unreadable or malformed sibling manifest fails
+   * the question (callers skip the note transiently) instead of answering
+   * "not a sibling's".
+   */
+  private async descendantAdoptionRecords(
+    owner: string,
+    childId: string
+  ): Promise<LegacyAdoptionRecord[]> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    const records: LegacyAdoptionRecord[] = [];
+    for (const project of cfg.projects.values()) {
+      for (const workspace of project.workspaces) {
+        const id = workspace.id;
+        if (id === undefined || id === childId || id === owner || resolve(id) !== owner) continue;
+        const manifest = await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(this.config.sessionsDir, id)),
+          { strict: true }
+        );
+        records.push(...manifest.values());
+      }
+    }
+    return records;
   }
 
   /**

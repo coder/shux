@@ -3398,6 +3398,121 @@ describe("MemoryService", () => {
         false
       );
     });
+
+    it("gives a descendant its own copy when the identical owner file is a sibling's adoption", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      const key = (rel: string, workspaceId: string) =>
+        memoryLogicalKey("workspace", rel, { projectPath: "", workspaceId });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      // shared.md: the child's adoption creates the owner copy (child viewed
+      // it, unpinned). own.md: a note the owner wrote itself, pinned.
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.metaService.recordAccess(key("shared.md", "ws-child"), { write: false });
+      await fixture.service.listIndexEntries(childCtx);
+      await fsPromises.writeFile(path.join(ownerRoot, "own.md"), "owner's own");
+      await fixture.metaService.setPinned(key("own.md", "ws-owner"), true);
+      // The grandchild holds both notes byte-identical, pinned.
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      await fsPromises.writeFile(path.join(grandchildRoot, "own.md"), "owner's own");
+      await fixture.metaService.setPinned(key("shared.md", "ws-grandchild"), true);
+      await fixture.metaService.setPinned(key("own.md", "ws-grandchild"), true);
+      await fixture.service.listIndexEntries(grandchildCtx);
+      // The sibling's copy is not reused: the grandchild gets its own, with
+      // its own pin; the child's copy and pin state are untouched.
+      const ownCopy = path.join(ownerRoot, "imported", "ws-grandchild", "shared.md");
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      const pinned = await fixture.metaService.getPinnedKeys();
+      expect(pinned.has(key("imported/ws-grandchild/shared.md", "ws-owner"))).toBe(true);
+      expect(pinned.has(key("shared.md", "ws-owner"))).toBe(false);
+      // The owner's own identical note IS reused (no slot, the owner's pin
+      // stands), as before.
+      expect(await pathExists(path.join(ownerRoot, "imported", "ws-grandchild", "own.md"))).toBe(
+        false
+      );
+      expect(pinned.has(key("own.md", "ws-owner"))).toBe(true);
+      const manifest = JSON.parse(
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(grandchildRoot)), "utf-8")
+      ) as Record<string, { target: string; created?: boolean }>;
+      expect(manifest["shared.md"]).toMatchObject({
+        target: "imported/ws-grandchild/shared.md",
+        created: true,
+      });
+      expect(manifest["own.md"]).toMatchObject({ target: "own.md", created: false });
+      // The creator edits, then deletes, its source: only ITS copy follows;
+      // the grandchild's copy is a separate file and stays.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "child's v2");
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "shared.md"), "utf-8")).toBe(
+        "child's v2"
+      );
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(childRoot, "shared.md"));
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await pathExists(path.join(ownerRoot, "shared.md"))).toBe(false);
+      expect(await fsPromises.readFile(ownCopy, "utf-8")).toBe("same note");
+      expect(
+        (await fixture.metaService.getPinnedKeys()).has(
+          key("imported/ws-grandchild/shared.md", "ws-owner")
+        )
+      ).toBe(true);
+    });
+
+    it("waits instead of reusing an identical owner file while a sibling's manifest cannot be read", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      const key = (workspaceId: string) =>
+        memoryLogicalKey("workspace", "shared.md", { projectPath: "", workspaceId });
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "shared.md"), "same note");
+      await fixture.service.listIndexEntries(childCtx);
+      await fixture.metaService.setPinned(key("ws-owner"), false);
+      await fsPromises.writeFile(path.join(grandchildRoot, "shared.md"), "same note");
+      await fixture.metaService.setPinned(key("ws-grandchild"), true);
+      // The child's manifest is malformed: whether the identical owner file
+      // is the child's copy cannot be told, so the note is neither reused
+      // (its pin would land on a possibly foreign copy) nor duplicated yet.
+      const childManifest = legacyAdoptionManifestPath(path.dirname(childRoot));
+      const intact = await fsPromises.readFile(childManifest, "utf-8");
+      await fsPromises.writeFile(childManifest, "{not json");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await pathExists(path.join(ownerRoot, "imported"))).toBe(false);
+      expect((await fixture.metaService.getPinnedKeys()).has(key("ws-owner"))).toBe(false);
+      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(grandchildRoot)))).toBe(
+        false
+      );
+      // Transient: not memoized. Once readable again, the note lands as the
+      // grandchild's own copy.
+      await fsPromises.writeFile(childManifest, intact);
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(passes).toHaveBeenCalledTimes(2);
+      expect(
+        await fsPromises.readFile(
+          path.join(ownerRoot, "imported", "ws-grandchild", "shared.md"),
+          "utf-8"
+        )
+      ).toBe("same note");
+      expect((await fixture.metaService.getPinnedKeys()).has(key("ws-owner"))).toBe(false);
+    });
   });
 
   describe("memory index entries", () => {
