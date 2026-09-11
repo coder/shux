@@ -493,6 +493,64 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "sanitizes a deferred checkout that archiving interrupted",
+    async () => {
+      // Archive aborts a running init but keeps the checkout registered (default behaviour),
+      // and unarchiving does not rerun init, so the interrupted materialization must still
+      // prune committed plugin enables before the workspace is parked.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      // README.md sorts after .xum/, so the override is on disk while its smudge filter stalls.
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=slow\n");
+      await execAsync(
+        "git add -A && git commit -m 'slow checkout' && git config filter.slow.smudge 'sleep 5; cat'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        // Archive once the checkout has written the override but is still stalled on README.md.
+        const overridePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(overridePath);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        const pruned = JSON.parse(await fs.readFile(overridePath, "utf8")) as {
+          enabledServers: string[];
+        };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        const { stdout } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(stdout.trim()).toBe(`refs/heads/${branchName}`);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();

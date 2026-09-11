@@ -3124,8 +3124,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       materializeError = error;
     }
-    if (args.initAbortController.signal.aborted) {
-      // Removal owns the checkout now (it aborted us and awaits this settlement).
+    if (this.removingWorkspaces.has(workspaceId)) {
+      // Removal owns the checkout now (it aborted us and awaits this settlement). Archive
+      // also aborts but keeps the checkout registered, so it still gets sanitized below.
       return;
     }
     const sanitizeError = await this.sanitizeMaterializedTaskWorkspace(

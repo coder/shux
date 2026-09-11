@@ -553,6 +553,56 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("refuses to overwrite files written into the reserved worktree and returns to the branch", async () => {
+    const branchName = "feature-stray-file";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      // The workspace is already announced, so a terminal or editor can write here first.
+      const strayFile = path.join(result.workspacePath, "README.md");
+      await fsPromises.writeFile(strayFile, "user data\n");
+
+      const failure = await fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization!
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain("README.md");
+      expect(await fsPromises.readFile(strayFile, "utf8")).toBe("user data\n");
+      // The retained workspace stays on its branch rather than the checkout placeholder.
+      expect(
+        execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(`refs/heads/${branchName}`);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("deletes a reserved worktree that was never materialized", async () => {
     const branchName = "feature-deferred-cancelled";
     const fixture = await createWorktreeManagerFixture();

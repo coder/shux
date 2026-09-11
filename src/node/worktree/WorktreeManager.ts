@@ -309,17 +309,11 @@ export class WorktreeManager {
     try {
       // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
       // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
+      // No --force: a deferred checkout runs in an announced workspace, so anything written
+      // there meanwhile (a terminal, an editor) must fail the checkout, not be overwritten.
       using checkoutProc = execFileAsync(
         "git",
-        [
-          "-C",
-          workspacePath,
-          "checkout",
-          "--progress",
-          "--force",
-          "--no-recurse-submodules",
-          branchName,
-        ],
+        ["-C", workspacePath, "checkout", "--progress", "--no-recurse-submodules", branchName],
         {
           ...noHooksEnv,
           // git delays progress output by 2s, which hides it for most checkouts.
@@ -334,6 +328,19 @@ export class WorktreeManager {
       }
     } catch (error) {
       progress.flush();
+      // A retained (deferred) workspace must not be left on the placeholder ref: later git
+      // operations would commit to it instead of the workspace branch. Runs without the
+      // caller's signal because an aborted checkout (archive) needs the restore most.
+      try {
+        using restoreProc = execFileAsync(
+          "git",
+          ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/${branchName}`],
+          noHooksEnv?.env ? { env: noHooksEnv.env } : undefined
+        );
+        await restoreProc.result;
+      } catch {
+        // The checkout error below is the one worth reporting.
+      }
       const diagnostics = output.filter((line) => !isGitProgressLine(line));
       throw new Error(diagnostics.length > 0 ? diagnostics.join("\n") : getErrorMessage(error));
     }
