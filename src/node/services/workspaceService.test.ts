@@ -15459,6 +15459,28 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     expect(calls).not.toContain("release");
   });
 
+  test("remove() succeeds and emits its removal event when finalizing harvest records fails", async () => {
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => Promise.resolve(),
+      releaseRemovalCancellation: () => undefined,
+      finalizeHarvestsForRemoval: () => Promise.reject(new Error("sidecar unwritable")),
+    });
+    const removed: string[] = [];
+    workspaceService.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.metadata === null) removed.push(event.workspaceId);
+    });
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    // Deregistration already committed: harvest bookkeeping is best-effort.
+    const result = await workspaceService.remove(workspaceId);
+    expect(result.success).toBe(true);
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
+    expect(removed).toEqual([workspaceId]);
+    expect(existsSync(sessionDir)).toBe(false);
+  });
+
   test("remove() flushes the timeline before deleting the session directory", async () => {
     const sessionDir = path.join(tempRoot, "sessions", workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });

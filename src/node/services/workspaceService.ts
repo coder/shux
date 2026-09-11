@@ -6609,7 +6609,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Only once the workspace is deregistered (and its session, with the
       // transcript, gone) are the retryable harvest records truly
       // unrecoverable; an aborted removal must leave them retryable.
-      await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+      // Best-effort: the removal is committed, so a sidecar failure here
+      // must not turn it into an error (the metadata event below still fires).
+      try {
+        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+      } catch (error) {
+        log.warn("Failed to finalize harvest records after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
 
       // Deregistration succeeded: drop the workspace's activity/status entry
       // so extensionMetadata.json stays bounded (stale entries were

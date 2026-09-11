@@ -459,10 +459,14 @@ function legacySidecarPinned(sidecar: string): boolean | null {
 
 /**
  * Change stamp of a sub-agent's legacy private store: the root directory's
- * mtime and every listed file's size + mtime — a DOWNGRADED build editing an
+ * mtime and every file's size + mtime — a DOWNGRADED build editing an
  * existing nested note moves the root mtime no more than a foreign backend's
- * self-fallback write does. Bounded by the per-scope file cap and paid only
- * while a legacy directory exists. Missing pieces read as fixed tokens.
+ * self-fallback write does. The walk is the FULL directory (strict,
+ * uncapped, no file reads): the adoption pass itself stops at the shared
+ * store's capacity, but a note sorted past the cap prefix still belongs to
+ * the store's state — fingerprinting only the capped listing would let an
+ * edit there leave the memo valid forever. Paid only while a legacy
+ * directory exists. Missing or unlistable pieces read as fixed tokens.
  */
 async function legacyStoreStamp(legacyRoot: string): Promise<string> {
   const rootMtime = await fsPromises
@@ -470,8 +474,8 @@ async function legacyStoreStamp(legacyRoot: string): Promise<string> {
     .then((stat) => String(stat.mtimeMs))
     .catch(() => "missing");
   const files = await new LocalMemoryStore(legacyRoot)
-    .listFiles({ includeDotfiles: true })
-    .catch(() => []);
+    .listFiles({ strict: true, includeDotfiles: true })
+    .catch(() => ["\u0002unlistable"]);
   const fileStamps = await Promise.all(
     files.map(async (relPath) => {
       const stamp = await fsPromises
@@ -1405,12 +1409,23 @@ export class MemoryService extends EventEmitter {
           encoding: "utf-8",
         });
       for (const relPath of files) {
-        // Same read gates as a memory command: containment (no symlink
-        // escape), size cap, and text-only. Dot-entries too (r73): `.note`
-        // is addressable, so a real note there may hold text `create`
-        // permitted or be transiently unreadable — exempting dot-entries
-        // would report a complete handover and let removal take the only
-        // copy. A stray `.DS_Store` costs a forced removal, never a note.
+        // Same gates as a memory command. Name first: a legacy file whose
+        // name the path grammar rejects (traversal-looking segments, control
+        // characters, XML metacharacters) can never be addressed through the
+        // shared store, so it is never copied there — a permanent skip that
+        // removal reports like any other unrepresentable note.
+        try {
+          parseMemoryPath(toVirtualPath("workspace", relPath));
+        } catch {
+          skipped++;
+          continue;
+        }
+        // Then containment (no symlink escape), size cap, and text-only.
+        // Dot-entries too (r73): `.note` is addressable, so a real note
+        // there may hold text `create` permitted or be transiently
+        // unreadable — exempting dot-entries would report a complete
+        // handover and let removal take the only copy. A stray `.DS_Store`
+        // costs a forced removal, never a note.
         let bytes: Buffer;
         try {
           await legacy.assertContained(relPath);
@@ -1646,6 +1661,15 @@ export class MemoryService extends EventEmitter {
           // Only an actual boolean transition of the child's pin overrides
           // the owner's; an unknown prior state never does.
           const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
+          // A first adoption onto an identical owner note keeps the owner's
+          // pin — unless that note is itself another descendant's adopted
+          // copy, in which case no owner choice exists and the descendants'
+          // pins combine (an unpinned sibling adopted first must not drop
+          // this child's pin).
+          const siblingCopy =
+            previous === undefined &&
+            !target.write &&
+            (await this.targetCreatedByDescendantAdoption(owner, childId, target.relPath));
           try {
             await this.metaService.mergeKeys(
               childKey,
@@ -1653,7 +1677,10 @@ export class MemoryService extends EventEmitter {
                 projectPath: ctx.projectPath,
                 workspaceId: owner,
               }),
-              { pinned: childPinChanged && foldChildPin ? "source" : "target" }
+              {
+                pinned:
+                  childPinChanged && foldChildPin ? "source" : siblingCopy ? "either" : "target",
+              }
             );
           } catch (error) {
             log.warn(
@@ -1748,6 +1775,41 @@ export class MemoryService extends EventEmitter {
       );
       return new Map();
     }
+  }
+
+  /**
+   * Whether `targetRelPath` in the owner store is a copy some OTHER
+   * descendant's adoption created (its manifest records the target as
+   * `created`), as opposed to a note the owner wrote itself. Tolerant reads:
+   * an unreadable sibling manifest answers "no", which keeps the owner's pin
+   * — today's behavior.
+   */
+  private async targetCreatedByDescendantAdoption(
+    owner: string,
+    childId: string,
+    targetRelPath: string
+  ): Promise<boolean> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    for (const project of cfg.projects.values()) {
+      for (const sibling of project.workspaces) {
+        const id = sibling.id;
+        if (id === undefined || id === childId || id === owner || resolve(id) !== owner) continue;
+        const manifest = await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(this.config.sessionsDir, id))
+        );
+        for (const record of manifest.values()) {
+          if (
+            record.target === targetRelPath &&
+            record.created === true &&
+            record.pending !== true
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   }
 
   /**

@@ -1968,6 +1968,103 @@ describe("MemoryService", () => {
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
     });
 
+    it("fingerprints the whole legacy store, so an edit past the cap prefix re-runs the pass", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      // The shared store is already full, and the legacy store holds more
+      // notes than the capped listing shows: every note is permanently
+      // skipped (no capacity), so the pass is memoized.
+      await Promise.all([
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
+          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
+        ),
+        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
+          fsPromises.writeFile(path.join(legacyRoot, `n${String(i).padStart(4, "0")}.md`), "n")
+        ),
+      ]);
+      await fsPromises.writeFile(path.join(legacyRoot, "zz-a.md"), "a");
+      await fsPromises.writeFile(path.join(legacyRoot, "zz-b.md"), "b");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(1);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(1);
+      // A downgraded build edits the note sorted beyond the capped listing:
+      // the fingerprint must see it (size change), not just the cap prefix.
+      await fsPromises.writeFile(path.join(legacyRoot, "zz-b.md"), "b edited on the old build");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(2);
+    }, 30_000);
+
+    it("combines two descendants' pins on one adopted copy instead of keeping the first one's", async () => {
+      using fixture = await createFixture("ws-owner");
+      await registerTaskTree(fixture);
+      // Same note, same bytes, in two pre-sharing descendants; only the one
+      // adopted second had it pinned.
+      for (const child of ["ws-child", "ws-grandchild"]) {
+        const legacyRoot = path.join(fixture.config.sessionsDir, child, "memory");
+        await fsPromises.mkdir(legacyRoot, { recursive: true });
+        await fsPromises.writeFile(path.join(legacyRoot, "same.md"), "shared lesson");
+      }
+      await fixture.metaService.setPinned("workspace:ws-grandchild:same.md", true);
+      await fixture.service.listIndexEntries(fixture.ctx);
+      expect(
+        await fsPromises.readFile(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "same.md"),
+          "utf-8"
+        )
+      ).toBe("shared lesson");
+      // The owner copy is the first descendant's adopted copy, not an owner
+      // choice: the second descendant's pin is not dropped against it.
+      expect(await fixture.metaService.getPinnedKeys()).toContain("workspace:ws-owner:same.md");
+
+      // An owner's OWN note (no adoption created it) keeps the owner's pin
+      // state on a descendant's first adoption, as before.
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      await fsPromises.writeFile(path.join(ownerRoot, "mine.md"), "owner wrote this");
+      await fixture.metaService.recordAccess("workspace:ws-owner:mine.md", { write: true });
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.writeFile(path.join(legacyRoot, "mine.md"), "owner wrote this");
+      await fixture.metaService.setPinned("workspace:ws-child:mine.md", true);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fixture.metaService.getPinnedKeys()).not.toContain("workspace:ws-owner:mine.md");
+    });
+
+    it("never copies a legacy note whose name the memory path grammar rejects", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "bad..name.md"), "traversal-looking");
+      await fsPromises.writeFile(path.join(legacyRoot, "ctl\u0001.md"), "control char");
+      await fsPromises.writeFile(path.join(legacyRoot, "good.md"), "fine");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "good.md"), "utf-8")).toBe("fine");
+      expect(await fsPromises.readdir(ownerRoot)).toEqual(["good.md"]);
+      // Permanent: an unchanged legacy store is not re-walked for them.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(1);
+      // Strict removal still refuses to leave them behind.
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/2 legacy workspace memory note\(s\)/);
+      expect(await fsPromises.readdir(ownerRoot)).toEqual(["good.md"]);
+    });
+
     it("owner access adopts an inactive pre-sharing child's notebook without the child touching memory", async () => {
       using fixture = await createFixture("ws-owner");
       await registerTaskTree(fixture);
