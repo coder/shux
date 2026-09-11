@@ -209,8 +209,6 @@ export class CompactionPreparationLifecycle {
     const tailCopies = structuredClone(input.tailCopies);
     const publication = structuredClone(input.publication);
     const attachments = structuredClone(input.attachments);
-    const current = this.current;
-    const surviving = current?.kind === "receipt" ? current : current?.surviving;
     const owner: PublicationOwner = {
       kind: "publication",
       historyOnly: true,
@@ -218,13 +216,6 @@ export class CompactionPreparationLifecycle {
       summaryId: summaryMessage.id,
       facts: { rolledBack: false },
       attachments: { diffs: [], loadedSkills: [], readFiles: [] },
-      surviving:
-        surviving &&
-        !surviving.facts.consumed &&
-        !surviving.facts.pendingRetired &&
-        !surviving.facts.rolledBack
-          ? surviving
-          : undefined,
     };
     let committed = false;
     try {
@@ -239,6 +230,18 @@ export class CompactionPreparationLifecycle {
         onCommitted: (receipt, previous, retention) => {
           committed = true;
           owner.historyOnly = !receipt;
+          // Earlier queued captures have adopted their observations by this held-lock commit.
+          // Keep their exact survivor if enrichment could not read it, before pruning/resetting
+          // current; choosing before queue entry can miss a receipt still being observed.
+          const current = this.current;
+          const surviving = current?.kind === "receipt" ? current : current?.surviving;
+          owner.surviving =
+            surviving &&
+            !surviving.facts.consumed &&
+            !surviving.facts.pendingRetired &&
+            !surviving.facts.rolledBack
+              ? surviving
+              : undefined;
           // Prune the pre-commit registry against its starting horizon before adding this
           // publication; reusing an ID cannot retain an already rolled-back occurrence.
           this.prune(retention);

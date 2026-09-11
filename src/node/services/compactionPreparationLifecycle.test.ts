@@ -769,6 +769,59 @@ describe("inactive local compaction preparation lifecycle", () => {
       );
     }
   );
+  it("retires a predecessor adopted by an earlier queued capture when publication reads fail", async () => {
+    assert((await publish("A", false, new CompactionPreparationLifecycle(restart()))).success);
+    const prepared = await input("B", true);
+    const preparation = lifecycle.begin(() => true);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const readFile = fs.readFile;
+    let pendingReads = 0;
+    const reading = spyOn(fs, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      if (args[0] === pendingPath) {
+        pendingReads++;
+        if (pendingReads === 1) {
+          const result = await readFile(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+        if (pendingReads === 2) throw new Error("Pending preparation read unavailable");
+      }
+      return readFile(...args);
+    }) as typeof fs.readFile);
+    const capturing = lifecycle.capture("pending");
+    await entered.promise;
+    // Start publication while capture is still awaiting real file I/O.
+    const publishing = lifecycle.publish(preparation, prepared);
+    release.resolve();
+    try {
+      expect((await capturing)?.readFiles).toEqual(["/A.ts"]);
+      const b = await publishing;
+      assert(b.success);
+      expect(pendingReads).toBe(2);
+      reading.mockRestore();
+      const empty = await lifecycle.capture("pending");
+      assert(empty);
+      expect(empty.readFiles).toEqual([]);
+      await lifecycle.consume(empty, "discard");
+      const restarted = new CompactionPreparationLifecycle(restart());
+      expect(await restarted.rollbackHeartbeat(b.data.summaryMessage, () => true)).toMatchObject({
+        success: true,
+        data: { outcome: "applied" },
+      });
+      expect(await restarted.capture("pending")).toBeUndefined();
+      expect(
+        await new CompactionPreparationLifecycle(restart()).capture("pending")
+      ).toBeUndefined();
+    } finally {
+      release.resolve();
+      await Promise.allSettled([capturing, publishing]);
+    }
+  });
+
   it("retires an unobserved foreign predecessor after publication read recovery and rollback", async () => {
     assert((await publish("A", false, new CompactionPreparationLifecycle(restart()))).success);
     const readFile = fs.readFile;
