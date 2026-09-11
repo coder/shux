@@ -742,6 +742,22 @@ describe("optional null JSON Schema contract", () => {
     expect(contract.restore({ a: { a: "" } })).toEqual({ a: {} });
   });
 
+  test("restores through an allOf chain too deep to judge without walking its depth", () => {
+    // The required-property lookup follows allOf branches; on a schema the
+    // validator declined it must stop where the placeholder walk stops.
+    let source: Record<string, unknown> = { required: ["r"] };
+    for (let depth = 0; depth < 100_000; depth++) {
+      source = { allOf: [source] };
+    }
+    const contract = createOptionalNullSchemaContract(
+      { type: "object", properties: { q: { type: "string" }, r: { type: "string" } }, ...source },
+      MCP
+    );
+
+    expect(contract.strict).toBe(false);
+    expect(contract.restore({ q: "", r: "x" })).toEqual({ r: "x" });
+  });
+
   test("leaves a schema too large to judge alone without compiling its properties", () => {
     // Every optional property costs one validator compilation when widened, so
     // an MCP server's schema width must not set the main process's work.

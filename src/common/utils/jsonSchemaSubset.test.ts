@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   JSON_SCHEMA_SUBSET_MAX_CHARS,
   JSON_SCHEMA_SUBSET_MAX_NODES,
+  createSchemaBudget,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
 } from "./jsonSchemaSubset";
@@ -253,6 +254,33 @@ describe("validateJsonSchemaSubset", () => {
         description: text.slice(0, JSON_SCHEMA_SUBSET_MAX_CHARS / 4),
       })
     ).toEqual({ success: true });
+  });
+
+  test("charges every schema from one source to the budget it shares", () => {
+    // Many schemas that each fit the per-schema bound are unbounded together;
+    // a source's budget pays for each walk and runs out.
+    const wide = (properties: number) => ({
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: properties }, (_, i) => [`p${i}`, { type: "string" }])
+      ),
+    });
+    const budget = createSchemaBudget(1);
+    // Two nodes per property plus the root's three: three fit the budget of
+    // one maximal schema, the fourth does not.
+    const schema = wide(JSON_SCHEMA_SUBSET_MAX_NODES / 8);
+
+    for (let i = 0; i < 3; i += 1) {
+      expect(validateJsonSchemaSubsetSchema(schema, { budget })).toEqual({ success: true });
+    }
+    const spent = validateJsonSchemaSubsetSchema(schema, { budget });
+    expect(spent.success).toBe(false);
+    if (!spent.success) {
+      expect(spent.errors[0]?.message).toBe("Schema is too large");
+    }
+    // The budget bounds its source, not the schema: the same schema still
+    // compiles on its own.
+    expect(validateJsonSchemaSubsetSchema(schema)).toEqual({ success: true });
   });
 
   test("supports enum, integer, and additionalProperties false", () => {

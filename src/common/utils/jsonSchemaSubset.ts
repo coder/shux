@@ -38,6 +38,27 @@ export const JSON_SCHEMA_SUBSET_MAX_DEPTH = 64;
 export const JSON_SCHEMA_SUBSET_MAX_NODES = 2048;
 export const JSON_SCHEMA_SUBSET_MAX_CHARS = 256 * 1024;
 
+/** A schema's node count and text length (see JSON_SCHEMA_SUBSET_MAX_NODES). */
+export interface SchemaSize {
+  nodes: number;
+  chars: number;
+}
+
+/**
+ * The schema size a caller will still compile. The per-schema bounds keep one
+ * schema's synchronous work bounded; a caller compiling many schemas from one
+ * source (an MCP server's tool catalog) passes one budget to all of them, so
+ * the source's total work is bounded too. Every schema walked is charged, and a
+ * schema the remaining budget cannot cover is outside the subset like an
+ * over-large one.
+ */
+export function createSchemaBudget(schemas: number): SchemaSize {
+  return {
+    nodes: schemas * JSON_SCHEMA_SUBSET_MAX_NODES,
+    chars: schemas * JSON_SCHEMA_SUBSET_MAX_CHARS,
+  };
+}
+
 /**
  * The dialects this validator speaks. A schema is judged in the dialect its
  * `$schema` declares: draft-07 Ajv would silently ignore 2020-12 keywords such
@@ -205,9 +226,15 @@ type CompiledJsonSchema =
   | { success: true; validate: ValidateFunction }
   | { success: false; errors: JsonSchemaValidationError[] };
 
+interface CompileJsonSchemaOptions {
+  requireObjectSchema?: boolean;
+  /** Shared across schemas from one source (see createSchemaBudget); one schema's worth when absent. */
+  budget?: SchemaSize;
+}
+
 function compileJsonSchema(
   schema: unknown,
-  options?: { requireObjectSchema?: boolean }
+  options?: CompileJsonSchemaOptions
 ): CompiledJsonSchema {
   if (!isPlainRecord(schema)) {
     return { success: false, errors: [{ path: "$", message: "Schema must be an object" }] };
@@ -224,7 +251,17 @@ function compileJsonSchema(
       ],
     };
   }
-  const subsetError = findSubsetViolation(schema, "$", 0, { nodes: 0, chars: 0 });
+  // The walk stops at the smaller of the per-schema bound and what the budget
+  // still covers, and the budget pays for what was walked either way.
+  const budget = options?.budget ?? createSchemaBudget(1);
+  const allowance: SchemaSize = {
+    nodes: Math.min(budget.nodes, JSON_SCHEMA_SUBSET_MAX_NODES),
+    chars: Math.min(budget.chars, JSON_SCHEMA_SUBSET_MAX_CHARS),
+  };
+  const size: SchemaSize = { nodes: 0, chars: 0 };
+  const subsetError = findSubsetViolation(schema, "$", 0, size, allowance);
+  budget.nodes -= size.nodes;
+  budget.chars -= size.chars;
   if (subsetError != null) {
     return { success: false, errors: [subsetError] };
   }
@@ -256,7 +293,7 @@ function compileJsonSchema(
 
 export function validateJsonSchemaSubsetSchema(
   schema: unknown,
-  options?: { requireObjectSchema?: boolean }
+  options?: CompileJsonSchemaOptions
 ): JsonSchemaSubsetValidationResult {
   const compiled = compileJsonSchema(schema, options);
   return compiled.success ? { success: true } : compiled;
@@ -420,18 +457,16 @@ function unescapePointer(part: string): string {
 // keyword is outside the subset.
 const REFERENCE_KEYWORDS = ["$ref", "$dynamicRef", "$recursiveRef"] as const;
 
-/** The size of the schema walked so far (see JSON_SCHEMA_SUBSET_MAX_NODES). */
-interface SchemaSize {
-  nodes: number;
-  chars: number;
-}
-
-/** The first way `schema` falls outside the subset: too deep, too large, or a reference. */
+/**
+ * The first way `schema` falls outside the subset: too deep, larger than
+ * `allowance` (counted into `size`), or a reference.
+ */
 function findSubsetViolation(
   schema: unknown,
   path: string,
   depth: number,
-  size: SchemaSize
+  size: SchemaSize,
+  allowance: SchemaSize
 ): JsonSchemaValidationError | null {
   if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH) {
     return { path, message: "Schema is too deeply nested" };
@@ -440,12 +475,12 @@ function findSubsetViolation(
   if (typeof schema === "string") {
     size.chars += schema.length;
   }
-  if (size.nodes > JSON_SCHEMA_SUBSET_MAX_NODES || size.chars > JSON_SCHEMA_SUBSET_MAX_CHARS) {
+  if (size.nodes > allowance.nodes || size.chars > allowance.chars) {
     return { path, message: "Schema is too large" };
   }
   if (Array.isArray(schema)) {
     for (const [index, item] of schema.entries()) {
-      const error = findSubsetViolation(item, `${path}[${index}]`, depth + 1, size);
+      const error = findSubsetViolation(item, `${path}[${index}]`, depth + 1, size, allowance);
       if (error != null) return error;
     }
     return null;
@@ -461,7 +496,7 @@ function findSubsetViolation(
   for (const [key, value] of Object.entries(schema)) {
     // The value is a node, so its visit judges the key's length too.
     size.chars += key.length;
-    const error = findSubsetViolation(value, `${path}.${key}`, depth + 1, size);
+    const error = findSubsetViolation(value, `${path}.${key}`, depth + 1, size, allowance);
     if (error != null) return error;
   }
   return null;

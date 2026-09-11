@@ -65,7 +65,10 @@ function isBinaryPart(item: MCPContent): item is MCPBinaryContent {
   );
 }
 
-/** The server's own words in a content part; empty for binary parts. */
+/**
+ * The server's own words in a content part: a text part's text, a text
+ * resource's text or, without text, its URI; empty for binary parts.
+ */
 function readableText(item: MCPContent): string {
   if (item.type === "text") {
     return item.text;
@@ -75,6 +78,23 @@ function readableText(item: MCPContent): string {
   }
   return "";
 }
+
+/** `item` with its readable text replaced in the field readableText read it from. */
+function withReadableText(item: MCPTextContent | MCPResourceContent, text: string): MCPContent {
+  if (item.type === "text") {
+    return { ...item, text };
+  }
+  return typeof item.resource.text === "string"
+    ? { ...item, resource: { ...item.resource, text } }
+    : { ...item, resource: { ...item.resource, uri: text } };
+}
+
+/**
+ * Result fields that carry the result as JSON. The model never reads them
+ * (toModelOutput reads content), so an oversized one is dropped whole instead
+ * of being truncated mid-structure.
+ */
+const STRUCTURED_RESULT_FIELDS = ["structuredContent", "toolResult"] as const;
 
 /**
  * Turn an `isError` result into the message of the thrown tool error. An error
@@ -311,22 +331,9 @@ export function transformMCPResult(result: unknown): unknown {
 
   const typed = result as MCPCallToolResult;
 
-  // If it has toolResult (non-standard result shape), pass through as-is when
-  // it fits the cap; otherwise replace it with a bounded notice.
-  if (typed.toolResult !== undefined) {
-    const size = jsonByteLength(result);
-    if (size <= MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
-      return result;
-    }
-    log.warn("[MCP] toolResult too large, omitting", {
-      size,
-      cap: MCP_TOOL_RESULT_MAX_TEXT_BYTES,
-    });
-    return { toolResult: omittedValueNotice("toolResult", size) };
-  }
-
-  // If no content array, pass through when it fits the cap; otherwise replace
-  // with a bounded notice in MCP text shape so toModelOutput surfaces it.
+  // If no content array (including the legacy toolResult-only shape), pass
+  // through when it fits the cap; otherwise replace with a bounded notice in
+  // MCP text shape so toModelOutput surfaces it.
   if (!typed.content || !Array.isArray(typed.content)) {
     const size = jsonByteLength(result);
     if (size <= MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
@@ -416,29 +423,17 @@ function capTextOnlyResult(typed: MCPCallToolResult): unknown {
   const cappedContent: MCPContent[] = [];
 
   for (const item of typed.content ?? []) {
-    if (item.type === "text") {
-      const capped = capText(item.text, budget);
-      if (capped === null) {
-        omitted += 1;
-        continue;
-      }
-      changed ||= capped.truncated;
-      cappedContent.push(capped.truncated ? { ...item, text: capped.text } : item);
+    if (item.type !== "text" && item.type !== "resource") {
+      cappedContent.push(item);
       continue;
     }
-    if (item.type === "resource" && typeof item.resource?.text === "string") {
-      const capped = capText(item.resource.text, budget);
-      if (capped === null) {
-        omitted += 1;
-        continue;
-      }
-      changed ||= capped.truncated;
-      cappedContent.push(
-        capped.truncated ? { ...item, resource: { ...item.resource, text: capped.text } } : item
-      );
+    const capped = capText(readableText(item), budget);
+    if (capped === null) {
+      omitted += 1;
       continue;
     }
-    cappedContent.push(item);
+    changed ||= capped.truncated;
+    cappedContent.push(capped.truncated ? withReadableText(item, capped.text) : item);
   }
 
   if (omitted > 0) {
@@ -446,37 +441,37 @@ function capTextOnlyResult(typed: MCPCallToolResult): unknown {
     cappedContent.push({ type: "text", text: omittedPartsNotice(omitted) });
   }
 
-  // structuredContent duplicates the content text as JSON and is invisible to
-  // the model (toModelOutput only reads content), so drop it wholesale when
-  // oversized instead of truncating JSON mid-structure.
-  const structuredSize =
-    typed.structuredContent !== undefined ? jsonByteLength(typed.structuredContent) : 0;
-  const dropStructured = structuredSize > MCP_TOOL_RESULT_MAX_TEXT_BYTES;
-  if (dropStructured) {
-    changed = true;
-    cappedContent.push({
-      type: "text",
-      text: omittedValueNotice("structuredContent", structuredSize),
-    });
+  const droppedFields = new Set<(typeof STRUCTURED_RESULT_FIELDS)[number]>();
+  for (const field of STRUCTURED_RESULT_FIELDS) {
+    if (typed[field] === undefined) {
+      continue;
+    }
+    const size = jsonByteLength(typed[field]);
+    if (size > MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
+      changed = true;
+      droppedFields.add(field);
+      cappedContent.push({ type: "text", text: omittedValueNotice(field, size) });
+    }
   }
 
   if (changed) {
     log.warn("[MCP] tool result text exceeded cap, truncated", {
       cap: MCP_TOOL_RESULT_MAX_TEXT_BYTES,
       omittedParts: omitted,
-      structuredContentDropped: dropStructured,
+      droppedFields: [...droppedFields],
     });
   }
 
   const candidate: MCPCallToolResult = changed ? { ...typed, content: cappedContent } : typed;
-  if (changed && dropStructured) {
-    delete candidate.structuredContent;
+  for (const field of droppedFields) {
+    delete candidate[field];
   }
 
   // The per-surface caps above cannot reach server-controlled metadata
-  // (result- and part-level _meta, unknown fields, resource URIs), so a total
-  // serialized budget backstops them: anything still oversized is flattened to
-  // bounded text parts so no unbounded bytes reach history.
+  // (result- and part-level _meta, unknown fields, the URI of a resource that
+  // has text), so a total serialized budget backstops them: anything still
+  // oversized is flattened to bounded text parts so no unbounded bytes reach
+  // history.
   const totalSize = jsonByteLength(candidate);
   if (totalSize <= MCP_TOOL_RESULT_MAX_TOTAL_BYTES) {
     return candidate;
@@ -517,11 +512,13 @@ function capTextOnlyResult(typed: MCPCallToolResult): unknown {
     // Strictly-true check: hostile servers can put unbounded junk in isError.
     ...(typed.isError === true ? { isError: true } : {}),
     content: boundedContent,
-    // Kept structuredContent is already bounded by its own serialized cap above.
-    ...(typed.structuredContent !== undefined && !dropStructured
-      ? { structuredContent: typed.structuredContent }
-      : {}),
   };
+  // Kept structured fields are already bounded by their own serialized cap above.
+  for (const field of STRUCTURED_RESULT_FIELDS) {
+    if (typed[field] !== undefined && !droppedFields.has(field)) {
+      rebuilt[field] = typed[field];
+    }
+  }
 
   // Remeasure the rebuilt output. Unreachable while every component above is
   // budgeted in serialized bytes, but a bounded collapse beats trusting that

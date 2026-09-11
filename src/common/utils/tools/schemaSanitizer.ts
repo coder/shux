@@ -1,4 +1,5 @@
 import { type Tool } from "ai";
+import { getJsonSchemaDialect, type Dialect } from "@/common/utils/jsonSchemaSubset";
 
 /**
  * JSON Schema properties that are not permitted by OpenAI's Responses API.
@@ -140,7 +141,7 @@ const OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES = new Set([
  */
 export function sanitizeWorkflowAgentReportSchemaForOpenAI<T>(schema: T): T {
   const clonedSchema = JSON.parse(JSON.stringify(schema)) as T;
-  sanitizeWorkflowAgentReportSchemaNode(clonedSchema);
+  sanitizeWorkflowAgentReportSchemaNode(clonedSchema, getJsonSchemaDialect(schema));
   return clonedSchema;
 }
 
@@ -215,12 +216,22 @@ function mergeAllOfObjectProperties(schema: Record<string, unknown>): void {
   }
 }
 
-function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
+function sanitizeWorkflowAgentReportSchemaNode(schema: unknown, dialect: Dialect): void {
   if (typeof schema !== "object" || schema === null) {
     return;
   }
 
   const obj = schema as Record<string, unknown>;
+  // The clone loses its `$schema` below and reads as draft-07 from then on, so
+  // a 2020-12 tuple is translated into draft-07's tuple keywords rather than
+  // left under keywords a draft-07 reader ignores.
+  if (dialect === "2020-12" && Array.isArray(obj.prefixItems)) {
+    if (obj.items !== undefined) {
+      obj.additionalItems = obj.items;
+    }
+    obj.items = obj.prefixItems;
+    delete obj.prefixItems;
+  }
   mergeAllOfObjectProperties(obj);
   for (const prop of OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES) {
     if (prop in obj) {
@@ -242,7 +253,7 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
   if (properties != null) {
     obj.additionalProperties = false;
     for (const propSchema of Object.values(properties)) {
-      sanitizeWorkflowAgentReportSchemaNode(propSchema);
+      sanitizeWorkflowAgentReportSchemaNode(propSchema, dialect);
     }
   } else if (obj.type === "object") {
     obj.additionalProperties = false;
@@ -253,16 +264,17 @@ function sanitizeWorkflowAgentReportSchemaNode(schema: unknown): void {
 
   if (Array.isArray(obj.items)) {
     for (const itemSchema of obj.items) {
-      sanitizeWorkflowAgentReportSchemaNode(itemSchema);
+      sanitizeWorkflowAgentReportSchemaNode(itemSchema, dialect);
     }
+    sanitizeWorkflowAgentReportSchemaNode(obj.additionalItems, dialect);
   } else if (obj.items != null) {
-    sanitizeWorkflowAgentReportSchemaNode(obj.items);
+    sanitizeWorkflowAgentReportSchemaNode(obj.items, dialect);
   }
 
   for (const keyword of ["anyOf"] as const) {
     if (Array.isArray(obj[keyword])) {
       for (const subSchema of obj[keyword]) {
-        sanitizeWorkflowAgentReportSchemaNode(subSchema);
+        sanitizeWorkflowAgentReportSchemaNode(subSchema, dialect);
       }
     }
   }

@@ -7,6 +7,8 @@ import {
   type Transport,
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
+import { MCP_TOOL_CATALOG_SCHEMA_BUDGET } from "@/common/constants/toolLimits";
+import { createSchemaBudget, type SchemaSize } from "@/common/utils/jsonSchemaSubset";
 import { createOptionalNullSchemaContract } from "@/common/utils/tools/optionalNullSchema";
 import assert from "@/common/utils/assert";
 
@@ -234,11 +236,15 @@ function createMCPSourceSchema(inputSchema: Record<string, unknown> | undefined)
   return sourceSchema;
 }
 
-export function createMCPToolContract(inputSchema: Record<string, unknown> | undefined) {
+export function createMCPToolContract(
+  inputSchema: Record<string, unknown> | undefined,
+  budget?: SchemaSize
+) {
   // Strict REST-backed servers reject present-but-empty arguments (#2887), so
   // an optional `""` is an omission here.
   const contract = createOptionalNullSchemaContract(createMCPSourceSchema(inputSchema), {
     emptyStringIsOmission: true,
+    budget,
   });
   return {
     strict: contract.strict,
@@ -264,9 +270,16 @@ type CallMCPTool = (
   options: { abortSignal?: AbortSignal }
 ) => ReturnType<Client["callTool"]>;
 
-/** An AI SDK tool over one MCP tool definition and the call that runs it. */
-export function createMCPTool(definition: MCPToolDefinition, callTool: CallMCPTool): Tool {
-  const contract = createMCPToolContract(definition.inputSchema);
+/**
+ * An AI SDK tool over one MCP tool definition and the call that runs it. The
+ * catalog's schema budget, when given, is shared with its other tools.
+ */
+export function createMCPTool(
+  definition: MCPToolDefinition,
+  callTool: CallMCPTool,
+  budget?: SchemaSize
+): Tool {
+  const contract = createMCPToolContract(definition.inputSchema, budget);
   return dynamicTool({
     description: definition.description,
     title: definition.title ?? definition.annotations?.title,
@@ -317,15 +330,19 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
       const tools: Record<string, Tool> = {};
+      const budget = createSchemaBudget(MCP_TOOL_CATALOG_SCHEMA_BUDGET);
       for (const definition of listResult.tools) {
-        tools[definition.name] = createMCPTool(definition, (args, options) =>
-          client.callTool(
-            { name: definition.name, arguments: args },
-            {
-              timeout: SDK_TOOL_CALL_TIMEOUT_MS,
-              ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
-            }
-          )
+        tools[definition.name] = createMCPTool(
+          definition,
+          (args, options) =>
+            client.callTool(
+              { name: definition.name, arguments: args },
+              {
+                timeout: SDK_TOOL_CALL_TIMEOUT_MS,
+                ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
+              }
+            ),
+          budget
         );
       }
       return tools;

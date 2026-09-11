@@ -301,6 +301,46 @@ describe("schemaSanitizer", () => {
       });
       expect(schema.properties.code.default).toBe("ABC");
     });
+
+    it("translates a 2020-12 tuple into the keywords the sanitized schema is read in", () => {
+      const rows = {
+        type: "array",
+        prefixItems: [{ type: "object", properties: { note: { type: "string" } } }],
+        items: { type: "object", properties: { extra: { type: "string" } } },
+      };
+      const closed = (schema: { properties: unknown }) => ({
+        ...schema,
+        additionalProperties: false,
+      });
+
+      // The clone drops `$schema`, so its tuple must live where a draft-07
+      // reader (and the widening that follows) looks for it.
+      expect(
+        sanitizeWorkflowAgentReportSchemaForOpenAI({
+          $schema: "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          properties: { rows },
+        })
+      ).toEqual({
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          rows: {
+            type: "array",
+            items: [closed(rows.prefixItems[0])],
+            additionalItems: closed(rows.items),
+          },
+        },
+      });
+      // In draft-07 `prefixItems` is an extension keyword the reader ignores.
+      expect(
+        sanitizeWorkflowAgentReportSchemaForOpenAI({ type: "object", properties: { rows } })
+      ).toEqual({
+        type: "object",
+        additionalProperties: false,
+        properties: { rows: { ...rows, items: closed(rows.items) } },
+      });
+    });
   });
 
   describe("sanitizeMCPToolsForOpenAI", () => {

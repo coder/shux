@@ -193,6 +193,43 @@ describe("agent_report tool", () => {
     });
   });
 
+  it("widens inside a 2020-12 tuple after translating it for providers", () => {
+    using tempDir = new TestTempDir("test-agent-report-tool-tuple-widening");
+    const tool = createAgentReportTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "task-workspace" }),
+      taskService: {
+        reportAgentProgress: mock(() => Promise.resolve()),
+      } as unknown as TaskService,
+      workflowAgentOutputSchema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        required: ["rows"],
+        properties: {
+          rows: {
+            type: "array",
+            prefixItems: [{ type: "object", properties: { note: { type: "string" } } }],
+          },
+        },
+      },
+    });
+
+    // The provider schema carries no `$schema`, so the tuple is read in
+    // draft-07 keywords; the slot is closed and its optional property widened.
+    const inputSchema = tool.inputSchema as {
+      jsonSchema?: { properties: Record<string, unknown> };
+    };
+    expect(inputSchema.jsonSchema?.properties.rows).toEqual({
+      type: "array",
+      items: [
+        {
+          type: "object",
+          additionalProperties: false,
+          properties: { note: { anyOf: [{ type: "string" }, { type: "null" }] } },
+        },
+      ],
+    });
+  });
+
   it("treats strict-provider nulls for optional workflow fields as omitted", async () => {
     using tempDir = new TestTempDir("test-agent-report-tool-optional-null-fields");
     const tool = createAgentReportTool({

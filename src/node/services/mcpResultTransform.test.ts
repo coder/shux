@@ -51,6 +51,36 @@ describe("describeMCPErrorResult", () => {
     expect(description).toContain("[MCP tool result text truncated:");
   });
 
+  it("caps a resource that has only a URI with the text budget", () => {
+    // Without text the URI is what the message reads, so it is text here.
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: [
+        {
+          type: "resource",
+          resource: { uri: "data:x," + "u".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES * 2) },
+        },
+      ],
+    });
+
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThan(
+      MCP_TOOL_RESULT_MAX_TEXT_BYTES + 300
+    );
+    expect(description).toContain("[MCP tool result text truncated:");
+  });
+
+  it("keeps the server's words when its legacy toolResult is oversized", () => {
+    const description = describeMCPErrorResult({
+      isError: true,
+      content: [{ type: "text", text: "Rate limited; retry after 30s." }],
+      toolResult: { data: "t".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
+    });
+
+    expect(description).toContain("Rate limited; retry after 30s.");
+    expect(description).toContain("[MCP toolResult omitted:");
+    expect(description.length).toBeLessThan(400);
+  });
+
   it("keeps binary part descriptions a fixed size regardless of the media type", () => {
     const partCount = 4;
     const description = describeMCPErrorResult({
@@ -377,13 +407,24 @@ describe("transformMCPResult", () => {
       expect(result.content[1].text).toContain("[MCP structuredContent omitted:");
     });
 
-    it("replaces an oversized toolResult with a bounded notice", () => {
+    it("drops an oversized toolResult beside content with a notice", () => {
+      const result = transformMCPResult({
+        content: [{ type: "text" as const, text: "summary" }],
+        toolResult: { data: "t".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
+      }) as TextContentResult & { toolResult?: unknown };
+
+      expect("toolResult" in result).toBe(false);
+      expect(result.content[0].text).toBe("summary");
+      expect(result.content[1].text).toContain("[MCP toolResult omitted:");
+    });
+
+    it("replaces an oversized legacy toolResult-only result with a bounded notice", () => {
       const result = transformMCPResult({
         toolResult: { data: "t".repeat(MCP_TOOL_RESULT_MAX_TEXT_BYTES + 5_000) },
-      }) as { toolResult: string };
+      }) as TextContentResult;
 
-      expect(result.toolResult).toContain("[MCP toolResult omitted:");
-      expect(result.toolResult.length).toBeLessThan(300);
+      expect(result.content[0].text).toContain("[MCP tool result omitted:");
+      expect(JSON.stringify(result).length).toBeLessThan(300);
     });
 
     it("replaces an oversized result without a content array with a bounded notice", () => {
@@ -437,7 +478,7 @@ describe("transformMCPResult", () => {
       );
     });
 
-    it("bounds resource parts with oversized URIs and no text", () => {
+    it("caps the URI of a resource without text in place", () => {
       const result = transformMCPResult({
         content: [
           {
@@ -447,12 +488,13 @@ describe("transformMCPResult", () => {
         ],
       }) as TextContentResult;
 
-      // Flattened to a truncated stringified text part plus the metadata notice.
-      expect(result.content[0].type).toBe("text");
-      expect(result.content[0].text).toContain("[MCP tool result text truncated:");
-      expect(result.content.at(-1)!.text).toContain("[MCP result metadata omitted:");
+      // The URI stands in for the text, so it is budgeted like text and keeps
+      // its shape instead of tripping the metadata backstop.
+      expect(result.content).toHaveLength(1);
+      expect(result.content[0].type).toBe("resource");
+      expect(result.content[0].resource!.uri).toContain("[MCP tool result text truncated:");
       expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(
-        MCP_TOOL_RESULT_MAX_TOTAL_BYTES
+        MCP_TOOL_RESULT_MAX_TEXT_BYTES + 300
       );
     });
 

@@ -7,6 +7,7 @@ import {
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
   type Dialect,
+  type SchemaSize,
 } from "@/common/utils/jsonSchemaSubset";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -26,18 +27,23 @@ function memoize<K, V>(fn: (key: K) => V): (key: K) => V {
   };
 }
 
-function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
+/**
+ * The properties `schema` requires of every instance: its own `required` and
+ * that of each `allOf` branch. Bounded like every walk here, since `restore`
+ * runs it on schemas the validator declined as too deep.
+ */
+function getRequiredProperties(schema: Record<string, unknown>, depth = 0): Set<string> {
   const required = new Set(
     Array.isArray(schema.required)
       ? schema.required.filter((key): key is string => typeof key === "string")
       : []
   );
-  if (Array.isArray(schema.allOf)) {
+  if (depth < JSON_SCHEMA_SUBSET_MAX_DEPTH && Array.isArray(schema.allOf)) {
     for (const subSchema of schema.allOf) {
       if (!isRecord(subSchema)) {
         continue;
       }
-      for (const key of getRequiredProperties(subSchema)) {
+      for (const key of getRequiredProperties(subSchema, depth + 1)) {
         required.add(key);
       }
     }
@@ -181,12 +187,17 @@ export interface OmissionPlaceholderOptions {
   emptyStringIsOmission: boolean;
 }
 
+export interface OptionalNullSchemaContractOptions extends OmissionPlaceholderOptions {
+  /** Shared by every schema from one source (see createSchemaBudget). */
+  budget?: SchemaSize;
+}
+
 export function createOptionalNullSchemaContract(
   schema: unknown,
-  options: OmissionPlaceholderOptions
+  options: OptionalNullSchemaContractOptions
 ): OptionalNullSchemaContract {
   const restore = (value: unknown) => stripOmissionPlaceholders(schema, value, options);
-  if (!validateJsonSchemaSubsetSchema(schema).success) {
+  if (!validateJsonSchemaSubsetSchema(schema, { budget: options.budget }).success) {
     // The validator cannot judge this schema (a reference, an unknown dialect,
     // too deep, too large, invalid), so nothing here can either: the model
     // sees the source schema as is, and the provider decodes without strict

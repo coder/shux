@@ -53,6 +53,14 @@ export const MCP_MEDIA_TYPE_MAX_BYTES = 255;
 // cannot make one tool call block the main process for seconds.
 export const OPTIONAL_PLACEHOLDER_MAX_JUDGED = 256;
 
+// One server authors every schema in its tool catalog, and each schema in the
+// validator's subset costs a compilation and a widened clone when the catalog
+// is listed. The catalog shares one schema budget (see createSchemaBudget), in
+// units of the largest schema the validator accepts, so a catalog of any
+// length costs at most this many such schemas of synchronous work. A tool past
+// the budget keeps working with its schema left alone, as an over-large one does.
+export const MCP_TOOL_CATALOG_SCHEMA_BUDGET = 64;
+
 // MCP prompt expansions are server-controlled; bound them like web_fetch output.
 export const MCP_PROMPT_MAX_TEXT_BYTES = 64 * 1024;
 export const MCP_PROMPT_TRUNCATION_MARKER = "\n\n[Prompt text truncated]";

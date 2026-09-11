@@ -118,4 +118,27 @@ describe("createMCPTool", () => {
 
     expect(calls).toEqual([{}]);
   });
+
+  test("leaves a tool's schema alone once its catalog's budget is spent", () => {
+    // Each schema fits on its own; the catalog pays for them together.
+    const definition = {
+      name: "search",
+      inputSchema: { type: "object" as const, properties: { q: { type: "string" } } },
+    };
+    const callTool = () => Promise.resolve({ content: [] });
+    const budget = { nodes: 10, chars: 10_000 };
+    const [first, second] = [
+      createMCPTool(definition, callTool, budget),
+      createMCPTool(definition, callTool, budget),
+    ].map((tool) => {
+      const inputSchema = tool.inputSchema as { jsonSchema?: { properties: { q: unknown } } };
+      return { strict: tool.strict, q: inputSchema.jsonSchema?.properties.q };
+    });
+
+    expect(first).toEqual({
+      strict: undefined,
+      q: { anyOf: [{ type: "string" }, { type: "null" }] },
+    });
+    expect(second).toEqual({ strict: false, q: { type: "string" } });
+  });
 });
