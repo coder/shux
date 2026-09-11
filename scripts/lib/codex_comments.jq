@@ -45,6 +45,13 @@ def codex_comment_is_informational($bot):
                 + "[^[:alnum:]|]*\\*\\*Completed\\*\\*"
                 + "( <relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
                 + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$")
+              # Security advisories stay listed after their review threads are resolved, and
+              # Codex adds the Resolved marker only when a later review completes. A bullet
+              # without it is a live finding and keeps blocking; other sections stay unknown.
+              or . == "### Security findings"
+              or test("^#### Advisory findings \\([0-9]+\\)$")
+              or test("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r[0-9]+\\)"
+                + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
             ))
         ) catch false) // false
       else
