@@ -428,6 +428,75 @@ describe("backup payload", () => {
     }
   });
 
+  it("keeps local headers and commands the backup entry does not carry when deselected", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { api: { url: "https://example.com/mcp" } } })
+    );
+    const destination = path.join(tempDir, "header-less");
+    await writeBackupPayload(
+      destination,
+      await createBackupPayload({
+        muxRoot,
+        contents: CONTENTS,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+      })
+    );
+    const localMcp = JSON.stringify({
+      servers: {
+        api: {
+          url: "https://example.com/mcp",
+          command: "local-mcp --stdio",
+          headers: { Authorization: "Bearer local" },
+        },
+      },
+    });
+
+    const keptRoot = path.join(tempDir, "kept");
+    await writeFixtureFile(keptRoot, "mcp.jsonc", localMcp);
+    const kept = resolveBackupContents({ includeMcpHeaders: false, includeMcpCommands: false });
+    await restoreBackupPayload({
+      muxRoot: keptRoot,
+      contents: kept,
+      payload: await readBackupPayload(destination, { contents: kept }),
+    });
+    expect(jsonc.parse(await fs.readFile(path.join(keptRoot, "mcp.jsonc"), "utf-8"))).toEqual({
+      servers: {
+        api: {
+          url: "https://example.com/mcp",
+          command: "local-mcp --stdio",
+          headers: { Authorization: "Bearer local" },
+        },
+      },
+    });
+
+    // Selected categories travel with the backup, so its header-less entry replaces the local one.
+    const replacedRoot = path.join(tempDir, "replaced");
+    await writeFixtureFile(replacedRoot, "mcp.jsonc", localMcp);
+    await restoreBackupPayload({
+      muxRoot: replacedRoot,
+      contents: CONTENTS,
+      payload: await readBackupPayload(destination, { contents: CONTENTS }),
+    });
+    expect(jsonc.parse(await fs.readFile(path.join(replacedRoot, "mcp.jsonc"), "utf-8"))).toEqual({
+      servers: { api: { url: "https://example.com/mcp" } },
+    });
+
+    // With nothing local to keep, the restore-side markers leave no trace.
+    const freshRoot = path.join(tempDir, "fresh");
+    await fs.mkdir(freshRoot, { recursive: true });
+    await restoreBackupPayload({
+      muxRoot: freshRoot,
+      contents: kept,
+      payload: await readBackupPayload(destination, { contents: kept }),
+    });
+    expect(jsonc.parse(await fs.readFile(path.join(freshRoot, "mcp.jsonc"), "utf-8"))).toEqual({
+      servers: { api: { url: "https://example.com/mcp" } },
+    });
+  });
+
   it("reads only the selected categories from a checked-out backup", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
     await writeFixtureFile(

@@ -1196,6 +1196,12 @@ function isReadableHeaderValue(value: unknown): boolean {
 export interface McpProjectionOptions {
   includeHeaders: boolean;
   includeCommands: boolean;
+  /**
+   * Restore side only: a deselected field the backup entry does not carry still gets a marker,
+   * so the local value survives the restore instead of vanishing with the entry. An export
+   * leaves the field absent, since the source machine had nothing there to keep.
+   */
+  markAbsent?: boolean;
 }
 
 export function mcpProjectionOptions(contents: BackupContents): McpProjectionOptions {
@@ -1334,6 +1340,15 @@ function redactMcpConfig(
       // Xum ignores every other field, so backing it up would only publish a value nothing
       // reads. Restore uses the local value at that exact path.
       redact(fieldPath);
+    }
+    if (options.markAbsent) {
+      const fields = objectKeyNames(tree, ["servers", serverName]);
+      if (!options.includeHeaders && !fields.includes("headers")) {
+        redact(["servers", serverName, "headers"]);
+      }
+      if (!options.includeCommands && !fields.includes("command")) {
+        redact(["servers", serverName, "command"]);
+      }
     }
   }
   return finish();
@@ -1966,7 +1981,7 @@ export function selectBackupContents(
     redactions = [];
   }
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
-  const projection = mcpProjectionOptions(contents);
+  const projection = { ...mcpProjectionOptions(contents), markAbsent: true };
   if (mcpFile && !(projection.includeHeaders && projection.includeCommands)) {
     // A manifest without the list is read by marker text; listing the markers it already has
     // keeps that reading once this pass adds paths of its own and the file is read by path.
