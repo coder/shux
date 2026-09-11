@@ -169,11 +169,18 @@ else:
             .replace('"status":"running"', '"status":"completed"')
             .replace("🔄 **Running** since", "✅ **Completed**")
         )
+        resolved_findings = completed_findings.replace(
+            "· **Medium**", "· **Medium** · **Resolved**"
+        )
         for body, expected in (
             (completed.replace('"status":"completed"', '"status":"running"'), 1),
             (completed.replace("✅ **Completed**", "🔄 **Running** since", 1), 1),
             (completed_pr_opened, 0),
             (completed_findings, 1),
+            (resolved_findings, 0),
+            (resolved_findings.replace("**Resolved**", "**Open**"), 1),
+            (resolved_findings.replace("/pull/4149#discussion_r", "/pull/4150#discussion_r"), 1),
+            (resolved_findings.replace("#### Advisory findings (1)", "#### Blocking findings (1)"), 1),
         ):
             for cached in (False, True):
                 with self.subTest(body=body, cached=cached):

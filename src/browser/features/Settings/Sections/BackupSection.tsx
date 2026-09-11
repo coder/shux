@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArchiveRestore, CheckCircle2, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
+import { ArchiveRestore, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
@@ -11,9 +11,17 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  type Keybind,
 } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import {
+  BACKUP_CONTENT_DEFAULTS,
+  BACKUP_CONTENT_FLAGS,
+  resolveBackupContents,
+  type BackupContentFlag,
+  type BackupContents,
+} from "@/common/config/schemas/settingsBackup";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -42,28 +50,86 @@ const BACKUP_SHORTCUTS = [
   ["restore", KEYBINDS.SETTINGS_BACKUP_RESTORE],
   ["toggleOverride", KEYBINDS.SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN],
   ["toggleApproveCommands", KEYBINDS.SETTINGS_BACKUP_APPROVE_COMMANDS],
-  ["toggleProjects", KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS],
 ] as const;
 
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
 type BackupShortcutHandlers = Record<BackupShortcutAction, () => void | Promise<void>>;
 
-const INCLUDED_SETTINGS = [
-  "Global instructions",
-  "Agent definitions",
-  "Agent skills",
-  "Global memory",
-  "MCP server configuration",
-  "Portable preferences",
-] as const;
+interface BackupContentOption {
+  flag: BackupContentFlag;
+  label: string;
+  description?: string;
+  /** Rendered indented under this flag and disabled while it is off. */
+  parent?: BackupContentFlag;
+  shortcut: Keybind;
+}
 
-type BackupDraft = SettingsBackupInput;
+/** One selection governs both directions: what a push publishes and what a restore writes. */
+const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
+  {
+    flag: "includeInstructions",
+    label: "Global instructions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS,
+  },
+  {
+    flag: "includeAgents",
+    label: "Agent definitions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_AGENTS,
+  },
+  {
+    flag: "includeSkills",
+    label: "Agent skills",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_SKILLS,
+  },
+  {
+    flag: "includeGlobalMemory",
+    label: "Global memory",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY,
+  },
+  {
+    flag: "includePreferences",
+    label: "Portable preferences",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
+  },
+  {
+    flag: "includeMcp",
+    label: "MCP server configuration",
+    description:
+      "URLs are copied as written; one that looks like it carries a credential waits for your review before publishing.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP,
+  },
+  {
+    flag: "includeMcpHeaders",
+    parent: "includeMcp",
+    label: "HTTP header values",
+    description:
+      "Copied as written, so a token in a header travels with the backup. Leave off to keep header values on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_HEADERS,
+  },
+  {
+    flag: "includeMcpCommands",
+    parent: "includeMcp",
+    label: "stdio commands",
+    description:
+      "Copied as written, so a token in a command line travels with the backup. Leave off to keep commands on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS,
+  },
+  {
+    flag: "includeProjects",
+    label: "Project list & project memories",
+    description:
+      "Adds your project list and per-project memories to the backup, and lets a restore reimport them on another machine.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS,
+  },
+];
+
+type BackupDraft = SettingsBackupInput & BackupContents;
 
 const DEFAULT_DRAFT: BackupDraft = {
   repoUrl: "",
   branch: "main",
   path: "xum/",
-  includeProjects: false,
+  ...BACKUP_CONTENT_DEFAULTS,
 };
 
 function toDraft(settings: SettingsBackupInput): BackupDraft {
@@ -71,7 +137,7 @@ function toDraft(settings: SettingsBackupInput): BackupDraft {
     repoUrl: settings.repoUrl,
     branch: settings.branch,
     path: settings.path,
-    includeProjects: settings.includeProjects === true,
+    ...resolveBackupContents(settings),
   };
 }
 
@@ -80,7 +146,7 @@ function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
     left.repoUrl === right.repoUrl &&
     left.branch === right.branch &&
     left.path === right.path &&
-    (left.includeProjects === true) === (right.includeProjects === true)
+    BACKUP_CONTENT_FLAGS.every((flag) => left[flag] === right[flag])
   );
 }
 
@@ -358,7 +424,7 @@ export function BackupSection() {
         repoUrl: draft.repoUrl.trim(),
         branch: draft.branch.trim(),
         path: draft.path.trim(),
-        includeProjects: draft.includeProjects === true,
+        ...resolveBackupContents(draft),
       });
       if (!result.success) {
         setSaveError(getOperationErrorMessage(result.error));
@@ -639,11 +705,15 @@ export function BackupSection() {
         setApproveCommands((current) => !current);
       }
     },
-    toggleProjects: () => {
-      if (!busy) {
-        setDraft((current) => ({ ...current, includeProjects: current.includeProjects !== true }));
-      }
-    },
+  };
+  const toggleContentRef = useRef<(option: BackupContentOption) => void>(() => undefined);
+  toggleContentRef.current = (option) => {
+    if (busy) return;
+    setDraft((current) => {
+      // Mirrors the checkbox: a sub-option is inert while its parent is off.
+      if (option.parent !== undefined && !current[option.parent]) return current;
+      return { ...current, [option.flag]: !current[option.flag] };
+    });
   };
 
   useEffect(() => {
@@ -652,11 +722,15 @@ export function BackupSection() {
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      if (!action) return;
+      const option = BACKUP_CONTENT_OPTIONS.find((candidate) =>
+        matchesKeybind(event, candidate.shortcut)
+      );
+      if (!action && !option) return;
 
       event.preventDefault();
       event.stopPropagation();
-      void action();
+      if (action) void action();
+      else if (option) toggleContentRef.current(option);
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -722,30 +796,47 @@ export function BackupSection() {
           </label>
         </div>
 
-        <label className="flex items-start gap-2">
-          <Checkbox
-            checked={draft.includeProjects === true}
-            onCheckedChange={(checked) =>
-              setDraft((current) => ({ ...current, includeProjects: checked === true }))
-            }
-            disabled={busy}
-            aria-label="Include project list and project memories"
-          />
-          <span className="min-w-0">
-            <span className="text-foreground block text-xs font-medium">
-              Include project list &amp; project memories
-              {/* Shortcut hint only; the shortcut itself stays bound on every viewport. */}
-              <span className="text-muted ml-1 hidden font-normal sm:inline">
-                ({formatKeybind(KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS)})
-              </span>
-            </span>
-            <span className="text-muted mt-0.5 block text-xs">
-              Adds your project list and per-project memories to the backup, and lets a restore
-              reimport them on another machine. Previously pushed backups keep project data in the
-              repository&apos;s git history even after disabling.
-            </span>
-          </span>
-        </label>
+        <fieldset className="space-y-2">
+          <legend className="text-foreground text-xs font-medium">
+            What to back up and restore
+          </legend>
+          {BACKUP_CONTENT_OPTIONS.map((option) => {
+            const parentOff = option.parent !== undefined && !draft[option.parent];
+            return (
+              <label
+                key={option.flag}
+                className={`flex items-start gap-2 ${option.parent ? "ml-6" : ""}`}
+              >
+                <Checkbox
+                  checked={draft[option.flag] && !parentOff}
+                  onCheckedChange={(checked) =>
+                    setDraft((current) => ({ ...current, [option.flag]: checked === true }))
+                  }
+                  disabled={busy || parentOff}
+                  aria-label={option.label}
+                />
+                <span className="min-w-0">
+                  <span className="text-foreground block text-xs font-medium">
+                    {option.label}
+                    {/* Shortcut hint only; the shortcut itself stays bound on every viewport. */}
+                    <span className="text-muted ml-1 hidden font-normal sm:inline">
+                      ({formatKeybind(option.shortcut)})
+                    </span>
+                  </span>
+                  {option.description ? (
+                    <span className="text-muted mt-0.5 block text-xs">{option.description}</span>
+                  ) : null}
+                </span>
+              </label>
+            );
+          })}
+          <p className="text-muted text-xs">
+            Provider key files and dedicated secret files are never backed up. Anything selected
+            here is copied as written; deselecting it later does not remove earlier copies from the
+            repository&apos;s git history. Inside skills and memory, only documentation is published
+            automatically; any other file waits for you to review it.
+          </p>
+        </fieldset>
 
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <Button
@@ -760,32 +851,6 @@ export function BackupSection() {
           {isDirty ? <span className="text-warning text-xs">Unsaved changes</span> : null}
         </div>
         {saveError ? <p className="text-error text-xs">{saveError}</p> : null}
-      </section>
-
-      <section className="space-y-3">
-        <div>
-          <h3 className="text-foreground text-sm font-medium">Included</h3>
-          <p className="text-muted mt-1 text-xs">Only portable, allowlisted settings are copied.</p>
-        </div>
-        <ul className="grid gap-2 sm:grid-cols-2">
-          {[
-            ...INCLUDED_SETTINGS,
-            ...(savedDraft.includeProjects === true
-              ? (["Project list & project memories"] as const)
-              : []),
-          ].map((item) => (
-            <li key={item} className="text-muted flex items-center gap-2 text-xs">
-              <CheckCircle2 className="text-success h-3.5 w-3.5 shrink-0" />
-              {item}
-            </li>
-          ))}
-        </ul>
-        <p className="text-foreground text-xs font-medium">
-          Provider key files and dedicated secret files have no export path. MCP commands and URLs
-          are included verbatim; credential-like URL components require review, while literal MCP
-          header values are redacted. Inside skills and memory, only documentation is published
-          automatically; any other file waits for you to review it.
-        </p>
       </section>
 
       <section className="border-border-light space-y-3 rounded-md border p-4">
@@ -872,11 +937,13 @@ export function BackupSection() {
             ) : null}
 
             <div className="border-border-light rounded-md border p-3">
-              <h4 className="text-foreground text-xs font-medium">
-                Redacted from repository backup
-              </h4>
-              {preview.redactions.length === 0 ? (
-                <p className="text-muted mt-2 text-xs">No MCP values were redacted.</p>
+              <h4 className="text-foreground text-xs font-medium">Kept on this device</h4>
+              {!savedDraft.includeMcp ? (
+                <p className="text-muted mt-2 text-xs">
+                  MCP server configuration is not in the backup, so all of it stays here.
+                </p>
+              ) : preview.redactions.length === 0 ? (
+                <p className="text-muted mt-2 text-xs">Every MCP value is in the backup.</p>
               ) : (
                 <ul className="text-muted mt-2 space-y-1 text-xs">
                   {preview.redactions.map((redaction) => (
@@ -890,7 +957,7 @@ export function BackupSection() {
           </div>
         ) : (
           <div className="border-border-light text-muted rounded-md border border-dashed p-4 text-xs">
-            Run a preview to compare both directions and inspect redactions.
+            Run a preview to compare both directions and see which MCP values stay local.
           </div>
         )}
       </section>

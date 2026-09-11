@@ -7,7 +7,12 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
-import { MAX_BACKUP_PROJECT_PATH_CHARS } from "@/common/config/schemas/settingsBackup";
+import {
+  BACKUP_CONTENT_FLAGS,
+  MAX_BACKUP_PROJECT_PATH_CHARS,
+  resolveBackupContents,
+  type BackupContents,
+} from "@/common/config/schemas/settingsBackup";
 import {
   BackupOperationErrorSchema,
   type BackupCommandApproval,
@@ -72,12 +77,12 @@ export interface BackupPayloadStore {
   exportTo(options: {
     repositoryRoot: string;
     managedPath: string;
-    includeProjects: boolean;
+    contents: BackupContents;
   }): Promise<{ redactions: string[]; secretFiles: string[]; secretApproval: string }>;
   previewRestore(options: {
     repositoryRoot: string;
     managedPath: string;
-    includeProjects: boolean;
+    contents: BackupContents;
   }): Promise<{
     changes: BackupFileChange[];
     localOnlyFiles: string[];
@@ -89,7 +94,7 @@ export interface BackupPayloadStore {
     repositoryRoot: string;
     managedPath: string;
     approvedCommandTokens?: readonly string[];
-    includeProjects: boolean;
+    contents: BackupContents;
   }): Promise<{
     hasProjectBundle: boolean;
     projectImports: BackupProjectImport[];
@@ -100,12 +105,12 @@ export interface BackupPayloadStore {
     matchedProjects: BackupMatchedProject[];
   }>;
   /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
-  writeSafetySnapshot(snapshotRoot: string): Promise<void>;
+  writeSafetySnapshot(snapshotRoot: string, contents: BackupContents): Promise<void>;
   restore(options: {
     repositoryRoot: string;
     managedPath: string;
     approvedCommandTokens?: readonly string[];
-    includeProjects: boolean;
+    contents: BackupContents;
     /** Receives the matched project memory snapshot, taken in the write's lock window. */
     snapshotPath: string;
     matchedProjects: readonly BackupMatchedProject[];
@@ -555,7 +560,7 @@ export class BackupService {
     >
   > {
     return this.withRepoLock(settings, async (normalized) => {
-      const includeProjects = normalized.includeProjects === true;
+      const contents = resolveBackupContents(normalized);
       const repository = await this.prepareRepository(normalized);
       // One critical section: the reported restore plan and the exported payload must describe
       // the same local state, or the two halves of the preview disagree.
@@ -563,7 +568,7 @@ export class BackupService {
         const restorePreview = await this.dependencies.payload.previewRestore({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
-          includeProjects,
+          contents,
         });
         // The push half fails on local state alone (an over-limit project list, an
         // unexportable path); that must not hide the restore half, which is the only
@@ -573,7 +578,7 @@ export class BackupService {
           exported = await this.dependencies.payload.exportTo({
             repositoryRoot: repository.rootDir,
             managedPath: repository.managedPath,
-            includeProjects,
+            contents,
           });
         } catch (error) {
           exported = { pushError: toOperationError(error).message };
@@ -634,7 +639,7 @@ export class BackupService {
         this.dependencies.payload.exportTo({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
-          includeProjects: normalized.includeProjects === true,
+          contents: resolveBackupContents(normalized),
         })
       );
       // Approval is bound to the exact flagged bytes, so an override the user granted for
@@ -691,7 +696,7 @@ export class BackupService {
       options.approvedCommandTokens == null ? undefined : [...options.approvedCommandTokens];
     const requestedImports = options.projectImports == null ? [] : [...options.projectImports];
     return this.withRepoLock(settings, async (normalized) => {
-      const includeProjects = normalized.includeProjects === true;
+      const contents = resolveBackupContents(normalized);
       const repository = await this.prepareRepository(normalized);
       const remoteCommit = repository.remoteCommit;
       if (remoteCommit == null) {
@@ -708,7 +713,7 @@ export class BackupService {
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
           approvedCommandTokens,
-          includeProjects,
+          contents,
         });
         // Import approvals are also checked before the snapshot and before any mutation: a
         // stale token or an unusable target directory refuses the whole restore while
@@ -717,7 +722,7 @@ export class BackupService {
           requestedImports,
           validated.projectImports,
           validated.matchedProjects,
-          includeProjects
+          contents.includeProjects
         );
         // The plan holds a handle per approved target from here until the imports are done
         // (see PlannedProjectImport.target), released however this ends.
@@ -746,7 +751,7 @@ export class BackupService {
           );
           const snapshotPath = await this.createSnapshotPath();
           try {
-            await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
+            await this.dependencies.payload.writeSafetySnapshot(snapshotPath, contents);
           } catch (error) {
             // Nothing has been restored yet, so a snapshot that did not finish is an empty or
             // partial unredacted copy that no recovery can use, and every retry would add one.
@@ -758,7 +763,7 @@ export class BackupService {
               repositoryRoot: repository.rootDir,
               managedPath: repository.managedPath,
               approvedCommandTokens,
-              includeProjects,
+              contents,
               snapshotPath,
               matchedProjects: validated.matchedProjects,
             });
@@ -1387,7 +1392,7 @@ export class BackupService {
       saved = {
         // Recording a commit re-applies on top of the settings currently saved, not the
         // ones the operation started with: same repository, but another window may have
-        // toggled includeProjects meanwhile, and that save must survive.
+        // toggled a content flag meanwhile, and that save must survive.
         ...(sameRepository && isCommitUpdate ? previous : settings),
         ...(sameRepository
           ? {
@@ -1403,25 +1408,26 @@ export class BackupService {
     if (saved == null) {
       throw new BackupServiceError("IO_ERROR", "Settings backup configuration was not saved");
     }
+    const persisted = saved;
     // saveConfig logs and swallows write failures by design, so a resolved editConfig does
     // not prove the write landed; on a full disk this method would otherwise report saved
     // settings, a recorded push, or a recorded restore that config.json never received.
     // loadConfigOrDefault reads the file fresh, so a lost write reads back as the old value.
     const stored = this.config.loadConfigOrDefault().settingsBackup;
     if (
-      stored?.repoUrl !== saved.repoUrl ||
-      stored.branch !== saved.branch ||
-      stored.path !== saved.path ||
-      stored.includeProjects !== saved.includeProjects ||
-      stored.lastPushedCommit !== saved.lastPushedCommit ||
-      stored.lastRestoredCommit !== saved.lastRestoredCommit
+      stored?.repoUrl !== persisted.repoUrl ||
+      stored.branch !== persisted.branch ||
+      stored.path !== persisted.path ||
+      BACKUP_CONTENT_FLAGS.some((flag) => stored[flag] !== persisted[flag]) ||
+      stored.lastPushedCommit !== persisted.lastPushedCommit ||
+      stored.lastRestoredCommit !== persisted.lastRestoredCommit
     ) {
       throw new BackupServiceError(
         "IO_ERROR",
         "The backup settings could not be written to config.json"
       );
     }
-    return saved;
+    return persisted;
   }
 
   /**

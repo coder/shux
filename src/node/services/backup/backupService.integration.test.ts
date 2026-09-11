@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as jsonc from "jsonc-parser";
 import { Config } from "@/node/config";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
@@ -67,7 +68,10 @@ describe("BackupService against a real repository", () => {
     originPath = path.join(tempDir, "origin.git");
     await fs.mkdir(muxRoot, { recursive: true });
     await runGit(["init", "--bare", "--initial-branch=main", originPath]);
-    settings = { repoUrl: originPath, branch: "main", path: "mux" };
+    // Header values stay local: a repository other people may read is the usual reason to
+    // back up at all, and it lets the fixture below carry a literal token without every push
+    // stopping for approval.
+    settings = { repoUrl: originPath, branch: "main", path: "mux", includeMcpHeaders: false };
     config = new Config(muxRoot);
     service = createService();
 
@@ -127,18 +131,59 @@ describe("BackupService against a real repository", () => {
     }
   });
 
-  it("keeps MCP URLs while redacting a literal header value", async () => {
+  it("keeps MCP URLs while leaving header values out of the backup", async () => {
     const pushed = await pushOrThrow();
-    expect(pushed.data.redactions.length).toBeGreaterThan(0);
+    expect(pushed.data.redactions).toEqual([
+      "servers.literal.headers",
+      "servers.referenced.headers",
+    ]);
 
     const clone = await cloneOrigin("verify");
     const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
     expect(mcp).not.toContain("Bearer abc123");
+    expect(mcp).not.toContain("MCP_TOKEN");
     expect(mcp).toContain(REDACTED_BACKUP_VALUE);
     expect(mcp).toContain('"url": "https://example.com/mcp"');
-    expect(mcp).toContain('"secret": "MCP_TOKEN"');
     // A comment is prose no projection can inspect, so it is not published at all.
     expect(mcp).not.toContain("comment-secret-abc123");
+  });
+
+  it("publishes header values once selected and approved, and restores them elsewhere", async () => {
+    const withHeaders = { ...settings, includeMcpHeaders: true };
+    const blocked = await service.push(withHeaders);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the literal header to need approval");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
+
+    const pushed = await service.push(withHeaders, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(pushed.success).toBe(true);
+    if (!pushed.success) throw new Error(pushed.error.message);
+    expect(pushed.data.redactions).toEqual([]);
+    const clone = await cloneOrigin("verify");
+    const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
+    expect(mcp).toContain("Bearer abc123");
+    expect(mcp).toContain('"secret": "MCP_TOKEN"');
+
+    // A fresh install gets the literal value; the reference names a secret it does not hold.
+    const freshRoot = path.join(tempDir, "fresh-root");
+    await fs.mkdir(freshRoot, { recursive: true });
+    const freshConfig = new Config(freshRoot);
+    const freshService = new BackupService(freshConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(freshRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: freshConfig }),
+    });
+    const restored = await freshService.restore(withHeaders);
+    expect(restored.success).toBe(true);
+    const restoredMcp = jsonc.parse(
+      await fs.readFile(path.join(freshRoot, "mcp.jsonc"), "utf-8")
+    ) as {
+      servers: Record<string, { headers?: unknown }>;
+    };
+    expect(restoredMcp.servers.literal.headers).toEqual({ Authorization: "Bearer abc123" });
+    expect(restoredMcp.servers.referenced.headers).toBeUndefined();
   });
 
   it("does not create a second commit when nothing changed", async () => {

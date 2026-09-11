@@ -539,6 +539,14 @@ export const KEYBINDS = {
   SETTINGS_BACKUP_RESTORE: { key: "r", code: "KeyR", ctrl: true, alt: true },
   SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: { key: "o", code: "KeyO", ctrl: true, alt: true },
   SETTINGS_BACKUP_APPROVE_COMMANDS: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS: { key: "i", code: "KeyI", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_AGENTS: { key: "g", code: "KeyG", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_SKILLS: { key: "k", code: "KeyK", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY: { key: "m", code: "KeyM", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_PREFERENCES: { key: "f", code: "KeyF", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP: { key: "c", code: "KeyC", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP_HEADERS: { key: "h", code: "KeyH", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: { key: "d", code: "KeyD", ctrl: true, alt: true },
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
 

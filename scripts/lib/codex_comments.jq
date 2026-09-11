@@ -36,7 +36,14 @@ def codex_comment_is_informational($bot):
               # a pending review row must keep that gate blocking independently.
               and .status == "completed")
             and ($lines[2:] | length >= 5)
-            and ($lines[2:] | all(
+            # A finding Codex marks resolved names a review thread on this PR, and the
+            # unresolved-thread gate inspects those directly. A live advisory carries no
+            # such marker and keeps the card blocking.
+            and (("^- [^[:alnum:]|\\[]*\\[[^]]+\\]\\(https://github\\.com/"
+              + ($security.repository | gsub("\\."; "\\."))
+              + "/pull/" + ($security.pullRequestNumber | tostring)
+              + "#discussion_r[0-9]+\\) · \\*\\*(Critical|High|Medium|Low)\\*\\* · \\*\\*Resolved\\*\\*$") as $resolvedFinding
+            | $lines[2:] | all(
               . == "## Codex Review Summary"
               or . == "This comment shows the latest Codex review activity on this pull request."
               or . == "| Review | Status | Commit | Review trigger |"
@@ -45,6 +52,9 @@ def codex_comment_is_informational($bot):
                 + "[^[:alnum:]|]*\\*\\*Completed\\*\\*"
                 + "( <relative-time datetime=\"[0-9TZ:.+-]+\">[0-9TZ:.+-]+</relative-time>)? "
                 + "\\| `[0-9a-f]+` \\| (Manual request|New commits|Draft marked ready|PR opened) \\|$")
+              or . == "### Security findings"
+              or test("^#### Advisory findings \\([0-9]+\\)$")
+              or test($resolvedFinding)
             ))
         ) catch false) // false
       else

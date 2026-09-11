@@ -1110,7 +1110,7 @@ describe("BackupService project imports", () => {
       config,
       payload: createPayload({
         exportTo: (options) => {
-          seen.push(options.includeProjects);
+          seen.push(options.contents.includeProjects);
           return Promise.resolve({ redactions: [], secretFiles: [], secretApproval: "" });
         },
       }),
