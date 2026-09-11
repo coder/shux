@@ -87,7 +87,8 @@ function createSession(args: {
 interface PrivateSessionAccess {
   resolveMemoryContext: (
     modelString: string,
-    options?: Parameters<AIService["buildMemorySessionContext"]>[2]
+    options?: Parameters<AIService["buildMemorySessionContext"]>[2],
+    cache?: Map<string, unknown>
   ) => Promise<MemorySessionContext | undefined>;
   getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
 }
@@ -132,6 +133,46 @@ describe("AgentSession memory context", () => {
       // invalidates from outside; the next resolve rebuilds from disk.
       session.invalidateMemoryContext();
       expect(await priv.resolveMemoryContext("test-model")).toEqual(context);
+      expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  test("does not cache a context whose build overlapped an invalidation", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-memory-context-race");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const stale: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: "<hot>stale</hot>" };
+    const fresh: MemorySessionContext = { indexEntries: [], hotMemoriesBlock: "<hot>fresh</hot>" };
+    let calls = 0;
+    const buildMemorySessionContext = mock(async () => {
+      calls++;
+      if (calls === 1) await gate;
+      return calls === 1 ? stale : fresh;
+    });
+    const session = createSession({
+      historyService,
+      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      buildMemorySessionContext,
+    });
+    const priv = session as unknown as PrivateSessionAccess;
+
+    try {
+      // A rollover candidate builds into its own staged map.
+      const staged = new Map();
+      const building = priv.resolveMemoryContext("test-model", undefined, staged);
+      // A sibling session writes the shared notebook mid-build: the files
+      // the build read are already stale.
+      session.invalidateMemoryContext();
+      release();
+      expect(await building).toEqual(stale);
+      // Served once for the request that needed it, but never cached.
+      expect(staged.size).toBe(0);
+      expect(await priv.resolveMemoryContext("test-model")).toEqual(fresh);
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);
     } finally {
       await session.dispose();

@@ -130,6 +130,7 @@ import {
   deriveSideChannelModelCandidates,
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
+import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
@@ -6330,11 +6331,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // directory. Fail-closed on a wedged writer: the catch below keeps
         // the directory as a recoverable orphan instead of deleting it out
         // from under a live commit.
+        // A sub-agent's workspace notes live in its task-tree owner's store:
+        // hold that store's lock too, so a child mutation admitted under the
+        // owner key cannot commit after this tombstone. The workspace is
+        // still registered here, so its parent chain resolves.
+        const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.config.loadConfigOrDefault(),
+          workspaceId
+        );
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
           attemptId: removalAttemptId,
+          sharedWorkspaceMemorySessionDir:
+            memoryOwnerId === workspaceId
+              ? undefined
+              : path.join(this.config.sessionsDir, memoryOwnerId),
         });
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
