@@ -1770,10 +1770,12 @@ function assertBackupMcpRedactions(
 }
 
 /**
- * `includeMcp: false` drops `mcpRedactions` unread: the list describes a file this selection
- * never opens, so its shape and size cannot be allowed to fail a restore of everything else.
+ * With `contents`, entries for unselected categories and, when MCP is left out, the
+ * `mcpRedactions` list are dropped before they are validated: they describe files this
+ * selection never opens, so their shape cannot be allowed to fail a restore of everything
+ * else. Entries whose category cannot be told (no string path) are still validated.
  */
-function parseManifest(raw: string, portable: boolean, includeMcp = true): BackupManifest {
+function parseManifest(raw: string, portable: boolean, contents?: BackupContents): BackupManifest {
   const tree = jsonc.parseTree(raw);
   if (!tree) throw new Error("Invalid backup manifest");
   assertNoDuplicateKeys(tree, "backup manifest");
@@ -1788,7 +1790,7 @@ function parseManifest(raw: string, portable: boolean, includeMcp = true): Backu
   ) {
     throw new Error("Invalid backup manifest");
   }
-  if (!includeMcp) delete manifest.mcpRedactions;
+  if (contents && !contents.includeMcp) delete manifest.mcpRedactions;
   const mcpRedactions: unknown = manifest.mcpRedactions;
   if (mcpRedactions !== undefined) {
     if (!Array.isArray(mcpRedactions)) throw new Error("Invalid backup manifest");
@@ -1796,6 +1798,14 @@ function parseManifest(raw: string, portable: boolean, includeMcp = true): Backu
   }
   if (!Array.isArray(manifest.files)) throw new Error("Invalid backup manifest");
   assertBackupFileCount(manifest.files.length);
+  if (contents) {
+    manifest.files = manifest.files.filter(
+      (file: unknown) =>
+        !isPlainObject(file) ||
+        typeof file.path !== "string" ||
+        isSelectedPayloadPath(file.path, contents)
+    );
+  }
   if (mcpRedactions !== undefined) {
     const paths = new Set<string>();
     for (const jsonPath of mcpRedactions) {
@@ -1921,18 +1931,13 @@ async function readBackupPayloadUnchecked(
   const manifestRaw = await readCheckedFile(root, BACKUP_MANIFEST_FILE, (size) => {
     budget(BACKUP_MANIFEST_FILE, size);
   });
-  const manifest = parseManifest(
-    manifestRaw.content.toString("utf-8"),
-    portable,
-    contents?.includeMcp ?? true
-  );
+  const manifest = parseManifest(manifestRaw.content.toString("utf-8"), portable, contents);
   const files: BackupFile[] = [];
   const seen = new Set<string>();
   for (const manifestFile of manifest.files) {
     const key = portable ? collisionKey(manifestFile.path) : manifestFile.path;
     if (seen.has(key)) throw new Error(`Duplicate backup path '${manifestFile.path}'`);
     seen.add(key);
-    if (contents && !isSelectedPayloadPath(manifestFile.path, contents)) continue;
     const content = await readManifestEntry(root, manifestFile.path, budget);
     if (sha256(content) !== manifestFile.sha256) {
       throw new Error(`Backup checksum mismatch for '${manifestFile.path}'`);

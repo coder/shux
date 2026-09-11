@@ -556,6 +556,26 @@ describe("backup payload", () => {
     expect((oversizedWithMcp as Error).message).toBe(
       `Backup has more than ${MAX_BACKUP_MCP_REDACTIONS} MCP redactions`
     );
+
+    // An unselected category's manifest entry is dropped before it is validated.
+    await fs.writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...manifest,
+        files: [...manifest.files, { path: "skills/demo/SKILL.md", sha256: "not-a-digest" }],
+      })
+    );
+    const badEntryUnselected = await readBackupPayload(destination, {
+      contents: resolveBackupContents({ includeMcp: false, includeSkills: false }),
+    });
+    expect(badEntryUnselected.manifest.files.map((file) => file.path)).toEqual([
+      "AGENTS.md",
+      "preferences.json",
+    ]);
+    const badEntrySelected = await captureRejection(
+      readBackupPayload(destination, { contents: CONTENTS })
+    );
+    expect((badEntrySelected as Error).message).toBe("Invalid backup manifest file entry");
   });
 
   it("restores a backup that redacted header values one by one with headers deselected", async () => {
