@@ -1,4 +1,6 @@
 import type { RestartBlocker } from "@/common/orpc/types";
+import { CompactionPendingState } from "./compactionPendingState";
+import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
@@ -4447,34 +4449,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private async getPersistedPostCompactionDiffPaths(workspaceId: string): Promise<string[] | null> {
-    const postCompactionPath = path.join(
+    const pendingPath = path.join(
       this.config.sessionsDir,
       workspaceId,
-      "post-compaction.json"
+      POST_COMPACTION_STATE_FILENAME
     );
-
-    try {
-      const raw = await fsPromises.readFile(postCompactionPath, "utf-8");
-      const parsed: unknown = JSON.parse(raw);
-      const diffsRaw = (parsed as { diffs?: unknown }).diffs;
-      if (!Array.isArray(diffsRaw)) {
-        return null;
-      }
-
-      const result: string[] = [];
-      for (const diff of diffsRaw) {
-        if (!diff || typeof diff !== "object") continue;
-        const p = (diff as { path?: unknown }).path;
-        if (typeof p !== "string") continue;
-        const trimmed = p.trim();
-        if (trimmed.length === 0) continue;
-        result.push(trimmed);
-      }
-
-      return result;
-    } catch {
+    // This reader owns no local receipts. Skip the redundant history proof only for
+    // confirmed absence; present or uncertain paths retain load qualification and cleanup.
+    if (
+      await fsPromises.stat(pendingPath).then(
+        () => false,
+        (error: unknown) => isErrnoWithCode(error, "ENOENT")
+      )
+    )
       return null;
-    }
+    const pending = new CompactionPendingState(
+      pendingPath,
+      this.historyService.getCompactionPendingHistory(workspaceId)
+    );
+    const receipt = await pending.load(() => true).catch(() => undefined);
+    return receipt?.attachments.diffs.map((diff) => diff.path) ?? null;
   }
 
   /**
@@ -4529,7 +4523,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // If session has pending compaction attachments, use cached paths
     // (history is cleared after compaction, but cache survives)
     const session = this.sessions.get(workspaceId);
-    const pendingPaths = session?.getPendingTrackedFilePaths();
+    const pendingPaths = await session?.getPendingTrackedFilePaths();
     if (pendingPaths) {
       // Filter out both new and legacy plan file paths
       const trackedFilePaths = pendingPaths.filter((p) => !isPlanPath(p));
@@ -12774,6 +12768,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         refuseFullDelete: truncationScope === "partial",
         refuseRowRemoval: truncationScope === "none",
         requireFullDelete: truncationScope === "all",
+        fenceEmptyHistory: isFullClear,
       });
     const truncateResult =
       effectivePercentage > 0
@@ -12936,24 +12931,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           );
         }
       }
-      const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-      if (!historyResult.success) {
-        return Err(`Failed to read active context before reset: ${historyResult.error}`);
-      }
+      const captured = await this.historyService.fenceEmptyContext(workspaceId);
+      if (!captured.success) return captured;
 
       const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(
-        historyResult.data
+        captured.data
       );
       if (!hasProviderEligibleMessages(activeContextMessages)) {
-        // An earlier reset may have failed AFTER writing its boundary but
-        // BEFORE its durable cleanup landed (the partial-failure Errs below).
-        // A retry then reaches this branch — no provider-eligible rows after
-        // the boundary — so pending cleanup must be re-attempted before the
-        // no-op is reported, or the UI claims success while a restart can
-        // still restore pre-reset carryover or kernel vars across the reset
-        // boundary. Both steps are idempotent: the pending-state unlink
-        // treats ENOENT as success and a discard tombstone re-publish is
-        // harmless, so a genuinely clean no-op stays a no-op.
+        // The provider-empty view was already fenced under the history locks. Retrying cleanup
+        // retires compatible legacy bytes without invalidating a post-reset successor.
         try {
           await this.getOrCreateSession(workspaceId).clearPostCompactionState();
         } catch (error) {
@@ -13194,7 +13180,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
-          () => this.historyService.clearHistory(workspaceId),
+          () => this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: !isCompaction }),
           { discardUnacceptedOnSuccess: true }
         );
         if (!clearResult.success) {

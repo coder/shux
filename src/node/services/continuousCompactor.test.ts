@@ -3,7 +3,7 @@ import { stat, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as atomicWrite from "write-file-atomic";
 import { EventEmitter } from "node:events";
-import { readFile } from "node:fs/promises";
+import * as syncFs from "node:fs";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import {
@@ -392,20 +392,22 @@ describe("ContinuousCompactor", () => {
     });
     expect((await store.historyService.updateHistory(workspaceId, edit)).success).toBe(true);
     await stage();
-    const original = store.historyService.persistBoundaryWithTailCopies.bind(store.historyService);
-    const persist = spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementation(
-      async (...args) => {
+    const rename = syncFs.renameSync;
+    let preparedBeforeBoundary = false;
+    spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      if (to === path.join(store.config.sessionsDir, workspaceId, "chat.jsonl")) {
         const state: unknown = JSON.parse(
-          await readFile(path.join(store.tempDir, "pending", "post-compaction.json"), "utf8")
+          syncFs.readFileSync(path.join(store.tempDir, "pending", "post-compaction.json"), "utf8")
         );
         expect(state).toMatchObject({
           diffs: [{ path: "/tmp/fix.ts", diff: "@@ -1 +1 @@\n-broken\n+fixed\n" }],
         });
-        return original(...args);
+        preparedBeforeBoundary = true;
       }
-    );
+      rename(from, to);
+    });
     expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
-    expect(persist).toHaveBeenCalledTimes(1);
+    expect(preparedBeforeBoundary).toBe(true);
     const restarted = new CompactionHandler({
       workspaceId,
       historyService: store.historyService,
@@ -422,11 +424,17 @@ describe("ContinuousCompactor", () => {
     await stage();
     const entered = deferred();
     const release = deferred();
-    const original = handler.preparePendingStateFromMessages.bind(handler);
-    spyOn(handler, "preparePendingStateFromMessages").mockImplementation(async (...args) => {
-      await original(...args);
-      entered.resolve();
-      await release.promise;
+    const remove = syncFs.promises.rm;
+    spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+      if (
+        String(file).startsWith(
+          path.join(store.tempDir, "pending", "post-compaction.json.continuous-")
+        )
+      ) {
+        entered.resolve();
+        await release.promise;
+      }
+      return remove(file, options);
     });
     const applying = compactor.observe(context.thresholdPercent, context);
     await entered.promise;
@@ -455,7 +463,11 @@ describe("ContinuousCompactor", () => {
           callback?: (error?: Error) => void
         ) => {
           await original(filename, data, typeof options === "function" ? undefined : options);
-          if (filename.includes(".continuous-")) {
+          if (
+            filename.startsWith(
+              path.join(store.config.sessionsDir, workspaceId, "chat.jsonl.continuous-")
+            )
+          ) {
             entered.resolve();
             await release.promise;
           }
@@ -485,23 +497,28 @@ describe("ContinuousCompactor", () => {
   it("ignores provisional pending state on restart until its boundary is durable", async () => {
     await seedConversation();
     await stage();
-    const original = store.historyService.persistBoundaryWithTailCopies.bind(store.historyService);
-    spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
-      async (...args) => {
-        const restarted = new CompactionHandler({
-          workspaceId,
-          historyService: store.historyService,
-          sessionDir: path.join(store.tempDir, "pending"),
-          emitter: new EventEmitter(),
-        });
-        expect(await restarted.peekPendingState()).toBeNull();
-        // Simulate the crash by rejecting the publication after testing its orphan snapshot.
+    const pendingPath = path.join(store.tempDir, "pending", "post-compaction.json");
+    let provisional: string | undefined;
+    const rename = syncFs.renameSync;
+    spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (to === pendingPath) {
+        provisional = syncFs.readFileSync(pendingPath, "utf8");
         compactor.reset("crash before boundary");
-        return original(...args);
       }
-    );
+    });
     expect(await compactor.observe(context.thresholdPercent, context)).toBe("none");
     expect((await rows())[0].id).toBe("old-user");
+    assert(provisional, "Expected a real provisional write");
+    // Reproduce crash residue after the real rejected publication releases its locks.
+    await writeFile(pendingPath, provisional);
+    const restarted = new CompactionHandler({
+      workspaceId,
+      historyService: new HistoryService(store.config),
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    expect(await restarted.peekPendingState()).toBeNull();
   });
 
   it.each(["reset", "append"] as const)(
@@ -511,16 +528,12 @@ describe("ContinuousCompactor", () => {
       await stage();
       const entered = deferred();
       const release = deferred();
-      const original = store.historyService.persistBoundaryWithTailCopies.bind(
-        store.historyService
-      );
-      spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
-        async (...args) => {
-          entered.resolve();
-          await release.promise;
-          return original(...args);
-        }
-      );
+      const original = handler.persistContinuousCompaction.bind(handler);
+      spyOn(handler, "persistContinuousCompaction").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return original(...args);
+      });
       const applying = compactor.observe(context.thresholdPercent, context);
       await entered.promise;
       if (mutation === "reset") compactor.reset("archive");
@@ -965,11 +978,15 @@ describe("ContinuousCompactor", () => {
     await store.historyService.writePartial(workspaceId, answer);
     streaming = false;
     live = undefined;
-    spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(() =>
-      Promise.resolve({ success: false, error: "transient write failure" })
-    );
+    const rename = syncFs.renameSync;
+    const failure = spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      if (to === path.join(store.config.sessionsDir, workspaceId, "chat.jsonl"))
+        throw new Error("Transient write failure");
+      rename(from, to);
+    });
     const disabled = { ...context, enabled: false, thresholdPercent: 100 };
     expect(await compactor.observe(0, disabled)).toBe("none");
+    failure.mockRestore();
     compactor.reset("disabled");
     expect(await journalStore.read()).not.toBeNull();
     expect(await compactor.observe(0, disabled)).toBe("applied");
@@ -986,8 +1003,8 @@ describe("ContinuousCompactor", () => {
     live = undefined;
     const entered = deferred();
     const release = deferred();
-    const original = handler.withContinuousPendingState.bind(handler);
-    spyOn(handler, "withContinuousPendingState").mockImplementation(async (...args) => {
+    const original = handler.persistContinuousCompaction.bind(handler);
+    spyOn(handler, "persistContinuousCompaction").mockImplementation(async (...args) => {
       entered.resolve();
       await release.promise;
       return original(...args);
@@ -1124,8 +1141,8 @@ describe("ContinuousCompactor", () => {
     compactor = new ContinuousCompactor(dependencies);
     const entered = deferred();
     const release = deferred();
-    const original = handler.withContinuousPendingState.bind(handler);
-    spyOn(handler, "withContinuousPendingState").mockImplementation(async (...args) => {
+    const original = handler.persistContinuousCompaction.bind(handler);
+    spyOn(handler, "persistContinuousCompaction").mockImplementation(async (...args) => {
       entered.resolve();
       await release.promise;
       return original(...args);

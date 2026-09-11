@@ -114,6 +114,64 @@ describe("inactive compaction history transactions", () => {
     });
   });
 
+  it.each(["unchanged", "archive edit", "raw reset"] as const)(
+    "qualifies publication against the archive-backed provider source (%s)",
+    async (change) => {
+      const { pending, summary, publication } = await preparedHeartbeat();
+      assert(
+        (
+          await pending.rollbackHeartbeat({
+            summaryMessage: summary,
+            isCurrent: () => true,
+            canRestorePrevious: () => true,
+            onCommitted: () => undefined,
+            onRestored: () => undefined,
+          })
+        ).success
+      );
+      assert(
+        (await foreign.appendToHistory(workspaceId, createMuxMessage("tail", "user", "New task")))
+          .success
+      );
+      const source = await service.getHistoryFromLatestBoundary(workspaceId);
+      assert(source.success);
+      expect(source.data.map((row) => row.id)).toEqual(["seed", "tail"]);
+      expect(await fs.readFile(chatPath, "utf8")).not.toContain('"seed"');
+      if (change === "archive edit") {
+        const edited = structuredClone(source.data[0]);
+        edited.parts = [{ type: "text", text: "Changed archived context" }];
+        await fs.writeFile(archivePath, line(edited));
+      } else if (change === "raw reset") {
+        await fs.appendFile(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},broken\n');
+      }
+      const before = await Promise.all([
+        fs.readFile(chatPath, "utf8"),
+        fs.readFile(archivePath, "utf8"),
+      ]);
+      const result = await pending.publishBoundary({
+        summaryMessage: boundary("next"),
+        tailCopies: [],
+        updateExisting: false,
+        publication,
+        attachments: { diffs: [], loadedSkills: [], readFiles: [] },
+        isCurrent: () => true,
+        shouldPersist: (messages, partial) =>
+          partial === null && JSON.stringify(messages) === JSON.stringify(source.data),
+        onCommitted: () => undefined,
+      });
+      expect(result.success).toBe(change === "unchanged");
+      if (change === "unchanged") {
+        const current = await service.getHistoryFromLatestBoundary(workspaceId);
+        assert(current.success);
+        expect(current.data.map((row) => row.id)).toEqual(["next"]);
+      } else {
+        expect(
+          await Promise.all([fs.readFile(chatPath, "utf8"), fs.readFile(archivePath, "utf8")])
+        ).toEqual(before);
+      }
+    }
+  );
+
   it("holds both locks through the callback and releases them after rejection", async () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -381,6 +439,148 @@ describe("inactive compaction history transactions", () => {
     failure.mockRestore();
     expect(await currentBoundary()).toEqual({ kind: "identified", messageId: "recoverable" });
   });
+
+  it.each([undefined, "{", "null", "{}", "[]"])(
+    "malformed-only retirement distinguishes missing and invalid content (%s)",
+    async (raw) => {
+      if (raw !== undefined) await fs.writeFile(partialPath, raw);
+      expect(await service.deletePartialIfMatches(workspaceId, null, () => true)).toEqual({
+        success: true,
+        data: raw !== undefined,
+      });
+      expect(await fs.stat(partialPath).catch((error: unknown) => error)).toMatchObject({
+        code: "ENOENT",
+      });
+    }
+  );
+
+  it("malformed-only retirement preserves a valid successor after an unreadable observation", async () => {
+    await fs.writeFile(partialPath, "{");
+    expect(await service.readPartial(workspaceId)).toBeNull();
+    assert(
+      (await foreign.writePartial(workspaceId, createMuxMessage("next", "assistant", "Valid")))
+        .success
+    );
+    const before = await fs.readFile(partialPath, "utf8");
+    expect(await service.deletePartialIfMatches(workspaceId, null, () => true)).toEqual({
+      success: true,
+      data: false,
+    });
+    expect(await fs.readFile(partialPath, "utf8")).toBe(before);
+  });
+
+  it.each(
+    (["logical", "physical", "queued successor"] as const).flatMap((scenario) =>
+      [false, true].map((directory) => ({ scenario, directory }))
+    )
+  )(
+    "malformed retirement preserves a successor after $scenario ownership changes (directory=$directory)",
+    async ({ scenario, directory }) => {
+      if (directory) await fs.mkdir(partialPath);
+      else await fs.writeFile(partialPath, "{");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const readFile = fs.readFile;
+      const held = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fs.readFile>
+      ) => {
+        try {
+          return await readFile(...args);
+        } finally {
+          if (args[0] === partialPath) {
+            entered.resolve();
+            await release.promise;
+          }
+        }
+      }) as typeof fs.readFile);
+      let current = true;
+      const retiring = service.deletePartialIfMatches(workspaceId, null, () => current);
+      let lease: Awaited<ReturnType<typeof reclaimHistoryLock>> | undefined;
+      let queued: ReturnType<HistoryService["writePartial"]> | undefined;
+      const successor = createMuxMessage("next", "assistant", "Valid successor");
+      try {
+        await entered.promise;
+        held.mockRestore();
+        if (scenario === "logical") current = false;
+        if (scenario === "physical") {
+          lease = await reclaimHistoryLock();
+          // Another process owns the reclaimed lease and writes its new stream partial.
+          if (directory) await fs.rmdir(partialPath);
+          await fs.writeFile(partialPath, JSON.stringify(successor));
+        }
+        if (scenario === "queued successor") queued = foreign.writePartial(workspaceId, successor);
+        release.resolve();
+        const result = await retiring;
+        if (scenario === "physical") expect(result.success).toBe(false);
+        else expect(result).toEqual({ success: true, data: scenario === "queued successor" });
+        if (queued) expect((await queued).success).toBe(true);
+        if (scenario === "logical") {
+          if (directory) expect((await fs.stat(partialPath)).isDirectory()).toBe(true);
+          else expect(await fs.readFile(partialPath, "utf8")).toBe("{");
+        } else expect((await capturedPartial()).id).toBe(successor.id);
+      } finally {
+        release.resolve();
+        await retiring;
+        await lease?.[Symbol.asyncDispose]();
+        await queued;
+      }
+    }
+  );
+
+  it.each(["read", "unlink", "rmdir"] as const)(
+    "malformed retirement reports %s permission failure and preserves bytes for retry",
+    async (operation) => {
+      if (operation === "rmdir") await fs.mkdir(partialPath);
+      else await fs.writeFile(partialPath, "{");
+      const error = Object.assign(new Error("Permission denied"), { code: "EACCES" });
+      const readFile = fs.readFile;
+      const failure =
+        operation === "read"
+          ? spyOn(fs, "readFile").mockImplementation((async (
+              ...args: Parameters<typeof fs.readFile>
+            ) => {
+              if (args[0] === partialPath) throw error;
+              return readFile(...args);
+            }) as typeof fs.readFile)
+          : spyOn(
+              syncFs,
+              operation === "rmdir" ? "rmdirSync" : "unlinkSync"
+            ).mockImplementationOnce(() => {
+              throw error;
+            });
+      const result = await service.deletePartialIfMatches(workspaceId, null, () => true);
+      assert(!result.success);
+      expect(result.error).toContain("Permission denied");
+      failure.mockRestore();
+      if (operation === "rmdir") expect((await fs.stat(partialPath)).isDirectory()).toBe(true);
+      else expect(await fs.readFile(partialPath, "utf8")).toBe("{");
+      expect(await service.deletePartialIfMatches(workspaceId, null, () => true)).toEqual({
+        success: true,
+        data: true,
+      });
+    }
+  );
+
+  it.each(["nonempty", "symlink", "captured message"] as const)(
+    "directory retirement preserves %s ownership",
+    async (scenario) => {
+      const directoryPath = scenario === "symlink" ? `${partialPath}.target` : partialPath;
+      await fs.mkdir(directoryPath);
+      if (scenario === "nonempty") await fs.writeFile(path.join(directoryPath, "keep"), "Owned");
+      if (scenario === "symlink") await fs.symlink(directoryPath, partialPath);
+      const result = await service.deletePartialIfMatches(
+        workspaceId,
+        scenario === "captured message" ? createMuxMessage("old", "assistant", "Captured") : null,
+        () => true
+      );
+      if (scenario === "captured message") expect(result).toEqual({ success: true, data: false });
+      else expect(result.success).toBe(false);
+      expect((await fs.stat(directoryPath)).isDirectory()).toBe(true);
+      if (scenario === "nonempty")
+        expect(await fs.readFile(path.join(directoryPath, "keep"), "utf8")).toBe("Owned");
+      if (scenario === "symlink") expect(await fs.readlink(partialPath)).toBe(directoryPath);
+    }
+  );
 
   it.each(["successor", "same-id flush", "captured mutation", "owner retired", "missing"])(
     "partial retirement preserves mismatched ownership (%s)",

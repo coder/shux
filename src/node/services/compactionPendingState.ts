@@ -70,7 +70,7 @@ export interface CompactionPendingBoundaryWrite {
   tailCopies: readonly MuxMessage[];
   updateExisting: boolean;
   publication: ContinuousCompactionPublication;
-  /** Pure admission check over held-lock history and a strictly parsed partial (null if absent). */
+  /** Pure admission over held-lock provider history and a strictly parsed partial (null if absent). */
   shouldPersist: (messages: MuxMessage[], partial: MuxMessage | null) => boolean;
 }
 
@@ -97,7 +97,6 @@ export interface CompactionPendingHistory {
   /**
    * Hold BOTH existing history locks throughout the callback, reject removed workspaces,
    * and provide a stable view without reacquiring history/journal queues inside the lock.
-   * The HistoryService adapter remains inactive: every producer/consumer must activate together.
    */
   withLock<T>(operation: (view: CompactionPendingHistoryView) => Promise<T>): Promise<T>;
 }
@@ -314,11 +313,11 @@ function eligibleState(
 }
 
 /**
- * Inactive pending-file protocol. CompactionHandler owns local caches/preparation; this owns disk.
+ * Pending-file protocol. CompactionPreparationLifecycle owns local facts; this owns disk.
  * Read-side cleanup is best-effort; mutation failures propagate so callers can distinguish
  * attachment writes from mandatory reset cleanup.
  *
- * Activation must use `publishBoundary` for every producer, with matching receipt consumers
+ * Producers must use `publishBoundary`, with matching receipt consumers
  * and an explicit policy for ambiguous legacy files. `prepare` alone is not atomic with history.
  * Queued methods acquire their own locks; never call them inside held locks.
  */

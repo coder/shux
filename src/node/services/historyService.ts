@@ -25,7 +25,7 @@ import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
-import { renameSync, unlinkSync } from "node:fs";
+import { renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import * as fs from "fs/promises";
 import type {
@@ -572,12 +572,16 @@ export class HistoryService {
             throw new Error("Compaction partial is unreadable");
           partial = normalizeLegacyMuxMetadata(parsed);
         }
+        // Preparation uses provider history, including archive rows exposed by a
+        // heartbeat rollback. Compare that same privacy-filtered view under the locks;
+        // active chat rows alone would reject an unchanged archive-backed source.
+        const providerMessages = await readProviderHistoryFromLatestBoundary(paths, 0);
         return this.persistBoundaryWithTailCopiesUnderWriteLock(
           workspaceId,
           input.summaryMessage,
           input.tailCopies,
           input.updateExisting,
-          (messages) => input.shouldPersist(messages, partial),
+          () => input.shouldPersist(providerMessages, partial),
           { publication: input.publication, onCommitted },
           assertStillOwned
         );
@@ -2581,10 +2585,10 @@ export class HistoryService {
     }
   }
 
-  /** Inactive compaction seam: retire only the captured partial, including its last flush. */
+  /** Retire the captured flush, or only malformed bytes when no readable partial was captured. */
   deletePartialIfMatches(
     workspaceId: string,
-    captured: MuxMessage,
+    captured: MuxMessage | null,
     isCurrent: () => boolean
   ): Promise<Result<boolean>> {
     // Capture before queueing: callers may keep updating their streamed message object.
@@ -2595,19 +2599,35 @@ export class HistoryService {
       async (assertStillOwned) => {
         if (!isCurrent()) return Ok(false);
         const partialPath = this.getPartialPath(workspaceId);
+        let directory = false;
         let raw: string;
         try {
           raw = await fs.readFile(partialPath, "utf8");
         } catch (error) {
           if (isErrnoWithCode(error, "ENOENT")) return Ok(false);
-          throw error;
+          if (!isErrnoWithCode(error, "EISDIR")) throw error;
+          directory = true;
+          raw = "";
         }
-        const current = normalizeLegacyMuxMetadata(JSON.parse(raw) as MuxMessage);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+        // A failed public read is not absence evidence. Re-read under both locks, and only
+        // heal malformed content; a now-valid successor or an I/O error must remain intact.
+        const current = isReadableHistoryMessage(parsed)
+          ? normalizeLegacyMuxMetadata(parsed)
+          : null;
         await assertStillOwned();
         if (!isDeepStrictEqual(current, expected) || !isCurrent()) return Ok(false);
-        // Keep the final ownership check and unlink indivisible to local cancellation.
+        // Keep the final ownership check and removal indivisible to local cancellation.
         // Both history locks exclude successor flushes from another service/process.
-        unlinkSync(partialPath);
+        // A directory at the partial path cannot contain a stream message. Remove only an
+        // empty directory: rmdir refuses children, symlinks and any replacement regular file.
+        if (directory) rmdirSync(partialPath);
+        else unlinkSync(partialPath);
         return Ok(true);
       }
     );
@@ -4285,12 +4305,14 @@ export class HistoryService {
       refuseFullDelete?: boolean;
       refuseRowRemoval?: boolean;
       requireFullDelete?: boolean;
+      /** Explicit context destruction must also fence carryover when no transcript rows exist. */
+      fenceEmptyHistory?: boolean;
     }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
-      async () => {
+      async (assertStillOwned) => {
         invalidateHistoryAppendProvenance();
         try {
           const { rows: archiveRows, messages: archivedMessages } =
@@ -4305,11 +4327,12 @@ export class HistoryService {
 
           if (percentage >= 1.0) {
             // Explicit full-clear intent includes display-only or malformed history.
-            // An already-empty history remains a no-op for publication ownership.
-            if (archiveRows.length > 0 || chatRows.length > 0) {
+            // Plain storage cleanup may be a no-op; explicit context destruction also fences
+            // attachments from legacy sessions whose transcript is already empty.
+            if (options?.fenceEmptyHistory || archiveRows.length > 0 || chatRows.length > 0) {
               await this.getContinuousCompactionJournal(
                 workspaceId
-              ).advanceGenerationUnderHistoryLock();
+              ).advanceGenerationUnderHistoryLock(undefined, assertStillOwned);
             }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
@@ -4470,8 +4493,37 @@ export class HistoryService {
     );
   }
 
-  async clearHistory(workspaceId: string): Promise<Result<number[], string>> {
-    const result = await this.truncateHistory(workspaceId, 1.0);
+  /** Read reset context and fence an empty provider view before either history lock is released. */
+  async fenceEmptyContext(workspaceId: string): Promise<Result<MuxMessage[]>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to read or fence reset context",
+      async (assertStillOwned) => {
+        const messages = await readProviderHistoryFromLatestBoundary(
+          {
+            chat: this.getChatHistoryPath(workspaceId),
+            archive: this.getChatArchivePath(workspaceId),
+          },
+          0
+        );
+        await assertStillOwned();
+        // The no-op decision and generation publication share this lease: a foreign reset,
+        // Stop, or journal publication cannot enter between them. Later cleanup never fences.
+        if (!hasProviderEligibleMessages(messages))
+          await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock(
+            undefined,
+            assertStillOwned
+          );
+        return Ok(messages);
+      }
+    );
+  }
+
+  async clearHistory(
+    workspaceId: string,
+    options?: { fenceEmptyHistory?: boolean }
+  ): Promise<Result<number[], string>> {
+    const result = await this.truncateHistory(workspaceId, 1.0, options);
     if (!result.success) {
       return Err(result.error);
     }
