@@ -143,6 +143,37 @@ describe("BackupSection", () => {
     await waitFor(() => expect(canvas.queryByText("Unsaved changes")).toBeNull());
   });
 
+  test("toggles the content selection from the keyboard under the parent gate", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+    const saveSettings = jest.spyOn(client.backup, "saveSettings");
+
+    const mcp = canvas.getByRole("checkbox", { name: "MCP server configuration" });
+    const headers = canvas.getByRole("checkbox", { name: "HTTP header values" });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("false");
+    // A sub-option shortcut is inert while its parent is off, like the disabled checkbox.
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(window, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("true");
+    fireEvent.keyDown(window, { key: "h", code: "KeyH", ctrlKey: true, altKey: true });
+    expect(headers.getAttribute("aria-checked")).toBe("false");
+    fireEvent.keyDown(window, { key: "j", code: "KeyJ", ctrlKey: true, altKey: true });
+
+    fireEvent.keyDown(window, { key: "s", code: "KeyS", ctrlKey: true, altKey: true });
+    await waitFor(() =>
+      expect(saveSettings).toHaveBeenCalledWith({
+        repoUrl: "git@github.com:example/dotfiles.git",
+        branch: "main",
+        path: "mux/",
+        ...BACKUP_CONTENT_DEFAULTS,
+        includeMcpHeaders: false,
+        includeProjects: true,
+      })
+    );
+  });
+
   test("refreshes backup settings changed by another window", async () => {
     const { client, view } = renderBackupSection();
     const canvas = within(view.container);

@@ -50,7 +50,6 @@ const BACKUP_SHORTCUTS = [
   ["restore", KEYBINDS.SETTINGS_BACKUP_RESTORE],
   ["toggleOverride", KEYBINDS.SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN],
   ["toggleApproveCommands", KEYBINDS.SETTINGS_BACKUP_APPROVE_COMMANDS],
-  ["toggleProjects", KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS],
 ] as const;
 
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
@@ -62,21 +61,42 @@ interface BackupContentOption {
   description?: string;
   /** Rendered indented under this flag and disabled while it is off. */
   parent?: BackupContentFlag;
-  shortcut?: Keybind;
+  shortcut: Keybind;
 }
 
 /** One selection governs both directions: what a push publishes and what a restore writes. */
 const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
-  { flag: "includeInstructions", label: "Global instructions" },
-  { flag: "includeAgents", label: "Agent definitions" },
-  { flag: "includeSkills", label: "Agent skills" },
-  { flag: "includeGlobalMemory", label: "Global memory" },
-  { flag: "includePreferences", label: "Portable preferences" },
+  {
+    flag: "includeInstructions",
+    label: "Global instructions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS,
+  },
+  {
+    flag: "includeAgents",
+    label: "Agent definitions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_AGENTS,
+  },
+  {
+    flag: "includeSkills",
+    label: "Agent skills",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_SKILLS,
+  },
+  {
+    flag: "includeGlobalMemory",
+    label: "Global memory",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY,
+  },
+  {
+    flag: "includePreferences",
+    label: "Portable preferences",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
+  },
   {
     flag: "includeMcp",
     label: "MCP server configuration",
     description:
       "URLs are copied as written; one that looks like it carries a credential waits for your review before publishing.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP,
   },
   {
     flag: "includeMcpHeaders",
@@ -84,6 +104,7 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     label: "HTTP header values",
     description:
       "Copied as written, so a token in a header travels with the backup. Leave off to keep header values on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_HEADERS,
   },
   {
     flag: "includeMcpCommands",
@@ -91,6 +112,7 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     label: "stdio commands",
     description:
       "Copied as written, so a token in a command line travels with the backup. Leave off to keep commands on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS,
   },
   {
     flag: "includeProjects",
@@ -683,11 +705,15 @@ export function BackupSection() {
         setApproveCommands((current) => !current);
       }
     },
-    toggleProjects: () => {
-      if (!busy) {
-        setDraft((current) => ({ ...current, includeProjects: !current.includeProjects }));
-      }
-    },
+  };
+  const toggleContentRef = useRef<(option: BackupContentOption) => void>(() => undefined);
+  toggleContentRef.current = (option) => {
+    if (busy) return;
+    setDraft((current) => {
+      // Mirrors the checkbox: a sub-option is inert while its parent is off.
+      if (option.parent !== undefined && !current[option.parent]) return current;
+      return { ...current, [option.flag]: !current[option.flag] };
+    });
   };
 
   useEffect(() => {
@@ -696,11 +722,15 @@ export function BackupSection() {
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      if (!action) return;
+      const option = BACKUP_CONTENT_OPTIONS.find((candidate) =>
+        matchesKeybind(event, candidate.shortcut)
+      );
+      if (!action && !option) return;
 
       event.preventDefault();
       event.stopPropagation();
-      void action();
+      if (action) void action();
+      else if (option) toggleContentRef.current(option);
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -788,12 +818,10 @@ export function BackupSection() {
                 <span className="min-w-0">
                   <span className="text-foreground block text-xs font-medium">
                     {option.label}
-                    {option.shortcut ? (
-                      // Shortcut hint only; the shortcut itself stays bound on every viewport.
-                      <span className="text-muted ml-1 hidden font-normal sm:inline">
-                        ({formatKeybind(option.shortcut)})
-                      </span>
-                    ) : null}
+                    {/* Shortcut hint only; the shortcut itself stays bound on every viewport. */}
+                    <span className="text-muted ml-1 hidden font-normal sm:inline">
+                      ({formatKeybind(option.shortcut)})
+                    </span>
                   </span>
                   {option.description ? (
                     <span className="text-muted mt-0.5 block text-xs">{option.description}</span>
@@ -910,7 +938,11 @@ export function BackupSection() {
 
             <div className="border-border-light rounded-md border p-3">
               <h4 className="text-foreground text-xs font-medium">Kept on this device</h4>
-              {preview.redactions.length === 0 ? (
+              {!savedDraft.includeMcp ? (
+                <p className="text-muted mt-2 text-xs">
+                  MCP server configuration is not in the backup, so all of it stays here.
+                </p>
+              ) : preview.redactions.length === 0 ? (
                 <p className="text-muted mt-2 text-xs">Every MCP value is in the backup.</p>
               ) : (
                 <ul className="text-muted mt-2 space-y-1 text-xs">

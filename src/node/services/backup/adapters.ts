@@ -68,7 +68,6 @@ import {
   planRestoreWrites,
   readBackupPayload,
   restoreBackupPayload,
-  selectBackupContents,
   backupSecretApprovalDigest,
   scanBackupFilesForSecrets,
   serializeBackupPreferences,
@@ -549,7 +548,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         };
       }
 
-      const payload = selectBackupContents(await readBackupPayload(sourceDir), contents);
+      const payload = await readBackupPayload(sourceDir, { contents });
       // The preflight restore itself runs, so a destination this payload cannot be written to
       // fails here instead of after the user accepts a plan that cannot execute. Recomputed
       // rather than carried over to the restore, for the same reason the approvals are.
@@ -632,10 +631,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           describeMissingBackup(validateOptions.managedPath)
         );
       }
-      const payload = selectBackupContents(
-        await readBackupPayload(sourceDir),
-        validateOptions.contents
-      );
+      const payload = await readBackupPayload(sourceDir, { contents: validateOptions.contents });
       assertBackupCommandsApproved(
         await collectMcpCommandApprovals(muxRoot, payload.files, payload.manifest.mcpRedactions),
         validateOptions.approvedCommandTokens
@@ -700,7 +696,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     async restore(restoreOptions) {
       const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
       const contents = restoreOptions.contents;
-      const payload = selectBackupContents(await readBackupPayload(sourceDir), contents);
+      const payload = await readBackupPayload(sourceDir, { contents });
       const before = await localFilesByPath(contents);
 
       const restoreCore = async (

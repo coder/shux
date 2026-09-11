@@ -428,6 +428,41 @@ describe("backup payload", () => {
     }
   });
 
+  it("reads only the selected categories from a checked-out backup", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { api: { url: "https://example.com/mcp", headers: { A: "x" } } } })
+    );
+    const destination = path.join(tempDir, "partial");
+    await writeBackupPayload(
+      destination,
+      await createBackupPayload({
+        muxRoot,
+        contents: resolveBackupContents({ includeMcpHeaders: false }),
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+      })
+    );
+    // The redaction list stays in the manifest while the file itself turns unreadable.
+    await tamperPayloadFile(destination, "mcp.jsonc", "{ not jsonc");
+
+    const withoutMcp = await readBackupPayload(destination, {
+      contents: resolveBackupContents({ includeMcp: false }),
+    });
+    expect(withoutMcp.files.map((file) => file.path)).toEqual(["AGENTS.md", "preferences.json"]);
+    expect(withoutMcp.manifest.files.map((file) => file.path)).toEqual([
+      "AGENTS.md",
+      "preferences.json",
+    ]);
+    expect(withoutMcp.manifest.mcpRedactions).toBeUndefined();
+    expect(withoutMcp.redactions).toEqual([]);
+
+    const withMcp = await captureRejection(readBackupPayload(destination, { contents: CONTENTS }));
+    expect((withMcp as Error).message).toContain("mcp.jsonc");
+  });
+
   it("does not create manifests above the MCP redaction limit", async () => {
     const redactedValues = Object.fromEntries(
       Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [

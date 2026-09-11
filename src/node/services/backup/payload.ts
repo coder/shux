@@ -1838,13 +1838,21 @@ function isFilesystemError(error: unknown): boolean {
  * `portable: false` for a local safety snapshot, matching the `writeBackupPayload` call that
  * produced it: those keep names only this filesystem has to accept, so the cross-platform
  * rules a repository payload needs would reject the copy a recovery reads.
+ *
+ * With `contents`, only the selected categories are read and the result is already projected
+ * through `selectBackupContents`. A restore leaves the rest alone, so a malformed or missing
+ * file there must not block the categories the user did select.
  */
 export async function readBackupPayload(
   sourceDir: string,
-  options: { portable?: boolean } = {}
+  options: { portable?: boolean; contents?: BackupContents } = {}
 ): Promise<BackupPayload> {
   try {
-    return await readBackupPayloadUnchecked(sourceDir, options.portable !== false);
+    return await readBackupPayloadUnchecked(
+      sourceDir,
+      options.portable !== false,
+      options.contents
+    );
   } catch (error) {
     if (isFilesystemError(error)) throw error;
     throw new BackupInvalidPayloadError(error);
@@ -1878,7 +1886,8 @@ async function readManifestEntry(
 
 async function readBackupPayloadUnchecked(
   sourceDir: string,
-  portable: boolean
+  portable: boolean,
+  contents?: BackupContents
 ): Promise<BackupPayload> {
   const budget = createByteBudget();
   const root = await resolveRoot(sourceDir);
@@ -1895,6 +1904,7 @@ async function readBackupPayloadUnchecked(
     const key = portable ? collisionKey(manifestFile.path) : manifestFile.path;
     if (seen.has(key)) throw new Error(`Duplicate backup path '${manifestFile.path}'`);
     seen.add(key);
+    if (contents && !isSelectedPayloadPath(manifestFile.path, contents)) continue;
     const content = await readManifestEntry(root, manifestFile.path, budget);
     if (sha256(content) !== manifestFile.sha256) {
       throw new Error(`Backup checksum mismatch for '${manifestFile.path}'`);
@@ -1915,20 +1925,22 @@ async function readBackupPayloadUnchecked(
   const parsedMcp = mcpFile
     ? parseJsoncObjectWithTree(mcpFile.content.toString("utf-8"), "backup mcp.jsonc")
     : undefined;
-  if (manifest.mcpRedactions !== undefined) {
+  // A deselected mcp.jsonc was never opened, so its redaction list has nothing to validate
+  // against; selectBackupContents drops the list along with the file.
+  const mcpRedactions = contents && !contents.includeMcp ? undefined : manifest.mcpRedactions;
+  let payload: BackupPayload;
+  if (mcpRedactions !== undefined) {
     if (!parsedMcp) throw new Error("Backup manifest lists MCP redactions without mcp.jsonc");
-    validateMcpRedactionPaths(parsedMcp.tree, manifest.mcpRedactions);
-    return {
+    validateMcpRedactionPaths(parsedMcp.tree, mcpRedactions);
+    payload = { manifest, files, redactions: mcpRedactions.map(redactionPathLabel) };
+  } else {
+    payload = {
       manifest,
       files,
-      redactions: manifest.mcpRedactions.map(redactionPathLabel),
+      redactions: parsedMcp ? findMcpRedactionPaths(parsedMcp.tree).map(redactionPathLabel) : [],
     };
   }
-  return {
-    manifest,
-    files,
-    redactions: parsedMcp ? findMcpRedactionPaths(parsedMcp.tree).map(redactionPathLabel) : [],
-  };
+  return contents ? selectBackupContents(payload, contents) : payload;
 }
 
 /**
@@ -1948,6 +1960,11 @@ export function selectBackupContents(
     files: payload.manifest.files.filter((file) => isSelectedPayloadPath(file.path, contents)),
   };
   let redactions = payload.redactions;
+  if (!contents.includeMcp) {
+    // The list describes a file this selection leaves alone.
+    delete manifest.mcpRedactions;
+    redactions = [];
+  }
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   const projection = mcpProjectionOptions(contents);
   if (mcpFile && !(projection.includeHeaders && projection.includeCommands)) {
