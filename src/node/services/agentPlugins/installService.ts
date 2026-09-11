@@ -2738,7 +2738,7 @@ export class AgentPluginInstallService {
             [...new Set(selection.skills)].sort(),
             [...new Set(selection.mcpServers)].sort(),
           ]);
-    const data = await this.runExclusive(async () => {
+    const { data, changed } = await this.runExclusive(async () => {
       const { envelope, rawEntries } = await this.readRegistryDocument("strict");
       const entry = this.parseRegistryEntries(rawEntries, "strict").find(
         (entry) => entry.name === args.name
@@ -2765,7 +2765,8 @@ export class AgentPluginInstallService {
         skills: inventory.skills.map((skill) => skill.name),
         mcpServers: inventory.mcpServers.map((server) => server.serverName),
       };
-      if (selectionKey(importedComponents) === selectionKey(previous)) return entry;
+      if (selectionKey(importedComponents) === selectionKey(previous))
+        return { data: entry, changed: false };
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) => {
@@ -2780,8 +2781,9 @@ export class AgentPluginInstallService {
           };
         })
       );
-      return { ...entry, importedComponents };
+      return { data: { ...entry, importedComponents }, changed: true };
     });
+    if (!changed) return { data };
     // Persist first and release the mutation lock: reconciliation rediscovers current policy.
     // Never recycle the tree or prune workspace preferences for reversible selections.
     try {

@@ -703,6 +703,65 @@ describe("AgentPluginInstallService", () => {
     ).toBe(false);
   });
 
+  test.each([false, true])(
+    "effective component no-op leaves disk and runtime untouched (explicit: %s)",
+    async (explicit) => {
+      const preview = await service.preview({ input: remoteDir });
+      const all = { skills: ["greet"], mcpServers: ["echo"] };
+      await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+        ...(explicit ? { importedComponents: all } : {}),
+      });
+      const manager = new MCPServerManager(new MCPConfigService(config));
+      const withRuntime = new AgentPluginInstallService(config, {
+        isEnabled: () => true,
+        mcpServerManager: manager,
+      });
+      const inventory = await withRuntime.getComponents({ name: "demo-plugin" });
+      const before = await fsPromises.readFile(registryFile(), "utf8");
+      const empty = { skills: [], mcpServers: [] };
+      const reconcile = spyOn(manager, "reconcilePluginComponents").mockImplementation(async () => {
+        // Reading takes the same mutation lock, proving it was released before cleanup.
+        expect(
+          (await withRuntime.getComponents({ name: "demo-plugin" })).importedComponents
+        ).toEqual(empty);
+      });
+      const write = spyOn(
+        withRuntime as unknown as { writeRegistry: () => Promise<void> },
+        "writeRegistry"
+      );
+      const request = {
+        name: "demo-plugin",
+        expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
+        expectedImportedComponents: explicit ? all : null,
+      };
+      try {
+        const unchanged = await withRuntime.setComponentsResult({
+          ...request,
+          importedComponents: { skills: ["greet", "greet"], mcpServers: ["echo", "echo"] },
+        });
+        expect(unchanged).toMatchObject({ success: true });
+        expect(write).not.toHaveBeenCalled();
+        expect(reconcile).not.toHaveBeenCalled();
+        expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+        const changed = await withRuntime.setComponentsResult({
+          ...request,
+          importedComponents: empty,
+        });
+        expect(changed).toMatchObject({ success: true, data: { importedComponents: empty } });
+        expect(changed).not.toHaveProperty("cleanupWarning");
+        expect(write).toHaveBeenCalledTimes(1);
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        write.mockRestore();
+        reconcile.mockRestore();
+        manager.dispose();
+      }
+    }
+  );
+
   test("cleanup failures report saved selections and reconciliation runs outside the mutation lock", async () => {
     const preview = await service.preview({ input: remoteDir });
     const all = { skills: ["greet"], mcpServers: ["echo"] };

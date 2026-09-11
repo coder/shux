@@ -1365,7 +1365,7 @@ export class MCPServerManager {
 
   /** Call after the atomic selection write and after releasing the install lock. */
   async reconcilePluginComponents(): Promise<void> {
-    await this.retireCrossProcessPluginInstances();
+    await this.retireCrossProcessPluginInstances(true);
   }
 
   private componentAllowed(
@@ -1389,7 +1389,8 @@ export class MCPServerManager {
     return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
   }
 
-  private async refreshComponentPolicy(): Promise<void> {
+  private async refreshComponentPolicy(): Promise<Error | undefined> {
+    let cleanupError: Error | undefined;
     const previous = this.componentPolicy;
     const policy = await this.readComponentPolicy();
     if (JSON.stringify(policy) !== JSON.stringify(this.componentPolicy)) {
@@ -1432,15 +1433,18 @@ export class MCPServerManager {
       // their retired client. Only active instances participate in retention.
       if (this.getLeaseCount(workspaceId) > 0) continue;
       const retired = entry.retiredPluginInstances;
-      delete entry.retiredPluginInstances;
       for (const instance of retired ?? []) {
         try {
           await instance.close();
+          retired?.delete(instance);
         } catch (error) {
+          cleanupError ??= error instanceof Error ? error : new Error(getErrorMessage(error));
           log.warn("Failed to close removed plugin component", { name: instance.name, error });
         }
       }
+      if (retired?.size === 0) delete entry.retiredPluginInstances;
     }
+    return cleanupError;
   }
 
   /**
@@ -1451,7 +1455,7 @@ export class MCPServerManager {
    * The first read only records the token: no plugin instance can predate it
    * because this method guards every serve path.
    */
-  private async retireCrossProcessPluginInstances(): Promise<void> {
+  private async retireCrossProcessPluginInstances(reportCleanupErrors = false): Promise<void> {
     const invalidation = this.pluginInvalidation;
     if (invalidation === undefined) {
       return;
@@ -1463,8 +1467,10 @@ export class MCPServerManager {
     // replaced tree. Queued serves wait for the in-flight sweep, then see the
     // published token and proceed; a failed sweep leaves the token
     // unpublished so the next serve retries it.
+    let cleanupError: Error | undefined;
     const run = async (): Promise<void> => {
-      if (invalidation.readComponentPolicy !== undefined) await this.refreshComponentPolicy();
+      if (invalidation.readComponentPolicy !== undefined)
+        cleanupError = await this.refreshComponentPolicy();
       const [token, overridesEpoch] = await Promise.all([
         invalidation.readToken(),
         invalidation.readOverridesEpoch?.(),
@@ -1520,6 +1526,12 @@ export class MCPServerManager {
     };
     const next = this.pluginInvalidationQueue.then(run, run);
     this.pluginInvalidationQueue = next.catch(() => undefined);
+    // Explicit saves report cleanup failures only after publishing policy/epoch work.
+    // Automatic MCP boundaries keep retained clients usable and retry retired clients later.
+    if (reportCleanupErrors) {
+      await next;
+      if (cleanupError !== undefined) throw cleanupError;
+    }
     return next;
   }
 
@@ -1952,7 +1964,7 @@ export class MCPServerManager {
     if (current === 1) {
       this.workspaceLeases.delete(workspaceId);
       if (this.pluginInvalidation?.readComponentPolicy !== undefined) {
-        this.reconcilePluginComponents().catch((error: unknown) => {
+        this.retireCrossProcessPluginInstances().catch((error: unknown) => {
           log.warn("Failed to reconcile plugin components after lease release", {
             workspaceId,
             error,
@@ -2100,7 +2112,7 @@ export class MCPServerManager {
     agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<MCPServerMap> {
     if (this.pluginInvalidation?.readComponentPolicy !== undefined)
-      await this.reconcilePluginComponents();
+      await this.retireCrossProcessPluginInstances();
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
     const enabled = this.applyServerOverrides(allServers, overrides);
     return this.filterServersByPolicy(enabled);
@@ -4174,7 +4186,7 @@ export class MCPServerManager {
     const removedComponents: string[] = [];
     for (;;) {
       if (this.pluginInvalidation?.readComponentPolicy !== undefined)
-        await this.reconcilePluginComponents();
+        await this.retireCrossProcessPluginInstances();
       for (const [name, instance] of instances) {
         if (this.componentAllowed(name)) continue;
         instances.delete(name);
@@ -4188,7 +4200,7 @@ export class MCPServerManager {
           log.warn("Failed to close removed plugin startup", { name, error });
         }
       }
-      if (removedComponents.length > 0) await this.reconcilePluginComponents();
+      if (removedComponents.length > 0) await this.retireCrossProcessPluginInstances();
       const clockBeforeScan = this.prefixInvalidationClock;
       invalidatedKeys.push(
         ...(await this.closeInvalidatedInstances(instances, startedAtEpoch, workspaceId))

@@ -341,6 +341,69 @@ describe("MCPServerManager", () => {
     }
   );
 
+  test.each([false, true])(
+    "component cleanup failures remain retryable without blocking retained clients (readd: %s)",
+    async (readd) => {
+      using tmp = new DisposableTempDir("mcp-component-cleanup-retry");
+      const f = await componentFixture(tmp.path);
+      const request = workspaceRequest("cleanup-retry");
+      const served = await manager.getToolsForWorkspace(request);
+      const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
+      const retained = f.started.filter((instance) => instance !== removed);
+      let failClose = true;
+      const close = spyOn(removed as { close: () => Promise<void> }, "close").mockImplementation(
+        () =>
+          failClose ? Promise.reject(new Error("removed client close failed")) : Promise.resolve()
+      );
+      try {
+        await f.write(["keep"]);
+        const error: unknown = await manager
+          .reconcilePluginComponents()
+          .catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).toContain("removed client close failed");
+        const entry = access.workspaceServers.get(request.workspaceId) as {
+          instances: Map<string, unknown>;
+          retiredPluginInstances?: Set<unknown>;
+        };
+        expect(entry.retiredPluginInstances?.has(removed)).toBe(true);
+        const after = await manager.getToolsForWorkspace(request);
+        expect(Object.values(after.toolServerNames).sort()).toEqual([
+          "ordinary",
+          "plugin:instance:keep",
+        ]);
+        expect(close.mock.calls.length).toBeGreaterThan(1);
+        const toolName = Object.keys(served.toolServerNames).find(
+          (key) => served.toolServerNames[key] === removed.name
+        )!;
+        const heldError: unknown = await Promise.resolve(
+          served.tools[toolName].execute!({}, { toolCallId: "removed", messages: [], context: {} })
+        ).catch((error: unknown) => error);
+        expect(heldError).toBeInstanceOf(Error);
+        expect(removed.tools.echo.execute).not.toHaveBeenCalled();
+        if (readd) {
+          await f.write(["keep", "remove"]);
+          const readded = await manager.getToolsForWorkspace(request);
+          expect(Object.values(readded.toolServerNames)).toContain(removed.name);
+          expect(entry.instances.get(removed.name)).not.toBe(removed);
+        }
+        failClose = false;
+        const attempts = close.mock.calls.length;
+        await manager.getToolsForWorkspace(request);
+        expect(close).toHaveBeenCalledTimes(attempts + 1);
+        expect(entry.retiredPluginInstances?.size ?? 0).toBe(0);
+        await manager.reconcilePluginComponents();
+        expect(close).toHaveBeenCalledTimes(attempts + 1);
+        for (const instance of retained) {
+          expect(entry.instances.get(instance.name)).toBe(instance);
+          expect(instance.close).not.toHaveBeenCalled();
+        }
+      } finally {
+        close.mockRestore();
+      }
+    }
+  );
+
   test("component policy rejects a held tool in a second manager without local notification", async () => {
     using tmp = new DisposableTempDir("mcp-components-sibling");
     const f = await componentFixture(tmp.path);
