@@ -2410,7 +2410,7 @@ describe("MemoryService", () => {
       expect(manifest["clash.md"].target).toBe(target);
     });
 
-    it("transfers provenance when a renamed legacy note lands on its own conflict copy", async () => {
+    it("re-adopts a legacy note renamed onto its own conflict-copy path as a fresh copy", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
@@ -2425,8 +2425,9 @@ describe("MemoryService", () => {
       const importedCopy = path.join(ownerRoot, "imported", "ws-child", "a.md");
       expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("child's a");
       // The downgraded build renames the source to exactly that imported
-      // path: the new record reuses the identical target; the old record's
-      // reconciliation must hand the copy over, not delete it.
+      // path: the old record's reconciliation removes its copy first, then
+      // the new name is adopted at the now-free path — the note stays
+      // represented, with provenance on the new record.
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.mkdir(path.join(legacyRoot, "imported", "ws-child"), { recursive: true });
       await fsPromises.rename(
@@ -2453,7 +2454,7 @@ describe("MemoryService", () => {
       expect(await pathExists(importedCopy)).toBe(false);
     });
 
-    it("transfers the installed generation to the successor across an interrupted replacement", async () => {
+    it("re-adopts a note renamed onto its conflict-copy path across an interrupted replacement", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
       const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
@@ -2487,10 +2488,11 @@ describe("MemoryService", () => {
           },
         })
       );
-      // Before the retry, the source is renamed onto the conflict-copy path:
-      // the successor record reuses the installed file, and must inherit the
-      // generation actually on disk — not the overwritten one, which would
-      // make the copy read as replaced by the owner at once.
+      // Before the retry, the source is renamed onto the conflict-copy path.
+      // The pending record still recognizes the installed file by its
+      // replacement receipt, so the old record's reconciliation removes it
+      // (rather than leaving it as the owner's), and the new name is adopted
+      // as a fresh copy with its own generation.
       await fsPromises.mkdir(path.join(legacyRoot, "imported", "ws-child"), { recursive: true });
       await fsPromises.rename(
         path.join(legacyRoot, "a.md"),
@@ -2500,12 +2502,14 @@ describe("MemoryService", () => {
         fixture.config,
         new MemoryMetaService(fixture.xumHome)
       ).listIndexEntries({ ...fixture.ctx });
-      const successor = (await readLegacyAdoptionManifest(manifestPath)).get(
-        "imported/ws-child/a.md"
-      )!;
+      const manifest = await readLegacyAdoptionManifest(manifestPath);
+      expect(manifest.get("a.md")).toMatchObject({ deleted: true, created: true });
+      const successor = manifest.get("imported/ws-child/a.md")!;
       expect(successor).toMatchObject({ target: "imported/ws-child/a.md", created: true });
-      expect(successor.targetStamp).toBe(installed);
-      // With the right generation, deleting the renamed source removes the copy.
+      expect(successor.pending).toBeUndefined();
+      expect(successor.targetStamp).toBe((await adoptionTargetStamp(importedCopy)) ?? undefined);
+      expect(await fsPromises.readFile(importedCopy, "utf-8")).toBe("child's a2");
+      // With its own generation, deleting the renamed source removes the copy.
       await fsPromises.rm(path.join(legacyRoot, "imported", "ws-child", "a.md"));
       await fixture.service.listIndexEntries({ ...fixture.ctx });
       expect(await pathExists(importedCopy)).toBe(false);
@@ -3512,6 +3516,43 @@ describe("MemoryService", () => {
         )
       ).toBe("same note");
       expect((await fixture.metaService.getPinnedKeys()).has(key("ws-owner"))).toBe(false);
+    });
+
+    it("lands a downgraded rename in one pass when the owner store is at capacity", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      // The adopted note takes the owner store's last slot.
+      await Promise.all(
+        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE - 1 }, (_, i) =>
+          fsPromises.writeFile(path.join(ownerRoot, `o${String(i).padStart(4, "0")}.md`), "o")
+        )
+      );
+      await fsPromises.writeFile(path.join(legacyRoot, "old.md"), "note");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "old.md"), "utf-8")).toBe("note");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      // The downgraded build renames it: the slot its copy frees is credited
+      // to the same pass, so the new name lands at once — not skipped as
+      // "full" (and then memoized) while the old copy still held the slot.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rename(path.join(legacyRoot, "old.md"), path.join(legacyRoot, "new.md"));
+      const files = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+        .filter((e) => e.scope === "workspace")
+        .map((e) => e.relPath);
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(files).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(files).toContain("new.md");
+      expect(files).not.toContain("old.md");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "new.md"), "utf-8")).toBe("note");
+      // Strict removal agrees the handover is complete.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
     });
   });
 
