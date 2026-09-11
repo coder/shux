@@ -9,6 +9,7 @@ import {
 } from "@/node/services/workspaceRemoval";
 import type { TaskService } from "@/node/services/taskService";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
+import { HistoryService } from "@/node/services/historyService";
 import { hasRawResetMarker } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -36,6 +37,7 @@ import {
 } from "./session_history";
 
 let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
+let restoreScanBudget: () => void;
 const workspaceId = "history-browser";
 let chatPath: string;
 let archivePath: string;
@@ -109,6 +111,21 @@ const rollover: MuxMetadata = {
 
 beforeEach(async () => {
   fixture = await createTestHistoryService();
+  // Keep the privacy/race fixtures small while exercising the real scanner. Clamp the
+  // shared object so descendant authorization still subtracts from the same page budget.
+  // Production-budget acceptance lives in session_history.budget.test.ts.
+  const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
+  const budgetSpy = spyOn(
+    fixture.historyService,
+    "scanHistoryBoundedUnderLocks"
+  ).mockImplementation((workspace, options) => {
+    if (options.budget) {
+      options.budget.maxBytes = Math.min(options.budget.maxBytes, SESSION_HISTORY_MAX_SCAN_BYTES);
+      options.budget.maxRows = Math.min(options.budget.maxRows, SESSION_HISTORY_MAX_SCAN_ROWS);
+    }
+    return scan(workspace, options);
+  });
+  restoreScanBudget = () => budgetSpy.mockRestore();
   chatPath = path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl");
   archivePath = path.join(fixture.config.sessionsDir, workspaceId, "chat-archive.jsonl");
   call = async (input, workspace = workspaceId) => {
@@ -122,7 +139,66 @@ beforeEach(async () => {
   await append("first", "opening facts");
 });
 afterEach(async () => {
+  restoreScanBudget();
   await fixture.cleanup();
+});
+
+describe("session_history continuations", () => {
+  test("short handles survive tool recreation and concurrent retries without advancing the source", async () => {
+    await append("second", "second facts");
+    await append("third", "third facts");
+    const args = { action: "list_items", limit: 1 } as const;
+    const first = await call(args);
+    expect(first.status).toBe("partial");
+    expect(first.nextCursor).toBeString();
+    expect(first.nextCursor!.length).toBeLessThanOrEqual(64);
+    const retries = await Promise.all([
+      call({ ...args, cursor: first.nextCursor }),
+      call({ ...args, cursor: first.nextCursor }),
+    ]);
+    expect(retries[0].items?.map((item) => item.text)).toEqual(["second facts"]);
+    expect(retries[1].items).toEqual(retries[0].items);
+    expect((await call({ ...args, cursor: retries[0].nextCursor })).status).toBe("complete");
+    expect((await call({ ...args, cursor: first.nextCursor })).items).toEqual(retries[0].items);
+  });
+
+  test("handles cannot cross service roots or survive a backend restart", async () => {
+    await append("second", "second facts");
+    const args = { action: "list_items", limit: 1 } as const;
+    const first = await call(args);
+    const other = await createTestHistoryService();
+    try {
+      const config = createTestToolConfig(other.tempDir, { workspaceId });
+      config.historyService = other.historyService;
+      const result: unknown = await createSessionHistoryTool(config).execute!(
+        { ...args, cursor: first.nextCursor },
+        mockToolCallOptions
+      );
+      expect(result).toMatchObject({ success: false, error: "invalid_cursor" });
+    } finally {
+      await other.cleanup();
+    }
+    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+    config.historyService = new HistoryService(fixture.config);
+    expect(
+      await createSessionHistoryTool(config).execute!(
+        { ...args, cursor: first.nextCursor },
+        mockToolCallOptions
+      )
+    ).toMatchObject({ success: false, error: "invalid_cursor" });
+    expect(
+      await createSessionHistoryTool(config).execute!(args, mockToolCallOptions)
+    ).toMatchObject({
+      success: true,
+      items: first.items,
+    });
+  });
+
+  test("the tool requires the persistent HistoryService", () => {
+    const config = createTestToolConfig(fixture.tempDir, { workspaceId });
+    config.historyService = undefined;
+    expect(() => createSessionHistoryTool(config)).toThrow();
+  });
 });
 
 describe("session_history real disk recovery", () => {
@@ -1217,7 +1293,7 @@ describe("session_history real disk recovery", () => {
         const listed = await pages({ action: "list_windows", limit: 1 });
         if (tailLength > 1) {
           // The reverse scan reaches its row cap at the floor; its boundary
-          // metadata must survive the signed cursor before any browse row runs.
+          // metadata must survive the continuation before any browse row runs.
           expect(listed[0].windows).toEqual([]);
           expect(listed[0].nextCursor).toBeString();
         }
@@ -1254,6 +1330,7 @@ describe("session_history real disk recovery", () => {
     expect(first.items).toEqual([]);
     expect(first.nextCursor).toBeString();
     expect(first.exhausted).toBe(false);
+    expect(first.status).toBe("scanning");
     const all = await pages({ action: "search", query: "private-before-reset", window_id: "w:0" });
     expect(all.flatMap((page) => page.items ?? [])).toEqual([]);
     expect(all.at(-1)?.exhausted).toBe(true);
@@ -1262,23 +1339,12 @@ describe("session_history real disk recovery", () => {
         -1
       )?.error
     ).toBe("item_not_found");
-    const envelope = JSON.parse(Buffer.from(first.nextCursor!, "base64url").toString()) as {
-      data: string;
-      signature: string;
-    };
-    const forged = JSON.parse(envelope.data) as {
-      scan: { phase: string; artifact: string; byteOffset: number };
-    };
-    forged.scan.phase = "browse";
-    forged.scan.artifact = "archive";
-    forged.scan.byteOffset = 0;
-    envelope.data = JSON.stringify(forged);
     expect(
       (
         await call({
           action: "read_item",
           item_id: String(hidden.metadata!.historySequence),
-          cursor: Buffer.from(JSON.stringify(envelope)).toString("base64url"),
+          cursor: `${first.nextCursor!}forged`,
         })
       ).error
     ).toBe("invalid_cursor");

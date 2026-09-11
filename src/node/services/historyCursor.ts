@@ -1,9 +1,14 @@
 import {
   SESSION_HISTORY_MAX_ID_CHARS,
+  SESSION_HISTORY_CURSOR_MAX_ENTRIES,
+  SESSION_HISTORY_CURSOR_MAX_BYTES,
+  SESSION_HISTORY_CURSOR_TTL_MS,
   SESSION_HISTORY_RESET_PROBE_CHARS,
 } from "@/common/constants/contextBudget";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
+import assert from "node:assert";
+import { LRUCache } from "lru-cache";
 import { z } from "zod";
 
 /** IDs must fit tool inputs and their JSON/cursor envelopes without lossy aliases. */
@@ -91,53 +96,51 @@ export const HistoryScanStateSchema = z
   .strict();
 export type HistoryScanState = z.infer<typeof HistoryScanStateSchema>;
 
-const CursorSchema = z
-  .object({
-    version: z.literal(1),
-    workspaceId: z.string(),
-    action: z.enum(["list_windows", "list_items", "search", "read_item"]),
-    query: z.string(),
-    // null while a descendant read is still proving authorization in the caller's history.
-    scan: HistoryScanStateSchema.nullable(),
-    // Descendant reads: bounded scan of the caller's own post-floor history looking for the
-    // branch root's creation receipt. Present until proven; the proof is then carried as the
-    // finished scan so later pages can revalidate the caller snapshot (an appended manual
-    // reset expires it) before disclosing more target rows.
-    authorization: z
-      .object({ branchRoot: z.string(), scan: HistoryScanStateSchema, proven: z.boolean() })
-      .strict()
-      .nullable(),
-  })
-  .strict();
-export type HistoryCursor = z.infer<typeof CursorSchema>;
-// Authentication prevents a model from manufacturing a pre-reset byte offset.
-// A backend restart intentionally expires cursors; callers can restart their query.
-const cursorKey = randomBytes(32);
-export function encodeHistoryCursor(cursor: Omit<HistoryCursor, "version">): string {
-  const data = JSON.stringify({ version: 1, ...cursor });
-  const signature = createHmac("sha256", cursorKey).update(data).digest("hex");
-  return Buffer.from(JSON.stringify({ data, signature })).toString("base64url");
+export interface HistoryCursor {
+  workspaceId: string;
+  action: "list_windows" | "list_items" | "search" | "read_item";
+  query: string;
+  // null while a descendant read is still proving authorization in the caller's history.
+  scan: HistoryScanState | null;
+  // Keep the finished caller scan to revalidate its privacy floor on later target pages.
+  authorization: { branchRoot: string; scan: HistoryScanState; proven: boolean } | null;
 }
-export function decodeHistoryCursor(
-  value: string,
-  binding: Pick<HistoryCursor, "workspaceId" | "action" | "query">
-): Pick<HistoryCursor, "scan" | "authorization"> {
-  try {
-    const envelope = z
-      .object({ data: z.string(), signature: z.string().regex(/^[a-f0-9]{64}$/) })
-      .strict()
-      .parse(JSON.parse(Buffer.from(value, "base64url").toString("utf8")));
-    const expected = createHmac("sha256", cursorKey).update(envelope.data).digest();
-    if (!timingSafeEqual(expected, Buffer.from(envelope.signature, "hex"))) throw new Error();
-    const cursor = CursorSchema.parse(JSON.parse(envelope.data));
+
+/** Backend-owned continuations avoid asking models to copy serialized scan state.
+ * Each HistoryService owns a separate store; restart/eviction requires a fresh query.
+ * Possession never replaces caller binding or the scanner's privacy revalidation.
+ */
+export class HistoryCursorStore {
+  private readonly entries = new LRUCache<string, HistoryCursor>({
+    max: SESSION_HISTORY_CURSOR_MAX_ENTRIES,
+    maxSize: SESSION_HISTORY_CURSOR_MAX_BYTES,
+    ttl: SESSION_HISTORY_CURSOR_TTL_MS,
+    // Lazy expiry only: even the clock cache must not schedule a timer.
+    ttlResolution: 0,
+  });
+
+  save(cursor: HistoryCursor): string {
+    const saved = structuredClone(cursor);
+    const size = Buffer.byteLength(JSON.stringify(saved));
+    assert(size <= SESSION_HISTORY_CURSOR_MAX_BYTES, "history continuation exceeds metadata quota");
+    const token = `hc1_${randomBytes(16).toString("base64url")}`;
+    this.entries.set(token, saved, { size });
+    return token;
+  }
+
+  load(
+    token: string,
+    binding: Pick<HistoryCursor, "workspaceId" | "action" | "query">
+  ): Pick<HistoryCursor, "scan" | "authorization"> {
+    const cursor = this.entries.get(token);
     if (
+      !cursor ||
       cursor.workspaceId !== binding.workspaceId ||
       cursor.action !== binding.action ||
       cursor.query !== binding.query
     )
-      throw new Error();
-    return { scan: cursor.scan, authorization: cursor.authorization };
-  } catch {
-    throw new Error("invalid_cursor");
+      throw new Error("invalid_cursor");
+    // Retries (including concurrent calls) must start at the same immutable position.
+    return structuredClone({ scan: cursor.scan, authorization: cursor.authorization });
   }
 }

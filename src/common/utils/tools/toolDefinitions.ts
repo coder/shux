@@ -2437,9 +2437,9 @@ export const TOOL_DEFINITIONS = {
       "task_id (a task ID returned by task/task_list) reads the retained history of a descendant sub-agent this workspace spawned since its latest manual reset (the spawn must be in an already settled turn: a child created in the current turn becomes readable once the turn ends); unknown, unauthorized or pre-reset IDs return task_not_found, and a descendant whose session files were removed returns session_unavailable. " +
       "Pass a returned itemId as item_id and windowId as window_id; read_item accepts offset_chars (zero-based UTF-16 units) and limit_chars. " +
       "Offsets inside a surrogate pair round back; pages preserve whole pairs, so a one-unit limit may return two units. " +
-      "Bounded scans may return empty progress pages: while exhausted is false, repeat the same action/query with nextCursor as cursor. " +
+      "Successful status is scanning (no entries yet), partial (entries with work remaining), or complete. Empty scanning pages are progress, not absence: while exhausted is false, repeat the same action/query with the short nextCursor as cursor. " +
       "exhausted describes scan completion; continue character paging with nextCharOffset as offset_chars. skipped_oversized_rows counts oversized rows encountered in this scan page. " +
-      "On stale_cursor restart without a cursor. Window IDs are w:<sequence>, w:0 (root), or w:m:<legacy message id>. " +
+      "On stale_cursor or invalid_cursor restart without a cursor; handles may expire or be lost after a backend restart. Window IDs are w:<sequence>, w:0 (root), or w:m:<legacy message id>. " +
       "Item IDs are opaque exact-row references; sequence or m:<legacy message id> inputs remain legacy aliases. Search again if a rewrite or rotation invalidates a row reference.",
     schema: z
       .object({
@@ -2465,6 +2465,8 @@ export const TOOL_DEFINITIONS = {
       .strict(),
     resultSchema: z.object({
       success: z.boolean(),
+      // Older recorded results predate explicit scan progress.
+      status: z.enum(["scanning", "partial", "complete"]).optional(),
       exhausted: z.boolean(),
       skipped_oversized_rows: z.number().int().nonnegative(),
       error: z.string().optional(),

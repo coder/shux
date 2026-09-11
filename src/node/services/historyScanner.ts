@@ -463,6 +463,9 @@ export interface BoundedHistoryRow {
 }
 export interface BoundedHistoryScanOptions {
   cursor?: HistoryScanState;
+  abortSignal?: AbortSignal;
+  /** Absolute performance.now() deadline, shared across composite scans; cleanup is not timed out. */
+  deadline?: number;
   /**
    * Visit rows newest-first. Attribution stays exact: each window span is
    * discovered backwards to its boundary row before any of its rows are
@@ -492,6 +495,11 @@ export async function scanHistoryFilesBounded(
   maxRows = SESSION_HISTORY_MAX_SCAN_ROWS
 ): Promise<BoundedHistoryScanResult> {
   assert(maxBytes >= 0 && maxRows >= 0, "history scan budgets must be non-negative");
+  const interrupted = () => {
+    options.abortSignal?.throwIfAborted();
+    return options.deadline != null && performance.now() >= options.deadline;
+  };
+  options.abortSignal?.throwIfAborted();
   const result: BoundedHistoryScanResult = {
     bytesRead: 0,
     rowsScanned: 0,
@@ -509,7 +517,9 @@ export async function scanHistoryFilesBounded(
   try {
     for (const artifact of ["chat", "archive"] as const) {
       try {
+        options.abortSignal?.throwIfAborted();
         handles.set(artifact, await fs.open(paths[artifact], "r"));
+        options.abortSignal?.throwIfAborted();
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
@@ -529,15 +539,18 @@ export async function scanHistoryFilesBounded(
         if (historyFileStamp(current) !== initialStamps.get(artifact))
           throw new Error("stale_cursor");
       }
+      options.abortSignal?.throwIfAborted();
       return result;
     };
     const read = async (artifact: HistoryArtifact, start: number, length: number) => {
+      options.abortSignal?.throwIfAborted();
       assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
         ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
         : 0;
       result.bytesRead += bytesRead;
+      options.abortSignal?.throwIfAborted();
       return buffer.subarray(0, bytesRead);
     };
     const snapshot = async (
@@ -654,12 +667,13 @@ export async function scanHistoryFilesBounded(
         possibleReset: position.possibleReset,
       };
       const deliver = (edge: number): boolean => {
+        options.abortSignal?.throwIfAborted();
         const start = reverse ? edge : rowEdge;
         const finish = reverse ? (position.oversizedRowEnd ?? rowEdge) : edge;
         if (size === 0 && !skipping) {
           rowEdge = edge;
           position.byteOffset = edge;
-          return true;
+          return !interrupted();
         }
         result.rowsScanned++;
         let message: MuxMessage | null = null;
@@ -686,12 +700,15 @@ export async function scanHistoryFilesBounded(
         position.byteOffset = edge;
         position.skippingOversized = false;
         position.oversizedRowEnd = null;
-        return true;
+        // Row disclosure and its offset commit are atomic with respect to the deadline.
+        // Returning before this commit would repeat a delivered row on the next page.
+        return !interrupted();
       };
       while (
         (reverse ? cursor > lower : cursor < end) &&
         remaining() > 0 &&
-        result.rowsScanned < maxRows
+        result.rowsScanned < maxRows &&
+        !interrupted()
       ) {
         const length = Math.min(
           SESSION_HISTORY_SCAN_CHUNK_BYTES,
@@ -701,6 +718,9 @@ export async function scanHistoryFilesBounded(
         const start = reverse ? cursor - length : cursor;
         const chunk = await read(artifact, start, length);
         if (chunk.length !== length) throw new Error("stale_cursor");
+        // Leave an unprocessed chunk out of the saved position/probe, just like byte
+        // exhaustion. Ordinary partial rows rewind; oversized probes retain progress.
+        if (interrupted()) break;
         let segmentEdge = reverse ? chunk.length : 0;
         const add = (segment: Buffer) => {
           addHistoryResetProbe(probe, segment, reverse);
@@ -942,7 +962,12 @@ export async function scanHistoryFilesBounded(
       state.phase = "probe";
       return true;
     };
-    while (state.phase !== "done" && remaining() > 0 && result.rowsScanned < maxRows) {
+    while (
+      state.phase !== "done" &&
+      remaining() > 0 &&
+      result.rowsScanned < maxRows &&
+      !interrupted()
+    ) {
       if (state.phase === "probe") {
         if (!(await probePage())) break;
         continue;
