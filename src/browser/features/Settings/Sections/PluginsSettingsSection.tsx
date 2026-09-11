@@ -250,6 +250,7 @@ const ManageComponentsPanel: React.FC<{
     setSaved(false);
     let confirmed = false;
     let responseLost = false;
+    let savedImports: AgentPluginImportedComponents | null = selected;
     let warning: string | undefined;
     try {
       const result = await api.agentPlugins
@@ -267,7 +268,7 @@ const ManageComponentsPanel: React.FC<{
       if (!result.success) throw new Error(result.error);
       confirmed = true;
       warning = result.cleanupWarning;
-      setSaved(true);
+      savedImports = result.data.importedComponents ?? null;
       publishAgentPluginsMutated();
     } catch (err) {
       setError(getErrorMessage(err));
@@ -280,8 +281,9 @@ const ManageComponentsPanel: React.FC<{
         current.data.lockedSha === inventory.lockedSha &&
         current.data.contentHash === inventory.contentHash;
       if (
-        confirmed ||
-        (responseLost && sameTree && sameImports(current.data.importedComponents ?? null, selected))
+        (confirmed || responseLost) &&
+        sameTree &&
+        sameImports(current.data.importedComponents ?? null, savedImports)
       ) {
         setInventory(current.data);
         setSelected(effectiveImports(current.data));
@@ -290,9 +292,11 @@ const ManageComponentsPanel: React.FC<{
         if (!confirmed) publishAgentPluginsMutated();
         await props.onSaved();
       } else if (
+        confirmed ||
         !sameTree ||
         !sameImports(current.data.importedComponents ?? null, inventory.importedComponents ?? null)
       ) {
+        setSaved(false);
         setInventory(current.data);
         setSelected(effectiveImports(current.data));
         setError(
@@ -307,9 +311,9 @@ const ManageComponentsPanel: React.FC<{
           ? `Components saved, but refreshing failed: ${getErrorMessage(err)}. Reopen to read the saved selection.`
           : `Could not confirm the saved selection: ${getErrorMessage(err)}. Reopen to refresh before retrying.`
       );
-      if (responseLost) {
-        // The write may have committed even when both responses are unavailable.
-        publishAgentPluginsMutated();
+      if (confirmed || responseLost) {
+        // Refresh counts for acknowledged or possible writes even without an inventory receipt.
+        if (!confirmed) publishAgentPluginsMutated();
         await props.onSaved();
       }
     } finally {
