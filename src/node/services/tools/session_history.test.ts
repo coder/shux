@@ -37,6 +37,7 @@ import {
 } from "./session_history";
 
 let fixture: Awaited<ReturnType<typeof createTestHistoryService>>;
+let restoreScanBudget: () => void;
 const workspaceId = "history-browser";
 let chatPath: string;
 let archivePath: string;
@@ -110,6 +111,21 @@ const rollover: MuxMetadata = {
 
 beforeEach(async () => {
   fixture = await createTestHistoryService();
+  // Keep the privacy/race fixtures small while exercising the real scanner. Clamp the
+  // shared object so descendant authorization still subtracts from the same page budget.
+  // Production-budget acceptance lives in session_history.budget.test.ts.
+  const scan = fixture.historyService.scanHistoryBoundedUnderLocks.bind(fixture.historyService);
+  const budgetSpy = spyOn(
+    fixture.historyService,
+    "scanHistoryBoundedUnderLocks"
+  ).mockImplementation((workspace, options) => {
+    if (options.budget) {
+      options.budget.maxBytes = Math.min(options.budget.maxBytes, SESSION_HISTORY_MAX_SCAN_BYTES);
+      options.budget.maxRows = Math.min(options.budget.maxRows, SESSION_HISTORY_MAX_SCAN_ROWS);
+    }
+    return scan(workspace, options);
+  });
+  restoreScanBudget = () => budgetSpy.mockRestore();
   chatPath = path.join(fixture.config.sessionsDir, workspaceId, "chat.jsonl");
   archivePath = path.join(fixture.config.sessionsDir, workspaceId, "chat-archive.jsonl");
   call = async (input, workspace = workspaceId) => {
@@ -123,6 +139,7 @@ beforeEach(async () => {
   await append("first", "opening facts");
 });
 afterEach(async () => {
+  restoreScanBudget();
   await fixture.cleanup();
 });
 

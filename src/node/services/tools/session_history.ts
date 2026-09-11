@@ -8,9 +8,10 @@ import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { HISTORY_PROVENANCE_MAX_RECEIPT_BYTES } from "@/node/services/historyAppendProvenance";
 import {
-  SESSION_HISTORY_MAX_SCAN_BYTES,
-  SESSION_HISTORY_MAX_SCAN_ROWS,
+  SESSION_HISTORY_TOOL_MAX_SCAN_BYTES,
+  SESSION_HISTORY_TOOL_MAX_SCAN_ROWS,
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
+  SESSION_HISTORY_SCAN_DEADLINE_MS,
   SESSION_HISTORY_DEFAULT_LIMIT,
   SESSION_HISTORY_RESULT_ENVELOPE_BYTES,
   SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES,
@@ -178,7 +179,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
   return tool({
     description: TOOL_DEFINITIONS.session_history.description,
     inputSchema: TOOL_DEFINITIONS.session_history.schema,
-    execute: async (input): Promise<SessionHistoryResult> => {
+    execute: async (input, { abortSignal }): Promise<SessionHistoryResult> => {
+      abortSignal?.throwIfAborted();
+      // One cooperative deadline covers caller authorization, target discovery and delivery.
+      const deadline = performance.now() + SESSION_HISTORY_SCAN_DEADLINE_MS;
       const args = TOOL_DEFINITIONS.session_history.schema.parse(input);
       if (args.action === "search" && !args.query)
         return {
@@ -224,6 +228,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               .resolveDescendantAgentTaskBranchRoot(workspaceId, target)
               .catch(() => ({ status: "unrelated" as const }))
           : { status: "unrelated" as const };
+        abortSignal?.throwIfAborted();
         if (relation.status !== "live")
           return {
             success: false,
@@ -292,8 +297,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         const cursor = args.cursor != null ? history.cursors.load(args.cursor, binding) : undefined;
         // One page budget is shared by the authorization scan and the target scan.
         const budget = {
-          maxBytes: SESSION_HISTORY_MAX_SCAN_BYTES,
-          maxRows: SESSION_HISTORY_MAX_SCAN_ROWS,
+          maxBytes: SESSION_HISTORY_TOOL_MAX_SCAN_BYTES,
+          maxRows: SESSION_HISTORY_TOOL_MAX_SCAN_ROWS,
         };
         let authorization = cursor?.authorization ?? null;
         if (branchRoot !== null) {
@@ -310,6 +315,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             let found = authorization?.proven === true;
             const auth = await history.scanHistoryBoundedUnderLocks(workspaceId, {
               cursor: authorization?.scan,
+              abortSignal,
+              deadline,
               budget,
               visit: ({ message }) => {
                 if (found || !createsTask(message, branchRoot)) return true;
@@ -362,7 +369,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           if (
             budget.maxBytes <=
               2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES + SESSION_HISTORY_SCAN_CHUNK_BYTES ||
-            budget.maxRows <= 0
+            budget.maxRows <= 0 ||
+            performance.now() >= deadline
           ) {
             result.exhausted = false;
             result.nextCursor = history.cursors.save({
@@ -376,6 +384,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         const scan = await history.scanHistoryBounded(target, {
           cursor: cursor?.scan ?? undefined,
           recentFirst: args.recent_first === true,
+          abortSignal,
+          deadline,
           requireExistingHistory: foreign,
           budget,
           visit: ({ message, itemId, windowId, windowBoundaryKind, startsWindow }) => {
@@ -479,8 +489,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       };
       try {
         const response = foreign
-          ? await history.withHistoryScanLocks(workspaceId, run)
+          ? await history.withHistoryScanLocks(workspaceId, run, abortSignal)
           : await run();
+        abortSignal?.throwIfAborted();
         if (response.success)
           response.status = response.exhausted
             ? "complete"
@@ -493,6 +504,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         );
         return response;
       } catch (error) {
+        abortSignal?.throwIfAborted();
         const message = error instanceof Error ? error.message : "history_unavailable";
         return {
           success: false,

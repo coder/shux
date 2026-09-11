@@ -40,6 +40,11 @@ export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;
 export const SESSION_HISTORY_MAX_SCAN_BYTES = 2 * 1024 * 1024;
 export const SESSION_HISTORY_MAX_SCAN_ROWS = 500;
+// Recovery tools can traverse a typical rollover archive in one call without
+// increasing the lower-level scanner's default work allowance.
+export const SESSION_HISTORY_TOOL_MAX_SCAN_BYTES = 32 * 1024 * 1024;
+export const SESSION_HISTORY_TOOL_MAX_SCAN_ROWS = 10_000;
+export const SESSION_HISTORY_SCAN_DEADLINE_MS = 2_000;
 export const SESSION_HISTORY_MAX_LINE_BYTES = 1024 * 1024;
 export const SESSION_HISTORY_DEFAULT_LIMIT = 10;
 export const SESSION_HISTORY_MAX_SEARCH_LIMIT = 25;
@@ -54,7 +59,9 @@ export const SESSION_HISTORY_CURSOR_MAX_BYTES = 8 * 1024 * 1024;
 export const SESSION_HISTORY_CURSOR_TTL_MS = 30 * 60 * 1000;
 export const SESSION_HISTORY_MAX_QUERY_CHARS = 1024;
 export const SESSION_HISTORY_MAX_ID_CHARS = 1024;
-export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 10 * 1024;
+// IDs and escaped payloads are counted while staging rows. The remaining fields
+// (26-character handle, status, counters and character offsets) fit within 512 bytes.
+export const SESSION_HISTORY_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_READ_RESULT_ENVELOPE_BYTES = 512;
 export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 // Compact JSON marker; the bounded scanner ignores JSON whitespace around it.

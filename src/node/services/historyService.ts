@@ -330,11 +330,28 @@ export class HistoryService {
    * Nested scans inside `operation` must target DESCENDANT workspaces only, so lock order
    * always follows the task tree and cannot deadlock with another caller's composite read.
    */
-  withHistoryScanLocks<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+  async withHistoryScanLocks<T>(
+    workspaceId: string,
+    operation: () => Promise<T>,
+    abortSignal?: AbortSignal
+  ): Promise<T> {
     assert(workspaceId.trim().length > 0, "history scan locks require workspaceId");
-    return this.fileLocks.withLock(workspaceId, () =>
-      this.withHistoryWriteFileLock(workspaceId, () => operation())
-    );
+    abortSignal?.throwIfAborted();
+    try {
+      return await this.fileLocks.withLock(workspaceId, () => {
+        abortSignal?.throwIfAborted();
+        return this.withHistoryWriteFileLock(workspaceId, async () => {
+          // Acquisition itself may wait; never start a scan after a cancelled wait.
+          abortSignal?.throwIfAborted();
+          const result = await operation();
+          abortSignal?.throwIfAborted();
+          return result;
+        });
+      });
+    } catch (error) {
+      abortSignal?.throwIfAborted();
+      throw error;
+    }
   }
 
   /** One bounded page under both history locks; never performs mutation recovery. */
@@ -342,8 +359,10 @@ export class HistoryService {
     workspaceId: string,
     options: Parameters<HistoryService["scanHistoryBoundedUnderLocks"]>[1]
   ) {
-    return this.withHistoryScanLocks(workspaceId, () =>
-      this.scanHistoryBoundedUnderLocks(workspaceId, options)
+    return this.withHistoryScanLocks(
+      workspaceId,
+      () => this.scanHistoryBoundedUnderLocks(workspaceId, options),
+      options.abortSignal
     );
   }
 
@@ -363,6 +382,7 @@ export class HistoryService {
     }
   ) {
     assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
+    options.abortSignal?.throwIfAborted();
     {
       {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
@@ -402,7 +422,9 @@ export class HistoryService {
         };
         await assertNoTruncate();
         const provenance = this.getAppendProvenance(workspaceId);
+        options.abortSignal?.throwIfAborted();
         const { receipt, bytesRead } = await provenance.forScan(options.cursor?.provenanceEpoch);
+        options.abortSignal?.throwIfAborted();
         const result = await scanHistoryFilesBounded(
           {
             chat: this.getChatHistoryPath(workspaceId),
@@ -419,6 +441,7 @@ export class HistoryService {
         );
         result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
         await assertNoTruncate();
+        options.abortSignal?.throwIfAborted();
         return result;
       }
     }
