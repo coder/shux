@@ -67,7 +67,11 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import {
+  MCP_OVERRIDES_READ_TIMEOUT_MS,
+  readWorkspaceOverridesEpochToken,
+  WorkspaceMcpOverridesService,
+} from "@/node/services/workspaceMcpOverridesService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { StoresFromCoreOptionsLive } from "./stores";
@@ -123,10 +127,20 @@ export const MemoryMetaLive: Layer.Layer<MemoryMeta, never, ConfigTag> = Layer.e
 export const WorkspaceMcpOverridesDefaultLive: Layer.Layer<
   WorkspaceMcpOverrides,
   never,
-  ConfigTag
+  ConfigTag | CoreOptionsTag
 > = Layer.effect(
   WorkspaceMcpOverrides,
-  Effect.map(ConfigTag, (config) => new WorkspaceMcpOverridesService(config))
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    const opts = yield* CoreOptionsTag;
+    // The override epoch and writer locks must live where a sibling backend
+    // looks for them: `xum run` registers under a disposable root while its
+    // MCP configuration (and the desktop/server backend's) is the persistent
+    // home, so coordinate under the latter.
+    return new WorkspaceMcpOverridesService(config, {
+      coordinationRootDir: (opts.mcpConfig ?? config).rootDir,
+    });
+  })
 );
 
 // ---------------------------------------------------------------------------
@@ -360,8 +374,24 @@ export const MCPServerManagerLive = Layer.effect(
         pluginInvalidation: {
           keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
           readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
-          readWorkspaceOverrides: async (workspaceId: string) =>
-            (await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)).overrides,
+          // Bounded/cancellable like the send path's own read: a distrusted or
+          // cold serve re-reads through here, and an unreachable SSH/Docker
+          // parent must not pin the send for the remote command timeout.
+          readWorkspaceOverrides: async (workspaceId, options) => {
+            const read = await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+              timeoutMs: options?.timeoutMs ?? MCP_OVERRIDES_READ_TIMEOUT_MS,
+              ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+            });
+            // undefined = not disk-authoritative; the manager keeps its fallbacks.
+            return read.authoritative ? read.overrides : undefined;
+          },
+          // A sibling backend's override save/prune bumps this; the manager
+          // refreshes or evicts its cached snapshots on the next serve.
+          readOverridesEpoch: () => readWorkspaceOverridesEpochToken(mcpConfig.rootDir),
+          // Served tool calls fence their dispatch against sibling-process
+          // override writes with the writer's own lock.
+          acquireOverridesLock: (options) =>
+            workspaceMcpOverridesService.acquireExclusiveLock(options),
         },
         ...opts.mcpServerManagerOptions,
       },

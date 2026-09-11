@@ -26,6 +26,7 @@ import {
   type HistoryScanState,
   type HistorySnapshot,
 } from "./historyCursor";
+import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
 const resetTokenPattern = new RegExp(
@@ -197,9 +198,13 @@ function historyFileStamp(
   return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "missing";
 }
 
+interface LocatedHistoryBoundary {
+  offset: number;
+  boundary: Exclude<PendingBoundary, { kind: "none" }>;
+}
 type ProviderHistoryStart =
-  | { kind: "start"; offset: number }
-  | { kind: "exhausted"; oldestBoundary: number | null; boundaryCount: number };
+  | ({ kind: "start" } & LocatedHistoryBoundary)
+  | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number };
 
 /** Provider-only location: bound row/probe carryover, not the amount of context scanned. */
 async function findProviderHistoryStart(
@@ -213,7 +218,7 @@ async function findProviderHistoryStart(
   let size = 0;
   let rowEnd = fileSize;
   let unreadableRunEnd: number | null = null;
-  let oldestBoundary: number | null = null;
+  let oldestBoundary: LocatedHistoryBoundary | null = null;
   let boundaryCount = 0;
   const add = (bytes: Buffer) => {
     addHistoryResetProbe(probe, bytes, true);
@@ -221,7 +226,7 @@ async function findProviderHistoryStart(
     if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
     else parts = [];
   };
-  const deliver = (start: number): number | null => {
+  const deliver = (start: number): LocatedHistoryBoundary | null => {
     if (size === 0) {
       rowEnd = start;
       return null;
@@ -236,14 +241,20 @@ async function findProviderHistoryStart(
     if (isManualHistoryReset(message, probe.possibleReset)) {
       // Retain readable reset markers, but never count them as skippable boundaries.
       // Deletion also needs readable malformed-role floors that provider requests exclude.
-      if (durableBoundary || (includeReadableResetFloor && message)) return start;
+      if (durableBoundary || (includeReadableResetFloor && message))
+        return {
+          offset: start,
+          boundary: durableBoundary
+            ? { kind: "identified", messageId: message.id }
+            : { kind: "unreadable-reset" },
+        };
       // A fragmented marker may end several rows to the right of the key that
       // completed recognition. Never return any of that unreadable evidence.
-      return unreadableRunEnd ?? rowEnd;
+      return { offset: unreadableRunEnd ?? rowEnd, boundary: { kind: "unreadable-reset" } };
     }
     if (durableBoundary) {
-      oldestBoundary = start;
-      if (boundaryCount++ === skip) return start;
+      oldestBoundary = { offset: start, boundary: { kind: "identified", messageId: message.id } };
+      if (boundaryCount++ === skip) return oldestBoundary;
     }
     if (message) {
       probe.resetProbe = "";
@@ -264,26 +275,26 @@ async function findProviderHistoryStart(
     for (let i = chunk.length - 1; i >= 0; i--) {
       if (chunk[i] !== 10) continue;
       add(chunk.subarray(i + 1, edge));
-      const offset = deliver(start + i + 1);
-      if (offset !== null) return { kind: "start", offset };
+      const location = deliver(start + i + 1);
+      if (location !== null) return { kind: "start", ...location };
       edge = i;
     }
     add(chunk.subarray(0, edge));
     end = start;
   }
-  const offset = deliver(0);
-  return offset === null
+  const location = deliver(0);
+  return location === null
     ? { kind: "exhausted", oldestBoundary, boundaryCount }
-    : { kind: "start", offset };
+    : { kind: "start", ...location };
 }
 
 /** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
 async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
-  project: (value: unknown) => Row | null,
+  project?: (value: unknown) => Row | null,
   includeReadableResetFloor = false
-): Promise<Row[]> {
+): Promise<{ messages: Row[]; boundary: PendingBoundary }> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
   try {
@@ -311,7 +322,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     };
     const readTail = async (artifact: HistoryArtifact, offset: number): Promise<Row[]> => {
       const file = files.get(artifact);
-      if (!file) return [];
+      if (!file || !project) return [];
       assert(offset >= 0 && offset <= file.size, "provider start must be within its snapshot");
       const buffer = Buffer.alloc(file.size - offset);
       const read = await file.handle.read(buffer, 0, buffer.length, offset);
@@ -330,20 +341,23 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     };
     const chat = await locate("chat", skip);
     let messages: Row[];
-    if (chat.kind === "start") messages = await readTail("chat", chat.offset);
-    else {
+    let boundary: PendingBoundary = { kind: "none" };
+    if (chat.kind === "start") {
+      boundary = chat.boundary;
+      messages = await readTail("chat", chat.offset);
+    } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
       if (archive.kind === "start" || archive.oldestBoundary !== null) {
+        const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
+        boundary = location.boundary;
         messages = [
-          ...(await readTail(
-            "archive",
-            archive.kind === "start" ? archive.offset : archive.oldestBoundary!
-          )),
+          ...(await readTail("archive", location.offset)),
           ...(await readTail("chat", 0)),
         ];
-      } else if (chat.oldestBoundary !== null)
-        messages = await readTail("chat", chat.oldestBoundary);
-      else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
+      } else if (chat.oldestBoundary !== null) {
+        boundary = chat.oldestBoundary.boundary;
+        messages = await readTail("chat", chat.oldestBoundary.offset);
+      } else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
     }
     // Foreign writers can replace either pathname while these descriptors stay
     // open. Never release provider rows assembled from an obsolete raw offset.
@@ -356,7 +370,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
         throw new Error("History changed during provider read");
       }
     }
-    return messages;
+    return { messages, boundary };
   } finally {
     await Promise.all([...files.values()].map((file) => file.handle.close()));
   }
@@ -375,7 +389,16 @@ export function readProviderHistoryFromLatestBoundary(
     skip,
     (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
     options?.includeReadableResetFloor
-  );
+  ).then((view) => view.messages);
+}
+
+/** Inactive pending-state evidence from the same raw locator and snapshot verification as reads. */
+export async function readCompactionPendingHistoryBoundary(
+  paths: Record<HistoryArtifact, string>
+): Promise<PendingBoundary> {
+  // Known absence requires exhausting BOTH files; an unreadable reset never becomes absence.
+  // No row projection is needed, so the verified location does not re-read the active tail.
+  return (await readHistoryProjectionFromLatestBoundary(paths, 0)).boundary;
 }
 
 /** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
@@ -398,7 +421,7 @@ export function readHistoryControlEvidenceFromLatestBoundary(
       role: row.role,
       ...(isPlainObject(row.metadata) ? { metadata: row.metadata } : {}),
     });
-  });
+  }).then((view) => view.messages);
 }
 
 export interface BoundedHistoryRow {

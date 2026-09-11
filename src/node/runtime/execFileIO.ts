@@ -176,8 +176,11 @@ export async function ensureDirViaExec(
   }
 }
 
-// -L follows symlinks so symlinked paths report the target's type.
-export const STAT_VIA_EXEC_COMMAND = "stat -L -c '%s %Y %F'";
+// -L follows symlinks so symlinked paths report the target's type. LC_ALL=C
+// pins stat(1)'s diagnostics to English: callers classify "No such file or
+// directory" from stderr (workspace MCP override probes), which a localized
+// remote host would otherwise render unrecognizable.
+export const STAT_VIA_EXEC_COMMAND = "LC_ALL=C stat -L -c '%s %Y %F'";
 
 /**
  * Get file statistics via exec; parses STAT_VIA_EXEC_COMMAND output.

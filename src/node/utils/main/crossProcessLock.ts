@@ -40,6 +40,14 @@ export interface CrossProcessLockOptions {
   staleMs: number;
   /** Error message thrown when the acquire timeout elapses. */
   timeoutMessage: string;
+  /**
+   * Abort waiting for a live holder. Checked before every attempt and wakes
+   * the inter-attempt sleep, so a caller whose own operation ended (a tool
+   * call interrupted with Escape) stops polling immediately instead of
+   * occupying its place in an in-process queue until `acquireTimeoutMs`.
+   * Never interrupts an acquisition that already succeeded.
+   */
+  signal?: AbortSignal;
 }
 
 export interface LockHolder {
@@ -102,8 +110,23 @@ function holderAlive(holder: LockHolder, staleMs: number): boolean {
   }
 }
 
-function sleepWithJitter(baseMs: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, baseMs + Math.floor(Math.random() * baseMs)));
+function sleepWithJitter(baseMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const delay = baseMs + Math.floor(Math.random() * baseMs);
+    if (signal === undefined) {
+      setTimeout(resolve, delay);
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delay);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -286,9 +309,14 @@ export async function reclaimStaleLock(
 export async function acquireCrossProcessLock(
   options: CrossProcessLockOptions
 ): Promise<() => Promise<void>> {
-  const { lockPath, acquireTimeoutMs, staleMs, timeoutMessage } = options;
+  const { lockPath, acquireTimeoutMs, staleMs, timeoutMessage, signal } = options;
   await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + acquireTimeoutMs;
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw new Error("Lock acquisition was aborted");
+    }
+  };
 
   // LEASE RENEWAL: `acquiredAt` is a renewable lease timestamp, not a birth
   // time. A LIVE transaction legitimately exceeding staleMs (e.g. a plugin
@@ -407,6 +435,7 @@ export async function acquireCrossProcessLock(
   };
 
   for (;;) {
+    throwIfAborted();
     const token = randomBytes(16).toString("hex");
     // Publish atomically WITH content: write the holder record to a temp
     // file, hard-link it into place (exclusive: EEXIST when the path
@@ -442,9 +471,12 @@ export async function acquireCrossProcessLock(
     } finally {
       await fsPromises.rm(publishPath, { force: true }).catch(() => undefined);
     }
-    if (Date.now() > deadline) {
+    // `>=`: a zero timeout is a try-lock (batch acquirers release earlier
+    // locks immediately on contention) and must reject without sleeping even
+    // when the failed attempt completed within the deadline's millisecond.
+    if (Date.now() >= deadline) {
       throw new Error(timeoutMessage);
     }
-    await sleepWithJitter(250);
+    await sleepWithJitter(250, signal);
   }
 }

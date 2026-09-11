@@ -1,10 +1,7 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundBashStateKnown } from "@/browser/stores/BackgroundBashStore";
-import {
-  useSessionUsageKnown,
-  useWorkspaceActivityHydrated,
-} from "@/browser/stores/WorkspaceStore";
+import { useSessionUsageKnown } from "@/browser/stores/WorkspaceStore";
 import { useProvidersConfigLoaded } from "@/browser/stores/ProvidersConfigStore";
 import {
   ensureAdditionalSystemContextHydrated,
@@ -46,7 +43,6 @@ export function useChatViewDataReady(workspaceId: string): boolean {
   // this barrier after reveal. Subscribing also starts/keeps the underlying
   // backend subscription where applicable (background bashes).
   const backgroundBashKnown = useBackgroundBashStateKnown(workspaceId);
-  const activityHydrated = useWorkspaceActivityHydrated();
   const providersConfigLoaded = useProvidersConfigLoaded();
   const sessionUsageKnown = useSessionUsageKnown(workspaceId);
   const instructionsHydrated = useAdditionalSystemContextHydrated(workspaceId);
@@ -60,12 +56,10 @@ export function useChatViewDataReady(workspaceId: string): boolean {
     }
   }, [api, workspaceId]);
 
+  // Shared-checkout warnings are intentionally gone; cross-workspace activity no longer
+  // affects the composer layout and must not delay first paint when its subscription stalls.
   const allKnown =
-    backgroundBashKnown &&
-    activityHydrated &&
-    providersConfigLoaded &&
-    sessionUsageKnown &&
-    instructionsHydrated;
+    backgroundBashKnown && providersConfigLoaded && sessionUsageKnown && instructionsHydrated;
 
   // Resilience deadline: every source self-heals on *error*, but a hung
   // backend (no response, no rejection) has no deterministic failure signal —

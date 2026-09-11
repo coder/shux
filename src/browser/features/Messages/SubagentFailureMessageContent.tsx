@@ -6,6 +6,7 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
   // A superseded turn stops reporting, but its workspace keeps running under the new input.
   // Present that handoff without the alarming failure protocol or a misleading workspace error.
   const isSuperseded = props.failure.errorType === "workspace_turn_superseded";
+  const isIncomplete = props.failure.errorType === "workspace_turn_incomplete";
   const StatusIcon = isSuperseded ? ArrowRightLeft : CircleAlert;
   const metadata = [
     ["Task ID", props.failure.taskId],
@@ -23,7 +24,11 @@ export function SubagentFailureMessageContent(props: { failure: SubagentFailureE
       <div className="min-w-0 flex-1 text-sm text-[var(--color-user-text)]">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
           <span className="font-medium">
-            {isSuperseded ? "New input took over" : "Subagent task failed"}
+            {isSuperseded
+              ? "New input took over"
+              : isIncomplete
+                ? "Workspace turn incomplete"
+                : "Subagent task failed"}
           </span>
           <span className="text-muted text-xs [overflow-wrap:anywhere]">
             {props.failure.agentType}

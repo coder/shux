@@ -1,3 +1,4 @@
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
@@ -5815,6 +5816,7 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         onStepSettled: (step) => this.onContextBudgetStepSettled(step),
@@ -7723,6 +7725,7 @@ export class AgentSession {
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         strictAgentResolution: options?.strictAgentResolution,
         hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        getQueuedInputStopCause: this.getQueuedInputStopCause.bind(this),
         contextBudgetRolloverAvailable:
           this.isTokenBudgetActive(options) && this.compactionMonitor.getThreshold() < 1,
         requestAssemblySnapshot: requestAssemblySnapshot ?? resumedFlushSnapshot,
@@ -9600,6 +9603,21 @@ export class AgentSession {
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
+  }
+
+  getQueuedInputStopCause(): QueuedInputStopCause | undefined {
+    const candidate = this.messageQueue.getNextQueueCutCandidate();
+    if (candidate?.dispatchMode !== "tool-end") return undefined;
+    return {
+      kind: "queued-input",
+      entryId: candidate.entryId,
+      // Monitor wakes acquire this execution correlation when they dispatch.
+      muxMetadata: structuredClone(
+        this.messageQueue.isNextEntryBashMonitorWake()
+          ? (this.activeStreamContext?.workspaceTurnMetadata ?? candidate.muxMetadata)
+          : candidate.muxMetadata
+      ),
+    };
   }
 
   /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */

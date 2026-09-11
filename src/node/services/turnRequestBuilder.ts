@@ -1,3 +1,4 @@
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
@@ -106,7 +107,7 @@ import {
   resolveCoderWireCanonicalModel,
 } from "@/common/constants/coderOAuth";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { MCPServerMap, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
@@ -122,14 +123,21 @@ import {
   customProviderWireOrigin,
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
-import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
+import {
+  workspaceOverridesEqual,
+  type MCPServerManager,
+  type MCPWorkspaceStats,
+} from "@/node/services/mcpServerManager";
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import { resolveSharedWorkspaceMemoryTopology } from "@/node/services/memoryWorkspaceOwner";
 import { memoryScopeContextFromToolConfig } from "@/node/services/tools/memory";
 import type { TaskService } from "@/node/services/taskService";
 import { READ_ONLY_ACCESS, resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
-import type { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
+import {
+  MCP_OVERRIDES_READ_TIMEOUT_MS,
+  type WorkspaceMcpOverridesService,
+} from "./workspaceMcpOverridesService";
 
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import {
@@ -211,6 +219,18 @@ import {
 } from "./toolAssembly";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
+
+/** Structural equality of two server inventories (plain JSON-shaped config records). */
+function mcpServerMapsEqual(a: MCPServerMap | undefined, b: MCPServerMap | undefined): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (key, index) => key === bKeys[index] && JSON.stringify(a[key]) === JSON.stringify(b[key])
+  );
+}
 
 export function resolveMuxProjectRootForHostFs(
   metadata: WorkspaceMetadata,
@@ -306,6 +326,7 @@ export interface StreamMessageOptions {
   prospectiveGoalStatusForToolAvailability?: GoalRecordV1["status"] | null;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
@@ -885,6 +906,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      getQueuedInputStopCause,
       onStepSettled,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
@@ -1639,17 +1661,41 @@ export class TurnRequestBuilder {
     // Fetch workspace MCP overrides (for filtering servers and tools)
     // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
     let mcpOverrides: WorkspaceMCPOverrides | undefined;
+    // Not authoritative (indeterminate probe, unreadable document, failed
+    // inheritance, read error): the manager re-reads disk and fails the MCP
+    // serve closed if it cannot vouch for the enablement either — "no
+    // overrides" would re-enable a globally enabled server that only the
+    // unreadable document disables.
+    let mcpOverridesAuthoritative = false;
     const loadWorkspaceMcpOverridesStartedAt = Date.now();
     try {
-      mcpOverrides = (
-        await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)
-      ).overrides;
+      // Bounded and cancellable: an inheriting child's resolution probes and
+      // reads every ancestor's document on that ancestor's runtime (SSH/Docker
+      // allow minutes per operation); a send must neither hang on it nor
+      // outlive its own interruption. A timeout yields a non-authoritative
+      // read (see above), never authoritative empty overrides.
+      const read = await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(
+        workspaceId,
+        { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal: combinedAbortSignal }
+      );
+      mcpOverrides = read.overrides;
+      mcpOverridesAuthoritative = read.authoritative;
     } catch (error) {
       log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
         workspaceId,
         error,
       });
       mcpOverrides = undefined;
+    }
+    if (combinedAbortSignal.aborted) {
+      // Interrupted during the (possibly long) resolution: end the send here
+      // instead of assembling a request nobody waits for.
+      return {
+        type: "finished",
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal)
+        ),
+      };
     }
     recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
 
@@ -1674,14 +1720,21 @@ export class TurnRequestBuilder {
     }
 
     const listMcpServersStartedAt = Date.now();
-    const mcpServers = this.dependencies.bindings.mcpServerManager
-      ? await this.dependencies.bindings.mcpServerManager.listServers(
-          metadata.projectPath,
-          mcpOverrides,
-          projectTrusted,
-          agentPluginsMcpContext
-        )
-      : undefined;
+    // The system prompt's MCP inventory. When the override read was not
+    // authoritative, a listing built from the fallback overrides could
+    // advertise servers the manager's serve excludes (it re-reads disk and
+    // fails closed when it cannot vouch) or omit servers disk enables. In that
+    // case the inventory is rebuilt below from the overrides the validated
+    // serve actually used, or omitted entirely when the serve failed closed.
+    let mcpServers =
+      this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
+        ? await this.dependencies.bindings.mcpServerManager.listServers(
+            metadata.projectPath,
+            mcpOverrides,
+            projectTrusted,
+            agentPluginsMcpContext
+          )
+        : undefined;
     recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
 
     const loadAdditionalSystemContextStartedAt = Date.now();
@@ -1833,6 +1886,9 @@ export class TurnRequestBuilder {
       memoryToolAvailable: memoryToolEligible,
       intuitionToolAvailable: intuitionToolEligible,
     });
+    // The MCP inventory the pre-policy context was built with; a later
+    // rebuild from the validated serve makes that context stale.
+    const mcpServersAtPrePolicy = mcpServers;
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
     const { agentSystemPromptSections, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
       prePolicyStreamSystemContext;
@@ -1857,20 +1913,65 @@ export class TurnRequestBuilder {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
-        const result = await mcpServerManager.getToolsForWorkspace({
-          workspaceId,
-          projectPath: metadata.projectPath,
-          runtime,
-          workspacePath,
-          trusted: projectTrusted,
-          overrides: mcpOverrides,
-          projectSecrets: await secretsToRecord(projectSecrets),
-          agentPlugins: agentPluginsMcpContext,
-        });
+        const result = await mcpServerManager.getToolsForWorkspace(
+          {
+            workspaceId,
+            projectPath: metadata.projectPath,
+            runtime,
+            workspacePath,
+            trusted: projectTrusted,
+            overrides: mcpOverrides,
+            overridesAuthoritative: mcpOverridesAuthoritative,
+            // A non-authoritative read that exhausted its budget (unreachable
+            // remote ancestor) must not be followed by a second full-length
+            // attempt inside the manager: it gets the remainder only.
+            ...(mcpOverridesAuthoritative
+              ? {}
+              : {
+                  overridesReadDeadlineAt:
+                    loadWorkspaceMcpOverridesStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS,
+                }),
+            projectSecrets: await secretsToRecord(projectSecrets),
+            agentPlugins: agentPluginsMcpContext,
+          },
+          // The manager's own authority re-read (cold/distrusted serve) is
+          // bounded like the read above and ends with this send's interruption.
+          { signal: combinedAbortSignal }
+        );
 
         mcpTools = result.tools;
         mcpToolServerNames = result.toolServerNames;
         mcpStats = result.stats;
+        if (result.overridesUsed === undefined) {
+          // The serve failed closed (overrides invalidated mid-serve, or the
+          // manager could not vouch for them): no tools, no prompts — the
+          // prompt must not advertise servers the serve deliberately withheld.
+          mcpServers = undefined;
+        } else if (result.serversUsed !== undefined) {
+          // The prompt inventory must match the served tools, and every input
+          // to that inventory — not only the override snapshot but project
+          // trust and the global/project MCP config — can change between the
+          // pre-serve listing above and the validated serve. Take the
+          // inventory the serve derived its enablement from; keep the
+          // pre-serve object when it is structurally identical so the
+          // system context is not rebuilt for nothing.
+          if (!mcpServerMapsEqual(mcpServers, result.serversUsed)) {
+            mcpServers = result.serversUsed;
+          }
+        } else if (
+          !mcpOverridesAuthoritative ||
+          !workspaceOverridesEqual(result.overridesUsed, mcpOverrides)
+        ) {
+          // Manager without a validated inventory (test doubles): list from
+          // the overrides the validated serve used, so at least the override
+          // snapshot matches the served tools.
+          mcpServers = await mcpServerManager.listServers(
+            metadata.projectPath,
+            result.overridesUsed,
+            projectTrusted,
+            agentPluginsMcpContext
+          );
+        }
         // Omit the tool when no prompts exist to avoid adding unused schema context.
         if (result.promptDescriptors.length > 0) {
           mcpPromptRuntime = {
@@ -1880,6 +1981,10 @@ export class TurnRequestBuilder {
           };
         }
       } catch (error) {
+        // No tools were served (e.g. runWithStablePluginEpoch gave up on an
+        // unreadable epoch): the prompt must not advertise the pre-serve
+        // inventory either.
+        mcpServers = undefined;
         workspaceLog.error("Failed to start MCP servers", { error });
       } finally {
         mcpSetupDurationMs = Date.now() - mcpToolSetupStartedAt;
@@ -2604,6 +2709,7 @@ export class TurnRequestBuilder {
         );
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
+          mcpServers === mcpServersAtPrePolicy &&
           advisorToolAvailable === advisorToolEligible &&
           memoryToolAvailable === memoryToolEligible &&
           intuitionToolAvailable === intuitionToolEligible &&
@@ -3335,6 +3441,7 @@ export class TurnRequestBuilder {
         toolPolicy: effectiveToolPolicy,
         providedStreamToken: streamToken,
         hasQueuedMessages,
+        getQueuedInputStopCause,
         onStepSettled,
         workspaceName: metadata.name,
         thinkingLevel: streamThinkingLevel,

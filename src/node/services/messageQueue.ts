@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
@@ -178,6 +179,7 @@ type QueueClearCallbacks = Pick<
  * exactly one dispatch.
  */
 interface QueueEntry {
+  entryId: string;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   messages: string[];
@@ -387,13 +389,17 @@ export class MessageQueue {
    * metadata.
    */
   getNextQueueCutCandidate():
-    | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
+    | { entryId: string; muxMetadata: unknown; dispatchMode: QueueDispatchMode }
     | undefined {
     const head = this.nextDispatchableEntry();
     if (head == null) {
       return undefined;
     }
-    return { muxMetadata: head.muxMetadata, dispatchMode: head.dispatchMode };
+    return {
+      entryId: head.entryId,
+      muxMetadata: head.muxMetadata,
+      dispatchMode: head.dispatchMode,
+    };
   }
 
   /**
@@ -616,6 +622,7 @@ export class MessageQueue {
       }
     } else {
       entry = {
+        entryId: randomUUID(),
         messages: [],
         fileParts: [],
         dedupeKeys: new Set<string>(),

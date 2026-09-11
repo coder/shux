@@ -1,3 +1,4 @@
+import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -192,7 +193,8 @@ export function formatSubagentFailureUserMessage(params: {
     "<error_message>",
     params.errorMessage,
     "</error_message>",
-    "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
+    // Older clients require this exact terminator to render persisted failures.
+    SUBAGENT_FAILURE_FOOTER,
     "</mux_subagent_failure>",
   ].join("\n");
 }
@@ -418,6 +420,7 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
   dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;

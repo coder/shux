@@ -18,6 +18,7 @@ import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
+import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -202,6 +203,60 @@ describe("createCodeExecutionTool", () => {
   });
 
   describe("static analysis", () => {
+    it("rejects raw heredoc strings without side effects and accepts a correctly quoted retry", async () => {
+      const executeBash = mock(() => mockResults.bash);
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({
+          bash: createMockTool("bash", z.object({ script: z.string() }), executeBash),
+        })
+      );
+      const script = [
+        "cat > /tmp/query.sql <<'SQL'",
+        "SELECT JSON_VALUE(report, '$.event_ticker') FROM `project.dataset.table`",
+        "SQL",
+        'bq.sh "$(cat /tmp/query.sql)" --label="${USER}"',
+        "printf '%s\\n' done",
+      ].join("\n");
+
+      const invalid = (await tool.execute!(
+        {
+          code: 'xum.bash({script: "must not run"});\nreturn xum.bash({script: "' + script + '"});',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(invalid.success).toBe(false);
+      expect(invalid.error).toContain(CODE_EXECUTION_STRING_GUIDANCE);
+      expect(invalid.error).toContain("(line 2)");
+      expect(invalid.toolCalls).toHaveLength(0);
+      expect(executeBash).not.toHaveBeenCalled();
+
+      const valid = (await tool.execute!(
+        { code: "return xum.bash({script: " + JSON.stringify(script) + "});" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(valid.success).toBe(true);
+      expect(valid.result).toEqual(mockResults.bash);
+      expect(executeBash).toHaveBeenCalledTimes(1);
+      expect(executeBash).toHaveBeenCalledWith({ script });
+
+      // Template literals need their own escaping even inside a shell heredoc.
+      const templateCode = [
+        "return xum.bash({script: `cat > /tmp/query.sql <<'SQL'",
+        "SELECT JSON_VALUE(report, '$.event_ticker') FROM \\`project.dataset.table\\`",
+        "SQL",
+        'bq.sh "$(cat /tmp/query.sql)" --label="\\${USER}"',
+        "printf '%s\\\\n' done`});",
+      ].join("\n");
+      const templateResult = (await tool.execute!(
+        { code: templateCode },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(templateResult.success).toBe(true);
+      expect(executeBash).toHaveBeenCalledTimes(2);
+      expect(executeBash).toHaveBeenLastCalledWith({ script });
+    });
+
     it("rejects code with syntax errors", async () => {
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
 

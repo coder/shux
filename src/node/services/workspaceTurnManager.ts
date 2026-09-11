@@ -2151,7 +2151,9 @@ export class WorkspaceTurnManager {
             executionId: record.handleId,
             errorType: isSupersededWorkspaceTurnInterrupt(record)
               ? "workspace_turn_superseded"
-              : "workspace_turn_error",
+              : record.finalMessage?.metadata?.finishReason === "tool-calls"
+                ? "workspace_turn_incomplete"
+                : "workspace_turn_error",
             errorMessage: record.error ?? "Workspace turn failed",
           });
     if (!alreadyDelivered) {
@@ -2223,6 +2225,8 @@ export class WorkspaceTurnManager {
      * same turn, and the correlated stream-end proves the turn's real outcome.
      */
     allowTerminalResettle?: boolean;
+    /** Release startup exclusion after persistence, before cleanup can join pending sends. */
+    releaseRecoveryLock?: () => Promise<void>;
     /**
      * Only the settlement that itself moved disposable ownership to a
      * successor (transferDisposableWorkspaceToSuccessor) may clear
@@ -2278,6 +2282,10 @@ export class WorkspaceTurnManager {
         // actually changes the outcome (duplicate stream-end replays must stay idempotent).
         const resettleStaleTerminal =
           params.allowTerminalResettle === true &&
+          (!this.isIntermediateToolStop(params.next.finalMessage?.metadata) ||
+            (current.status === params.record.status &&
+              current.messageId === params.record.messageId &&
+              current.updatedAt === params.record.updatedAt)) &&
           this.isTerminalWorkspaceTurnStatus(current.status) &&
           current.status !== "completed" &&
           isSelfHealEligibleSettledWorkspaceTurn(current) &&
@@ -2422,6 +2430,7 @@ export class WorkspaceTurnManager {
             error: queuedProgressRemoval.error,
           });
         }
+        await params.releaseRecoveryLock?.();
         const foregroundWaiterWorkspaceIds = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
           params.waiterSettlement
@@ -2830,22 +2839,20 @@ export class WorkspaceTurnManager {
           });
         }
         const recovered = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-          // Repair preserves — never invents — a supersede classification.
-          // History order is not causal queue-dispatch evidence (an unrelated
-          // later user message must not upgrade an error settlement), while the
-          // persisted supersede stays authoritative when rebuilding from the
-          // SAME correlated final that settled it: the superseding queued input
-          // may not have appended its user message yet, and that absence must
-          // not downgrade the supersede to a truncation error. Only a different
-          // correlated final (contradictory same-turn evidence) may resettle.
-          // "preserved" keeps whichever flavor (generic or owner follow-up) was
-          // persisted verbatim, so repair cannot downgrade the quiet flavor.
+          // Explicit stop causes survive recovery. Without one, preserve only the same final's
+          // existing supersession; later unrelated history cannot prove a queue stop.
           supersedeEvidence:
-            isSupersededWorkspaceTurnInterrupt(record) &&
-            event.messageId === record.messageId &&
-            record.error != null
-              ? { kind: "preserved", error: record.error }
-              : null,
+            event.metadata.stopCause != null
+              ? this.getQueueCutSupersedeEvidence(event, record, {
+                  activeStream: undefined,
+                  cutter: undefined,
+                  hasPendingQueuedOrPreparingTurn: false,
+                })
+              : isSupersededWorkspaceTurnInterrupt(record) &&
+                  event.messageId === record.messageId &&
+                  record.error != null
+                ? { kind: "preserved", error: record.error }
+                : null,
         });
         if (
           !options.repairFromHistory ||
@@ -4027,7 +4034,19 @@ export class WorkspaceTurnManager {
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     const hasRuntimeActivity =
       this.aiService.isStreaming(record.workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId);
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId) ||
+      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId) ||
+      this.hasSameTurnContinuation(
+        {
+          workspaceId: record.workspaceId,
+          messageId: record.deferredMessageIds?.at(-1) ?? record.messageId ?? "",
+        },
+        {
+          taskHandleId: record.handleId,
+          ownerWorkspaceId: record.ownerWorkspaceId,
+          turnId: record.turnId,
+        }
+      );
     if (hasRuntimeActivity) {
       return true;
     }
@@ -4052,10 +4071,34 @@ export class WorkspaceTurnManager {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
+    // Admission exclusion also covers sends whose user row is not durable yet.
+    const admission = this.workspaceService.acquireIdleTurnExclusion(record.workspaceId);
+    if (!admission.success) return;
+    let admissionHold: Disposable | undefined = admission.data;
+    let recoveryLock: AsyncDisposable | undefined;
+    await using recoveryScope = {
+      [Symbol.asyncDispose]: () => {
+        admissionHold?.[Symbol.dispose]();
+        admissionHold = undefined;
+        const lock = recoveryLock;
+        recoveryLock = undefined;
+        return Promise.resolve(lock?.[Symbol.asyncDispose]());
+      },
+    };
+    const releaseRecoveryLock = () => recoveryScope[Symbol.asyncDispose]();
+    // Lock order: admission, stream start, then handle settlement.
+    recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
+    // Preparing input stays visible until registration. Existing streams include finalization.
+    if (
+      this.streamManager?.getStreamInfo(record.workspaceId, true) != null ||
+      (await this.isLiveWorkspaceTurn(record))
+    )
+      return;
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
         cause: { kind: "stale-history-recovery" },
+        releaseRecoveryLock,
         record,
         next: recovered,
         waiterSettlement:
@@ -4066,18 +4109,9 @@ export class WorkspaceTurnManager {
       return;
     }
 
-    // Same-process deferred stream-ends can be observed before the final assistant message is
-    // readable from history. Keep the handle alive in that narrow window; after restart the active
-    // map is empty, so unrecoverable deferred handles still settle terminally instead of leaking.
-    const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
-    if (
-      (record.deferredMessageIds?.length ?? 0) > 0 &&
-      active?.handleId === record.handleId &&
-      active.ownerWorkspaceId === record.ownerWorkspaceId
-    ) {
-      return;
-    }
-
+    // Recovery reads can overlap a continuation start. Check live work again before the fallback.
+    if (await this.isLiveWorkspaceTurn(record)) return;
+    // No runtime work remains. A missing history row must not keep a deferred handle active forever.
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
       status: "interrupted",
@@ -4086,6 +4120,7 @@ export class WorkspaceTurnManager {
     };
     await this.settleWorkspaceTurn({
       cause: { kind: "stale-restart" },
+      releaseRecoveryLock,
       record,
       next,
       waiterSettlement: {
@@ -4298,17 +4333,7 @@ export class WorkspaceTurnManager {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
-    // A "tool-calls" finish on a delegated turn backed by queue-dispatch
-    // evidence is a queue cut: some other queued input (a manual user message,
-    // /compact, the owner's own follow-up turn) dispatched at the tool boundary
-    // and superseded the turn (same-turn continuations were already deferred by
-    // the caller). The child keeps working under that new input, so this is a
-    // supersede — not a failure of the delegated work. Settle as interrupted
-    // with a human-readable reason instead of alarming the owner with an
-    // "error" and internal finishReason jargon. Without such evidence a
-    // "tool-calls" finish can come from other stop conditions (e.g. a
-    // successful required-tool result), so it falls through to the truncation
-    // branch.
+    // Persisted queue decisions remain authoritative after the cutter leaves the queue.
     if (event.metadata.finishReason === "tool-calls" && options.supersedeEvidence != null) {
       const evidence = options.supersedeEvidence;
       const error =
@@ -4331,13 +4356,20 @@ export class WorkspaceTurnManager {
       };
     }
     // Truncated/non-stop provider finishes are partial output, not a completed delegated turn.
-    if (event.metadata.finishReason != null && event.metadata.finishReason !== "stop") {
+    if (
+      event.metadata.finishReason != null &&
+      event.metadata.finishReason !== "stop" &&
+      event.metadata.stopCause?.kind !== "required-tool"
+    ) {
       return {
         ...baseRecord,
         status: "error",
         updatedAt: getIsoNow(),
         messageId: event.messageId,
-        error: `Workspace turn ended before completion (finishReason: ${event.metadata.finishReason})`,
+        error:
+          event.metadata.finishReason === "tool-calls"
+            ? this.describeIncompleteToolStop(event)
+            : `Workspace turn ended before completion (finishReason: ${event.metadata.finishReason})`,
         finalMessageRef: this.buildWorkspaceTurnFinalMessageRef(event),
         finalMessage: {
           messageId: event.messageId,
@@ -4357,6 +4389,31 @@ export class WorkspaceTurnManager {
         metadata: event.metadata,
       },
     };
+  }
+
+  private isIntermediateToolStop(
+    metadata: Pick<StreamEndEvent["metadata"], "finishReason" | "stopCause"> | undefined
+  ): boolean {
+    return metadata?.finishReason === "tool-calls" && metadata.stopCause?.kind !== "required-tool";
+  }
+
+  private describeIncompleteToolStop(event: StreamEndEvent): string {
+    const cause = event.metadata.stopCause;
+    if (cause == null) {
+      log.warn("Workspace turn tool-calls stop has unknown cause", {
+        workspaceId: event.workspaceId,
+        messageId: event.messageId,
+        muxMetadata: event.metadata.muxMetadata,
+      });
+      return "Workspace turn incomplete: unknown stop cause; no correlated continuation found.";
+    }
+    if (cause.kind === "queued-input") {
+      return `Workspace turn continuation unavailable after queue stop (entryId: ${cause.entryId}).`;
+    }
+    if (cause.kind === "context-budget") {
+      return `Workspace turn incomplete: context budget ${cause.decision}; no continuation remains.`;
+    }
+    return "Workspace turn incomplete: step limit reached.";
   }
 
   private isDeferredWorkspaceTurnMessage(
@@ -4389,14 +4446,19 @@ export class WorkspaceTurnManager {
       }
       const event = this.buildWorkspaceTurnStreamEndEventFromHistory(record, message);
       if (event != null) {
-        // History order alone cannot prove a queue cut (a later unrelated user
-        // message is not causal evidence), so stale recovery conservatively
-        // settles tool-calls finals as errors. Genuine supersedes are
-        // classified live at stream-end; a crash-window misclassification here
-        // stays self-heal eligible for later correlated evidence.
-        return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-          supersedeEvidence: null,
+        const supersedeEvidence = this.getQueueCutSupersedeEvidence(event, record, {
+          activeStream: undefined,
+          cutter: undefined,
+          hasPendingQueuedOrPreparingTurn: false,
         });
+        const correlation = this.getWorkspaceTurnMetadata(event);
+        if (
+          supersedeEvidence == null &&
+          correlation != null &&
+          this.hasSameTurnContinuation(event, correlation)
+        )
+          return null;
+        return this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, { supersedeEvidence });
       }
     }
     return null;
@@ -4584,12 +4646,24 @@ export class WorkspaceTurnManager {
     });
   }
 
+  private matchesWorkspaceTurnRecord(
+    record: WorkspaceTurnTaskHandleRecord,
+    value: unknown
+  ): boolean {
+    const correlation = this.getWorkspaceTurnMetadataFromValue(value);
+    return (
+      correlation?.taskHandleId === record.handleId &&
+      correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+      correlation.turnId === record.turnId
+    );
+  }
+
   /**
    * Whether a continuation of this exact delegated turn is pending or streaming.
    * Pending entries must carry the same correlation metadata as the ended stream.
    */
   private hasSameTurnContinuation(
-    event: StreamEndEvent,
+    event: Pick<StreamEndEvent, "workspaceId" | "messageId">,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
   ): boolean {
     if (
@@ -4600,7 +4674,7 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
+    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId, true);
     if (activeStream == null || activeStream.messageId === event.messageId) {
       return false;
     }
@@ -4655,6 +4729,12 @@ export class WorkspaceTurnManager {
         ? { kind: "same_owner_follow_up", successorHandleId }
         : { kind: "other_input" };
     };
+    const cause = event.metadata.stopCause;
+    if (cause != null) {
+      if (cause.kind !== "queued-input") return null;
+      if (this.matchesWorkspaceTurnRecord(record, cause.muxMetadata)) return null;
+      return classifyMetadata(cause.muxMetadata);
+    }
     // Already streaming at the cut: the uncorrelated active stream is the
     // engaged cutter.
     const { activeStream, cutter } = snapshot;
@@ -4762,6 +4842,7 @@ export class WorkspaceTurnManager {
       return true;
     }
 
+    // Check runtime state before history. A finishing successor commits history before it disappears.
     // Parent guidance and report wake-ups continue the exact delegated turn. This includes
     // turn-end guidance: don't publish an early report before the queued guidance runs.
     // Uncorrelated bash-monitor wakes inherit only an open tool-boundary continuation;
@@ -4770,12 +4851,53 @@ export class WorkspaceTurnManager {
       (event.metadata.finishReason === "tool-calls" ||
         event.metadata.finishReason === "stop" ||
         event.metadata.finishReason == null) &&
+      (event.metadata.stopCause == null ||
+        this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot) == null) &&
       (this.hasSameTurnContinuation(event, metadata) ||
         (event.metadata.finishReason === "tool-calls" &&
           this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
+    }
+
+    if (
+      event.metadata.finishReason === "tool-calls" &&
+      (event.metadata.stopCause == null ||
+        this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot) == null)
+    ) {
+      const history = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+      // A continuation can start during the read before its assistant row reaches history.
+      if (
+        this.hasSameTurnContinuation(event, metadata) ||
+        this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)
+      ) {
+        await this.markWorkspaceTurnStreamEndDeferred(event);
+        return true;
+      }
+      if (history.success) {
+        const index = history.data.findIndex((message) => message.id === event.messageId);
+        if (index >= 0) {
+          const successor = history.data
+            .slice(index + 1)
+            .findLast(
+              (message) =>
+                message.role === "assistant" &&
+                this.matchesWorkspaceTurnRecord(record, message.metadata?.muxMetadata)
+            );
+          if (successor != null) {
+            const successorEvent = this.buildWorkspaceTurnStreamEndEventFromHistory(
+              record,
+              successor
+            );
+            if (successorEvent != null) {
+              return this.finalizeWorkspaceTurnFromStreamEnd(successorEvent, queueCutSnapshot);
+            }
+            await this.markWorkspaceTurnStreamEndDeferred(event);
+            return true;
+          }
+        }
+      }
     }
 
     const supersedeEvidence = this.getQueueCutSupersedeEvidence(event, record, queueCutSnapshot);
@@ -4821,7 +4943,14 @@ export class WorkspaceTurnManager {
       // delegated turn's real outcome. A handle that settled interrupted/error from a
       // transient failure (provider error, restart) may have self-healed via auto-retry
       // of the same turn; let this settlement correct that stale record.
-      allowTerminalResettle: true,
+      // An intermediate stop cannot replace a concrete continuation failure.
+      allowTerminalResettle:
+        !this.isIntermediateToolStop(event.metadata) ||
+        (record.messageId === event.messageId &&
+          record.finalMessage?.metadata?.finishReason === "tool-calls") ||
+        (typeof event.metadata.historySequence === "number" &&
+          typeof record.finalMessage?.metadata?.historySequence === "number" &&
+          event.metadata.historySequence > record.finalMessage.metadata.historySequence),
       disposableOwnershipTransferred,
     });
     return true;

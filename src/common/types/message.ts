@@ -1,3 +1,4 @@
+import type { StreamStopCause } from "@/common/types/streamStopCause";
 import type { ModelMessage, UIMessage } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "./errors";
@@ -992,6 +993,7 @@ export interface MuxMetadata {
   duration?: number;
   ttftMs?: number; // Time-to-first-token measured from stream start; omitted when unavailable
   finishReason?: string; // Provider/model finish reason for the final step (e.g. stop, length)
+  stopCause?: StreamStopCause;
   /** @deprecated Legacy base mode derived from agent definition. */
   mode?: AgentMode;
   timestamp?: number;
