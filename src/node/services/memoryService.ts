@@ -432,11 +432,17 @@ interface MemoryStore {
  */
 const LEGACY_IMPORT_DIR = "imported";
 /**
- * Hidden (dot-entry: never listed, never indexed) owner-store directory the
- * adoption pass stages a copy's bytes in before installing them by rename
+ * Directory beside the owner's memory root (in its session dir, OUTSIDE the
+ * model-writable memory namespace — a legacy note may legitimately live under
+ * any in-namespace path, dot-entries included) where the adoption pass stages
+ * a copy's bytes before installing them by rename
  * (adoptLegacyPrivateStoreOrThrow); emptied at the start of every pass.
  */
-const LEGACY_ADOPTION_STAGING_DIR = ".adoption-staging";
+const LEGACY_ADOPTION_STAGING_DIR_NAME = "memory-adoption-staging";
+
+function legacyAdoptionStagingDir(store: MemoryStore): string {
+  return path.join(path.dirname(store.physicalRoot), LEGACY_ADOPTION_STAGING_DIR_NAME);
+}
 
 /**
  * Pin bit of a manifest record's child sidecar fingerprint. No child entry at
@@ -1394,7 +1400,8 @@ export class MemoryService extends EventEmitter {
         MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles({ strict: true })).length;
       // Staged bytes a crashed pass never installed: their records claim
       // nothing (no file carries the receipt), so they are simply dropped.
-      await store.remove(LEGACY_ADOPTION_STAGING_DIR);
+      const stagingDir = legacyAdoptionStagingDir(store);
+      await fsPromises.rm(stagingDir, { recursive: true, force: true });
       let capacityExhausted = false;
       let manifestDirty = false;
       let imported = 0;
@@ -1563,10 +1570,10 @@ export class MemoryService extends EventEmitter {
           // follow it out of the shared store. A replacement keeps the PRIOR
           // record (old hash and stamp, same target) while pending: on either
           // side of the install the retry recognizes the file by its stamp.
-          const stagingRelPath = `${LEGACY_ADOPTION_STAGING_DIR}/${randomUUID()}`;
+          const stagingPath = path.join(stagingDir, randomUUID());
           try {
-            await store.assertContained(stagingRelPath);
-            await store.writeFile(stagingRelPath, content);
+            await fsPromises.mkdir(stagingDir, { recursive: true });
+            await writeFileAtomic(stagingPath, content, { encoding: "utf-8" });
           } catch (error) {
             log.warn("[MemoryService] cannot stage a legacy note for adoption; retrying later", {
               childId,
@@ -1576,9 +1583,9 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          const stagedStamp = await adoptionTargetStamp(store.physicalPath(stagingRelPath));
+          const stagedStamp = await adoptionTargetStamp(stagingPath);
           if (stagedStamp === null) {
-            await store.remove(stagingRelPath);
+            await fsPromises.rm(stagingPath, { force: true });
             skipped++;
             continue;
           }
@@ -1611,11 +1618,14 @@ export class MemoryService extends EventEmitter {
               ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
                 target.generation
               : (await store.kind(target.relPath, { strict: true })) === null;
-          if (!installable) {
-            await store.remove(stagingRelPath);
+          const restoreRecord = async () => {
+            await fsPromises.rm(stagingPath, { force: true });
             if (previous === undefined) adopted.delete(relPath);
             else adopted.set(relPath, previous);
             await writeManifest();
+          };
+          if (!installable) {
+            await restoreRecord();
             log.warn(
               "[MemoryService] adoption destination changed before install; retrying later",
               {
@@ -1627,7 +1637,24 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          await store.rename(stagingRelPath, target.relPath);
+          // The install: same session dir, so a plain rename (an EXDEV — the
+          // memory root mounted apart from its session dir — fails this note,
+          // not the pass).
+          try {
+            const destination = store.physicalPath(target.relPath);
+            await fsPromises.mkdir(path.dirname(destination), { recursive: true });
+            await fsPromises.rename(stagingPath, destination);
+          } catch (error) {
+            await restoreRecord();
+            log.warn("[MemoryService] cannot install a staged legacy note; retrying later", {
+              childId,
+              relPath,
+              target: target.relPath,
+              error,
+            });
+            skipped++;
+            continue;
+          }
           if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
@@ -1848,7 +1875,7 @@ export class MemoryService extends EventEmitter {
         manifestDirty = true;
       }
       if (manifestDirty) await writeManifest();
-      await store.remove(LEGACY_ADOPTION_STAGING_DIR);
+      await fsPromises.rm(stagingDir, { recursive: true, force: true });
       if (capacityExhausted) {
         log.warn(
           "[MemoryService] shared workspace notebook is full; legacy notes left in the sub-agent's private directory until space frees up",

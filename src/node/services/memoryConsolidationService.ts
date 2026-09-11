@@ -72,6 +72,7 @@ import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrel
 import {
   compactionClosingPolicyEpoch,
   duplicateUserMessageIds,
+  isPersistedHistorySequence,
   isRequestPreludeRow,
 } from "@/common/utils/messages/compactionBoundary";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
@@ -408,7 +409,7 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
     // Persisted rows are raw JSON: only a history sequence in the clock's
     // domain covers anything (r79); a fractional or negative value leaves the
     // turn uncovered and the refusal below fails closed.
-    if (typeof bound !== "number" || !Number.isSafeInteger(bound) || bound < 0) continue;
+    if (!isPersistedHistorySequence(bound)) continue;
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);

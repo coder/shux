@@ -1911,6 +1911,16 @@ describe("MemoryService", () => {
       await fsPromises.mkdir(path.join(legacyRoot, ".hidden"), { recursive: true });
       await fsPromises.writeFile(path.join(legacyRoot, ".note"), "dot note");
       await fsPromises.writeFile(path.join(legacyRoot, ".hidden", "n.md"), "nested dot note");
+      // Every in-namespace path is a note's, including one named like the
+      // pass's own staging area (which lives OUTSIDE the memory root, r91):
+      // adoption must never mistake it for staged bytes and remove it.
+      await fsPromises.mkdir(path.join(legacyRoot, "memory-adoption-staging"), {
+        recursive: true,
+      });
+      await fsPromises.writeFile(
+        path.join(legacyRoot, "memory-adoption-staging", "n.md"),
+        "staging-named note"
+      );
       await fsPromises.writeFile(
         path.join(legacyRoot, ".DS_Store"),
         Buffer.from([0, 0, 1, 255, 254])
@@ -1926,6 +1936,9 @@ describe("MemoryService", () => {
         "nested dot note"
       );
       expect(await pathExists(path.join(ownerRoot, ".DS_Store"))).toBe(false);
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "memory-adoption-staging", "n.md"), "utf-8")
+      ).toBe("staging-named note");
       // Removing the stray entry lets a retried (non-forced) handover complete.
       await fsPromises.rm(path.join(legacyRoot, ".DS_Store"));
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
@@ -2448,8 +2461,11 @@ describe("MemoryService", () => {
         (await adoptionTargetStamp(path.join(ownerRoot, "imported", "ws-child", "note.md"))) ??
           undefined
       );
-      // The staged bytes were installed by rename; nothing lingers.
-      expect(await pathExists(path.join(ownerRoot, ".adoption-staging"))).toBe(false);
+      // The staged bytes were installed by rename; nothing lingers (the
+      // staging dir sits beside the memory root, outside the namespace).
+      expect(await pathExists(path.join(path.dirname(ownerRoot), "memory-adoption-staging"))).toBe(
+        false
+      );
     });
 
     it("never claims a copy by byte match alone: a pending record without its receipt's generation", async () => {
@@ -2510,8 +2526,10 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe(
         "same bytes"
       );
-      // No staged bytes linger in the owner store.
-      expect(await pathExists(path.join(ownerRoot, ".adoption-staging"))).toBe(false);
+      // No staged bytes linger beside the owner store.
+      expect(await pathExists(path.join(path.dirname(ownerRoot), "memory-adoption-staging"))).toBe(
+        false
+      );
     });
 
     it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {

@@ -1959,6 +1959,13 @@ describe("CompactionHandler", () => {
           requestHistorySequence: boundarySequence + 18.5,
           workspaceMemoryPolicyEpoch: boundarySequence,
         }),
+        // An unsafe integer is outside the domain too (r90): the gate refuses
+        // it, so the copy must not read as covered either.
+        createMuxMessage("u11", "user", "question behind an unsafe bound"),
+        createMuxMessage("a11", "assistant", "unsafe bound", {
+          requestHistorySequence: Number.MAX_SAFE_INTEGER + 1,
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1985,6 +1992,8 @@ describe("CompactionHandler", () => {
         undefined, // a9 (no stamp, malformed bound: not a synthetic row)
         undefined, // u10 (its turn's bound is fractional: never covered)
         boundarySequence, // a10 (recorded stamp kept)
+        undefined, // u11 (its turn's bound is an unsafe integer: never covered)
+        boundarySequence, // a11 (recorded stamp kept)
       ]);
     });
 

@@ -93,6 +93,18 @@ export function latestContextBoundaryHistorySequence(
 }
 
 /**
+ * A persisted history sequence (stamp, request bound, segment start) in the
+ * clock's domain: a nonnegative safe integer. History rows are raw JSON, so
+ * every policy check reading one — the harvest gate, the tail-copy stamps,
+ * the segment start — must apply this same predicate (r90): a fractional,
+ * negative or unsafe value covers nothing anywhere, or one check would grant
+ * what another refused.
+ */
+export function isPersistedHistorySequence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
  * Start sequence of the history segment `messages` belong to (the largest
  * `historySegment` stamp among them; 0 for legacy rows and the first
  * segment). Every row of a segment carries the same stamp, so any non-empty
@@ -103,7 +115,7 @@ export function historySegmentStart(messages: readonly MuxMessage[]): number {
   let start = 0;
   for (const message of messages) {
     const segment = message.metadata?.historySegment;
-    if (typeof segment !== "number" || !Number.isSafeInteger(segment) || segment < 0) continue;
+    if (!isPersistedHistorySequence(segment)) continue;
     if (segment > start) start = segment;
   }
   return start;

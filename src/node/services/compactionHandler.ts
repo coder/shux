@@ -43,6 +43,7 @@ import {
   isDurableContextBoundaryMarker,
   latestContextBoundaryHistorySequence,
   duplicateUserMessageIds,
+  isPersistedHistorySequence,
   isRequestPreludeRow,
   sliceMessagesFromLatestCompactionBoundary,
   workspaceMemoryPolicyEpochOf,
@@ -1693,12 +1694,13 @@ export class CompactionHandler {
       if (message.role !== "assistant") continue;
       const bound = message.metadata?.requestHistorySequence;
       const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
-      // Same domain check as the harvest gate (epochHarvestRefusal, r79): a
-      // fractional or negative bound covers nothing there, so it must not
+      // Same domain check as the harvest gate (epochHarvestRefusal, r79 —
+      // the shared predicate, so an unsafe integer is refused alike, r90): a
+      // bound outside the clock's domain covers nothing there, so it must not
       // stamp a batch here either — the copies would then carry an epoch
       // without ever having been covered, and the association would grant
       // in a later epoch what the gate refused in this one.
-      if (typeof policyEpoch !== "number" || !isNonNegativeInteger(bound)) continue;
+      if (typeof policyEpoch !== "number" || !isPersistedHistorySequence(bound)) continue;
       const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
       if (anchor === undefined) continue;
       // Same prelude rule as the harvest gate: a listed id stamps a user row
