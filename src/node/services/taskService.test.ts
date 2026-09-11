@@ -9337,6 +9337,10 @@ describe("TaskService", () => {
     );
     slashCard.metadata = {
       ...slashCard.metadata,
+      // Like WorkspaceService's slash-command append, drop the builder's
+      // placeholder sequence: HistoryService assigns the real one (and refuses
+      // a counter it could not advance past).
+      historySequence: undefined,
       muxMetadata: { type: WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE, runId: workflowRunId },
     };
     const appendCard = await historyService.appendToHistory(rootWorkspaceId, slashCard);
