@@ -158,26 +158,13 @@ export class WorktreeManager {
           "Skipping origin fetch while project automation is disabled; using local state."
         );
       }
-      const fetchedOrigin = remoteSyncAllowed
-        ? await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv)
-        : false;
-
-      // Determine best base for new branches: use origin if local can fast-forward to it,
-      // otherwise preserve local state (user may have unpushed work)
-      const shouldUseOrigin =
-        remoteSyncAllowed &&
-        fetchedOrigin &&
-        (await this.canFastForwardToOrigin(
-          projectPath,
-          trunkBranch,
-          initLogger,
-          params.abortSignal
-        ));
 
       // Files are populated by a separate checkout (materializeWorkspace) so large repositories
       // can stream progress, and so callers may announce the workspace before populating it.
-      // Restore flows may supply an exact saved commit instead of the current trunk.
-      const newBranchBase = startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
+      // The origin fetch belongs to that phase as well: a new branch starts from the local
+      // trunk here and is fast-forwarded to origin before its files are checked out, so a slow
+      // remote never delays the announcement. Restore flows may supply an exact saved commit
+      // instead of the current trunk.
       using addProc = execFileAsync(
         "git",
         [
@@ -188,7 +175,7 @@ export class WorktreeManager {
           "--no-checkout",
           ...(branchExists
             ? [workspacePath, branchName]
-            : ["-b", branchName, workspacePath, newBranchBase]),
+            : ["-b", branchName, workspacePath, startPoint ?? trunkBranch]),
         ],
         noHooksEnv
       );
@@ -201,10 +188,9 @@ export class WorktreeManager {
         if (line) initLogger.logStdout(line);
       }
 
-      // Fast-forward existing branches to origin only when local trunk can fast-forward too
-      // (preserves unpushed work).
       const pending: PendingMaterialization = {
-        fastForwardFromOrigin: !skipRemoteSync && shouldUseOrigin && branchExists,
+        // An explicit start point is the requested base, so only trunk-based branches sync.
+        syncWithOrigin: remoteSyncAllowed && (branchExists || startPoint === undefined),
       };
       if (params.deferMaterialization) {
         await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
@@ -264,12 +250,12 @@ export class WorktreeManager {
   }
 
   /**
-   * Populate a worktree reserved by createWorkspace: streamed checkout, .xumignore sync,
-   * optional fast-forward, submodules. Throws on failure without touching the worktree; a
+   * Populate a worktree reserved by createWorkspace: origin sync, streamed checkout,
+   * .xumignore sync, submodules. Throws on failure without touching the worktree; a
    * deferred checkout is already registered, so its owner decides what happens to it.
    * abortSignal cancels every phase; when checkoutAbortSignal is given it is the only signal
-   * the file checkout honours, so an owner that keeps a cancelled worktree gets complete files
-   * while everything after them still stops.
+   * the origin sync and file checkout honour, so an owner that keeps a cancelled worktree gets
+   * complete files while everything after them still stops.
    */
   async materializeWorkspace(
     params: {
@@ -291,6 +277,18 @@ export class WorktreeManager {
       params.trusted,
       params.abortSignal
     );
+    const checkoutSignal = params.checkoutAbortSignal ?? params.abortSignal;
+
+    if (pending.syncWithOrigin) {
+      await this.fastForwardBranchToOrigin({
+        projectPath,
+        workspacePath,
+        branchName,
+        trunkBranch,
+        initLogger,
+        execOptions: { ...noHooksEnv, signal: checkoutSignal },
+      });
+    }
 
     initLogger.logStep("Checking out files...");
     // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
@@ -332,7 +330,7 @@ export class WorktreeManager {
         ],
         {
           ...checkoutOptions,
-          signal: params.checkoutAbortSignal ?? params.abortSignal,
+          signal: checkoutSignal,
           // git delays progress output by 2s, which hides it for most checkouts.
           env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
         }
@@ -410,10 +408,6 @@ export class WorktreeManager {
     initLogger.logStep("Syncing .xumignore files...");
     await syncXumignoreFiles(projectPath, workspacePath, params.abortSignal);
 
-    if (pending.fastForwardFromOrigin) {
-      await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
-    }
-
     // Worktree creation is responsible for materializing the checkout completely.
     // Skills, docs, and other repo-managed files may live inside submodules, so make
     // them available before any runtime-specific provisioning or init hooks run.
@@ -466,7 +460,7 @@ export class WorktreeManager {
   }
 
   /**
-   * Fetch trunk branch from origin before worktree creation.
+   * Fetch trunk branch from origin before the checkout.
    * Returns true if fetch succeeded (origin is available for branching).
    */
   private async fetchOriginTrunk(
@@ -522,67 +516,78 @@ export class WorktreeManager {
     }
   }
 
-  /**
-   * Check if local trunk can fast-forward to origin/<trunk>.
-   * Returns true if local is behind or equal to origin (safe to use origin).
-   * Returns false if local is ahead or diverged (preserve local state).
-   */
-  private async canFastForwardToOrigin(
+  /** Exit code 0 = ancestor (or equal); anything else, including unknown refs, = not. */
+  private async isAncestor(
     projectPath: string,
-    trunkBranch: string,
-    initLogger: InitLogger,
-    abortSignal?: AbortSignal
+    ancestor: string,
+    descendant: string,
+    execOptions: GitExecOptions
   ): Promise<boolean> {
     try {
-      // Check if local trunk is an ancestor of origin/trunk
-      // Exit code 0 = local is ancestor (can fast-forward), non-zero = cannot
       using proc = execFileAsync(
         "git",
-        ["-C", projectPath, "merge-base", "--is-ancestor", trunkBranch, `origin/${trunkBranch}`],
-        abortSignal ? { signal: abortSignal } : undefined
+        ["-C", projectPath, "merge-base", "--is-ancestor", ancestor, descendant],
+        execOptions
       );
       await proc.result;
-      return true; // Local is behind or equal to origin
+      return true;
     } catch (error) {
-      if (isAbortError(error, abortSignal)) {
+      if (isAbortError(error, execOptions?.signal)) {
         throw error;
       }
-      // Local is ahead or diverged - preserve local state
-      initLogger.logStderr(
-        `Note: Local ${trunkBranch} is ahead of or diverged from origin, using local state`
-      );
       return false;
     }
   }
 
   /**
-   * Fast-forward merge to latest origin/<trunkBranch> after checkout.
-   * Best-effort operation for existing branches that may be behind origin.
+   * Fetch origin/<trunk> and move the branch to it while the worktree is still empty, so the
+   * checkout populates files once, at the synced tip. Best effort: an unreachable origin or
+   * diverged history keeps the local state.
    */
-  private async fastForwardToOrigin(
-    workspacePath: string,
-    trunkBranch: string,
-    initLogger: InitLogger,
-    noHooksEnv: GitExecOptions
-  ): Promise<void> {
-    try {
-      initLogger.logStep("Fast-forward merging...");
-
-      using mergeProc = execFileAsync(
-        "git",
-        ["-C", workspacePath, "merge", "--ff-only", `origin/${trunkBranch}`],
-        noHooksEnv
-      );
-      await mergeProc.result;
-      initLogger.logStep("Fast-forwarded to latest origin successfully");
-    } catch (mergeError) {
-      if (isAbortError(mergeError, noHooksEnv?.signal)) {
-        throw mergeError;
-      }
-      // Fast-forward not possible (diverged branches) - just warn
-      const errorMsg = getErrorMessage(mergeError);
-      initLogger.logStderr(`Note: Fast-forward failed (${errorMsg}), using local branch state`);
+  private async fastForwardBranchToOrigin(args: {
+    projectPath: string;
+    workspacePath: string;
+    branchName: string;
+    trunkBranch: string;
+    initLogger: InitLogger;
+    execOptions: GitExecOptions;
+  }): Promise<void> {
+    const { projectPath, workspacePath, branchName, trunkBranch, initLogger, execOptions } = args;
+    if (!(await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, execOptions))) {
+      return;
     }
+    const originTrunk = `origin/${trunkBranch}`;
+    // A local trunk with unpushed work stays the base, for existing branches too.
+    if (!(await this.isAncestor(projectPath, trunkBranch, originTrunk, execOptions))) {
+      initLogger.logStderr(
+        `Note: Local ${trunkBranch} is ahead of or diverged from origin, using local state`
+      );
+      return;
+    }
+    using tipsProc = execFileAsync(
+      "git",
+      ["-C", projectPath, "rev-parse", `refs/heads/${branchName}`, `refs/remotes/${originTrunk}`],
+      execOptions
+    );
+    const [branchTip, originTip] = (await tipsProc.result).stdout.trim().split("\n");
+    if (branchTip === originTip) {
+      return;
+    }
+    if (!(await this.isAncestor(projectPath, branchTip, originTip, execOptions))) {
+      initLogger.logStderr(
+        `Note: ${branchName} has diverged from ${originTrunk}, using local branch state`
+      );
+      return;
+    }
+    // With no index or files yet, moving the ref is the whole fast-forward. HEAD stays a
+    // symref to the branch, so it remains claimed throughout.
+    using updateProc = execFileAsync(
+      "git",
+      ["-C", workspacePath, "update-ref", `refs/heads/${branchName}`, originTip, branchTip],
+      execOptions
+    );
+    await updateProc.result;
+    initLogger.logStep(`Fast-forwarded to ${originTrunk}`);
   }
 
   async renameWorkspace(

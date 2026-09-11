@@ -72,11 +72,7 @@ import {
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import {
-  useWorkspaceName,
-  type WorkspaceNameState,
-  type WorkspaceIdentity,
-} from "@/browser/hooks/useWorkspaceName";
+import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -236,8 +232,6 @@ interface UseCreationWorkspaceReturn {
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** The confirmed identity being used for creation (null until generation resolves) */
-  creatingWithIdentity: WorkspaceIdentity | null;
   /** Reload branches (e.g., after git init) */
   reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
@@ -336,8 +330,6 @@ export function useCreationWorkspace({
      * so onConfirm trusts the correct project even if the user navigates. */
     projectPath: string;
   } | null>(null);
-  // The confirmed identity being used for workspace creation (set after waitForGeneration resolves)
-  const [creatingWithIdentity, setCreatingWithIdentity] = useState<WorkspaceIdentity | null>(null);
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
@@ -493,14 +485,6 @@ export function useCreationWorkspace({
 
       setIsSending(true);
       setToast(null);
-      // If user provided a manual name, show it immediately in the overlay
-      // instead of "Generating name…". Auto-generated names still show the
-      // loading text until generation resolves.
-      setCreatingWithIdentity(
-        !workspaceNameState.autoGenerate && workspaceNameState.name.trim()
-          ? { name: workspaceNameState.name.trim(), title: workspaceNameState.name.trim() }
-          : null
-      );
 
       let createdWorkspaceId: string | null = null;
 
@@ -512,9 +496,6 @@ export function useCreationWorkspace({
           setIsSending(false);
           return { success: false };
         }
-
-        // Set the confirmed identity for splash UI display
-        setCreatingWithIdentity(identity);
 
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
@@ -896,8 +877,6 @@ export function useCreationWorkspace({
       settings.reasoningMode,
       settings.trunkBranch,
       waitForGeneration,
-      workspaceNameState.autoGenerate,
-      workspaceNameState.name,
       subProjectPath,
       dynamicWorkflowsEnabled,
       draftId,
@@ -966,8 +945,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // The confirmed identity being used for creation (null until generation resolves)
-    creatingWithIdentity,
     // Reload branches (e.g., after git init)
     reloadBranches: loadBranches,
     // Runtime availability state for each mode

@@ -118,7 +118,7 @@ import {
   type ModelSelectorRef,
 } from "@/browser/components/ModelSelector/ModelSelector";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { SendHorizontal } from "lucide-react";
+import { Loader2, SendHorizontal } from "lucide-react";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
 import { ChatAttachments } from "@/browser/features/ChatInput/ChatAttachments";
@@ -151,7 +151,6 @@ import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { trackCommandUsed } from "@/common/telemetry";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 
-import { CreationCenterContent } from "./CreationCenterContent";
 import { cn } from "@/common/lib/utils";
 import type {
   ChatInputProps,
@@ -2441,19 +2440,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   return (
     <Wrapper {...wrapperProps}>
       {creationState.trustDialog}
-      {/* Loading overlay during workspace creation */}
-      {variant === "creation" && (
-        <CreationCenterContent
-          projectName={props.projectName}
-          isSending={isSendInFlight}
-          workspaceName={
-            isSendInFlight && props.kind !== "scratch"
-              ? creationState.creatingWithIdentity?.name
-              : undefined
-          }
-          workspaceTitle={isSendInFlight ? creationState.creatingWithIdentity?.title : undefined}
-        />
-      )}
 
       {/* Input section - centered card for creation, bottom bar for workspace */}
       <div
@@ -2784,7 +2770,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                             "[@media(hover:none)_and_(pointer:coarse)]:h-9 [@media(hover:none)_and_(pointer:coarse)]:w-9 [@media(hover:none)_and_(pointer:coarse)]:text-sm"
                           )}
                         >
-                          <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
+                          {/* Creation has no splash: the button itself shows the send in flight
+                              until the new workspace's transcript takes over. */}
+                          {variant === "creation" && isSendInFlight ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2.5} />
+                          ) : (
+                            <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
+                          )}
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent align="start" className="max-w-80 whitespace-normal">

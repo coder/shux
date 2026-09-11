@@ -215,8 +215,8 @@ export interface WorkspaceCreationParams {
 
 /** Creation-time decisions materializeWorkspace() needs to finish a deferred checkout. */
 export interface PendingMaterialization {
-  /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
-  fastForwardFromOrigin: boolean;
+  /** Fetch origin/<trunkBranch> and fast-forward the branch to it before checking out files. */
+  syncWithOrigin: boolean;
 }
 
 /** Init params for materializeWorkspace(), plus how far a cancellation may reach. */

@@ -128,6 +128,24 @@ async function waitForProcessesToExit(pids: number[]): Promise<boolean> {
   return false;
 }
 
+/** Clone the project as its origin and add one commit there, so origin/main is ahead of main. */
+function installOriginAhead(fixture: { rootDir: string; projectPath: string }): string {
+  const remotePath = path.join(fixture.rootDir, "remote");
+  execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], { stdio: "ignore" });
+  execSync(
+    'git config user.email "test@example.com" && git config user.name "test" && ' +
+      'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
+    { cwd: remotePath, stdio: "ignore" }
+  );
+  execFileSync("git", ["remote", "add", "origin", remotePath], {
+    cwd: fixture.projectPath,
+    stdio: "ignore",
+  });
+  const remoteHead = gitRevParseHead(remotePath);
+  expect(remoteHead).not.toBe(gitRevParseHead(fixture.projectPath));
+  return remoteHead;
+}
+
 function gitRevParseHead(cwd: string): string {
   return execFileSync("git", ["rev-parse", "HEAD"], { cwd, stdio: ["ignore", "pipe", "ignore"] })
     .toString()
@@ -462,7 +480,7 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath,
-        pendingMaterialization: { fastForwardFromOrigin: false },
+        pendingMaterialization: { syncWithOrigin: false },
       });
       // Reserved but empty: registered with git, no files, no checkout activity yet.
       expect(
@@ -1084,21 +1102,7 @@ describe("WorktreeManager.createWorkspace", () => {
     const fixture = await createWorktreeManagerFixture();
 
     try {
-      const remotePath = path.join(fixture.rootDir, "remote");
-      execFileSync("git", ["clone", "--quiet", fixture.projectPath, remotePath], {
-        stdio: "ignore",
-      });
-      execSync(
-        'git config user.email "test@example.com" && git config user.name "test" && ' +
-          'git config commit.gpgsign false && git commit --allow-empty -m "remote-only"',
-        { cwd: remotePath, stdio: "ignore" }
-      );
-      execFileSync("git", ["remote", "add", "origin", remotePath], {
-        cwd: fixture.projectPath,
-        stdio: "ignore",
-      });
-      const remoteHead = gitRevParseHead(remotePath);
-      expect(remoteHead).not.toBe(gitRevParseHead(fixture.projectPath));
+      const remoteHead = installOriginAhead(fixture);
 
       const result = await fixture.manager.createWorkspace({
         projectPath: fixture.projectPath,
@@ -1113,6 +1117,163 @@ describe("WorktreeManager.createWorkspace", () => {
         throw new Error("Expected createWorkspace to return a workspace path");
       }
       expect(gitRevParseHead(result.workspacePath)).toBe(remoteHead);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  for (const existing of [false, true]) {
+    it(`defers the origin fetch to materialization and fast-forwards ${existing ? "an existing" : "a new"} branch there`, async () => {
+      const branchName = `feature-deferred-fetch-${existing ? "existing" : "new"}`;
+      const fixture = await createWorktreeManagerFixture({
+        existingBranchName: existing ? branchName : undefined,
+      });
+      const steps: string[] = [];
+      const initLogger = {
+        ...fixture.initLogger,
+        logStep: (message: string) => steps.push(message),
+      };
+
+      try {
+        const remoteHead = installOriginAhead(fixture);
+        const localHead = gitRevParseHead(fixture.projectPath);
+
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger,
+          deferMaterialization: true,
+        });
+        expect(result).toEqual({
+          success: true,
+          workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, branchName),
+          pendingMaterialization: { syncWithOrigin: true },
+        });
+        if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+        // The announcement never waits on the remote: the branch still sits on the local trunk.
+        expect(steps.some((step) => step.startsWith("Fetching latest from origin"))).toBe(false);
+        expect(gitRevParseHead(result.workspacePath)).toBe(localHead);
+
+        await fixture.manager.materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger,
+          },
+          result.pendingMaterialization!
+        );
+        expect(steps.indexOf("Fetched latest from origin")).toBeLessThan(
+          steps.indexOf("Checking out files...")
+        );
+        expect(steps).toContain("Fast-forwarded to origin/main");
+        expect(gitRevParseHead(result.workspacePath)).toBe(remoteHead);
+        expect(
+          execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath }).toString()
+        ).toBe("");
+        expect(
+          execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+            .toString()
+            .trim()
+        ).toBe(branchName);
+      } finally {
+        await fixture.cleanup();
+      }
+    }, 20_000);
+  }
+
+  it("keeps a local trunk with unpushed work as the base", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const steps: string[] = [];
+    const stderrLines: string[] = [];
+
+    try {
+      installOriginAhead(fixture);
+      execSync('git commit --allow-empty -m "local-only"', {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      const localHead = gitRevParseHead(fixture.projectPath);
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-diverged-trunk",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStep: (message) => steps.push(message),
+          logStderr: (line) => stderrLines.push(line),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected a workspace");
+      expect(steps).toContain("Fetched latest from origin");
+      expect(steps.some((step) => step.startsWith("Fast-forwarded"))).toBe(false);
+      expect(stderrLines).toEqual([
+        "Note: Local main is ahead of or diverged from origin, using local state",
+      ]);
+      expect(gitRevParseHead(result.workspacePath)).toBe(localHead);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("finishes the deferred fetch and checkout when only a non-removal abort arrives", async () => {
+    const branchName = "feature-archived-during-fetch";
+    const fixture = await createWorktreeManagerFixture({ fetchTimeoutMs: 1_000 });
+
+    try {
+      const stall = await installStalledOriginFetch(fixture);
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const initAbort = new AbortController();
+      const checkoutAbort = new AbortController();
+      const pending = fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath: result.workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+          abortSignal: initAbort.signal,
+          checkoutAbortSignal: checkoutAbort.signal,
+        },
+        result.pendingMaterialization!
+      );
+      await stall.waitForPids();
+      // Archive-style: init is cancelled while the fetch is still stalled.
+      initAbort.abort();
+      const outcome = await pending.then(
+        () => "resolved",
+        () => "rejected"
+      );
+      expect(outcome).toBe("rejected");
+
+      // The fetch fell back to the local trunk and the files were still populated.
+      expect(await fsPromises.readFile(path.join(result.workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+      expect(gitRevParseHead(result.workspacePath)).toBe(gitRevParseHead(fixture.projectPath));
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(branchName);
     } finally {
       await fixture.cleanup();
     }
