@@ -1297,6 +1297,124 @@ describe("MCPServerManager", () => {
     }
   );
 
+  test.each(["initial", "additional", "retry", "restart", "retired-only", "readd"] as const)(
+    "failed component startup retirement stays owned after %s publication",
+    async (mode) => {
+      using tmp = new DisposableTempDir("mcp-startup-retirement");
+      const f = await componentFixture(tmp.path);
+      const key = "plugin:instance:remove";
+      const request = workspaceRequest("startup-retirement");
+      const startServers = access.startServers;
+      if (mode === "retired-only") {
+        delete f.configs.ordinary;
+        await f.write(["remove"]);
+      } else if (mode === "additional") {
+        await f.write(["keep"]);
+        await manager.getToolsForWorkspace(request);
+        await f.write(["keep", "remove"]);
+      } else if (mode === "retry") {
+        access.startServers = async (servers, ...args) => {
+          const remaining = { ...(servers as Record<string, MCPServerInfo>) };
+          delete remaining[key];
+          const result = await startServers.call(manager, remaining, ...args);
+          return { ...result, failedServerNames: [key], timedOutServerNames: [key] };
+        };
+        await manager.getToolsForWorkspace(request);
+        access.startServers = startServers;
+      } else if (mode === "restart") {
+        await manager.getToolsForWorkspace(request);
+        f.started.find((client) => client.name === key)!.isClosed = true;
+        manager.acquireLease(request.workspaceId);
+      }
+      const entered = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const original = access.startSingleServer;
+      let failClose = true;
+      let failedClient: ReturnType<typeof testInstance> | undefined;
+      access.startSingleServer = async (...args) => {
+        const client = (await original(...args)) as ReturnType<typeof testInstance>;
+        if (args[0] === key && failedClient === undefined) {
+          failedClient = client;
+          client.close = mock(() =>
+            failClose ? Promise.reject(new Error("startup close failed")) : Promise.resolve()
+          );
+          entered.resolve();
+          await resume.promise;
+        }
+        return client;
+      };
+      const pending = manager.getToolsForWorkspace(request);
+      pending.catch(() => undefined);
+      try {
+        await entered.promise;
+        await f.write(mode === "retired-only" ? [] : ["keep"]);
+        resume.resolve();
+        const served = await pending;
+        const retained = f.started.filter((client) => client.name !== key);
+        const entry = access.workspaceServers.get(request.workspaceId) as {
+          instances: Map<string, unknown>;
+          retiredPluginInstances?: Set<unknown>;
+          enabledServerNames: Set<string>;
+          timedOutServerNames: string[];
+          lastActivity: number;
+        };
+        expect(failedClient).toBeDefined();
+        expect(failedClient!.close.mock.calls.length).toBeGreaterThan(0);
+        expect(entry.retiredPluginInstances?.has(failedClient)).toBe(true);
+        expect(entry.instances.has(key)).toBe(false);
+        expect(entry.enabledServerNames.has(key)).toBe(false);
+        expect(entry.timedOutServerNames).not.toContain(key);
+        expect(Object.values(served.toolServerNames)).not.toContain(key);
+        expect(served.stats.startedServerCount).toBe(mode === "retired-only" ? 0 : 2);
+        expect(served.stats.enabledServerCount).toBe(mode === "retired-only" ? 0 : 2);
+        expect(served.stats.failedServerNames).not.toContain(key);
+        for (const client of retained) {
+          expect(entry.instances.get(client.name)).toBe(client);
+          expect(client.close).not.toHaveBeenCalled();
+        }
+        if (mode === "readd") {
+          await f.write(["keep", "remove"]);
+          const readded = await manager.getToolsForWorkspace(request);
+          expect(Object.values(readded.toolServerNames)).toContain(key);
+          expect(entry.instances.get(key)).not.toBe(failedClient);
+          expect(entry.retiredPluginInstances?.has(failedClient)).toBe(true);
+        }
+        failClose = false;
+        const attempts = failedClient!.close.mock.calls.length;
+        if (mode === "retired-only") {
+          const sweep = spyOn(
+            manager as unknown as { retireCrossProcessPluginInstances: () => Promise<void> },
+            "retireCrossProcessPluginInstances"
+          );
+          try {
+            entry.lastActivity = Date.now() - 11 * 60_000;
+            access.cleanupIdleServers();
+            expect(sweep).toHaveBeenCalledTimes(1);
+            await sweep.mock.results[0].value;
+          } finally {
+            sweep.mockRestore();
+          }
+        } else if (mode === "additional" || mode === "restart") {
+          await manager.stopServersWithKeyPrefix(key);
+        } else {
+          await manager.reconcilePluginComponents();
+        }
+        expect(failedClient!.close).toHaveBeenCalledTimes(attempts + 1);
+        expect(entry.retiredPluginInstances?.has(failedClient) ?? false).toBe(false);
+        for (const client of retained) {
+          expect(entry.instances.get(client.name)).toBe(client);
+          expect(client.close).not.toHaveBeenCalled();
+        }
+      } finally {
+        failClose = false;
+        resume.resolve();
+        await pending.catch(() => undefined);
+        if (mode === "restart") manager.releaseLease(request.workspaceId);
+        await manager.reconcilePluginComponents();
+      }
+    }
+  );
+
   test.each([false, true])(
     "component removal fences pending startup (readd during cleanup: %s)",
     async (readd) => {

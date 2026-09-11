@@ -2788,7 +2788,7 @@ export class MCPServerManager {
             retriedInstances,
             startupEpoch,
             workspaceId,
-            (invalidatedRetryKeys) => {
+            (invalidatedRetryKeys, failedRetirements) => {
               // Recheck ownership INSIDE the synchronous callback: a
               // removal-style stopServers (or config-change replacement)
               // landing while the awaited invalidation scan yielded has
@@ -2799,6 +2799,8 @@ export class MCPServerManager {
                 retryOwnershipLost = true;
                 return;
               }
+              for (const instance of failedRetirements)
+                (existing.retiredPluginInstances ??= new Set()).add(instance);
               for (const [serverName, instance] of retriedInstances) {
                 existing.instances.set(serverName, instance);
               }
@@ -2973,7 +2975,7 @@ export class MCPServerManager {
           restartedInstances,
           startupEpoch,
           workspaceId,
-          (invalidatedRestartKeys) => {
+          (invalidatedRestartKeys, failedRetirements) => {
             // Same ownership recheck as the timed-out retry path: a removal
             // or replacement landing during the awaited scan must not let
             // this merge revive clients on a detached entry.
@@ -2982,6 +2984,8 @@ export class MCPServerManager {
               return;
             }
 
+            for (const instance of failedRetirements)
+              (existing.retiredPluginInstances ??= new Set()).add(instance);
             for (const [serverName, instance] of restartedInstances) {
               existing.instances.set(serverName, instance);
             }
@@ -3230,7 +3234,7 @@ export class MCPServerManager {
         instances,
         startupEpoch,
         workspaceId,
-        (invalidatedKeys) => {
+        (invalidatedKeys, failedRetirements) => {
           // Recheck the removal-stop epoch INSIDE the synchronous publication
           // callback: a stopServers(workspaceId) landing while the awaited
           // invalidation scan yielded found no cache entry to close, so
@@ -3241,6 +3245,8 @@ export class MCPServerManager {
           }
           if (retained) {
             if (this.workspaceServers.get(workspaceId) !== retained) return;
+            for (const instance of failedRetirements)
+              (retained.retiredPluginInstances ??= new Set()).add(instance);
             for (const [name, instance] of instances) retained.instances.set(name, instance);
             retained.configSignature = signature;
             retained.enabledServerNames = enabledServerNames;
@@ -3259,6 +3265,7 @@ export class MCPServerManager {
           entry = {
             configSignature: signature,
             instances,
+            ...(failedRetirements.size > 0 ? { retiredPluginInstances: failedRetirements } : {}),
             enabledServerNames,
             enabledServers,
             enabledServersGeneration: configGenerationUsed,
@@ -4276,16 +4283,19 @@ export class MCPServerManager {
    * after publication, so it sees the published entry and closes matches.
    *
    * `publish` MUST NOT await; it receives every key closed across all scans
-   * and must queue them for retry (see closeInvalidatedInstances docs).
+   * and must queue them for retry (see closeInvalidatedInstances docs). Failed
+   * component closes transfer to the published entry's retired-client set so
+   * they remain retryable without exposing their tools or blocking a readd.
    */
   private async closeInvalidatedInstancesThenPublish(
     instances: Map<string, MCPServerInstance>,
     startedAtEpoch: number,
     workspaceId: string,
-    publish: (invalidatedKeys: string[]) => void
+    publish: (invalidatedKeys: string[], failedRetirements: Set<MCPServerInstance>) => void
   ): Promise<void> {
     const invalidatedKeys: string[] = [];
     const removedComponents: string[] = [];
+    const failedRetirements = new Set<MCPServerInstance>();
     for (;;) {
       if (this.pluginInvalidation?.readComponentPolicy !== undefined)
         await this.retireCrossProcessPluginInstances();
@@ -4299,6 +4309,7 @@ export class MCPServerManager {
         try {
           await instance.close();
         } catch (error) {
+          failedRetirements.add(instance);
           log.warn("Failed to close removed plugin startup", { name, error });
         }
       }
@@ -4311,7 +4322,8 @@ export class MCPServerManager {
       // calls, which are finite user-driven plugin update/uninstall events.
       if (this.prefixInvalidationClock === clockBeforeScan) {
         publish(
-          [...invalidatedKeys, ...removedComponents].filter((name) => this.componentAllowed(name))
+          [...invalidatedKeys, ...removedComponents].filter((name) => this.componentAllowed(name)),
+          failedRetirements
         );
         return;
       }
