@@ -5,6 +5,9 @@ import { Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import { log } from "./log";
 import { EventEmitter } from "events";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { Err, Ok } from "@/common/types/result";
 import type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -62,6 +65,71 @@ function observePolicy(session: AgentSession) {
 }
 
 describe("AgentSession turn completion", () => {
+  test("ordinary completion drains queued input despite an unreadable compaction generation", async () => {
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const nextStarted = Promise.withResolvers<void>();
+    const emitter = new EventEmitter();
+    let calls = 0;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++calls}`;
+          start(emitter, messageId);
+          if (calls === 2) nextStarted.resolve();
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                calls === 1
+                  ? completion.promise
+                  : createStartedTurnHandle(h.session.closingSignal).completion,
+            })
+          );
+        }),
+      },
+    });
+    const consumer = observePolicy(h.session);
+    const observation = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
+    const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+    try {
+      expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
+      const firstPolicy = policyPromise(consumer);
+      h.session.queueMessage("queued follow-up", sendOptions);
+      // A compaction-only sidecar must not strand ordinary completion policy or its queue.
+      const generationPath = path.join(
+        h.config.sessionsDir,
+        workspaceId,
+        CONTINUOUS_COMPACTION_GENERATION_FILE
+      );
+      await fs.mkdir(generationPath);
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await firstPolicy;
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      expect(observation).toHaveBeenCalledTimes(1);
+      expect(accounting).toHaveBeenCalledTimes(1);
+      await nextStarted.promise;
+      expect(calls).toBe(2);
+      expect(h.session.isBusy()).toBe(true);
+      expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(1);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.at(-1)?.parts).toMatchObject([
+        { type: "text", text: "queued follow-up" },
+      ]);
+      expect((await fs.stat(generationPath)).isDirectory()).toBe(true);
+    } finally {
+      completion.resolve({ status: "completed", streamEnd: end() });
+      observation.mockRestore();
+      accounting.mockRestore();
+      consumer.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("late abort bookkeeping failure preserves output in the renderer lifecycle", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
     const emitter = new EventEmitter();

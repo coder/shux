@@ -598,6 +598,11 @@ export class ContinuousCompactor {
 
   private async finalizeJournal(pendingFollowUp?: CompactionFollowUpRequest): Promise<boolean> {
     const generation = this.generation;
+    const preparation = this.deps.compactionHandler.beginPreparation(
+      () =>
+        generation === this.generation &&
+        !this.deps.streamManager.isStreaming(this.deps.workspaceId)
+    );
     const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
     const journal = await store.read(
       () => generation === this.generation,
@@ -681,39 +686,29 @@ export class ContinuousCompactor {
     const boundary = structuredClone(journal.boundary);
     if (pendingFollowUp && boundary.metadata?.muxMetadata?.type === "compaction-summary")
       boundary.metadata.muxMetadata.pendingFollowUp = pendingFollowUp;
-    const applied = await this.deps.compactionHandler.withContinuousPendingState(
-      head,
-      async (_boundaryMessageId, onCommitted) => {
-        if (
-          generation !== this.generation ||
-          this.deps.streamManager.isStreaming(this.deps.workspaceId)
-        )
-          return false;
-        return this.deps.compactionHandler.persistContinuousCompaction({
-          messages: rows,
-          text: boundary.parts
-            .filter((part) => part.type === "text")
-            .map((part) => part.text)
-            .join("\n"),
-          model: journal.summaryModel,
-          tail: [],
-          systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
-          attachmentTokens: injectPostCompactionAttachments(
-            [],
-            journal.postCompactionAttachments
-          ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
-          // Sequence assignment must not mutate the exact journal receipt used by cleanup.
-          prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
-          publication: { generation: journal.publicationGeneration, journal },
-          onCommitted,
-          shouldPersist: (current) =>
-            generation === this.generation &&
-            !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
-            fingerprint(sliceMessagesFromLatestCompactionBoundary(current)) === snapshot,
-        });
-      },
-      boundary.id
-    );
+    const applied = await this.deps.compactionHandler.persistContinuousCompaction({
+      messages: rows,
+      text: boundary.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n"),
+      model: journal.summaryModel,
+      tail: [],
+      systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
+      attachmentTokens: injectPostCompactionAttachments(
+        [],
+        journal.postCompactionAttachments
+      ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
+      // Sequence assignment must not mutate the exact journal receipt used by cleanup.
+      prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
+      publication: { generation: journal.publicationGeneration, journal },
+      preparation,
+      attachmentMessages: head,
+      shouldPersist: (current) =>
+        generation === this.generation &&
+        !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
+        fingerprint(sliceMessagesFromLatestCompactionBoundary(current)) === snapshot,
+    });
     if (applied && generation === this.generation) {
       await this.clearJournalBestEffort(journal);
       if (generation === this.generation) {
@@ -729,6 +724,11 @@ export class ContinuousCompactor {
     context: ContinuousCompactionContext,
     pendingFollowUp?: CompactionFollowUpRequest
   ): Promise<boolean> {
+    const preparation = this.deps.compactionHandler.beginPreparation(
+      () =>
+        staged.generation === this.generation &&
+        !this.deps.streamManager.isStreaming(this.deps.workspaceId)
+    );
     assert(
       !this.deps.streamManager.isStreaming(this.deps.workspaceId),
       "Cannot apply a boundary while a stream is active"
@@ -739,46 +739,41 @@ export class ContinuousCompactor {
     assert(head !== null, "Validated rolling head disappeared");
     context = await this.withAttachmentEstimate(head, context);
     if (staged.generation !== this.generation) return false;
-    return this.deps.compactionHandler.withContinuousPendingState(
-      head,
-      async (boundaryMessageId, onCommitted) => {
-        // Pending-state persistence yields; a reset/edit during it must still invalidate this job.
-        rows = await this.readSnapshot();
-        if (!rows || !this.isValid(staged, rows)) return false;
-        assert(
-          !this.deps.streamManager.isStreaming(this.deps.workspaceId),
-          "Stream started during continuous apply"
-        );
-        const partial = await this.deps.historyService.readPartial(this.deps.workspaceId);
-        assert(!partial, "Continuous apply requires the partial to be committed first");
-        if (staged.generation !== this.generation) return false;
-        if (!this.wouldFit(staged, rows, context)) return false;
-        const tail = this.materializeTail(staged, rows);
-        const snapshotFingerprint = fingerprint(rows);
-        const applied = await this.deps.compactionHandler.persistContinuousCompaction({
-          boundaryMessageId,
-          publication: { generation: staged.publicationGeneration },
-          onCommitted,
-          shouldPersist: (currentRows) => {
-            const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
-            return (
-              staged.generation === this.generation &&
-              !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
-              this.isValid(staged, current) &&
-              fingerprint(current) === snapshotFingerprint
-            );
-          },
-          messages: rows,
-          text: staged.text,
-          model: staged.model,
-          tail,
-          systemMessageTokens: context.systemMessageTokens ?? 0,
-          attachmentTokens: context.attachmentTokens ?? 0,
-          pendingFollowUp,
-        });
-        if (applied && staged.generation === this.generation) this.reset("applied");
-        return applied;
-      }
+    // Attachment estimation yields; revalidate the captured source before preparing rows.
+    rows = await this.readSnapshot();
+    if (!rows || !this.isValid(staged, rows)) return false;
+    assert(
+      !this.deps.streamManager.isStreaming(this.deps.workspaceId),
+      "Stream started during continuous apply"
     );
+    const partial = await this.deps.historyService.readPartial(this.deps.workspaceId);
+    assert(!partial, "Continuous apply requires the partial to be committed first");
+    if (staged.generation !== this.generation) return false;
+    if (!this.wouldFit(staged, rows, context)) return false;
+    const tail = this.materializeTail(staged, rows);
+    const snapshotFingerprint = fingerprint(rows);
+    const applied = await this.deps.compactionHandler.persistContinuousCompaction({
+      publication: { generation: staged.publicationGeneration },
+      preparation,
+      attachmentMessages: head,
+      shouldPersist: (currentRows) => {
+        const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
+        return (
+          staged.generation === this.generation &&
+          !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
+          this.isValid(staged, current) &&
+          fingerprint(current) === snapshotFingerprint
+        );
+      },
+      messages: rows,
+      text: staged.text,
+      model: staged.model,
+      tail,
+      systemMessageTokens: context.systemMessageTokens ?? 0,
+      attachmentTokens: context.attachmentTokens ?? 0,
+      pendingFollowUp,
+    });
+    if (applied && staged.generation === this.generation) this.reset("applied");
+    return applied;
   }
 }

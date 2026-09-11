@@ -456,9 +456,18 @@ describe("AgentSession continuous compaction wiring", () => {
     const retained = createMuxMessage("retained-user", "user", "Earlier task");
     await h.historyService.appendToHistory(workspaceId, retained);
     const handler = Reflect.get(h.session, "compactionHandler") as CompactionHandler;
+    const preparation = handler.beginPreparation(() => true);
+    const source = await rows(h);
     expect(
       await handler.persistContinuousCompaction({
-        messages: await rows(h),
+        preparation,
+        publication: {
+          generation: await h.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        attachmentMessages: source,
+        messages: source,
         text: "Continuous summary",
         model,
         tail: [retained],
@@ -826,8 +835,16 @@ describe("AgentSession continuous compaction wiring", () => {
           if (context.phase !== "mid-stream") return "none";
           const applied = await internals(h.session).interruptForContinuousCompaction(
             async (followUp) => {
+              const preparation = handler.beginPreparation(() => true);
               const history = await rows(h);
               const applied = await handler.persistContinuousCompaction({
+                preparation,
+                publication: {
+                  generation: await h.historyService
+                    .getContinuousCompactionJournal(workspaceId)
+                    .captureGeneration(),
+                },
+                attachmentMessages: history,
                 messages: history,
                 text: "Recovered summary",
                 model,

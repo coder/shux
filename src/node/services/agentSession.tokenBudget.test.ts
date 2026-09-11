@@ -28,6 +28,9 @@ import { createTurnCompletionController, type SettledStepBudget } from "./stream
 import { createRolloverPrefix, type ContextWindowRollover } from "./contextWindowRollover";
 import * as rolloverMessages from "./contextWindowRollover";
 import * as contextLimits from "@/common/utils/compaction/contextLimit";
+import { CompactionPendingState } from "./compactionPendingState";
+import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
+import { log } from "./log";
 
 const workspaceId = "token-budget-session";
 const model = "openai:gpt-4o";
@@ -1362,6 +1365,144 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(rolloverRows(rows)).toHaveLength(1);
       expect(text(rows.at(-1)!)).toBe("Recover accepted work");
       expect(h.requests).toHaveLength(1);
+    }
+  );
+
+  test.each(
+    (["on-send", "emergency"] as const).flatMap((mode) =>
+      (
+        [
+          "committed",
+          "append-failed",
+          "ack-failed",
+          "successor",
+          "cleanup-failed",
+          "ack-and-cleanup-failed",
+        ] as const
+      ).map((outcome) => ({ mode, outcome }))
+    )
+  )(
+    "rollover pending cleanup follows durable history ($mode, $outcome)",
+    async ({ mode, outcome }) => {
+      const h = await setup({
+        failure:
+          mode === "emergency" ? (attempt) => (attempt === 1 ? exceeded : undefined) : undefined,
+      });
+      await seedHistory(h, mode === "emergency" ? 20_000 : 110_000);
+      const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+      const pendingPath = path.join(sessionDir, POST_COMPACTION_STATE_FILENAME);
+      const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
+      let before = "";
+      let successor = "";
+      const acknowledgmentFailure = "injected post-commit failure";
+      const cleanupFails = outcome === "cleanup-failed" || outcome === "ack-and-cleanup-failed";
+      const reportedErrors = spyOn(log, "error");
+      const cleanup = h.session.applyContextResetSideEffects.bind(h.session);
+      spyOn(h.session, "applyContextResetSideEffects").mockImplementationOnce(async (...args) => {
+        // A foreign pending publication can arrive after preparation, including after the
+        // emergency path rejected an earlier attachment. The reset must retire this owner too.
+        before = JSON.stringify({
+          version: 1,
+          createdAt: 1,
+          publicationGeneration: (await journal.captureGeneration()) ?? null,
+          diffs: [{ path: "/before.ts", diff: "+before", truncated: false }],
+          loadedSkills: [{ name: "before", scope: "project", body: "Pre-reset instructions" }],
+          readFiles: ["/before.ts"],
+        });
+        await fs.writeFile(pendingPath, before);
+        await cleanup(...args);
+      });
+      const append = h.historyService.appendManyToHistory.bind(h.historyService);
+      spyOn(h.historyService, "appendManyToHistory").mockImplementation(async (id, rows) => {
+        const rollover = rolloverRows(rows).length > 0;
+        if (rollover && outcome === "append-failed") return Err("injected rollover append failure");
+        const result = await append(id, rows);
+        if (!rollover || !result.success) return result;
+        if (outcome === "successor") {
+          const pending = new CompactionPendingState(
+            pendingPath,
+            h.historyService.getCompactionPendingHistory(workspaceId)
+          );
+          expect(
+            (
+              await pending.publishBoundary({
+                summaryMessage: createMuxMessage("successor", "assistant", "New context", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 1,
+                }),
+                tailCopies: [],
+                updateExisting: false,
+                attachments: { diffs: [], loadedSkills: [], readFiles: ["/after.ts"] },
+                publication: { generation: await journal.captureGeneration() },
+                isCurrent: () => true,
+                shouldPersist: () => true,
+                onCommitted: () => undefined,
+              })
+            ).success
+          ).toBe(true);
+          successor = await fs.readFile(pendingPath, "utf8");
+        }
+        if (cleanupFails) {
+          const unlink = fs.unlink;
+          spyOn(fs, "unlink").mockImplementation((file) =>
+            file === pendingPath
+              ? Promise.reject(
+                  Object.assign(new Error("pending unlink failed"), { code: "EACCES" })
+                )
+              : unlink(file)
+          );
+        }
+        if (outcome === "ack-failed" || outcome === "ack-and-cleanup-failed") {
+          throw new Error(acknowledgmentFailure);
+        }
+        return result;
+      });
+
+      const sent = await h.session.sendMessage("Roll over this window", options);
+      if (cleanupFails) {
+        const causes = reportedErrors.mock.calls.flatMap((args) =>
+          args.filter((value): value is Error => value instanceof Error).map((error) => error.cause)
+        );
+        expect(causes).toContainEqual(expect.objectContaining({ code: "EACCES" }));
+      }
+      expect(sent.success).toBe(
+        outcome === "committed" || outcome === "successor" || outcome === "cleanup-failed"
+      );
+      expect(rolloverRows(await allRows(h))).toHaveLength(outcome === "append-failed" ? 0 : 1);
+      const persistedPending = await fs.readFile(pendingPath, "utf8").catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      });
+      // Generation fences protect the current reader only. Removing the compatible bytes is
+      // what prevents a preceding version from reloading them immediately after a downgrade.
+      expect(persistedPending).toBe(
+        outcome === "successor"
+          ? successor
+          : outcome === "append-failed" || cleanupFails
+            ? before
+            : undefined
+      );
+      if (!sent.success) {
+        expect(h.requests).toHaveLength(mode === "emergency" ? 1 : 0);
+        if (outcome === "ack-and-cleanup-failed") {
+          expect(sent.error).toMatchObject({ type: "unknown", raw: acknowledgmentFailure });
+        }
+      }
+      if (outcome === "cleanup-failed") {
+        expect(h.requests).toHaveLength(mode === "emergency" ? 2 : 1);
+        h.settleStream(0);
+        await h.session.waitForIdle();
+        expect((await h.session.sendMessage("Continue accepted work", options)).success).toBe(true);
+        const rows = await allRows(h);
+        expect(rolloverRows(rows)).toHaveLength(1);
+        const active = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(active.success).toBe(true);
+        if (active.success)
+          expect(active.data.filter((row) => text(row) === "Roll over this window")).toHaveLength(
+            1
+          );
+      }
     }
   );
 

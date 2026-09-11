@@ -1,4 +1,6 @@
 import type { TurnCompletion } from "./streamManager";
+import { CompactionPendingState } from "./compactionPendingState";
+import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
@@ -27,7 +29,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
@@ -7818,16 +7820,28 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.mkdir(sessionDir, { recursive: true });
       const pendingStatePath = path.join(sessionDir, "post-compaction.json");
-      await fsPromises.writeFile(
+      const pending = new CompactionPendingState(
         pendingStatePath,
-        JSON.stringify({
-          version: 1,
-          createdAt: Date.now(),
-          diffs: [],
-          loadedSkills: [],
-          readFiles: ["/tmp/pre-reset-read.ts"],
-        })
+        historyService.getCompactionPendingHistory(workspaceId)
       );
+      expect(
+        (
+          await pending.publishBoundary({
+            summaryMessage: createMuxMessage("summary", "assistant", "Summary", {
+              compacted: "user",
+              compactionBoundary: true,
+              compactionEpoch: 1,
+            }),
+            tailCopies: [],
+            updateExisting: false,
+            publication: { generation: undefined },
+            attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/pre-reset-read.ts"] },
+            isCurrent: () => true,
+            shouldPersist: () => true,
+            onCommitted: () => undefined,
+          })
+        ).success
+      ).toBe(true);
 
       expect(await workspaceService.resetContext(workspaceId)).toEqual({
         success: true,
@@ -7844,11 +7858,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
-  test("context reset fails when the post-compaction carryover discard is not durable", async () => {
-    // Best-effort deletion of post-compaction.json swallowed unlink failures
-    // while resetContext still reported success — after a restart the stale
-    // file re-injects PRE-reset read paths/skills/diffs. The discard must be
-    // durable-or-fail, matching the sandbox invalidation posture.
+  test("context reset repairs an empty directory at the pending-state path", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-carryover-not-durable";
     try {
@@ -7863,19 +7873,362 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         workspaceId,
         createMuxMessage("pre-reset-user", "user", "before reset", {})
       );
-      // Deterministic unlink failure: a DIRECTORY at the pending-state path
-      // fails unlink with EISDIR (read errors are swallowed at load, so this
-      // models exactly the stale-undeletable-file case).
+      // Invalid optional state should heal without blocking a durable history reset.
       const pendingStatePath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
       await fsPromises.mkdir(pendingStatePath, { recursive: true });
 
       const result = await workspaceService.resetContext(workspaceId);
-      expect(result.success).toBe(false);
-      expect(result.success ? "" : result.error).toContain("post-compaction carryover");
+      expect(result.success).toBe(true);
+      expect(
+        await fsPromises.stat(pendingStatePath).catch((error: unknown) => error)
+      ).toMatchObject({ code: "ENOENT" });
     } finally {
       await cleanup();
     }
   });
+
+  test.each(
+    (["reset", "clear", "replace"] as const).flatMap((operation) =>
+      (["legacy", "future", "current"] as const).map((format) => ({ operation, format }))
+    )
+  )(
+    "empty-history $operation durably fences initial $format carryover",
+    async ({ operation, format }) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "empty-history-carryover";
+      try {
+        await config.addWorkspace("/tmp/empty-history-carryover", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "empty-history-carryover",
+          projectPath: "/tmp/empty-history-carryover",
+          runtimeConfig: { type: "local" },
+        });
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        let original = JSON.stringify({
+          version: format === "future" ? 9 : 1,
+          createdAt: 1,
+          diffs: [],
+          loadedSkills: [],
+          readFiles: ["/tmp/discarded.ts"],
+        });
+        await fsPromises.mkdir(path.dirname(pendingPath), { recursive: true });
+        await fsPromises.writeFile(pendingPath, original);
+        const pending = new CompactionPendingState(
+          pendingPath,
+          historyService.getCompactionPendingHistory(workspaceId)
+        );
+        const journal = historyService.getContinuousCompactionJournal(workspaceId);
+        if (format === "current") {
+          await journal.advanceGeneration();
+          expect(
+            (
+              await pending.publishBoundary({
+                summaryMessage: createMuxMessage("A", "assistant", "", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 1,
+                }),
+                tailCopies: [],
+                updateExisting: false,
+                publication: { generation: await journal.captureGeneration() },
+                attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/discarded.ts"] },
+                isCurrent: () => true,
+                shouldPersist: () => true,
+                onCommitted: () => undefined,
+              })
+            ).success
+          ).toBe(true);
+          original = await fsPromises.readFile(pendingPath, "utf8");
+        }
+        expect((await pending.load(() => true))?.attachments.readFiles).toEqual(
+          format === "future" ? undefined : ["/tmp/discarded.ts"]
+        );
+        if (format !== "current") expect(await journal.captureGeneration()).toBeUndefined();
+        const result =
+          operation === "reset"
+            ? await workspaceService.resetContext(workspaceId)
+            : operation === "clear"
+              ? await workspaceService.truncateHistory(workspaceId, 1)
+              : await workspaceService.replaceHistory(
+                  workspaceId,
+                  createMuxMessage("replacement", "user", "New context")
+                );
+        expect(result.success).toBe(true);
+        if (operation === "reset") expect(result).toEqual({ success: true, data: "noop" });
+        expect(await journal.captureGeneration()).toBeDefined();
+        if (format === "future")
+          expect(await fsPromises.readFile(pendingPath, "utf8")).toBe(original);
+        else
+          expect(await fsPromises.stat(pendingPath).catch((error: unknown) => error)).toMatchObject(
+            {
+              code: "ENOENT",
+            }
+          );
+        expect(await pending.load(() => true)).toBeUndefined();
+        await workspaceService.disposeSession(workspaceId);
+        const restarted = new CompactionPendingState(
+          pendingPath,
+          new HistoryService(config).getCompactionPendingHistory(workspaceId)
+        );
+        expect(await restarted.load(() => true)).toBeUndefined();
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
+  test("late no-op reset cleanup preserves a foreign successor after its committed fence", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "empty-reset-successor";
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let resetting: ReturnType<WorkspaceService["resetContext"]> | undefined;
+    try {
+      await config.addWorkspace("/tmp/empty-reset-successor", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "empty-reset-successor",
+        projectPath: "/tmp/empty-reset-successor",
+        runtimeConfig: { type: "local" },
+      });
+      const capture = historyService.fenceEmptyContext.bind(historyService);
+      spyOn(historyService, "fenceEmptyContext").mockImplementationOnce(async (...args) => {
+        const captured = await capture(...args);
+        entered.resolve();
+        await release.promise;
+        return captured;
+      });
+      resetting = workspaceService.resetContext(workspaceId);
+      await entered.promise;
+      const foreign = new HistoryService(config);
+      const foreignJournal = foreign.getContinuousCompactionJournal(workspaceId);
+      await foreignJournal.advanceGeneration();
+      const generation = await foreignJournal.captureGeneration();
+      const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+      const pending = new CompactionPendingState(
+        pendingPath,
+        foreign.getCompactionPendingHistory(workspaceId)
+      );
+      expect(
+        (
+          await pending.publishBoundary({
+            summaryMessage: createMuxMessage("B", "assistant", "New context", {
+              compacted: "user",
+              compactionBoundary: true,
+              compactionEpoch: 1,
+            }),
+            tailCopies: [],
+            updateExisting: false,
+            publication: { generation },
+            attachments: { diffs: [], loadedSkills: [], readFiles: ["/tmp/successor.ts"] },
+            isCurrent: () => true,
+            shouldPersist: () => true,
+            onCommitted: () => undefined,
+          })
+        ).success
+      ).toBe(true);
+      release.resolve();
+      expect(await resetting).toEqual({ success: true, data: "noop" });
+      expect(await foreignJournal.captureGeneration()).toBe(generation);
+      expect((await pending.load(() => true))?.attachments.readFiles).toEqual([
+        "/tmp/successor.ts",
+      ]);
+    } finally {
+      release.resolve();
+      await resetting;
+      await cleanup();
+    }
+  });
+
+  test.each(["absent", "probe error"] as const)(
+    "post-compaction metadata avoids only proven absent pending scans (%s)",
+    async (state) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "pending-metadata-scan";
+      try {
+        await config.addWorkspace("/tmp/pending-metadata-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "pending-metadata-project",
+          projectPath: "/tmp/pending-metadata-project",
+          runtimeConfig: { type: "local" },
+        });
+        const edited = createMuxMessage("edited", "assistant", "");
+        edited.parts = [
+          {
+            type: "dynamic-tool",
+            toolCallId: "edit",
+            toolName: "file_edit_replace_string",
+            state: "output-available",
+            input: { path: "/tmp/from-history.ts" },
+            output: { success: true, diff: "changed" },
+          },
+        ];
+        expect((await historyService.appendToHistory(workspaceId, edited)).success).toBe(true);
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        const stat = fsPromises.stat;
+        const probe = spyOn(fsPromises, "stat").mockImplementation((async (
+          ...args: Parameters<typeof fsPromises.stat>
+        ) => {
+          if (state === "probe error" && args[0] === pendingPath)
+            throw Object.assign(new Error("Probe denied"), { code: "EACCES" });
+          return stat(...args);
+        }) as typeof fsPromises.stat);
+        const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
+        const fallback = spyOn(historyService, "getHistoryFromLatestBoundary");
+        using _spies = {
+          [Symbol.dispose]: () => {
+            probe.mockRestore();
+            proof.mockRestore();
+            fallback.mockRestore();
+          },
+        };
+        for (let attempt = 0; attempt < 2; attempt++) {
+          expect(
+            (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+          ).toEqual(["/tmp/from-history.ts"]);
+        }
+        expect(proof).toHaveBeenCalledTimes(state === "absent" ? 0 : 2);
+        expect(fallback).toHaveBeenCalledTimes(2);
+        probe.mockRestore();
+
+        // A fresh store models another backend publishing after the earlier absence checks.
+        const foreign = new HistoryService(config);
+        const pending = new CompactionPendingState(
+          pendingPath,
+          foreign.getCompactionPendingHistory(workspaceId)
+        );
+        expect(
+          (
+            await pending.publishBoundary({
+              summaryMessage: createMuxMessage("published", "assistant", "Summary", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              }),
+              tailCopies: [],
+              updateExisting: false,
+              publication: {
+                generation: await foreign
+                  .getContinuousCompactionJournal(workspaceId)
+                  .captureGeneration(),
+              },
+              attachments: {
+                diffs: [{ path: "/tmp/published.ts", diff: "changed", truncated: false }],
+                loadedSkills: [],
+                readFiles: [],
+              },
+              isCurrent: () => true,
+              shouldPersist: () => true,
+              onCommitted: () => undefined,
+            })
+          ).success
+        ).toBe(true);
+        proof.mockClear();
+        fallback.mockClear();
+        expect(
+          (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+        ).toEqual(["/tmp/published.ts"]);
+        expect(proof).toHaveBeenCalledTimes(1);
+        expect(fallback).not.toHaveBeenCalled();
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
+  test.each([
+    "current",
+    "foreign boundary",
+    "reset",
+    "future",
+    "directory",
+    "nonempty directory",
+  ] as const)(
+    "post-compaction metadata qualifies pending paths against history (%s)",
+    async (change) => {
+      const { config, historyService, workspaceService, cleanup } = await createServices();
+      const workspaceId = "pending-path-qualification";
+      try {
+        await config.addWorkspace("/tmp/pending-path-project", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "pending-path-project",
+          projectPath: "/tmp/pending-path-project",
+          runtimeConfig: { type: "local" },
+        });
+        const pendingPath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
+        const pending = new CompactionPendingState(
+          pendingPath,
+          historyService.getCompactionPendingHistory(workspaceId)
+        );
+        expect(
+          (
+            await pending.publishBoundary({
+              summaryMessage: createMuxMessage("A", "assistant", "A", {
+                compacted: "user",
+                compactionBoundary: true,
+                compactionEpoch: 1,
+              }),
+              tailCopies: [],
+              updateExisting: false,
+              publication: { generation: undefined },
+              attachments: {
+                diffs: [{ path: "/tmp/pending.ts", diff: "changed", truncated: false }],
+                loadedSkills: [],
+                readFiles: [],
+              },
+              isCurrent: () => true,
+              shouldPersist: () => true,
+              onCommitted: () => undefined,
+            })
+          ).success
+        ).toBe(true);
+        if (change === "foreign boundary")
+          expect(
+            (
+              await historyService.appendToHistory(
+                workspaceId,
+                createMuxMessage("B", "assistant", "B", {
+                  compacted: "user",
+                  compactionBoundary: true,
+                  compactionEpoch: 2,
+                })
+              )
+            ).success
+          ).toBe(true);
+        else if (change === "reset")
+          expect((await historyService.clearHistory(workspaceId)).success).toBe(true);
+        const future = '{"version":9,"diffs":[{"path":"/tmp/future.ts"}]}\n';
+        if (change === "future") await fsPromises.writeFile(pendingPath, future);
+        if (change === "directory" || change === "nonempty directory") {
+          await fsPromises.unlink(pendingPath);
+          await fsPromises.mkdir(pendingPath);
+          if (change === "nonempty directory")
+            await fsPromises.writeFile(path.join(pendingPath, "keep"), "Owned content");
+        }
+        const proof = spyOn(historyScanner, "readCompactionPendingHistoryObservation");
+        using _proof = { [Symbol.dispose]: () => proof.mockRestore() };
+        expect(
+          (await workspaceService.getPostCompactionState(workspaceId)).trackedFilePaths
+        ).toEqual(change === "current" ? ["/tmp/pending.ts"] : []);
+        expect(proof).toHaveBeenCalledTimes(1);
+        if (change === "future")
+          expect(await fsPromises.readFile(pendingPath, "utf8")).toBe(future);
+        if (change === "directory")
+          expect(await fsPromises.stat(pendingPath).catch((error: unknown) => error)).toMatchObject(
+            { code: "ENOENT" }
+          );
+        if (change === "nonempty directory")
+          expect(await fsPromises.readFile(path.join(pendingPath, "keep"), "utf8")).toBe(
+            "Owned content"
+          );
+      } finally {
+        await cleanup();
+      }
+    }
+  );
 
   test("context reset fails when the sandbox invalidation is not durable", async () => {
     // The reset's kernel-vars invalidation is only durable once the
@@ -8627,17 +8980,16 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/context-reset-history-read-fails-project",
         runtimeConfig: { type: "local" },
       });
-      const historySpy = spyOn(
-        historyService,
-        "getHistoryFromLatestBoundary"
-      ).mockResolvedValueOnce(Err("read failed"));
+      const historySpy = spyOn(historyService, "fenceEmptyContext").mockResolvedValueOnce(
+        Err("read failed")
+      );
 
       try {
         const result = await workspaceService.resetContext(workspaceId);
 
         expect(result).toEqual({
           success: false,
-          error: "Failed to read active context before reset: read failed",
+          error: "read failed",
         });
       } finally {
         historySpy.mockRestore();

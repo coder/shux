@@ -91,22 +91,25 @@ describe("pending snapshot consumers", () => {
             output: { success: true },
           },
         ];
+        const preparation = handler.beginPreparation(() => true);
         expect(
-          await handler.withContinuousPendingState(
-            [edit],
-            (boundaryMessageId) =>
-              handler.persistContinuousCompaction({
-                messages: [edit],
-                boundaryMessageId,
-                text: `${id} summary`,
-                model,
-                tail: [],
-                systemMessageTokens: 0,
-                attachmentTokens: 0,
-                shouldPersist: () => true,
-              }),
-            id
-          )
+          await handler.persistContinuousCompaction({
+            preparation,
+            publication: {
+              generation: await h.historyService
+                .getContinuousCompactionJournal(workspaceId)
+                .captureGeneration(),
+            },
+            attachmentMessages: [edit],
+            messages: [edit],
+            boundaryMessageId: id,
+            text: `${id} summary`,
+            model,
+            tail: [],
+            systemMessageTokens: 0,
+            attachmentTokens: 0,
+            shouldPersist: () => true,
+          })
         ).toBe(true);
       }
       let policy: Promise<void> | undefined;
@@ -197,7 +200,14 @@ describe("pending snapshot consumers", () => {
             (await handler.peekPendingState())?.diffs.some((diff) => diff.path === "/b.ts")
           ).toBe(true);
           assert(bytes !== undefined, "Expected replacement file");
-          expect(await readFile(pendingPath, "utf8")).toBe(bytes);
+          const {
+            previousState: _previous,
+            previousStateGeneration: _generation,
+            previousStateBoundary: _boundary,
+            ...successor
+          } = JSON.parse(bytes) as Record<string, unknown>;
+          // Retiring A also retires its crash fallback, while B's exact owner survives.
+          expect(JSON.parse(await readFile(pendingPath, "utf8"))).toEqual(successor);
         } else {
           // The failed periodic injection still owns A's retained read-path carryover after ack.
           await publish("c");

@@ -10,12 +10,15 @@ import type {
 } from "@/common/types/attachment";
 import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import { AgentSession } from "./agentSession";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import type { CompactionHandler } from "./compactionHandler";
+import { CompactionPendingState } from "./compactionPendingState";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import { DisposableTempDir } from "./tempDir";
@@ -156,7 +159,7 @@ function createSessionForHistory(historyService: HistoryService, sessionDir: str
 interface PrivateSessionAccess {
   compactionOccurred: boolean;
   turnsSinceLastAttachment: number;
-  postCompactionLoadedSkills: LoadedSkillSnapshot[];
+  compactionHandler: CompactionHandler;
   getPostCompactionAttachmentsIfNeeded: () => Promise<PostCompactionAttachment[] | null>;
 }
 
@@ -170,14 +173,12 @@ async function getImmediatePostCompactionAttachments(
 }
 
 async function generatePeriodicPostCompactionAttachments(
-  session: AgentSession,
-  loadedSkills: LoadedSkillSnapshot[] = []
+  session: AgentSession
 ): Promise<PostCompactionAttachment[]> {
   const privateSession = session as unknown as PrivateSessionAccess;
 
   privateSession.compactionOccurred = true;
   privateSession.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS - 1;
-  privateSession.postCompactionLoadedSkills = loadedSkills;
 
   const attachments = await privateSession.getPostCompactionAttachmentsIfNeeded();
   expect(attachments).not.toBeNull();
@@ -190,6 +191,7 @@ async function writePendingPostCompactionState(args: {
   diffs: Array<{ path: string; diff: string; truncated: boolean }>;
   loadedSkills: LoadedSkillSnapshot[];
   readFiles?: string[];
+  boundaryMessageId?: string;
 }): Promise<void> {
   await fs.mkdir(args.sessionDir, { recursive: true });
   await fs.writeFile(
@@ -199,6 +201,7 @@ async function writePendingPostCompactionState(args: {
       createdAt: Date.now(),
       diffs: args.diffs,
       loadedSkills: args.loadedSkills,
+      boundaryMessageId: args.boundaryMessageId,
       ...(args.readFiles ? { readFiles: args.readFiles } : {}),
     })
   );
@@ -225,6 +228,14 @@ describe("AgentSession post-compaction attachments", () => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
+    expect(
+      (
+        await historyService.appendToHistory(
+          WORKSPACE_ID,
+          createMuxMessage("source", "user", "Context")
+        )
+      ).success
+    ).toBe(true);
     // A compaction persisted cumulative pre-boundary read paths...
     await writePendingPostCompactionState({
       sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
@@ -250,6 +261,7 @@ describe("AgentSession post-compaction attachments", () => {
 
       // A new context segment starts (context reset / full history clear):
       // the reset was meant to discard that context, so...
+      expect((await historyService.clearHistory(WORKSPACE_ID)).success).toBe(true);
       await session.clearPostCompactionState();
 
       // ...no later turn may re-inject pre-boundary paths — neither
@@ -257,8 +269,7 @@ describe("AgentSession post-compaction attachments", () => {
       for (let turn = 0; turn <= TURNS_BETWEEN_ATTACHMENTS; turn++) {
         expect(await privateSession.getPostCompactionAttachmentsIfNeeded(true)).toBeNull();
       }
-      // The persisted pending state is discarded too, so a NEW session after
-      // an app restart cannot resurrect the carryover either.
+      // Explicit destruction removes compatible legacy bytes so a downgrade cannot reload them.
       const stateExists = await fs
         .access(path.join(sessionDir.path, WORKSPACE_ID, "post-compaction.json"))
         .then(
@@ -266,6 +277,19 @@ describe("AgentSession post-compaction attachments", () => {
           () => false
         );
       expect(stateExists).toBe(false);
+      const restarted = createSessionForHistory(
+        historyService,
+        path.join(sessionDir.path, WORKSPACE_ID)
+      );
+      try {
+        expect(
+          await (
+            restarted as unknown as PrivateSessionAccess
+          ).getPostCompactionAttachmentsIfNeeded()
+        ).toBeNull();
+      } finally {
+        await restarted.dispose();
+      }
     } finally {
       await session.dispose();
     }
@@ -426,9 +450,6 @@ describe("AgentSession post-compaction attachments", () => {
     const workspaceId = "workspace-post-compaction-test";
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
-    for (const msg of history) {
-      await historyService.appendToHistory(workspaceId, msg);
-    }
 
     const session = createSessionForHistory(
       historyService,
@@ -440,7 +461,37 @@ describe("AgentSession post-compaction attachments", () => {
     });
 
     try {
-      const attachments = await generatePeriodicPostCompactionAttachments(session, [loadedSkill]);
+      // Acknowledged warmth belongs to the exact durable publication; seed its row and
+      // pending file together so the test exercises the same identity as real compaction.
+      const pending = new CompactionPendingState(
+        path.join(sessionDir.path, WORKSPACE_ID, POST_COMPACTION_STATE_FILENAME),
+        historyService.getCompactionPendingHistory(workspaceId)
+      );
+      expect(
+        (
+          await pending.publishBoundary({
+            summaryMessage: history[0],
+            tailCopies: history.slice(1),
+            updateExisting: false,
+            attachments: { diffs: [], loadedSkills: [loadedSkill], readFiles: [] },
+            publication: {
+              generation: await historyService
+                .getContinuousCompactionJournal(workspaceId)
+                .captureGeneration(),
+            },
+            isCurrent: () => true,
+            shouldPersist: () => true,
+            onCommitted: () => undefined,
+          })
+        ).success
+      ).toBe(true);
+      expect(getLoadedSkillNames(await getImmediatePostCompactionAttachments(session))).toEqual([
+        "react-effects",
+      ]);
+      await (
+        session as unknown as PrivateSessionAccess
+      ).compactionHandler.ackPendingStateConsumed();
+      const attachments = await generatePeriodicPostCompactionAttachments(session);
       expect(getLoadedSkillNames(attachments)).toEqual(["react-effects"]);
       expect(getLoadedSkillAttachment(attachments)?.skills[0]?.body).toContain(
         "Persist this guardrail across follow-up turns."

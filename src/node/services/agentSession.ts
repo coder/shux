@@ -1032,19 +1032,6 @@ export class AgentSession {
   private compactionOccurred = false;
 
   /**
-   * Skill guardrails loaded before compaction are preserved here so later turns can
-   * continue reattaching them even after the pending on-disk state is acknowledged.
-   */
-  private postCompactionLoadedSkills: LoadedSkillSnapshot[] = [];
-
-  /**
-   * Cumulative read-file paths from summarized epochs, mirrored like
-   * postCompactionLoadedSkills so periodic re-injections keep the pre-boundary
-   * reads after the pending on-disk state is acknowledged. RLM-only surface.
-   */
-  private postCompactionReadFilePaths: string[] = [];
-
-  /**
    * Retain the exact injected snapshot so a late completion cannot consume a replacement.
    *
    * This is intentionally delayed until stream-end so a crash mid-stream doesn't lose the diffs.
@@ -1052,8 +1039,6 @@ export class AgentSession {
   private pendingPostCompactionStateToAcknowledge: Awaited<
     ReturnType<CompactionHandler["peekPendingState"]>
   > = null;
-  /** Periodic reinjection retains the consumed owner of the cached skill/read carryover. */
-  private postCompactionState: typeof this.pendingPostCompactionStateToAcknowledge = null;
 
   /**
    * Cached memory session context (memory experiment): index snapshot for
@@ -4344,10 +4329,9 @@ export class AgentSession {
           if (isAdmissionStale() || this.coordinator.admissionBlocked || this.coordinator.closing) {
             return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
           }
-          // Fail closed before publication: a crash must not reopen a fresh window
-          // with stale carryover/kernel state. An append failure may leave the old
-          // transcript with disposable context state cleared (ADR-0005).
-          await this.applyContextResetSideEffects();
+          // Invalidate disposable/kernel state before publication. Pending carryover must
+          // wait for the writer's generation fence or it still qualifies as current.
+          await this.applyContextResetSideEffects({ deferCarryoverDiscard: true });
         }
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (
@@ -4358,8 +4342,9 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
         // Ordinary sends stay append-only; only coupled snapshots/boundaries need an atomic batch.
-        const appended =
-          batch.length === 1
+        const appended = contextRollover
+          ? await this.appendContextRolloverRows(batch)
+          : batch.length === 1
             ? await this.historyService.appendToHistory(this.workspaceId, userMessage)
             : await this.historyService.appendManyToHistory(this.workspaceId, batch);
         if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
@@ -5083,7 +5068,7 @@ export class AgentSession {
   }
 
   /** Shared with manual reset, but only context-scoped state: tasks, costs and goal consent survive. */
-  async applyContextResetSideEffects(): Promise<void> {
+  async applyContextResetSideEffects(options?: { deferCarryoverDiscard?: boolean }): Promise<void> {
     assert(
       !this.streamManager.isStreaming(this.workspaceId),
       "context reset requires a settled stream"
@@ -5094,14 +5079,7 @@ export class AgentSession {
     this.continuousCompactor.reset("context-changed");
     this.clearFileState();
     this.memoryContextByModelString.clear();
-    try {
-      await this.clearPostCompactionState();
-    } catch (error) {
-      throw new Error(
-        `The persisted post-compaction carryover could not be durably discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be re-injected after a restart.`,
-        { cause: error }
-      );
-    }
+    if (!options?.deferCarryoverDiscard) await this.discardContextResetCarryover();
     try {
       await sandboxHostService.discardScope(
         this.workspaceId,
@@ -5113,6 +5091,37 @@ export class AgentSession {
         { cause: error }
       );
     }
+  }
+
+  private async discardContextResetCarryover(): Promise<void> {
+    try {
+      await this.clearPostCompactionState();
+    } catch (error) {
+      throw new Error(
+        `The persisted post-compaction carryover could not be durably discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be re-injected after a restart.`,
+        { cause: error }
+      );
+    }
+  }
+
+  private async appendContextRolloverRows(rows: MuxMessage[]): Promise<Result<void>> {
+    let appended: Result<void>;
+    try {
+      appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
+    } catch (error) {
+      appended = Err(getErrorMessage(error));
+    }
+    // The writer may commit its boundary/fence before reporting an error. Always reconcile
+    // afterward: unchanged generations and newer successors remain protected by the store.
+    try {
+      await this.discardContextResetCarryover();
+    } catch (error) {
+      // Cleanup cannot undo accepted rows. Preserve the writer's result so success completes
+      // rollover bookkeeping instead of inviting a duplicate send; generation checks still
+      // exclude stale carryover in this version. Keep the downgrade cleanup failure visible.
+      log.error("Carryover cleanup failed after rollover history append", error);
+    }
+    return appended;
   }
 
   private async checkContextBudgetHistoryAccess(
@@ -5429,7 +5438,7 @@ export class AgentSession {
         this.contextBudgetGeneration !== generation
       )
         return Ok(undefined);
-      await this.applyContextResetSideEffects();
+      await this.applyContextResetSideEffects({ deferCarryoverDiscard: true });
       if (
         !this.coordinator.isCurrentTurn(turn) ||
         !this.coordinator.isCurrentOperation(operation) ||
@@ -5440,7 +5449,7 @@ export class AgentSession {
         this.coordinator.closing
       )
         return Ok(undefined);
-      const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
+      const appended = await this.appendContextRolloverRows(rows);
       if (
         !this.coordinator.isCurrentTurn(turn) ||
         !this.coordinator.isCurrentOperation(operation) ||
@@ -6535,14 +6544,15 @@ export class AgentSession {
 
   private async buildContinuousCompactionAttachments(head: MuxMessage[]) {
     const pending = await this.compactionHandler.peekPendingState();
+    const warm = await this.compactionHandler.peekCarryoverState();
     return this.buildAttachmentsFromContext({
       diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
       loadedSkills: mergeLoadedSkillSnapshots([
-        ...this.postCompactionLoadedSkills,
+        ...(warm?.loadedSkills ?? []),
         ...(pending?.loadedSkills ?? []),
         ...extractLoadedSkillSnapshotsFromMessages(head),
       ]),
-      readFilePaths: mergeReadFilePaths(this.postCompactionReadFilePaths, [
+      readFilePaths: mergeReadFilePaths(warm?.readFiles ?? [], [
         ...(pending?.readFiles ?? []),
         ...extractReadFilePaths(head),
       ]),
@@ -7915,11 +7925,6 @@ export class AgentSession {
     });
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
-    if (this.postCompactionState === pendingState) {
-      this.postCompactionLoadedSkills = [];
-      this.postCompactionReadFilePaths = [];
-      this.postCompactionState = null;
-    }
     try {
       await this.compactionHandler.discardPendingState("context_exceeded", pendingState);
       this.onPostCompactionStateChange?.();
@@ -8510,7 +8515,8 @@ export class AgentSession {
 
       const handled = await this.compactionHandler.handleCompletion(
         streamEndPayload,
-        completedCompactionRequest?.id
+        completedCompactionRequest?.id,
+        () => this.coordinator.isCurrentTurn(turn) && this.coordinator.isCurrentOperation(operation)
       );
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return;
@@ -10293,24 +10299,17 @@ export class AgentSession {
    * resurrect context the user explicitly discarded and tell the model files
    * were "previously read" when their contents are gone from active context.
    * Covers both injection routes: the immediate pending-state path (on-disk
-   * post-compaction.json + handler caches) and the periodic re-merge path
-   * (compactionOccurred + the in-session mirrors).
+   * post-compaction.json) and the periodic capture of qualified carryover.
    */
   async clearPostCompactionState(): Promise<void> {
-    this.postCompactionState = null;
     this.memoryContextByModelString.clear();
     // In-memory clears stay unconditional: they stop THIS session from
     // injecting carryover even when the durable discard below fails.
     this.compactionOccurred = false;
     this.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
-    this.postCompactionLoadedSkills = [];
-    this.postCompactionReadFilePaths = [];
     this.pendingPostCompactionStateToAcknowledge = null;
-    // Durable-or-throw: a swallowed unlink failure would leave the stale
-    // post-compaction.json to re-inject pre-boundary carryover after a
-    // restart while the boundary caller reports success — the same
-    // invalidation-must-be-durable invariant as the sandbox reset tombstone.
-    // Boundary callers surface the throw as a partial failure.
+    // The destructive history operation already fenced its captured context under the locks.
+    // Retire compatible old bytes for downgrades; preserve newer publications and unknown schemas.
     await this.compactionHandler.discardPendingStateDurably("context-boundary");
     this.onPostCompactionStateChange?.();
   }
@@ -10401,12 +10400,9 @@ export class AgentSession {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
     const pendingState = await this.compactionHandler.peekPendingState();
     if (pendingState !== null) {
-      this.postCompactionState = pendingState;
       this.pendingPostCompactionStateToAcknowledge = pendingState;
       this.compactionOccurred = true;
       this.turnsSinceLastAttachment = 0;
-      this.postCompactionLoadedSkills = pendingState.loadedSkills;
-      this.postCompactionReadFilePaths = pendingState.readFiles;
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
@@ -10430,9 +10426,10 @@ export class AgentSession {
 
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
-      this.pendingPostCompactionStateToAcknowledge = this.postCompactionState;
+      const warm = await this.compactionHandler.peekCarryoverState();
+      this.pendingPostCompactionStateToAcknowledge = warm;
       this.turnsSinceLastAttachment = 0;
-      return this.generatePostCompactionAttachments(includeReadFiles);
+      return this.generatePostCompactionAttachments(includeReadFiles, warm);
     }
 
     return null;
@@ -10442,7 +10439,8 @@ export class AgentSession {
    * Generate post-compaction attachments by extracting diffs and loaded skills from message history.
    */
   private async generatePostCompactionAttachments(
-    includeReadFiles: boolean
+    includeReadFiles: boolean,
+    warm: Awaited<ReturnType<CompactionHandler["peekCarryoverState"]>>
   ): Promise<PostCompactionAttachment[]> {
     // getHistoryFromLatestBoundary already returns only the active compaction epoch,
     // so no further boundary slicing is needed.
@@ -10453,16 +10451,13 @@ export class AgentSession {
 
     const fileDiffs = extractEditedFileDiffs(historyResult.data);
     const loadedSkills = mergeLoadedSkillSnapshots([
-      ...this.postCompactionLoadedSkills,
+      ...(warm?.loadedSkills ?? []),
       ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
     ]);
     // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
     // merged with reads from the current epoch (newest-first, capped).
     const readFilePaths = includeReadFiles
-      ? mergeReadFilePaths(
-          this.postCompactionReadFilePaths,
-          extractReadFilePaths(historyResult.data)
-        )
+      ? mergeReadFilePaths(warm?.readFiles ?? [], extractReadFilePaths(historyResult.data))
       : [];
 
     // Reports completed before the latest boundary had their tool results summarized away;
@@ -11026,9 +11021,16 @@ export class AgentSession {
       return Err("Cannot reset heartbeat context while queued user input is pending.");
     }
 
+    const turn = this.coordinator.turnId;
     const result = await this.compactionHandler.appendHeartbeatContextResetBoundary({
       boundaryText: params.boundaryText,
       pendingFollowUp: params.pendingFollowUp,
+      isCurrent: () =>
+        this.coordinator.isCurrentTurn(turn) &&
+        !this.isBusy() &&
+        !this.hasQueuedMessages() &&
+        !this.coordinator.closing &&
+        !this.coordinator.disposed,
     });
     if (result.success) {
       this.clearUsageState();
@@ -11049,7 +11051,7 @@ export class AgentSession {
    * Peek at cached file paths from pending compaction.
    * Returns paths that will be reinjected, or null if no pending compaction.
    */
-  getPendingTrackedFilePaths(): string[] | null {
+  async getPendingTrackedFilePaths(): Promise<string[] | null> {
     return this.compactionHandler.peekCachedFilePaths();
   }
 

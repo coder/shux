@@ -5,7 +5,6 @@ import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
-import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -252,7 +251,7 @@ describe("AgentSession disposal race conditions", () => {
     }
   });
 
-  test("forwards task-created events to onChatEvent subscribers for the matching workspace", () => {
+  test("forwards task-created events to onChatEvent subscribers for the matching workspace", async () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
@@ -269,9 +268,9 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage: mock(() => Promise.resolve(Ok(undefined))),
     } as unknown as AIService;
 
-    const historyService: HistoryService = {
-      appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as HistoryService;
+    // Session startup owns compaction/history services even when this test only forwards events.
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    await using _history = { [Symbol.asyncDispose]: cleanup };
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -287,11 +286,6 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
     const session = new AgentSession({
       workspaceId: "ws",
       config,
@@ -300,6 +294,7 @@ describe("AgentSession disposal race conditions", () => {
       initStateManager,
       backgroundProcessManager,
     });
+    await using _session = { [Symbol.asyncDispose]: () => session.dispose() };
 
     const chatEvents: Array<{ workspaceId: string; message: unknown }> = [];
     session.onChatEvent((event) => {
@@ -339,7 +334,7 @@ describe("AgentSession disposal race conditions", () => {
     });
   });
 
-  test("forwards session-usage-delta events to onChatEvent subscribers for the matching workspace", () => {
+  test("forwards session-usage-delta events to onChatEvent subscribers for the matching workspace", async () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
@@ -356,9 +351,8 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage: mock(() => Promise.resolve(Ok(undefined))),
     } as unknown as AIService;
 
-    const historyService: HistoryService = {
-      appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as HistoryService;
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    await using _history = { [Symbol.asyncDispose]: cleanup };
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -374,11 +368,6 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
     const session = new AgentSession({
       workspaceId: "ws",
       config,
@@ -387,6 +376,7 @@ describe("AgentSession disposal race conditions", () => {
       initStateManager,
       backgroundProcessManager,
     });
+    await using _session = { [Symbol.asyncDispose]: () => session.dispose() };
 
     const chatEvents: Array<{ workspaceId: string; message: unknown }> = [];
     session.onChatEvent((event) => {
@@ -450,9 +440,8 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage: mock(() => Promise.resolve(Ok(undefined))),
     } as unknown as AIService;
 
-    const historyService: HistoryService = {
-      appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as HistoryService;
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    await using _history = { [Symbol.asyncDispose]: cleanup };
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -468,11 +457,6 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
     const session = new AgentSession({
       workspaceId: "ws",
       config,
@@ -481,20 +465,13 @@ describe("AgentSession disposal race conditions", () => {
       initStateManager,
       backgroundProcessManager,
     });
+    await using _session = { [Symbol.asyncDispose]: () => session.dispose() };
 
-    const cancel = mock(() => undefined);
-    const setEnabled = mock((_enabled: boolean) => undefined);
-    (
-      session as unknown as {
-        retryManager: {
-          cancel: typeof cancel;
-          setEnabled: typeof setEnabled;
-        };
-      }
-    ).retryManager = {
-      cancel,
-      setEnabled,
+    const { retryManager } = session as unknown as {
+      retryManager: { cancel: () => void; setEnabled: (enabled: boolean) => void };
     };
+    const cancel = spyOn(retryManager, "cancel");
+    const setEnabled = spyOn(retryManager, "setEnabled");
 
     const options = {
       model: "anthropic:claude-sonnet-4-5",
@@ -583,7 +560,7 @@ describe("AgentSession disposal race conditions", () => {
     }
   });
 
-  test("preserves synthetic flag when flushing queued messages", () => {
+  test("preserves synthetic flag when flushing queued messages", async () => {
     const aiService: AIService = {
       ...createStreamLifecycleMocks(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -597,9 +574,8 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage: mock(() => Promise.resolve(Ok(undefined))),
     } as unknown as AIService;
 
-    const historyService: HistoryService = {
-      appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as HistoryService;
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    await using _history = { [Symbol.asyncDispose]: cleanup };
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -615,11 +591,6 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
     const session = new AgentSession({
       workspaceId: "ws",
       config,
@@ -628,6 +599,7 @@ describe("AgentSession disposal race conditions", () => {
       initStateManager,
       backgroundProcessManager,
     });
+    await using _session = { [Symbol.asyncDispose]: () => session.dispose() };
 
     const sendMessage = mock(
       (

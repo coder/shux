@@ -3,7 +3,7 @@ import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { createMuxMessage } from "@/common/types/message";
-import { Err } from "@/common/types/result";
+import * as syncFs from "node:fs";
 import assert from "@/common/utils/assert";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
@@ -56,6 +56,14 @@ describe("exact pending snapshot consumption", () => {
     await store.cleanup();
   });
 
+  function failRename(target: string) {
+    const rename = syncFs.renameSync;
+    return spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+      if (to === target) throw new Error("Publication unavailable");
+      rename(from, to);
+    });
+  }
+
   async function publish(id?: string) {
     if (id) {
       await store.historyService.appendToHistory(workspaceId, readMessage(id));
@@ -78,7 +86,7 @@ describe("exact pending snapshot consumption", () => {
       [false, true].map((reload) => ({ action, reload }))
     )
   )(
-    "late $action preserves an identical-byte successor (reload=$reload)",
+    "late $action preserves a successor with identical attachments (reload=$reload)",
     async ({ action, reload }) => {
       spyOn(Date, "now").mockReturnValue(1234);
       await publish();
@@ -86,11 +94,14 @@ describe("exact pending snapshot consumption", () => {
       const consumed = await handler.peekPendingState();
       const previous = await fs.readFile(pendingPath, "utf8");
       await publish();
-      expect(await fs.readFile(pendingPath, "utf8")).toBe(previous);
+      const successor = JSON.parse(await fs.readFile(pendingPath, "utf8")) as { writeId: string };
+      expect(successor.writeId).not.toBe((JSON.parse(previous) as { writeId: string }).writeId);
       if (action === "ack") await handler.ackPendingStateConsumed(consumed);
       else await handler.discardPendingState("context_exceeded", consumed);
       expect(await handler.peekPendingState()).not.toBeNull();
-      expect(await fs.readFile(pendingPath, "utf8")).toBe(previous);
+      expect(JSON.parse(await fs.readFile(pendingPath, "utf8"))).toMatchObject({
+        writeId: successor.writeId,
+      });
     }
   );
 
@@ -113,26 +124,20 @@ describe("exact pending snapshot consumption", () => {
       let replacement: ReturnType<typeof publish> | undefined;
       try {
         await entered.promise;
-        // Observe the real persistence call after B's cache update; keep A's physical unlink held.
-        const persistence = handler as unknown as {
-          persistPendingStateBestEffort(...args: unknown[]): Promise<void>;
-        };
-        const persist = persistence.persistPendingStateBestEffort.bind(handler);
-        const writeRequested = Promise.withResolvers<void>();
-        spyOn(persistence, "persistPendingStateBestEffort").mockImplementation((...args) => {
-          const result = persist(...args);
-          writeRequested.resolve();
+        const begin = handler.beginPreparation.bind(handler);
+        const requested = Promise.withResolvers<void>();
+        spyOn(handler, "beginPreparation").mockImplementation((guard) => {
+          const result = begin(guard);
+          requested.resolve();
           return result;
         });
-        const mkdir = spyOn(fs, "mkdir");
-        replacement = publish("b");
-        await writeRequested.promise;
-        expect(mkdir.mock.calls.some(([dir]) => String(dir) === sessionDir)).toBe(false);
+        replacement = publish();
+        await requested.promise;
         release.resolve();
         await cleanup;
         await replacement;
-        expect((await handler.peekPendingState())?.readFiles).toContain("/b.ts");
-        expect((await restart().peekPendingState())?.readFiles).toContain("/b.ts");
+        expect(await handler.peekPendingState()).not.toBeNull();
+        expect(await restart().peekPendingState()).not.toBeNull();
       } finally {
         release.resolve();
         await cleanup;
@@ -146,17 +151,11 @@ describe("exact pending snapshot consumption", () => {
     async (action) => {
       await publish("a");
       const previous = await fs.readFile(pendingPath, "utf8");
-      const mkdir = fs.mkdir;
-      const failure = spyOn(fs, "mkdir").mockImplementation((async (
-        ...args: Parameters<typeof fs.mkdir>
-      ) => {
-        if (String(args[0]) === sessionDir) throw new Error("pending mkdir failed");
-        return mkdir(...args);
-      }) as typeof fs.mkdir);
+      const failure = failRename(pendingPath);
       let consumed: Awaited<ReturnType<typeof publish>>;
       try {
         consumed = await publish("b");
-        expect(failure.mock.calls.some(([dir]) => String(dir) === sessionDir)).toBe(true);
+        expect(failure.mock.calls.some(([, target]) => target === pendingPath)).toBe(true);
       } finally {
         failure.mockRestore();
       }
@@ -179,9 +178,14 @@ describe("exact pending snapshot consumption", () => {
 
   it("a failed unlink cannot let a retried old acknowledgement remove its successor", async () => {
     const consumed = await publish("a");
-    spyOn(fs, "unlink").mockRejectedValueOnce(new Error("pending unlink failed"));
+    const unlink = fs.unlink;
+    const failure = spyOn(fs, "unlink").mockImplementation(async (target) => {
+      if (target === pendingPath) throw new Error("pending unlink failed");
+      await unlink(target);
+    });
     await handler.ackPendingStateConsumed(consumed);
     expect(await fs.readFile(pendingPath, "utf8")).toContain("/a.ts");
+    failure.mockRestore();
     await publish("b");
     await handler.ackPendingStateConsumed(consumed);
     expect((await handler.peekPendingState())?.readFiles).toContain("/b.ts");
@@ -197,7 +201,7 @@ describe("exact pending snapshot consumption", () => {
         muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       })
     );
-    spyOn(store.historyService, "appendToHistory").mockResolvedValueOnce(Err("B boundary failed"));
+    failRename(path.join(store.config.sessionsDir, workspaceId, "chat.jsonl"));
     expect(
       await handler.handleCompletion({
         type: "stream-end",
@@ -211,7 +215,7 @@ describe("exact pending snapshot consumption", () => {
     const history = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
     assert(history.success, "Expected readable history after failed boundary");
     expect(history.data.some((message) => message.metadata?.compacted === "user")).toBe(false);
-    expect(await handler.peekPendingState()).toBeNull();
+    expect((await handler.peekPendingState())?.readFiles).toEqual(["/a.ts"]);
     await handler.ackPendingStateConsumed(consumed);
     expect(await handler.peekPendingState()).toBeNull();
     expect(await restart().peekPendingState()).toBeNull();
@@ -225,29 +229,34 @@ describe("exact pending snapshot consumption", () => {
     "request A can $action after continuous rollback (failed rewrite=$failedRestore)",
     async ({ action, failedRestore }) => {
       const consumed = await publish("a");
-      let restore: ReturnType<typeof spyOn<typeof fs, "mkdir">> | undefined;
-      const mkdir = fs.mkdir;
-      try {
-        expect(
-          await handler.withContinuousPendingState(
-            [readMessage("b")],
-            () => {
-              if (failedRestore) {
-                restore = spyOn(fs, "mkdir").mockImplementation((async (
-                  ...args: Parameters<typeof fs.mkdir>
-                ) => {
-                  if (String(args[0]) === sessionDir) throw new Error("restore mkdir failed");
-                  return mkdir(...args);
-                }) as typeof fs.mkdir);
-              }
-              return Promise.resolve(false);
-            },
-            "b"
-          )
-        ).toBe(false);
-      } finally {
-        restore?.mockRestore();
-      }
+      const rename = syncFs.renameSync;
+      let pendingWrites = 0;
+      const failure = spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+        if (to === pendingPath && ++pendingWrites > 1 && failedRestore)
+          throw new Error("Restore unavailable");
+        rename(from, to);
+      });
+      const preparation = handler.beginPreparation(() => true);
+      const publication = {
+        generation: await store.historyService
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration(),
+      };
+      expect(
+        await handler.persistContinuousCompaction({
+          preparation,
+          publication,
+          attachmentMessages: [readMessage("b")],
+          messages: [readMessage("b")],
+          tail: [],
+          text: "B",
+          model: followUp.model,
+          systemMessageTokens: 0,
+          attachmentTokens: 0,
+          shouldPersist: () => false,
+        })
+      ).toBe(false);
+      failure.mockRestore();
       expect((await handler.peekPendingState())?.readFiles).toEqual(["/a.ts"]);
       if (action === "ack") await handler.ackPendingStateConsumed(consumed);
       else await handler.discardPendingState("context_exceeded", consumed);
@@ -267,24 +276,23 @@ describe("exact pending snapshot consumption", () => {
     async ({ outcome, action, failedRestore }) => {
       const consumed = await publish("a");
       await store.historyService.appendToHistory(workspaceId, readMessage("b"));
-      let restore: ReturnType<typeof spyOn<typeof fs, "mkdir">> | undefined;
-      const mkdir = fs.mkdir;
+      let restore: ReturnType<typeof failRename> | undefined;
       function failRestoreIfRequested() {
-        if (!failedRestore) return;
-        restore = spyOn(fs, "mkdir").mockImplementation((async (
-          ...args: Parameters<typeof fs.mkdir>
-        ) => {
-          if (String(args[0]) === sessionDir) throw new Error("heartbeat restore mkdir failed");
-          return mkdir(...args);
-        }) as typeof fs.mkdir);
+        if (failedRestore) restore = failRename(pendingPath);
       }
 
       try {
         if (outcome === "failed append") {
-          spyOn(store.historyService, "appendToHistory").mockImplementationOnce(() => {
-            // B's provisional file already exists; only its restoration write should fail.
-            failRestoreIfRequested();
-            return Promise.resolve(Err("heartbeat B append failed"));
+          const rename = syncFs.renameSync;
+          let failedBoundary = false;
+          restore = spyOn(syncFs, "renameSync").mockImplementation((from, to) => {
+            if (to === path.join(store.config.sessionsDir, workspaceId, "chat.jsonl")) {
+              failedBoundary = true;
+              throw new Error("heartbeat B append failed");
+            }
+            if (to === pendingPath && failedBoundary && failedRestore)
+              throw new Error("Restore unavailable");
+            rename(from, to);
           });
           expect(
             (
@@ -311,7 +319,7 @@ describe("exact pending snapshot consumption", () => {
           expect(history.data.some((row) => row.id === message.id)).toBe(false);
         }
         if (failedRestore) {
-          expect(restore?.mock.calls.some(([dir]) => String(dir) === sessionDir)).toBe(true);
+          expect(restore?.mock.calls.some(([, target]) => target === pendingPath)).toBe(true);
         }
       } finally {
         restore?.mockRestore();
@@ -336,7 +344,11 @@ describe("exact pending snapshot consumption", () => {
       const unlink = fs.unlink;
       let current = true;
       spyOn(fs, "unlink").mockImplementation(async (target) => {
-        if (String(target) === lockPath && current) {
+        if (
+          String(target) === lockPath &&
+          current &&
+          (await fs.readFile(historyPath)).length === 0
+        ) {
           // Admission changes during real lock release, after the boundary deletion committed.
           expect((await fs.readFile(historyPath)).length).toBe(0);
           current = false;

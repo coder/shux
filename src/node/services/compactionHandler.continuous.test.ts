@@ -43,12 +43,23 @@ describe("continuous compaction provider replay", () => {
       });
     const handler = makeHandler();
     expect((await handler.peekPendingState())?.diffs).toEqual(diffs);
+    const preparation = handler.beginPreparation(() => true);
     expect(
-      await handler.withContinuousPendingState([], async () => {
-        // New preparation has no boundary: a restart must load the preceding
-        // pending snapshot, not treat the uncommitted one as a completed fold.
-        expect((await makeHandler().peekPendingState())?.diffs).toEqual(diffs);
-        return false;
+      await handler.persistContinuousCompaction({
+        preparation,
+        attachmentMessages: [],
+        publication: {
+          generation: await store.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        messages: [],
+        tail: [],
+        text: "Unpublished summary",
+        model: "anthropic:test",
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => false,
       })
     ).toBe(false);
     expect((await handler.peekPendingState())?.diffs).toEqual(diffs);
@@ -81,22 +92,21 @@ describe("continuous compaction provider replay", () => {
         .getContinuousCompactionJournal(workspaceId)
         .captureGeneration(),
     };
+    const preparation = handler.beginPreparation(() => true);
     expect(
       await handler
-        .withContinuousPendingState([source], (boundaryMessageId, onCommitted) =>
-          handler.persistContinuousCompaction({
-            boundaryMessageId,
-            onCommitted,
-            publication,
-            shouldPersist: () => true,
-            messages: [source],
-            tail: [],
-            text: "Fix completed",
-            model: "anthropic:test",
-            systemMessageTokens: 0,
-            attachmentTokens: 0,
-          })
-        )
+        .persistContinuousCompaction({
+          preparation,
+          attachmentMessages: [source],
+          publication,
+          shouldPersist: () => true,
+          messages: [source],
+          tail: [],
+          text: "Fix completed",
+          model: "anthropic:test",
+          systemMessageTokens: 0,
+          attachmentTokens: 0,
+        })
         .catch((error: unknown) => error)
     ).toEqual(new Error("observer failed"));
     const restarted = new CompactionHandler({
@@ -164,7 +174,12 @@ describe("continuous compaction provider replay", () => {
         sessionDir: path.join(store.tempDir, "pending"),
         emitter,
       });
-      await handler.preparePendingStateFromMessages(before.data);
+      const preparation = handler.beginPreparation(() => true);
+      const publication = {
+        generation: await store.historyService
+          .getContinuousCompactionJournal(workspaceId)
+          .captureGeneration(),
+      };
       const tail = [
         prompt,
         {
@@ -175,6 +190,9 @@ describe("continuous compaction provider replay", () => {
       ];
       expect(
         await handler.persistContinuousCompaction({
+          preparation,
+          publication,
+          attachmentMessages: before.data,
           shouldPersist: () => true,
           messages: before.data,
           text: "The bug is fixed; verification is in progress.",
