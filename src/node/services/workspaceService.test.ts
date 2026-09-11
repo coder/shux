@@ -14902,14 +14902,14 @@ describe("WorkspaceService remove shared-workspace guard", () => {
 describe("WorkspaceService remove shared memory owner pinning", () => {
   const projectPath = "/tmp/proj-memory-pin";
   const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
-  type Entry = {
+  interface Entry {
     id: string;
     name: string;
     path: string;
     runtimeConfig: typeof runtimeConfig;
     parentWorkspaceId?: string;
     memoryOwnerWorkspaceId?: string;
-  };
+  }
 
   /** owner → mid → grand: removing `mid` must keep `grand` on the owner's notebook. */
   function buildTopology(): { projects: Map<string, { trusted: boolean; workspaces: Entry[] }> } {
