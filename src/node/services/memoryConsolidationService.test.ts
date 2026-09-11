@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -7,7 +8,10 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
-import type { MemoryConsolidationStatusChangeEventPayload } from "@/common/orpc/schemas/memory";
+import type {
+  MemoryConsolidationStatusChangeEventPayload,
+  MemoryHarvestRecordPayload,
+} from "@/common/orpc/schemas/memory";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -17,6 +21,7 @@ import {
 import { Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  HARVEST_MAX_ATTEMPTS,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
@@ -1501,6 +1506,102 @@ describe("MemoryConsolidationService", () => {
     expect(orphan.success).toBe(true);
     expect(await fixture.service.getRecord("ws-orphan")).not.toBeNull();
     expect(fixture.modelCalls).toHaveLength(3);
+  });
+
+  it("releases the teardown gate when a removal aborts before its point of no return", async () => {
+    using fixture = await createFixture();
+    // The removal drain marks the workspace; every trigger is refused...
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const refused = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("being removed");
+    expect(fixture.modelCalls).toHaveLength(0);
+    // ...until the aborted removal (no tombstone, workspace intact) lifts it.
+    fixture.service.releaseRemovalCancellation("ws-dream");
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const record = (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    // The owner's run no longer sees a retryable child bucket.
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
+  });
+
+  it("keeps a removal-finalized harvest record terminal against residual retryable writes", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    const boundaryKey = metadata.summaryMessageId;
+    const base = {
+      startedAt: Date.now() - 10_000,
+      attemptCount: 1,
+      boundaryKey,
+      compactionEpoch: metadata.compactionEpoch,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+      completionMetadata: metadata,
+    };
+    // Residual runs of the bounded cancellation drain record through the same
+    // path as the live harvest; reach it directly to interleave with finalization.
+    const save = (record: MemoryHarvestRecordPayload) =>
+      Effect.runPromise(
+        (
+          fixture.service as unknown as {
+            saveHarvestRecordEffect: (
+              workspaceId: string,
+              boundaryKey: string,
+              record: MemoryHarvestRecordPayload,
+              projectPath: string
+            ) => Effect.Effect<void>;
+          }
+        ).saveHarvestRecordEffect("ws-sub", boundaryKey, record, "")
+      );
+    await save({ ...base, status: "pending" });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const latest = async () => (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+
+    // A residual retryable failure landing after finalization must not reopen the bucket...
+    await save({ ...base, status: "failed", completedAt: Date.now(), error: "residual failure" });
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect((await latest())?.error).toContain("workspace removed");
+    // ...while a residual completion (its writes really landed) is kept as the truth,
+    // and finalization never demotes a completed record.
+    await save({ ...base, status: "completed", completedAt: Date.now(), acceptedCandidates: 1 });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    expect((await latest())?.status).toBe("completed");
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {

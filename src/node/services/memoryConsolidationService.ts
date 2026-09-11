@@ -291,7 +291,26 @@ function pruneHarvestRecords(records: Record<string, MemoryHarvestRecord>): void
   }
 }
 
-const HARVEST_MAX_ATTEMPTS = 3;
+export const HARVEST_MAX_ATTEMPTS = 3;
+
+/** Completed, or failed with retries exhausted: nothing may retry it. */
+function isTerminalHarvestRecord(record: MemoryHarvestRecord): boolean {
+  return (
+    record.status === "completed" ||
+    (record.status === "failed" && record.attemptCount >= HARVEST_MAX_ATTEMPTS)
+  );
+}
+
+/** Terminal marker for a bucket whose transcript is being deleted (see finalizeHarvestsForRemoval). */
+function finalizeHarvestRecordForRemoval(record: MemoryHarvestRecord): MemoryHarvestRecord {
+  return {
+    ...record,
+    status: "failed",
+    completedAt: record.completedAt ?? Date.now(),
+    attemptCount: HARVEST_MAX_ATTEMPTS,
+    error: "workspace removed before the harvest could be retried; transcript no longer available",
+  };
+}
 
 export class MemoryConsolidationService extends EventEmitter {
   private readonly sidecarPath: string;
@@ -324,10 +343,9 @@ export class MemoryConsolidationService extends EventEmitter {
    * post-harvest sweep, and a cancelled run still starts retryable-harvest
    * recovery, each with a fresh un-aborted signal. Entry points refuse and
    * new controllers start pre-aborted while a workspace is in this set.
-   * Entries are never cleared: removal is terminal, and if a force=false
-   * removal fails after the drain, losing background consolidation for the
-   * surviving workspace (until restart) matches the documented drained-
-   * producers tradeoff in WorkspaceService.removeWorkspace. Cross-PROCESS
+   * Entries are cleared only when removal aborts before its point of no
+   * return (releaseRemovalCancellation); once the tombstone is published,
+   * removal is terminal. Cross-PROCESS
    * teardown is covered by the durable removal tombstone instead (see
    * workspaceRemoval.ts), checked at memory mutation commit points.
    */
@@ -485,16 +503,27 @@ export class MemoryConsolidationService extends EventEmitter {
     const self = this;
     return Effect.uninterruptible(
       Effect.gen(function* () {
-        yield* Effect.promise(() =>
+        const saved = yield* Effect.promise(() =>
           self.locks.withLock(self.sidecarPath, async () => {
             const file = await self.load();
             file.harvestsByWorkspace[workspaceId] ??= {};
+            const existing = file.harvestsByWorkspace[workspaceId][boundaryKey];
+            // A terminal record is never reopened: removal finalization
+            // (finalizeHarvestsForRemoval) races the bounded cancellation
+            // drain's residual harvest runs on this file, and a residual
+            // pending/retryable-failure write landing afterwards would turn
+            // a bucket whose transcript is gone back into a retry candidate.
+            // Only a genuine completion may replace it (the writes happened).
+            if (existing !== undefined && isTerminalHarvestRecord(existing)) {
+              if (record.status !== "completed") return false;
+            }
             file.harvestsByWorkspace[workspaceId][boundaryKey] = record;
             pruneHarvestRecords(file.harvestsByWorkspace[workspaceId]);
             await writeFileAtomic(self.sidecarPath, JSON.stringify(file, null, 2));
+            return true;
           })
         );
-        self.emitStatusChange(workspaceId, projectPath);
+        if (saved) self.emitStatusChange(workspaceId, projectPath);
       })
     );
   }
@@ -624,6 +653,51 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   cancelInFlightConsolidation(workspaceId: string): Promise<void> {
     return Effect.runPromise(this.cancelInFlightConsolidationEffect(workspaceId));
+  }
+
+  /**
+   * Removal aborted BEFORE its point of no return (no tombstone published, the
+   * workspace stays registered and intact — e.g. a non-forced removal whose
+   * checkout deletion was refused): lift the teardown gate again, or the
+   * surviving workspace would refuse every Dream run and post-compaction
+   * harvest until restart. The drained in-flight runs are gone regardless
+   * (retryable harvests recover on the next trigger).
+   */
+  releaseRemovalCancellation(workspaceId: string): void {
+    this.removalCancelled.delete(workspaceId);
+  }
+
+  /**
+   * Removal teardown for harvest state: the workspace's transcript is about
+   * to be deleted, so its failed/stale-pending harvest records can never be
+   * retried (recovery needs the compaction epoch's messages) — and once the
+   * config entry is gone they could not even be associated with the memory
+   * owner. Mark them terminal now so nothing lingers as "retryable".
+   */
+  async finalizeHarvestsForRemoval(workspaceId: string): Promise<void> {
+    // One read-check-write under the sidecar lock: residual harvest runs
+    // (cancelInFlightConsolidation's drain is bounded) may still be recording
+    // outcomes, and a completion landing between an unlocked read and this
+    // write must not be overwritten with a failure.
+    const finalized = await this.locks.withLock(this.sidecarPath, async () => {
+      const file = await this.load();
+      const records = file.harvestsByWorkspace[workspaceId];
+      if (records === undefined) return false;
+      let changed = false;
+      for (const [boundaryKey, record] of Object.entries(records)) {
+        if (isTerminalHarvestRecord(record)) continue;
+        records[boundaryKey] = finalizeHarvestRecordForRemoval(record);
+        changed = true;
+      }
+      if (changed) await writeFileAtomic(this.sidecarPath, JSON.stringify(file, null, 2));
+      return changed;
+    });
+    if (!finalized) return;
+    const workspace = this.config.findWorkspace(workspaceId);
+    this.emitStatusChange(
+      workspaceId,
+      workspace == null ? "" : resolveConsolidationProjectPath(workspace)
+    );
   }
 
   /**
@@ -846,11 +920,18 @@ export class MemoryConsolidationService extends EventEmitter {
       }
 
       const projectPath = resolveConsolidationProjectPath(workspace);
+      // A child's redirected run sweeps under the owner's identity; the
+      // child's own removal tombstone still refuses every read and commit of
+      // the run (MemoryScopeContext.guardedWorkspaceId) — a remover in another
+      // backend cannot abort this controller.
       const ctx: MemoryScopeContext = {
         runtime: null,
         checkoutCwd: "",
         workspaceId,
         projectPath,
+        ...(options.actingWorkspaceId !== undefined && options.actingWorkspaceId !== workspaceId
+          ? { guardedWorkspaceId: options.actingWorkspaceId }
+          : {}),
       };
 
       const result = yield* Effect.promise(async () =>
