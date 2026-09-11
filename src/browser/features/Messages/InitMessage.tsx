@@ -23,8 +23,10 @@ export function InitMessage(props: InitMessageProps) {
   const detailsExpanded = steps.length === 0 || (detailsOverride ?? !isRunning);
   const preRef = useRef<HTMLPreElement>(null);
 
+  // Keep the newest output in view: while lines stream in, and when a finished (often
+  // failed) card first reveals its log, whose last lines explain the outcome.
   useEffect(() => {
-    if (isRunning && preRef.current) {
+    if (preRef.current) {
       preRef.current.scrollTop = preRef.current.scrollHeight;
     }
   }, [isRunning, message.lines.length, expanded, detailsExpanded]);

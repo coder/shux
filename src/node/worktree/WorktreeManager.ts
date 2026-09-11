@@ -191,11 +191,10 @@ export class WorktreeManager {
       const addResult = await addProc.result;
       createdBranch = !branchExists;
       worktreeCreated = true;
-      for (const line of addResult.stdout.split(/[\r\n]/)) {
+      // git reports routine progress ("Preparing worktree", "Updating files") on stderr;
+      // failures surface through the thrown error below, so none of this is error output.
+      for (const line of `${addResult.stdout}\n${addResult.stderr}`.split(/[\r\n]/)) {
         if (line) initLogger.logStdout(line);
-      }
-      for (const line of addResult.stderr.split(/[\r\n]/)) {
-        if (line) initLogger.logStderr(line);
       }
 
       initLogger.logStep("Checking out files...");
@@ -209,7 +208,7 @@ export class WorktreeManager {
       await unbornProc.result;
       const progress = new GitProgressParser(
         (stage, percent) => initLogger.logProgress?.(stage, percent),
-        (line) => initLogger.logStderr(line)
+        (line) => initLogger.logStdout(line)
       );
       try {
         // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
@@ -268,6 +267,11 @@ export class WorktreeManager {
       return { success: true, workspacePath };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
+      if (!isAbortError(error, params.abortSignal)) {
+        for (const line of errorMessage.split(/\r?\n/)) {
+          if (line) initLogger.logStderr(line);
+        }
+      }
 
       if (!worktreeCreated) {
         return {

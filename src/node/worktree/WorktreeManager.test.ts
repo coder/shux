@@ -242,13 +242,15 @@ describe("WorktreeManager.createWorkspace", () => {
         ).toBe(branchName);
         expect(existsSync(hookMarker)).toBe(false);
         expect(stdout).toContain("worktree metadata ready");
-        expect(stderr.some((line) => line.includes("Preparing worktree"))).toBe(true);
+        expect(stdout.some((line) => line.includes("Preparing worktree"))).toBe(true);
         // Real git progress: a one-file checkout only reports progress because the
         // checkout disables git's 2s progress delay.
-        expect(stderr.some((line) => /^Updating files: 100% \(1\/1\), done\.$/.test(line))).toBe(
+        expect(stdout.some((line) => /^Updating files: 100% \(1\/1\), done\.$/.test(line))).toBe(
           true
         );
-        expect(stderr.some((line) => line.includes(branchName))).toBe(true);
+        expect(stdout.some((line) => line.includes(branchName))).toBe(true);
+        // git's routine stderr chatter must not render as error output.
+        expect(stderr).toEqual([]);
         expect(progress).toEqual([["Updating files", 100]]);
       } finally {
         execSpy.mockRestore();
