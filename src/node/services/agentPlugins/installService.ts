@@ -2701,11 +2701,20 @@ export class AgentPluginInstallService {
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
     this.assertEnabled();
-    return this.runExclusive(async () => {
-      const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
-      if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
-      return this.readInstalledComponents(entry);
-    });
+    // Inventory must not hold the writer lock over full-tree hashes and deny
+    // live MCP admission. Reuse discovery's journal/epoch bracket to reject
+    // overlapping installer moves, including a complete rollback or reinstall.
+    const gate = await journalDerivedDiscoveryGate([this.containerDir]);
+    const changed = () =>
+      new Error(
+        "Installed plugin files changed during component review. Refresh the component inventory."
+      );
+    if (gate.suppressed.length > 0) throw changed();
+    const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
+    if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
+    const inventory = await this.readInstalledComponents(entry);
+    if ((await gate.confirm()).length > 0) throw changed();
+    return inventory;
   }
 
   async setComponents(args: {

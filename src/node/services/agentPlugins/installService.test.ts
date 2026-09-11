@@ -573,6 +573,125 @@ describe("AgentPluginInstallService", () => {
     }
   );
 
+  test("component inventory does not contend with managed MCP admission", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const manager = new MCPServerManager(
+      new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+          xumHome: muxRoot,
+          isEnabled: () => true,
+        }),
+      }),
+      {
+        pluginInvalidation: {
+          keyPrefix: "plugin:",
+          readToken: () => Promise.resolve(undefined),
+          readComponentPolicy: () => readPluginMcpPolicy(registryFile()),
+          tryAcquireComponentPolicyLock: (options) =>
+            acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options }),
+        },
+      }
+    );
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const hash = treeHash.hashPluginTree;
+    let pause = true;
+    const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+      if (pause) {
+        pause = false;
+        entered.resolve();
+        await resume.promise;
+      }
+      return hash(...args);
+    });
+    const exec = mock(() => Promise.reject(new Error("admitted launch reached")));
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    const inventory = service.getComponents({ name: "demo-plugin" });
+    inventory.catch(() => undefined);
+    try {
+      await entered.promise;
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "echo"
+      );
+      const result = await manager.test({ projectPath: muxRoot, name: key });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected the injected launch failure");
+      expect(result.error).toContain("admitted launch reached");
+      const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+      await release();
+      resume.resolve();
+      expect((await inventory).skills.map((skill) => skill.name)).toEqual(["greet"]);
+    } finally {
+      resume.resolve();
+      await inventory.catch(() => undefined);
+      receipt.mockRestore();
+      runtime.mockRestore();
+      manager.dispose();
+    }
+  });
+
+  test("component inventory rejects a complete reinstall even when receipt bytes match", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const install = { source: preview.source, expectedSha: preview.lockedSha };
+    await service.install(install);
+    const reviewed = await service.getComponents({ name: "demo-plugin" });
+    const hash = treeHash.hashPluginTree;
+    let replace = true;
+    const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+      const result = await hash(...args);
+      if (replace) {
+        replace = false;
+        // Fail promptly on the old locked reader rather than deadlocking its
+        // in-process queue. The real uninstall/reinstall then spans the scan.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
+        await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+        await service.install(install);
+      }
+      return result;
+    });
+    try {
+      await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /changed.*review/i
+      );
+    } finally {
+      receipt.mockRestore();
+    }
+    const refreshed = await service.getComponents({ name: "demo-plugin" });
+    expect(refreshed.contentHash).toBe(reviewed.contentHash);
+    expect(refreshed.lockedSha).toBe(reviewed.lockedSha);
+    expect(refreshed.skills).toEqual(reviewed.skills);
+  });
+
+  test.each(["before", "during"])(
+    "component inventory rejects a pending installer journal created %s the scan",
+    async (when) => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const journal = path.join(stagingDir(), "update-demo-plugin.json");
+      const hash = treeHash.hashPluginTree;
+      const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+        const result = await hash(...args);
+        if (when === "during") await fsPromises.writeFile(journal, "{}");
+        return result;
+      });
+      try {
+        if (when === "before") await fsPromises.writeFile(journal, "{}");
+        await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+          /changed.*review/i
+        );
+      } finally {
+        receipt.mockRestore();
+        await fsPromises.rm(journal, { force: true });
+      }
+    }
+  );
+
   test("component inventory stays pinned through an A-to-B-to-A logical-root retarget", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({
@@ -873,7 +992,9 @@ describe("AgentPluginInstallService", () => {
       const before = await fsPromises.readFile(registryFile(), "utf8");
       const empty = { skills: [], mcpServers: [] };
       const reconcile = spyOn(manager, "reconcilePluginComponents").mockImplementation(async () => {
-        // Reading takes the same mutation lock, proving it was released before cleanup.
+        // Cleanup must run after releasing the component writer lock.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
         expect(
           (await withRuntime.getComponents({ name: "demo-plugin" })).importedComponents
         ).toEqual(empty);
@@ -937,7 +1058,9 @@ describe("AgentPluginInstallService", () => {
     };
     const reconcile = spyOn(manager, "reconcilePluginComponents").mockImplementationOnce(
       async () => {
-        // This read acquires the same lock; it must see the saved policy, not deadlock.
+        // Cleanup must run after releasing the component writer lock.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
         expect(
           (await withRuntime.getComponents({ name: request.name })).importedComponents
         ).toEqual(empty);
