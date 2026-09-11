@@ -306,6 +306,11 @@ const ManageComponentsPanel: React.FC<{
           ? `Components saved, but refreshing failed: ${getErrorMessage(err)}. Reopen to read the saved selection.`
           : `Could not confirm the saved selection: ${getErrorMessage(err)}. Reopen to refresh before retrying.`
       );
+      if (responseLost) {
+        // The write may have committed even when both responses are unavailable.
+        publishAgentPluginsMutated();
+        await props.onSaved();
+      }
     } finally {
       setBusy(false);
     }

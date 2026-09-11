@@ -8,6 +8,7 @@ import { preloadTestModules } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo } from "../../ipc/helpers";
 import { createAppHarness, type AppHarness } from "../harness";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -271,6 +272,88 @@ describeIntegration("Selective plugin imports", () => {
         (await canvas.findByRole("checkbox", { name: "research" })).getAttribute("aria-checked")
       ).toBe("true");
       expect(canvas.queryByRole("alert")).toBeNull();
+    },
+    120000
+  );
+
+  test.each(["lost response", "rejected save"] as const)(
+    "%s with failed confirmation invalidates availability and counts only when a commit is possible",
+    async (failure) => {
+      const { canvas, user } = await openPreview(app, remote);
+      await user.click(canvas.getByRole("checkbox", { name: "research" }));
+      await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+      await user.click(await canvas.findByRole("checkbox", { name: "review" }));
+
+      // Model a still-mounted availability consumer with real discovery, not an event-name assertion.
+      const readSkills = () => app.env.orpc.agentSkills.list({ workspaceId: app.workspaceId });
+      let available = await readSkills();
+      expect(available.some((skill) => skill.name === "review")).toBe(true);
+      let consumerRefresh = Promise.resolve();
+      let refreshCount = 0;
+      const unsubscribe = subscribeAgentPluginsMutated(() => {
+        refreshCount++;
+        consumerRefresh = readSkills().then((skills) => {
+          available = skills;
+        });
+      });
+      const backend = app.env.services.agentPluginInstallService;
+      const original = backend.setComponentsResult.bind(backend);
+      const mutation = jest
+        .spyOn(backend, "setComponentsResult")
+        .mockImplementationOnce(async (input) => {
+          if (failure === "rejected save") return { success: false, error: "Registry unavailable" };
+          const result = await original(input);
+          expect(result.success).toBe(true);
+          throw new Error("Connection lost after persistence");
+        });
+      jest
+        .spyOn(backend, "getComponents")
+        .mockRejectedValueOnce(new Error("Confirmation unavailable"));
+      try {
+        await user.click(canvas.getByRole("button", { name: "Save changes" }));
+        await waitFor(() =>
+          expect(canvas.getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(
+            false
+          )
+        );
+        await consumerRefresh;
+        expect(available.some((skill) => skill.name === "review")).toBe(
+          failure === "rejected save"
+        );
+        expect(refreshCount).toBe(failure === "lost response" ? 1 : 0);
+        expect(
+          canvas.getByText(
+            failure === "lost response" ? /0 of 2 skills imported/ : /1 of 2 skills imported/
+          )
+        ).toBeDefined();
+        expect(canvas.getByRole("alert").textContent).toMatch(/could not confirm/i);
+        expect(canvas.queryByRole("button", { name: "Done" })).toBeNull();
+        expect(canvas.getByRole("checkbox", { name: "review" }).getAttribute("aria-checked")).toBe(
+          "false"
+        );
+        expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
+          false
+        );
+        expect(mutation).toHaveBeenCalledTimes(1);
+        await user.click(canvas.getByRole("button", { name: "Cancel" }));
+        await user.click(
+          canvas.getByRole("button", { name: "Manage components for review-tools" })
+        );
+        expect(
+          (await canvas.findByRole("checkbox", { name: "review" })).getAttribute("aria-checked")
+        ).toBe(failure === "rejected save" ? "true" : "false");
+        expect(
+          canvas.getByText(
+            failure === "lost response" ? /0 of 2 skills imported/ : /1 of 2 skills imported/
+          )
+        ).toBeDefined();
+      } finally {
+        unsubscribe();
+        await consumerRefresh;
+      }
     },
     120000
   );
