@@ -401,40 +401,47 @@ export class CompactionPendingState {
   }
 
   /** Qualify disk and acknowledged memory against one locked history/sidecar observation. */
-  async observe(
+  observe(
     warmth: readonly CompactionPendingReceipt[],
     isCurrent: () => boolean,
-    noLocalOwnership = false
+    noLocalOwnership: () => boolean = () => false
   ): Promise<CompactionPendingObservation | undefined> {
-    // Ordinary sends with no local ownership need no history proof when the sidecar is
-    // absent. Probe every call so foreign publications are visible; uncertainty stays locked.
-    if (
-      noLocalOwnership &&
-      warmth.length === 0 &&
-      (await fs.stat(this.filePath).then(
-        () => false,
-        (error: NodeJS.ErrnoException) => error.code === "ENOENT"
-      ))
-    )
-      return;
-    return this.enqueue(async (view) => {
-      const raw = await this.readBytes(view.assertStillOwned).then(
-        (value) => ({ value, readable: true }),
-        () => ({ value: undefined, readable: false })
-      );
-      await view.assertStillOwned();
-      if (!isCurrent()) return;
-      return raw.readable
-        ? this.observation(view, raw.value, warmth)
-        : {
-            retention: this.retention(view),
-            readable: false,
-          };
+    return this.enqueueOperation(async () => {
+      // Earlier queued publications must settle before probing; a history-only publication
+      // can establish local ownership without creating a sidecar, so evaluate that fact now.
+      // Ordinary absent state still needs neither history locks nor a history scan.
+      if (
+        noLocalOwnership() &&
+        warmth.length === 0 &&
+        (await fs.stat(this.filePath).then(
+          () => false,
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT"
+        ))
+      )
+        return;
+      return this.history.withLock(async (view) => {
+        const raw = await this.readBytes(view.assertStillOwned).then(
+          (value) => ({ value, readable: true }),
+          () => ({ value: undefined, readable: false })
+        );
+        await view.assertStillOwned();
+        if (!isCurrent()) return;
+        return raw.readable
+          ? this.observation(view, raw.value, warmth)
+          : {
+              retention: this.retention(view),
+              readable: false,
+            };
+      });
     });
   }
 
   private enqueue<T>(operation: (view: CompactionPendingHistoryView) => Promise<T>): Promise<T> {
-    const result = this.pending.then(() => this.history.withLock(operation));
+    return this.enqueueOperation(() => this.history.withLock(operation));
+  }
+
+  private enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.pending.then(operation);
     this.pending = result.catch(() => undefined);
     return result;
   }

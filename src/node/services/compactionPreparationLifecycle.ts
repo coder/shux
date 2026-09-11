@@ -197,7 +197,7 @@ export class CompactionPreparationLifecycle {
       const observation = await this.store.observe(
         this.warmth(),
         isCurrent,
-        this.receipts.size === 0 && this.publications.size === 0
+        () => this.receipts.size === 0 && this.publications.size === 0
       );
       if (!observation || !isCurrent()) return;
       this.adopt(observation);

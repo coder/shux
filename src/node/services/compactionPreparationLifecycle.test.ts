@@ -112,6 +112,65 @@ describe("inactive local compaction preparation lifecycle", () => {
     expect(locked.mock.calls.length).toBe(beforeWarmth + 1);
   });
 
+  it.each([false, true])(
+    "observes an earlier queued publication before probing absence (history-only=%s)",
+    async (historyOnly) => {
+      const adapter = h.historyService.getCompactionPendingHistory(workspaceId);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const target = new CompactionPreparationLifecycle(
+        new CompactionPendingState(pendingPath, {
+          ...adapter,
+          withLock: async (operation) => {
+            entered.resolve();
+            await release.promise;
+            return adapter.withLock(operation);
+          },
+        })
+      );
+      const prepared = await input("A");
+      const stat = fs.stat;
+      const absent = await stat(pendingPath).catch((error: NodeJS.ErrnoException) => error);
+      assert("code" in absent && absent.code === "ENOENT");
+      let released = false;
+      spyOn(fs, "stat").mockImplementation((async (...args: Parameters<typeof fs.stat>) => {
+        if (args[0] === pendingPath && !released) throw absent;
+        return stat(...args);
+      }) as typeof fs.stat);
+      const readFile = fs.readFile;
+      spyOn(fs, "readFile").mockImplementation((async (...args: Parameters<typeof fs.readFile>) => {
+        if (historyOnly && args[0] === pendingPath) throw new Error("Sidecar unavailable");
+        return readFile(...args);
+      }) as typeof fs.readFile);
+      const publishing = target.publish(
+        target.begin(() => true),
+        prepared
+      );
+      let capturing: ReturnType<typeof target.capture> | undefined;
+      try {
+        await entered.promise;
+        let settled = false;
+        capturing = target.capture("pending").then((result) => {
+          settled = true;
+          return result;
+        });
+        // The absent probe rejects synchronously, so this event-loop turn drains its promise
+        // continuations without racing disk latency. Publication is still held by our barrier.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        released = true;
+        release.resolve();
+        assert((await publishing).success);
+        expect((await capturing)?.readFiles).toEqual(historyOnly ? [] : ["/A.ts"]);
+      } finally {
+        released = true;
+        release.resolve();
+        await publishing;
+        await capturing;
+      }
+    }
+  );
+
   it.each(["error", "directory"] as const)(
     "qualifies ambiguous sidecar presence through history (%s)",
     async (presence) => {
