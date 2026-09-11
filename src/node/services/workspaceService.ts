@@ -227,6 +227,12 @@ import {
   isWorkflowRunEmittingToolName,
 } from "@/common/utils/workflowRunMessages";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type {
+  PendingMaterialization,
+  Runtime,
+  WorkspaceCreationResult,
+  WorkspaceInitParams,
+} from "@/node/runtime/Runtime";
 import {
   hasSrcBaseDir,
   getSrcBaseDir,
@@ -3033,6 +3039,116 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return false;
   }
 
+  /**
+   * Undo a registration whose checkout could not be sanitized: the config entry, the
+   * worktree this creation made, and the in-memory state registered for it. Returns whether
+   * the entry is provably gone.
+   */
+  private async abortUnsanitizedCreation(args: {
+    workspaceId: string;
+    runtime: Runtime;
+    runtimeConfig: RuntimeConfig;
+    projectPath: string;
+    workspaceName: string;
+    trusted: boolean;
+    initAbortController: AbortController;
+  }): Promise<boolean> {
+    const { workspaceId } = args;
+    const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+    // WORKTREE runtimes created a fresh checkout; without deleting it,
+    // retrying the same branch collides with the orphaned worktree and leaks
+    // a suffixed checkout per attempt. LocalRuntime registered an EXISTING
+    // user directory, which must be preserved (its deleteWorkspace is a
+    // no-op by design, but we never call it here to keep that contract
+    // explicit). Only after a successful config rollback: while the entry
+    // persists, the checkout is still referenced.
+    if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
+      const deleteResult = await args.runtime
+        .deleteWorkspace(
+          args.projectPath,
+          // Worktree directories are named after the sanitized workspace
+          // name (branch names may contain "/").
+          args.workspaceName,
+          false,
+          undefined,
+          args.trusted
+        )
+        .catch((error: unknown) => ({
+          success: false as const,
+          error: getErrorMessage(error),
+        }));
+      if (!deleteResult.success) {
+        log.warn("Failed to remove created worktree after sanitization aborted creation", {
+          workspaceId,
+          error: deleteResult.error,
+        });
+      }
+    }
+    // Tear down the in-memory state registered earlier in this creation
+    // (session, init record, abort controller) exactly like workspace
+    // removal would; without this every aborted retry against the same bad
+    // file leaks another unreachable session for the process lifetime.
+    args.initAbortController.abort();
+    this.initAbortControllers.delete(workspaceId);
+    this.initStateManager.clearInMemoryState(workspaceId);
+    await this.disposeSession(workspaceId);
+    return rolledBack;
+  }
+
+  /**
+   * Background init for a worktree announced before its files existed: populate the
+   * checkout (streaming progress to the creation card), then sanitize plugin overrides
+   * exactly as task worktrees do after materialization, then run the ordinary init.
+   * A checkout failure fails the init like any deferred runtime's sync failure; a
+   * sanitize failure tears the creation down, as it would have at registration time.
+   */
+  private async materializeDeferredCheckout(args: {
+    workspaceId: string;
+    runtime: Runtime;
+    runtimeConfig: RuntimeConfig;
+    workspaceName: string;
+    initParams: WorkspaceInitParams;
+    pending: PendingMaterialization;
+    initAbortController: AbortController;
+  }): Promise<void> {
+    const { workspaceId, runtime, initParams } = args;
+    assert(
+      runtime.materializeWorkspace !== undefined,
+      "materializeDeferredCheckout: runtime cannot materialize"
+    );
+    try {
+      await runtime.materializeWorkspace(initParams, args.pending);
+    } catch (error) {
+      log.error(`Workspace checkout failed for ${workspaceId}:`, { error });
+      initParams.initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+      initParams.initLogger.logComplete(-1);
+      return;
+    }
+    const sanitizeError = await this.sanitizeMaterializedTaskWorkspace(
+      workspaceId,
+      initParams.workspacePath,
+      args.runtimeConfig
+    );
+    if (sanitizeError !== undefined) {
+      log.error(`Workspace creation aborted for ${workspaceId}: ${sanitizeError}`);
+      initParams.initLogger.logStderr(sanitizeError);
+      await this.abortUnsanitizedCreation({
+        workspaceId,
+        runtime,
+        runtimeConfig: args.runtimeConfig,
+        projectPath: initParams.projectPath,
+        workspaceName: args.workspaceName,
+        trusted: initParams.trusted ?? false,
+        initAbortController: args.initAbortController,
+      });
+      initParams.initLogger.logComplete(-1);
+      // Already announced, unlike a registration-time abort.
+      this.emit("metadata", { workspaceId, metadata: null });
+      return;
+    }
+    await runBackgroundInit(runtime, initParams, workspaceId, log);
+  }
+
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
     this.workspaceGoalService = service;
   }
@@ -4887,7 +5003,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     runtimeConfig?: RuntimeConfig,
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
-    tags?: Record<string, string>
+    tags?: Record<string, string>,
+    options?: {
+      /**
+       * Resolve only once the checkout's files exist. By default a local worktree is
+       * announced first so its checkout progress streams to the creation card; callers that
+       * read the checkout right after create() (and cannot wait for init) opt out.
+       */
+      awaitMaterialization?: boolean;
+    }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
     if (tags != null) {
       for (const [tagKey, tagValue] of Object.entries(tags)) {
@@ -5024,7 +5148,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let finalBranchName = resolvedBranchName;
       let finalWorkspaceName = initialWorkspaceName;
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
-      let createResult: { success: boolean; workspacePath?: string; error?: string };
+      let createResult: WorkspaceCreationResult;
 
       // If runtime uses config-level collision detection (e.g., Coder - can't reach host),
       // check against existing workspace names before createWorkspace.
@@ -5068,6 +5192,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           abortSignal: initAbortController.signal,
           env: createEnv,
           trusted: projectConfig.trusted ?? false,
+          deferMaterialization:
+            options?.awaitMaterialization !== true && runtime.materializeWorkspace !== undefined,
         });
 
         if (createResult.success) break;
@@ -5135,15 +5261,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // registration pending BEFORE the entry persists so an overlapping
       // creation for the same checkout cannot mistake the not-yet-sanitized
       // entry for a live sibling and skip its own sanitization.
-      const isHostLocalCheckout =
-        finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree";
+      // A deferred worktree has no files yet; it is sanitized once
+      // materialized, before its init hook (see materializeDeferredCheckout).
+      const pendingMaterialization = createResult!.pendingMaterialization;
+      const sanitizeAtRegistration =
+        (finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree") &&
+        pendingMaterialization === undefined;
       let completeMetadata: FrontendWorkspaceMetadata | undefined;
-      if (isHostLocalCheckout) {
+      if (sanitizeAtRegistration) {
         this.pendingPluginSanitizations.add(workspaceId);
       }
       let releaseRegistrationLock: (() => Promise<void>) | undefined;
       try {
-        if (isHostLocalCheckout) {
+        if (sanitizeAtRegistration) {
           // Cross-process: persist + sanitize must not interleave with a
           // sibling process registering the same checkout (see
           // acquireRegistrationSanitizeLock).
@@ -5191,52 +5321,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // a failure aborts the creation so nothing stale ever activates.
         // SSH/container runtimes exec off-host, where plugin servers never
         // spawn (host-path containers only in v1).
-        if (isHostLocalCheckout) {
+        if (sanitizeAtRegistration) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             workspaceId,
             createResult!.workspacePath
           );
           if (sanitizeError !== undefined) {
-            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
-            // WORKTREE runtimes created a fresh checkout above; without
-            // deleting it, retrying the same branch collides with the
-            // orphaned worktree and leaks a suffixed checkout per attempt.
-            // LocalRuntime registered an EXISTING user directory, which must
-            // be preserved (its deleteWorkspace is a no-op by design, but we
-            // never call it here to keep that contract explicit). Only after
-            // a successful config rollback: while the entry persists, the
-            // checkout is still referenced.
-            if (rolledBack && isWorktreeRuntime(finalRuntimeConfig)) {
-              const deleteResult = await runtime
-                .deleteWorkspace(
-                  owningProjectPath,
-                  // Worktree directories are named after the sanitized
-                  // workspace name (branch names may contain "/").
-                  finalWorkspaceName,
-                  false,
-                  undefined,
-                  projectConfig.trusted ?? false
-                )
-                .catch((error: unknown) => ({
-                  success: false as const,
-                  error: getErrorMessage(error),
-                }));
-              if (!deleteResult.success) {
-                log.warn("Failed to remove created worktree after sanitization aborted creation", {
-                  workspaceId,
-                  error: deleteResult.error,
-                });
-              }
-            }
-            // Tear down the in-memory state registered earlier in this
-            // creation (session, init record, abort controller) exactly like
-            // workspace removal would; without this every aborted retry
-            // against the same bad file leaks another unreachable session
-            // for the process lifetime.
-            initAbortController.abort();
-            this.initAbortControllers.delete(workspaceId);
-            this.initStateManager.clearInMemoryState(workspaceId);
-            await this.disposeSession(workspaceId);
+            const rolledBack = await this.abortUnsanitizedCreation({
+              workspaceId,
+              runtime,
+              runtimeConfig: finalRuntimeConfig,
+              projectPath: owningProjectPath,
+              workspaceName: finalWorkspaceName,
+              trusted: projectConfig.trusted ?? false,
+              initAbortController,
+            });
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -5265,24 +5364,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // If the user cancelled creation while create() was still in flight, avoid spawning
       // additional background work for a workspace that's already being removed.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
+        const initParams: WorkspaceInitParams = {
+          projectPath: owningProjectPath,
+          branchName: finalBranchName,
+          trunkBranch: normalizedTrunkBranch,
+          workspacePath: createResult!.workspacePath,
+          initLogger,
+          env: secrets,
+          abortSignal: initAbortController.signal,
+          trusted: projectConfig.trusted ?? false,
+        };
         // Retained (not just fired) so archive can await the hook process's actual exit.
         this.retainInitSettlement(
           workspaceId,
-          runBackgroundInit(
-            runtime,
-            {
-              projectPath: owningProjectPath,
-              branchName: finalBranchName,
-              trunkBranch: normalizedTrunkBranch,
-              workspacePath: createResult!.workspacePath,
-              initLogger,
-              env: secrets,
-              abortSignal: initAbortController.signal,
-              trusted: projectConfig.trusted ?? false,
-            },
-            workspaceId,
-            log
-          )
+          pendingMaterialization
+            ? this.materializeDeferredCheckout({
+                workspaceId,
+                runtime,
+                runtimeConfig: finalRuntimeConfig,
+                workspaceName: finalWorkspaceName,
+                initParams,
+                pending: pendingMaterialization,
+                initAbortController,
+              })
+            : runBackgroundInit(runtime, initParams, workspaceId, log)
         );
       } else {
         initAbortController.abort();

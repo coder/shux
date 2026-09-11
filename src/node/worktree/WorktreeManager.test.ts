@@ -414,6 +414,116 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   });
 
+  it("reserves the worktree and populates it later when materialization is deferred", async () => {
+    const branchName = "feature-deferred";
+    const fixture = await createWorktreeManagerFixture({ existingBranchName: branchName });
+    const steps: string[] = [];
+    const progress: Array<[string, number]> = [];
+    const initLogger = {
+      ...fixture.initLogger,
+      logStep: (message: string) => steps.push(message),
+      logProgress: (label: string, percent: number) => progress.push([label, percent]),
+    };
+    const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+    const hookLog = path.join(fixture.rootDir, "post-checkout-args");
+    try {
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        '#!/bin/sh\nprintf "%s %s %s" "$1" "$2" "$3" >> "' + hookLog + '"\n'
+      );
+      await fsPromises.chmod(hook, 0o755);
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger,
+        deferMaterialization: true,
+      });
+      expect(result).toEqual({
+        success: true,
+        workspacePath,
+        pendingMaterialization: { fastForwardFromOrigin: false },
+      });
+      // Reserved but empty: registered with git, no files, no checkout activity yet.
+      expect(
+        execFileSync("git", ["worktree", "list", "--porcelain"], {
+          cwd: fixture.projectPath,
+        }).toString()
+      ).toContain(workspacePath);
+      expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
+      expect(existsSync(hookLog)).toBe(false);
+      expect(steps).not.toContain("Checking out files...");
+      expect(progress).toEqual([]);
+
+      await fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: workspacePath }).toString()
+      ).toBe("");
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: workspacePath }).toString().trim()
+      ).toBe(branchName);
+      expect(progress).toEqual([["Updating files", 100]]);
+      expect(steps).toContain("Checking out files...");
+      // The deferred checkout still reports itself to hooks as a fresh worktree add.
+      const tip = execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+        .toString()
+        .trim();
+      expect(await fsPromises.readFile(hookLog, "utf8")).toBe(`${"0".repeat(40)} ${tip} 1`);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("deletes a reserved worktree that was never materialized", async () => {
+    const branchName = "feature-deferred-cancelled";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      const deleteResult = await fixture.manager.deleteWorkspace(
+        fixture.projectPath,
+        branchName,
+        false,
+        true
+      );
+      expect(deleteResult.success).toBe(true);
+      const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+      expect(existsSync(workspacePath)).toBe(false);
+      expect(
+        execFileSync("git", ["branch", "--list", branchName], { cwd: fixture.projectPath })
+          .toString()
+          .trim()
+      ).toBe("");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("runs post-checkout with the new-worktree arguments of a plain worktree add", async () => {
     const branchName = "feature-hook-contract";
     const fixture = await createWorktreeManagerFixture();

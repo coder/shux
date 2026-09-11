@@ -507,7 +507,8 @@ export interface WorkspaceProvisioningHost {
     runtimeConfig?: RuntimeConfig,
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
-    tags?: Record<string, string>
+    tags?: Record<string, string>,
+    options?: { awaitMaterialization?: boolean }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,

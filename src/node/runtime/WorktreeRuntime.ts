@@ -1,6 +1,7 @@
 import type {
   EnsureReadyOptions,
   EnsureReadyResult,
+  PendingMaterialization,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
@@ -103,7 +104,27 @@ export class WorktreeRuntime extends LocalBaseRuntime {
       abortSignal: params.abortSignal,
       env: params.env,
       trusted: params.trusted,
+      deferMaterialization: params.deferMaterialization,
     });
+  }
+
+  async materializeWorkspace(
+    params: WorkspaceInitParams,
+    pending: PendingMaterialization
+  ): Promise<void> {
+    return this.worktreeManager.materializeWorkspace(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        branchName: params.branchName,
+        trunkBranch: params.trunkBranch,
+        initLogger: params.initLogger,
+        abortSignal: params.abortSignal,
+        env: params.env,
+        trusted: params.trusted,
+      },
+      pending
+    );
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {

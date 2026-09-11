@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import type {
+  PendingMaterialization,
   WorkspaceCreationResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
@@ -96,6 +97,8 @@ export class WorktreeManager {
     abortSignal?: AbortSignal;
     env?: Record<string, string>;
     trusted?: boolean;
+    /** See WorkspaceCreationParams.deferMaterialization. */
+    deferMaterialization?: boolean;
   }): Promise<WorkspaceCreationResult> {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
     // Disable git hooks for untrusted projects (prevents post-checkout execution).
@@ -171,7 +174,8 @@ export class WorktreeManager {
           params.abortSignal
         ));
 
-      // Separate checkout so large repositories can stream file materialization progress.
+      // Files are populated by a separate checkout (materializeWorkspace) so large repositories
+      // can stream progress, and so callers may announce the workspace before populating it.
       // Restore flows may supply an exact saved commit instead of the current trunk.
       const newBranchBase = startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
       using addProc = execFileAsync(
@@ -197,71 +201,38 @@ export class WorktreeManager {
         if (line) initLogger.logStdout(line);
       }
 
-      initLogger.logStep("Checking out files...");
-      // Point HEAD at an unborn ref first so the checkout reports the same post-checkout
-      // hook arguments as a plain `git worktree add` (null old commit, new-worktree flag).
+      // Point HEAD at an unborn ref so the checkout reports the same post-checkout hook
+      // arguments as a plain `git worktree add` (null old commit, new-worktree flag).
       using unbornProc = execFileAsync(
         "git",
         ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
         noHooksEnv
       );
       await unbornProc.result;
-      const progress = new GitProgressParser(
-        (stage, percent) => initLogger.logProgress?.(stage, percent),
-        (line) => initLogger.logStdout(line)
+
+      // Fast-forward existing branches to origin only when local trunk can fast-forward too
+      // (preserves unpushed work).
+      const pending: PendingMaterialization = {
+        fastForwardFromOrigin: !skipRemoteSync && shouldUseOrigin && branchExists,
+      };
+      if (params.deferMaterialization) {
+        await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
+        return { success: true, workspacePath, pendingMaterialization: pending };
+      }
+
+      await this.materializeWorkspace(
+        {
+          projectPath,
+          workspacePath,
+          branchName,
+          trunkBranch,
+          initLogger,
+          abortSignal: params.abortSignal,
+          env: params.env,
+          trusted: params.trusted,
+        },
+        pending
       );
-      try {
-        // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
-        // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
-        using checkoutProc = execFileAsync(
-          "git",
-          [
-            "-C",
-            workspacePath,
-            "checkout",
-            "--progress",
-            "--force",
-            "--no-recurse-submodules",
-            branchName,
-          ],
-          {
-            ...noHooksEnv,
-            // git delays progress output by 2s, which hides it for most checkouts.
-            env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
-            onStderrData: (chunk) => progress.push(chunk),
-          }
-        );
-        const { stdout } = await checkoutProc.result;
-        for (const line of stdout.split(/[\r\n]/)) {
-          if (line) initLogger.logStdout(line);
-        }
-      } finally {
-        progress.flush();
-      }
-
-      initLogger.logStep("Worktree created successfully");
-
-      // Sync gitignored files declared in .xumignore (e.g. .env)
-      // before init hooks run so they have access to secrets/config
-      initLogger.logStep("Syncing .xumignore files...");
-      await syncXumignoreFiles(projectPath, workspacePath);
-
-      // For existing branches, fast-forward to latest origin (best-effort)
-      // Only if local can fast-forward (preserves unpushed work)
-      if (!skipRemoteSync && shouldUseOrigin && branchExists) {
-        await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
-      }
-
-      // Worktree creation is responsible for materializing the checkout completely.
-      // Skills, docs, and other repo-managed files may live inside submodules, so make
-      // them available before any runtime-specific provisioning or init hooks run.
-      await syncLocalGitSubmodules({
-        workspacePath,
-        initLogger,
-        abortSignal: params.abortSignal,
-        env: params.env,
-        trusted: params.trusted,
-      });
 
       await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
       return { success: true, workspacePath };
@@ -299,6 +270,88 @@ export class WorktreeManager {
         };
       }
     }
+  }
+
+  /**
+   * Populate a worktree reserved by createWorkspace: streamed checkout, .xumignore sync,
+   * optional fast-forward, submodules. Throws on failure without touching the worktree; a
+   * deferred checkout is already registered, so its owner decides what happens to it.
+   */
+  async materializeWorkspace(
+    params: {
+      projectPath: string;
+      workspacePath: string;
+      branchName: string;
+      trunkBranch: string;
+      initLogger: InitLogger;
+      abortSignal?: AbortSignal;
+      env?: Record<string, string>;
+      trusted?: boolean;
+    },
+    pending: PendingMaterialization
+  ): Promise<void> {
+    const { projectPath, workspacePath, branchName, trunkBranch, initLogger } = params;
+    const noHooksEnv = await this.getGitExecOptions(
+      projectPath,
+      params.trusted,
+      params.abortSignal
+    );
+
+    initLogger.logStep("Checking out files...");
+    const progress = new GitProgressParser(
+      (stage, percent) => initLogger.logProgress?.(stage, percent),
+      (line) => initLogger.logStdout(line)
+    );
+    try {
+      // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
+      // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
+      using checkoutProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          workspacePath,
+          "checkout",
+          "--progress",
+          "--force",
+          "--no-recurse-submodules",
+          branchName,
+        ],
+        {
+          ...noHooksEnv,
+          // git delays progress output by 2s, which hides it for most checkouts.
+          env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
+          onStderrData: (chunk) => progress.push(chunk),
+        }
+      );
+      const { stdout } = await checkoutProc.result;
+      for (const line of stdout.split(/[\r\n]/)) {
+        if (line) initLogger.logStdout(line);
+      }
+    } finally {
+      progress.flush();
+    }
+
+    initLogger.logStep("Worktree created successfully");
+
+    // Sync gitignored files declared in .xumignore (e.g. .env)
+    // before init hooks run so they have access to secrets/config
+    initLogger.logStep("Syncing .xumignore files...");
+    await syncXumignoreFiles(projectPath, workspacePath);
+
+    if (pending.fastForwardFromOrigin) {
+      await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
+    }
+
+    // Worktree creation is responsible for materializing the checkout completely.
+    // Skills, docs, and other repo-managed files may live inside submodules, so make
+    // them available before any runtime-specific provisioning or init hooks run.
+    await syncLocalGitSubmodules({
+      workspacePath,
+      initLogger,
+      abortSignal: params.abortSignal,
+      env: params.env,
+      trusted: params.trusted,
+    });
   }
 
   private async rollbackFailedWorkspaceCreation(args: {

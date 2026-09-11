@@ -5,7 +5,7 @@ import type {
   WorkspaceChatMessage,
   WorkspaceInitEvent,
 } from "@/common/orpc/types";
-import { isInitStart, isInitOutput, isInitEnd } from "@/common/orpc/types";
+import { isInitStart, isInitOutput, isInitProgress, isInitEnd } from "@/common/orpc/types";
 
 // Re-export StreamCollector utilities for backwards compatibility
 export {
@@ -472,7 +472,7 @@ export async function waitForInitComplete(
     const initEvents = collector
       .getEvents()
       .filter(
-        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitEnd(msg)
+        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
       ) as WorkspaceInitEvent[];
 
     // Check if init succeeded (exitCode === 0)
@@ -527,7 +527,7 @@ export async function waitForInitEnd(
     return collector
       .getEvents()
       .filter(
-        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitEnd(msg)
+        (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
       ) as WorkspaceInitEvent[];
   } finally {
     collector.stop();

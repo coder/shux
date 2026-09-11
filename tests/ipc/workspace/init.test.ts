@@ -18,7 +18,7 @@ import {
 } from "../helpers";
 import { createStreamCollector } from "../streamCollector";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
-import { isInitOutput, isInitEnd, isInitStart } from "@/common/orpc/types";
+import { isInitOutput, isInitEnd, isInitProgress, isInitStart } from "@/common/orpc/types";
 import * as os from "os";
 import * as fs from "fs/promises";
 import { exec } from "child_process";
@@ -313,6 +313,89 @@ describeIntegration("Workspace init hook", () => {
       } finally {
         await cleanupTestEnvironment(env);
         await cleanupTempGitRepo(tempDir);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "streams checkout progress to a subscriber that attaches after create() resolves",
+    async () => {
+      // The renderer only subscribes once create() has announced the workspace, so
+      // checkout progress emitted before that point can never reach the creation card.
+      const env = await createTestEnvironment();
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        stdoutLines: ["hook ran"],
+      });
+
+      try {
+        const branchName = generateBranchName("checkout-progress");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const progressEvents = initEvents.filter(isInitProgress);
+        expect(progressEvents.at(-1)).toMatchObject({ label: "Updating files", percent: 100 });
+
+        // The checkout must be complete before the hook runs against it.
+        const lines = initEvents.filter(isInitOutput).map((e) => e.line);
+        const materializedAt = lines.indexOf("Worktree created successfully");
+        const hookAt = lines.findIndex((line) => /Running init hook:/.test(line));
+        expect(materializedAt).toBeGreaterThanOrEqual(0);
+        expect(hookAt).toBeGreaterThan(materializedAt);
+        expect(lines).toContain("hook ran");
+        await fs.access(path.join(createResult.metadata.namedWorkspacePath, "README.md"));
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "prunes committed plugin overrides after the deferred checkout and before the hook",
+    async () => {
+      // A repository that tracks .xum/mcp.local.jsonc materializes committed plugin enables
+      // into every fresh worktree; the sanitization that used to run at registration must
+      // now run once the files exist, and still ahead of the repo-controlled hook.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        customScript: "cat .xum/mcp.local.jsonc > hook-saw-overrides",
+      });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await execAsync("git add -A && git commit -m 'track plugin overrides'", {
+        cwd: tempGitRepo,
+      });
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(
+          JSON.parse(await fs.readFile(path.join(workspacePath, "hook-saw-overrides"), "utf8"))
+        ).toEqual(pruned);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
       }
     },
     15000
