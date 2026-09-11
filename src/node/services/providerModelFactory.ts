@@ -85,6 +85,7 @@ import {
   normalizeGatewayStreamUsage,
   normalizeGatewayGenerateResult,
 } from "@/node/utils/gatewayStreamNormalization";
+import { wrapFetchWithGatewayFilePartNormalization } from "@/node/utils/gatewayFilePartNormalization";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import packageJson from "../../../package.json";
 
@@ -2206,7 +2207,12 @@ export class ProviderModelFactory {
           );
           // For Anthropic models via gateway, normalize cache_control on the final payload.
           // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
-          const baseFetch = getProviderFetch(providerConfig);
+          // The gateway server still expects spec-v3 string-encoded file parts;
+          // rewrite the v4 `{ type: "data" | "url" }` objects the 4.x SDK emits
+          // so image attachments are not rejected as "invalid request".
+          const baseFetch = wrapFetchWithGatewayFilePartNormalization(
+            getProviderFetch(providerConfig)
+          );
           const isAnthropicModel = modelId.startsWith("anthropic/");
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
           // For Anthropic models via gateway, wrap for cache_control normalization;
