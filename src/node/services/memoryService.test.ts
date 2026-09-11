@@ -2283,6 +2283,126 @@ describe("MemoryService", () => {
           .map((e) => e.relPath)
       ).toEqual(["real.md"]);
     });
+
+    it("preserves a leading BOM through adoption and never matches it against a BOM-less owner note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+      await fsPromises.writeFile(
+        path.join(legacyRoot, "fresh.md"),
+        Buffer.concat([bom, Buffer.from("fresh")])
+      );
+      await fsPromises.writeFile(
+        path.join(legacyRoot, "clash.md"),
+        Buffer.concat([bom, Buffer.from("same text")])
+      );
+      await fsPromises.writeFile(path.join(ownerRoot, "clash.md"), "same text");
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      // Byte-exact copy: the BOM is part of the note, not decoder noise.
+      expect(
+        (await fsPromises.readFile(path.join(ownerRoot, "fresh.md"))).equals(
+          Buffer.concat([bom, Buffer.from("fresh")])
+        )
+      ).toBe(true);
+      // A BOM-less owner note is different content: the legacy note lands
+      // beside it instead of being settled as already present.
+      expect(
+        (
+          await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "clash.md"))
+        ).equals(Buffer.concat([bom, Buffer.from("same text")]))
+      ).toBe(true);
+      expect(await fsPromises.readFile(path.join(ownerRoot, "clash.md"), "utf-8")).toBe(
+        "same text"
+      );
+    });
+
+    it("classifies untyped dirents by lstat in the strict legacy walk instead of dropping them", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(path.join(legacyRoot, "nested"), { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "top.md"), "top");
+      await fsPromises.writeFile(path.join(legacyRoot, "nested", "deep.md"), "deep");
+      // A filesystem reporting DT_UNKNOWN: every type predicate of the dirent
+      // is false, for regular files and directories alike.
+      const realReaddir = fsPromises.readdir.bind(fsPromises);
+      const untyped = spyOn(fsPromises, "readdir").mockImplementation((async (
+        target: string,
+        options: unknown
+      ) => {
+        const entries = (await realReaddir(target, options as { withFileTypes: true })) as Array<
+          Record<string, unknown>
+        >;
+        if (!String(target).startsWith(legacyRoot)) return entries;
+        const no = () => false;
+        return entries.map((entry) => ({
+          ...entry,
+          name: entry.name,
+          isFile: no,
+          isDirectory: no,
+          isSymbolicLink: no,
+          isFIFO: no,
+          isSocket: no,
+          isBlockDevice: no,
+          isCharacterDevice: no,
+        }));
+      }) as unknown as typeof fsPromises.readdir);
+      try {
+        await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      } finally {
+        untyped.mockRestore();
+      }
+      expect(await fsPromises.readFile(path.join(ownerRoot, "top.md"), "utf-8")).toBe("top");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "nested", "deep.md"), "utf-8")).toBe(
+        "deep"
+      );
+    });
+
+    it("imports conflicting notes of a child whose id the path grammar rejects under an escaped segment", async () => {
+      using fixture = await createFixture("proj~1-child");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.set(FIXTURE_PROJECT_PATH, {
+          workspaces: [
+            { id: "ws-owner", name: "owner", path: "/checkouts/owner" },
+            {
+              id: "proj~1-child",
+              name: "child",
+              path: "/checkouts/child",
+              parentWorkspaceId: "ws-owner",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "proj~1-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "clash.md"), "child");
+      await fsPromises.writeFile(path.join(ownerRoot, "clash.md"), "owner");
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("proj~1-child", "ws-owner");
+      // `~` is not a memory path character: verbatim, the copy would be
+      // written but invisible to the index and unaddressable.
+      const target = "imported/proj=7E1-child/clash.md";
+      expect(await fsPromises.readFile(path.join(ownerRoot, target), "utf-8")).toBe("child");
+      expect(await pathExists(path.join(ownerRoot, "imported", "proj~1-child"))).toBe(false);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      expect(
+        (await fixture.service.listIndexEntries(ownerCtx))
+          .filter((e) => e.scope === "workspace")
+          .map((e) => e.relPath)
+          .sort()
+      ).toEqual(["clash.md", target]);
+      const manifest = JSON.parse(
+        await fsPromises.readFile(legacyAdoptionManifestPath(path.dirname(legacyRoot)), "utf-8")
+      ) as Record<string, { target: string }>;
+      expect(manifest["clash.md"].target).toBe(target);
+    });
   });
 
   describe("memory index entries", () => {

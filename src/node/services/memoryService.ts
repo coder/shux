@@ -18,6 +18,7 @@
  */
 import { EventEmitter } from "events";
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -427,6 +428,34 @@ interface MemoryStore {
 
 const LEGACY_IMPORT_DIR = "imported";
 /**
+ * The per-child directory a conflicting legacy note is imported under. A
+ * workspace id is not a memory path segment by construction — a legacy id
+ * keeps its project basename's `~`, and an id may carry `..`, `%2e`, control
+ * or XML characters the grammar rejects (parseMemoryPath) — and a copy placed
+ * under such a segment would be written and settled yet filtered out of the
+ * index and unaddressable by every command, while removal then deletes the
+ * legacy source. Ids the grammar admits are used verbatim (every manifest
+ * written so far names them that way); the rest are escaped per UTF-8 byte
+ * as `=XX` (a `.` cannot be percent-encoded: `%2e` is itself rejected). A
+ * verbatim segment never contains `=` (such ids are escaped too), so the two
+ * forms cannot collide and an escaped segment decodes unambiguously.
+ */
+function legacyImportSegment(childId: string): string {
+  if (!childId.includes("=")) {
+    try {
+      parseMemoryPath(toVirtualPath("workspace", `${LEGACY_IMPORT_DIR}/${childId}/x`));
+      return childId;
+    } catch {
+      // escaped below
+    }
+  }
+  return Array.from(Buffer.from(childId, "utf-8"), (byte) =>
+    /[A-Za-z0-9_-]/.test(String.fromCharCode(byte))
+      ? String.fromCharCode(byte)
+      : `=${byte.toString(16).toUpperCase().padStart(2, "0")}`
+  ).join("");
+}
+/**
  * Directory beside the owner's memory root (in its session dir, OUTSIDE the
  * model-writable memory namespace — a legacy note may legitimately live under
  * any in-namespace path, dot-entries included) where the adoption pass stages
@@ -492,6 +521,19 @@ async function legacyStoreStamp(legacyRoot: string): Promise<string> {
 function isMissingPathError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | null)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** DT_UNKNOWN: readdir could not type the entry (no predicate holds). */
+function isDirentTypeUnknown(entry: Dirent): boolean {
+  return !(
+    entry.isFile() ||
+    entry.isDirectory() ||
+    entry.isSymbolicLink() ||
+    entry.isFIFO() ||
+    entry.isSocket() ||
+    entry.isBlockDevice() ||
+    entry.isCharacterDevice()
+  );
 }
 
 /**
@@ -588,9 +630,25 @@ class LocalMemoryStore implements MemoryStore {
         if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
         if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
+        // A filesystem may report DT_UNKNOWN: every type predicate is false
+        // and the entry would drop out of the walk. Strict callers (removal's
+        // legacy handover) would then see a complete listing that omits a
+        // regular note or a whole subtree, so they classify by lstat instead;
+        // an unclassifiable entry fails the listing like an unreadable dir.
+        let kind: "dir" | "file" | "other";
         if (entry.isDirectory()) {
-          await walk(childRel);
+          kind = "dir";
         } else if (entry.isFile()) {
+          kind = "file";
+        } else if (options?.strict === true && isDirentTypeUnknown(entry)) {
+          const stat = await fsPromises.lstat(this.abs(childRel));
+          kind = stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
+        } else {
+          kind = "other";
+        }
+        if (kind === "dir") {
+          await walk(childRel);
+        } else if (kind === "file") {
           results.push(childRel);
         }
       }
@@ -1442,10 +1500,13 @@ export class MemoryService extends EventEmitter {
         }
         // Strict decode: invalid UTF-8 cannot be carried by a text write, but a
         // note that legitimately contains U+FFFD must not be mistaken for one
-        // (a lossy decode would make the two indistinguishable).
+        // (a lossy decode would make the two indistinguishable). BOM kept: a
+        // memory write admits a leading U+FEFF, and the default decoder would
+        // swallow it — the copy and its hash would then differ from the
+        // byte-exact source (and a BOM-less owner note would read as equal).
         let content: string;
         try {
-          content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
         } catch {
           skipped++;
           continue;
@@ -1792,7 +1853,10 @@ export class MemoryService extends EventEmitter {
     relPath: string,
     content: string
   ): Promise<{ relPath: string; write: boolean } | null> {
-    for (const candidate of [relPath, `${LEGACY_IMPORT_DIR}/${childId}/${relPath}`]) {
+    for (const candidate of [
+      relPath,
+      `${LEGACY_IMPORT_DIR}/${legacyImportSegment(childId)}/${relPath}`,
+    ]) {
       // Never even compare through an escaping path (the write site re-checks).
       const contained = await store.assertContained(candidate).then(
         () => true,
@@ -1853,7 +1917,7 @@ export class MemoryService extends EventEmitter {
     const bytes = await store.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
     if (bytes.length > MEMORY_MAX_FILE_BYTES) return { content: null };
     try {
-      return { content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+      return { content: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes) };
     } catch {
       return { content: null };
     }
