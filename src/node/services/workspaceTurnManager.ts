@@ -1222,7 +1222,10 @@ export class WorkspaceTurnManager {
         parentMeta.runtimeConfig,
         parentMeta.subProjectPath,
         false,
-        tags
+        tags,
+        // The agentId validation below reads the target checkout under the task mutex, so
+        // a local worktree must be populated before create() resolves.
+        { awaitMaterialization: true }
       );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);

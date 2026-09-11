@@ -839,6 +839,7 @@ export class WorkspaceStore {
 
   // Idle callbacks keep high-frequency init logs from blocking the renderer.
   private deltaIdleHandles = new Map<string, number>();
+  private idleBumpPreludes = new Map<string, () => void>();
 
   private pendingStreamingMessageBump = new Map<string, string>();
   // Live keyed-channel key per workspace, so every stream-clearing path can
@@ -1114,7 +1115,13 @@ export class WorkspaceStore {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       // Init output can be very high-frequency (e.g. installs, rsync). Like stream/tool deltas,
       // we update aggregator state immediately but coalesce UI bumps to keep the renderer responsive.
-      this.scheduleIdleStateBump(workspaceId);
+      // The aggregator throttles its own cache invalidation separately, so flush it right before
+      // the bump or the bump can render the stale cached row.
+      this.scheduleIdleStateBump(workspaceId, () => aggregator.flushPendingInitOutput());
+    },
+    "init-progress": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.scheduleIdleStateBump(workspaceId, () => aggregator.flushPendingInitOutput());
     },
     "init-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1625,19 +1632,28 @@ export class WorkspaceStore {
    * The "presentation clock" (useSmoothStreamingText) handles visual cadence
    * independently — do not collapse them into a single mechanism.
    */
-  private scheduleIdleStateBump(workspaceId: string): void {
+  private scheduleIdleStateBump(workspaceId: string, beforeBump?: () => void): void {
+    // Record the prelude even when a bump is already scheduled so it runs on that bump.
+    if (beforeBump) {
+      this.idleBumpPreludes.set(workspaceId, beforeBump);
+    }
     // Skip if already scheduled
     if (this.deltaIdleHandles.has(workspaceId)) {
       return;
     }
 
+    const bump = () => {
+      this.deltaIdleHandles.delete(workspaceId);
+      const prelude = this.idleBumpPreludes.get(workspaceId);
+      this.idleBumpPreludes.delete(workspaceId);
+      prelude?.();
+      this.states.bump(workspaceId);
+    };
+
     // requestIdleCallback is not available in some environments (e.g. Node-based unit tests).
     // Fall back to a regular timeout so we still throttle bumps.
     if (typeof requestIdleCallback !== "function") {
-      const handle = setTimeout(() => {
-        this.deltaIdleHandles.delete(workspaceId);
-        this.states.bump(workspaceId);
-      }, 0);
+      const handle = setTimeout(bump, 0);
 
       // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       this.deltaIdleHandles.set(workspaceId, handle as unknown as number);
@@ -1645,10 +1661,7 @@ export class WorkspaceStore {
     }
 
     const handle = requestIdleCallback(
-      () => {
-        this.deltaIdleHandles.delete(workspaceId);
-        this.states.bump(workspaceId);
-      },
+      bump,
       { timeout: 100 } // Force update within 100ms even if browser stays busy
     );
 
@@ -1936,6 +1949,7 @@ export class WorkspaceStore {
       }
       this.deltaIdleHandles.delete(workspaceId);
     }
+    this.idleBumpPreludes.delete(workspaceId);
   }
 
   /**

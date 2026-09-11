@@ -9020,6 +9020,7 @@ export class AgentSession {
 
     forward("init-start", (payload) => this.emitChatEvent(payload));
     forward("init-output", (payload) => this.emitChatEvent(payload));
+    forward("init-progress", (payload) => this.emitChatEvent(payload));
     forward("init-end", (payload) => this.emitChatEvent(payload));
   }
 

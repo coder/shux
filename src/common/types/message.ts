@@ -1392,10 +1392,11 @@ export type DisplayedMessage =
   | {
       type: "workspace-init";
       id: string; // Display ID for UI/React keys
-      historySequence: number; // Position in message stream (-1 for ephemeral, non-persisted events)
+      historySequence: number; // -1 for the creation card placed after the first displayed user turn
       status: "running" | "success" | "error";
-      hookPath: string; // Path to the init script being executed
-      lines: Array<{ line: string; isError: boolean }>; // Accumulated output lines (stderr tagged via isError)
+      hookPath: string; // Project path being initialized
+      lines: Array<{ line: string; isError: boolean; step?: boolean }>;
+      progress: { label: string; percent: number } | null;
       exitCode: number | null; // Final exit code (null while running)
       timestamp: number;
       durationMs: number | null; // Duration in milliseconds (null while running)

@@ -288,15 +288,16 @@ function createHydrationStory(workspaceId: string): AppStory {
       emitChat({
         type: "init-output",
         line: "Preparing workspace",
+        step: true,
         isError: false,
         timestamp: STABLE_TIMESTAMP,
         replay: true,
       });
-      await expect((await canvas.findAllByText(/Running init hook/))[0]).toBeVisible();
+      await expect((await canvas.findAllByText(/Creating workspace/))[0]).toBeVisible();
       await expect(await canvas.findByText("Preparing workspace")).toBeVisible();
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat({ type: "init-end", exitCode: 0, timestamp: STABLE_TIMESTAMP, replay: true });
-      await expect(await canvas.findByText(/Init hook completed/)).toBeVisible();
+      await expect(await canvas.findByText(/Workspace created/)).toBeVisible();
       await checkTranscriptLayout(canvasElement);
       emitChat({
         type: "stream-lifecycle",

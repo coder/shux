@@ -165,6 +165,7 @@ export interface FileStat {
 export interface InitLogger {
   /** Log a creation step (e.g., "Creating worktree", "Syncing files") */
   logStep(message: string): void;
+  logProgress?(label: string, percent: number): void;
   /** Log stdout line from init hook */
   logStdout(line: string): void;
   /** Log stderr line from init hook */
@@ -204,6 +205,27 @@ export interface WorkspaceCreationParams {
   env?: Record<string, string>;
   /** Whether the project is trusted — when false, git hooks are disabled */
   trusted?: boolean;
+  /**
+   * Return once the checkout is reserved and leave populating its files to
+   * materializeWorkspace(), so that work streams to a workspace that is already announced.
+   * Runtimes whose creation never populates files ignore this.
+   */
+  deferMaterialization?: boolean;
+}
+
+/** Creation-time decisions materializeWorkspace() needs to finish a deferred checkout. */
+export interface PendingMaterialization {
+  /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
+  fastForwardFromOrigin: boolean;
+}
+
+/** Init params for materializeWorkspace(), plus how far a cancellation may reach. */
+export interface WorkspaceMaterializeParams extends WorkspaceInitParams {
+  /**
+   * When given, the only signal the file checkout honours; abortSignal still cancels every
+   * later phase, so an owner that keeps a cancelled checkout gets whole files.
+   */
+  checkoutAbortSignal?: AbortSignal;
 }
 
 /**
@@ -214,6 +236,8 @@ export interface WorkspaceCreationResult {
   /** Absolute path to workspace (local path for LocalRuntime, remote path for SSHRuntime) */
   workspacePath?: string;
   error?: string;
+  /** Set when deferMaterialization left populating the checkout to materializeWorkspace(). */
+  pendingMaterialization?: PendingMaterialization;
 }
 
 /**
@@ -474,7 +498,7 @@ export interface Runtime {
 
   /**
    * Create a workspace for this runtime (fast, returns immediately)
-   * - LocalRuntime: Creates git worktree
+   * - LocalRuntime: Creates git worktree (populating it can be deferred to materializeWorkspace)
    * - SSHRuntime: Creates remote directory only
    * Does NOT run init hook or sync files.
    * @param params Workspace creation parameters
@@ -537,6 +561,15 @@ export interface Runtime {
    * @param params Same as initWorkspace params
    */
   postCreateSetup?(params: WorkspaceInitParams): Promise<void>;
+
+  /**
+   * Populate a checkout reserved by createWorkspace({ deferMaterialization: true }).
+   * Streams progress via initLogger; throws on failure and leaves the checkout registered.
+   */
+  materializeWorkspace?(
+    params: WorkspaceMaterializeParams,
+    pending: PendingMaterialization
+  ): Promise<void>;
 
   /**
    * Initialize workspace asynchronously (may be slow, streams progress)

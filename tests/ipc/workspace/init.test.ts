@@ -18,7 +18,7 @@ import {
 } from "../helpers";
 import { createStreamCollector } from "../streamCollector";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
-import { isInitOutput, isInitEnd, isInitStart } from "@/common/orpc/types";
+import { isInitOutput, isInitEnd, isInitProgress, isInitStart } from "@/common/orpc/types";
 import * as os from "os";
 import * as fs from "fs/promises";
 import { exec } from "child_process";
@@ -319,6 +319,291 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "streams checkout progress to a subscriber that attaches after create() resolves",
+    async () => {
+      // The renderer only subscribes once create() has announced the workspace, so
+      // checkout progress emitted before that point can never reach the creation card.
+      const env = await createTestEnvironment();
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        stdoutLines: ["hook ran"],
+      });
+
+      try {
+        const branchName = generateBranchName("checkout-progress");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const progressEvents = initEvents.filter(isInitProgress);
+        expect(progressEvents.at(-1)).toMatchObject({ label: "Updating files", percent: 100 });
+
+        // The checkout must be complete before the hook runs against it.
+        const lines = initEvents.filter(isInitOutput).map((e) => e.line);
+        const materializedAt = lines.indexOf("Worktree created successfully");
+        const hookAt = lines.findIndex((line) => /Running init hook:/.test(line));
+        expect(materializedAt).toBeGreaterThanOrEqual(0);
+        expect(hookAt).toBeGreaterThan(materializedAt);
+        expect(lines).toContain("hook ran");
+        await fs.access(path.join(createResult.metadata.namedWorkspacePath, "README.md"));
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "prunes committed plugin overrides after the deferred checkout and before the hook",
+    async () => {
+      // A repository that tracks .xum/mcp.local.jsonc materializes committed plugin enables
+      // into every fresh worktree; the sanitization that used to run at registration must
+      // now run once the files exist, and still ahead of the repo-controlled hook.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({
+        exitCode: 0,
+        customScript: "cat .xum/mcp.local.jsonc > hook-saw-overrides",
+      });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await execAsync("git add -A && git commit -m 'track plugin overrides'", {
+        cwd: tempGitRepo,
+      });
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        await collectInitEvents(env, createResult.metadata.id, 10000);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(
+          JSON.parse(await fs.readFile(path.join(workspacePath, "hook-saw-overrides"), "utf8"))
+        ).toEqual(pruned);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "reports a failed deferred checkout on the card and keeps the workspace",
+    async () => {
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=fail\n");
+      await execAsync(
+        "git add -A && git commit -m 'require checkout filter' && git config filter.fail.smudge 'exit 1' && git config filter.fail.required true",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-checkout-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        const endEvent = initEvents.find(isInitEnd);
+        expect(endEvent?.exitCode).toBe(-1);
+        const errorLines = initEvents
+          .filter((e): e is Extract<WorkspaceInitEvent, { type: "init-output" }> => isInitOutput(e))
+          .filter((e) => e.isError === true)
+          .map((e) => e.line);
+        expect(
+          errorLines.filter((line) => line.includes("smudge filter fail failed"))
+        ).toHaveLength(1);
+        expect(initEvents.filter(isInitOutput).some((e) => /Running init hook/.test(e.line))).toBe(
+          false
+        );
+        // Like a remote sync failure, the workspace stays so the user can inspect and remove it.
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "prunes committed plugin overrides even when materialization fails after the checkout",
+    async () => {
+      // A broken submodule fails materialization after the tracked override file is on
+      // disk, and the workspace stays usable after a failed init, so the prune must not
+      // depend on materialization succeeding.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await fs.writeFile(
+        path.join(tempGitRepo, ".gitmodules"),
+        '[submodule "dep"]\n\tpath = dep\n\turl = /nonexistent/dep.git\n'
+      );
+      await execAsync(
+        "git add -A && git update-index --add --cacheinfo 160000,4b825dc642cb6eb9a060e54bf8d69288fbee4904,dep && git commit -m 'broken submodule'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize-after-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        expect(initEvents.find(isInitEnd)?.exitCode).toBe(-1);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
+    "archiving during a deferred checkout parks a complete, sanitized checkout",
+    async () => {
+      // Archive aborts a running init but keeps the checkout registered (default behaviour),
+      // and unarchiving does not rerun init, so the checkout must finish and prune committed
+      // plugin enables before the workspace is parked.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      // README.md sorts after .xum/, so the override is on disk while its smudge filter stalls.
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=slow\n");
+      await execAsync(
+        "git add -A && git commit -m 'slow checkout' && git config filter.slow.smudge 'sleep 5; cat'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        // Archive once the checkout has written the override but is still stalled on README.md.
+        const overridePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(overridePath);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        const pruned = JSON.parse(await fs.readFile(overridePath, "utf8")) as {
+          enabledServers: string[];
+        };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
+        const { stdout } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(stdout.trim()).toBe(`refs/heads/${branchName}`);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
+    "archiving once the files have landed stops the rest of materialization",
+    async () => {
+      // Only the file checkout may outlive an archive; what follows it (here a trusted
+      // post-checkout hook standing in for submodule or fast-forward work) must stop instead
+      // of holding the archive for as long as it runs.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      const hookStarted = path.join(tempGitRepo, ".git", "post-checkout-started");
+      await fs.writeFile(
+        path.join(tempGitRepo, ".git", "hooks", "post-checkout"),
+        `#!/bin/sh\n: > "${hookStarted}"\nsleep 600\n`,
+        { mode: 0o755 }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive-after-checkout");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(hookStarted);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
+        const { stdout: head } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(head.trim()).toBe(`refs/heads/${branchName}`);
+        const { stdout: status } = await execAsync("git status --porcelain", {
+          cwd: workspacePath,
+        });
+        expect(status).toBe("");
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();
@@ -360,15 +645,22 @@ describeIntegration("Workspace init hook", () => {
         // Should include workspace creation logs + hook output
         expect(status.lines).toEqual(
           expect.arrayContaining([
-            { line: "Creating git worktree...", isError: false, timestamp: expect.any(Number) },
+            {
+              line: "Creating git worktree...",
+              isError: false,
+              step: true,
+              timestamp: expect.any(Number),
+            },
             {
               line: "Worktree created successfully",
               isError: false,
+              step: true,
               timestamp: expect.any(Number),
             },
             expect.objectContaining({
               line: expect.stringMatching(/Running init hook:/),
               isError: false,
+              step: true,
             }),
             { line: "Installing dependencies", isError: false, timestamp: expect.any(Number) },
             { line: "Done!", isError: false, timestamp: expect.any(Number) },

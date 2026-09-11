@@ -15,7 +15,12 @@ import {
   shouldRunIntegrationTests,
   type TestEnvironment,
 } from "./setup";
-import { cleanupTempGitRepo, createTempGitRepo, createWorkspace } from "./helpers";
+import {
+  cleanupTempGitRepo,
+  createTempGitRepo,
+  createWorkspace,
+  waitForInitComplete,
+} from "./helpers";
 
 function monitorInternals(service: WorkspaceService) {
   return service as unknown as {
@@ -49,6 +54,8 @@ describeIntegration("Server update restart blockers", () => {
     if (!result.success) throw new Error(result.error);
     workspaceId = result.metadata.id;
     workspacePath = result.metadata.namedWorkspacePath ?? repo;
+    // Creation finishes the checkout in the background and counts as a restart blocker until then.
+    await waitForInitComplete(env, workspaceId);
     await monitorInternals(env.services.workspaceService).bashMonitorRecoveryPromise;
     restart = jest.fn(() => Promise.resolve());
     await env.services.updateService.enableServerUpdater(

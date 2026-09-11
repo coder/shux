@@ -22,7 +22,11 @@ export function parseXumignorePatterns(content: string): string[] {
  * Get gitignored files matching the selected .xumignore or legacy .muxignore patterns.
  * Uses `git ls-files` for consistency with the project's git-first philosophy.
  */
-async function getFilesToSync(projectPath: string, patterns: string[]): Promise<string[]> {
+async function getFilesToSync(
+  projectPath: string,
+  patterns: string[],
+  abortSignal?: AbortSignal
+): Promise<string[]> {
   // Patterns that start with ! are "negative" entries (e.g. from `!!foo`) and
   // cannot select candidate files on their own, so only positive patterns are
   // used for git prefiltering.
@@ -50,17 +54,21 @@ async function getFilesToSync(projectPath: string, patterns: string[]): Promise<
     .filter((pattern, index, all) => all.indexOf(pattern) === index);
   if (includePathspecs.length === 0) return [];
 
-  using proc = execFileAsync("git", [
-    "-C",
-    projectPath,
-    "ls-files",
-    "--others",
-    "--ignored",
-    "--exclude-standard",
-    "-z",
-    "--",
-    ...includePathspecs,
-  ]);
+  using proc = execFileAsync(
+    "git",
+    [
+      "-C",
+      projectPath,
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...includePathspecs,
+    ],
+    abortSignal ? { signal: abortSignal } : undefined
+  );
   const { stdout } = await proc.result;
   const ignoredFiles = stdout
     .split("\0")
@@ -78,11 +86,13 @@ async function getFilesToSync(projectPath: string, patterns: string[]): Promise<
  * falling back to legacy .muxignore. Runs after `git worktree add` so files
  * like `.env` are available before project init hooks execute.
  *
- * Best-effort: logs debug details but never throws.
+ * Best-effort: logs debug details but never throws, except to propagate a cancellation so
+ * the caller stops with it instead of copying the rest.
  */
 export async function syncXumignoreFiles(
   projectPath: string,
-  workspacePath: string
+  workspacePath: string,
+  abortSignal?: AbortSignal
 ): Promise<void> {
   try {
     let content: string | undefined;
@@ -99,10 +109,11 @@ export async function syncXumignoreFiles(
     const patterns = parseXumignorePatterns(content);
     if (patterns.length === 0) return;
 
-    const filesToSync = await getFilesToSync(projectPath, patterns);
+    const filesToSync = await getFilesToSync(projectPath, patterns, abortSignal);
     let copied = 0;
 
     for (const relPath of filesToSync) {
+      abortSignal?.throwIfAborted();
       const src = path.join(projectPath, relPath);
       const dest = path.join(workspacePath, relPath);
 
@@ -127,6 +138,7 @@ export async function syncXumignoreFiles(
       log.debug(`xumignore: synced ${copied} file(s) to worktree`);
     }
   } catch (err) {
+    if (abortSignal?.aborted) throw err;
     // Best-effort — never let ignore-file sync break workspace creation.
     log.debug("xumignore: sync failed", { error: String(err) });
   }

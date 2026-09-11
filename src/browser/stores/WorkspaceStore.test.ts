@@ -3036,6 +3036,7 @@ describe("WorkspaceStore", () => {
             isError: false,
             timestamp: 1_001,
           };
+          yield { type: "init-progress", label: "Checkout", percent: 87, timestamp: 1_002 };
           return;
         }
 
@@ -3075,7 +3076,8 @@ describe("WorkspaceStore", () => {
         return (
           state.loading === false &&
           initMessage?.status === "running" &&
-          initMessage.lines[0]?.line === firstLine
+          initMessage.lines[0]?.line === firstLine &&
+          initMessage.progress?.percent === 87
         );
       });
       expect(sawInitialInit).toBe(true);
@@ -3126,6 +3128,60 @@ describe("WorkspaceStore", () => {
         );
       });
       expect(stayedVisibleAfterCaughtUp).toBe(true);
+    });
+
+    it("shows init progress on the coalesced bump without waiting for the aggregator throttle", async () => {
+      const workspaceId = "workspace-init-progress-bump";
+      let releaseProgress: (() => void) | undefined;
+      const progressAtBump: Array<number | null> = [];
+
+      const readInitProgress = (): number | null => {
+        const initMessage = store
+          .getWorkspaceState(workspaceId)
+          .messages.find(
+            (message): message is Extract<DisplayedMessage, { type: "workspace-init" }> =>
+              message.type === "workspace-init"
+          );
+        return initMessage?.progress?.percent ?? null;
+      };
+
+      mockChatStreamFor(workspaceId, async function* () {
+        yield { type: "caught-up" };
+        await Promise.resolve();
+        yield { type: "init-start", hookPath: "/tmp/project", timestamp: 1_000 };
+        await new Promise<void>((resolve) => {
+          releaseProgress = resolve;
+        });
+        yield {
+          type: "init-output",
+          line: "Checking out files...",
+          step: true,
+          isError: false,
+          timestamp: 1_001,
+        };
+        yield { type: "init-progress", label: "Updating files", percent: 87, timestamp: 1_002 };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      const unsubscribe = store.subscribeKey(workspaceId, () => {
+        progressAtBump.push(readInitProgress());
+      });
+      try {
+        // Reading state here caches the running card without progress, which is the
+        // stale snapshot a later bump must not re-render.
+        const sawRunningCard = await waitUntil(
+          () => readInitProgress() === null && releaseProgress !== undefined
+        );
+        expect(sawRunningCard).toBe(true);
+        progressAtBump.length = 0;
+
+        releaseProgress?.();
+
+        expect(await waitUntil(() => progressAtBump.length > 0)).toBe(true);
+        expect(progressAtBump[0]).toBe(87);
+      } finally {
+        unsubscribe();
+      }
     });
 
     it("active workspace still shows starting during legitimate startup gap", async () => {

@@ -1,12 +1,14 @@
 import type {
   EnsureReadyOptions,
   EnsureReadyResult,
+  PendingMaterialization,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
   WorkspaceInitResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
+  WorkspaceMaterializeParams,
 } from "./Runtime";
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
@@ -103,7 +105,28 @@ export class WorktreeRuntime extends LocalBaseRuntime {
       abortSignal: params.abortSignal,
       env: params.env,
       trusted: params.trusted,
+      deferMaterialization: params.deferMaterialization,
     });
+  }
+
+  async materializeWorkspace(
+    params: WorkspaceMaterializeParams,
+    pending: PendingMaterialization
+  ): Promise<void> {
+    return this.worktreeManager.materializeWorkspace(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        branchName: params.branchName,
+        trunkBranch: params.trunkBranch,
+        initLogger: params.initLogger,
+        abortSignal: params.abortSignal,
+        checkoutAbortSignal: params.checkoutAbortSignal,
+        env: params.env,
+        trusted: params.trusted,
+      },
+      pending
+    );
   }
 
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {

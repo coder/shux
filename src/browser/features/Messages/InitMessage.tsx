@@ -1,94 +1,156 @@
-import React, { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
-import { Loader2, Wrench, CheckCircle2, AlertCircle } from "lucide-react";
+import { Loader2, GitBranch, ChevronRight, CheckCircle2, AlertCircle } from "lucide-react";
 import { Shimmer } from "../AIElements/Shimmer";
 import { formatDuration } from "@/common/utils/formatDuration";
+import { ProgressBar } from "@/browser/components/ProgressBar/ProgressBar";
 
 interface InitMessageProps {
   message: Extract<DisplayedMessage, { type: "workspace-init" }>;
   className?: string;
 }
 
-export const InitMessage = React.memo<InitMessageProps>(({ message, className }) => {
+export function InitMessage(props: InitMessageProps) {
+  const message = props.message;
   const isError = message.status === "error";
   const isRunning = message.status === "running";
-  const isSuccess = message.status === "success";
+  const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null);
+  const [detailsOverride, setDetailsOverride] = useState<boolean | null>(null);
+  const expanded = expandedOverride ?? message.status !== "success";
+  const steps = message.lines.filter((line) => line.step === true);
+  const rawLines = message.lines.filter((line) => line.step !== true);
+  const detailsExpanded = steps.length === 0 || (detailsOverride ?? !isRunning);
   const preRef = useRef<HTMLPreElement>(null);
 
-  // Auto-scroll to bottom while running
+  // Keep the newest output in view: while lines stream in, and when a finished (often
+  // failed) card first reveals its log, whose last lines explain the outcome.
   useEffect(() => {
-    if (isRunning && preRef.current) {
+    if (preRef.current) {
       preRef.current.scrollTop = preRef.current.scrollHeight;
     }
-  }, [isRunning, message.lines.length]);
+  }, [isRunning, message.lines.length, expanded, detailsExpanded]);
 
   const durationText =
     message.durationMs !== null ? ` in ${formatDuration(message.durationMs, "precise")}` : "";
 
   return (
-    <div
-      className={cn(
-        "my-2 rounded border px-3 py-2",
-        isError ? "border-init-error-border bg-init-error-bg" : "border-init-border bg-init-bg",
-        className
-      )}
-    >
-      <div className="flex items-center gap-2">
-        <span
-          className={cn(
-            "flex-shrink-0",
-            isError ? "text-error" : isSuccess ? "text-success" : "text-accent"
-          )}
-        >
+    <div className={cn("my-2 min-w-0 text-xs", props.className)}>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpandedOverride(!expanded)}
+        className={cn(
+          "flex w-full min-w-0 items-center gap-2 py-2 text-left",
+          isError ? "text-error" : "text-muted"
+        )}
+      >
+        <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="min-w-0 truncate">
           {isRunning ? (
-            <Loader2 className="size-3.5 animate-spin" />
-          ) : isSuccess ? (
-            <CheckCircle2 className="size-3.5" />
+            <Shimmer colorClass="var(--color-accent)">Creating workspace</Shimmer>
           ) : isError ? (
-            <AlertCircle className="size-3.5" />
+            <>
+              Workspace setup failed (exit code {message.exitCode}){durationText}
+            </>
           ) : (
-            <Wrench className="size-3.5" />
+            <>Workspace created{durationText}</>
           )}
         </span>
-        <span className="font-primary text-foreground text-[12px]">
-          {isRunning ? (
-            <Shimmer colorClass="var(--color-accent)">Running init hook...</Shimmer>
-          ) : isSuccess ? (
-            `Init hook completed${durationText}`
-          ) : (
-            <span className="text-error">
-              Init hook failed (exit code {message.exitCode}){durationText}
-            </span>
-          )}
-        </span>
-      </div>
-      <div className="text-muted mt-1 truncate font-mono text-[11px]">{message.hookPath}</div>
-      {message.lines.length > 0 && (
-        <pre
-          ref={preRef}
+        <ChevronRight
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0", expanded && "rotate-90")}
+        />
+      </button>
+      {expanded && (
+        <div
           className={cn(
-            "m-0 mt-2.5 max-h-[120px] overflow-auto rounded-sm",
-            "bg-init-output-bg px-2 py-1.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap",
-            isError ? "text-init-output-error-text" : "text-init-output-text"
+            "min-w-0 rounded border px-3 py-2",
+            isError ? "border-init-error-border bg-init-error-bg" : "border-init-border bg-init-bg"
           )}
         >
-          {message.truncatedLines && (
-            <span className="text-muted">
-              ... {message.truncatedLines.toLocaleString()} earlier lines truncated ...
-              {"\n"}
-            </span>
+          {steps.length > 0 && (
+            <ol className="m-0 mb-2 list-none space-y-2 p-0">
+              {steps.map((step, index) => {
+                const isLast = index === steps.length - 1;
+                return (
+                  <li
+                    key={index}
+                    className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2"
+                  >
+                    {isLast && isRunning ? (
+                      <Loader2
+                        aria-label="In progress"
+                        className="text-accent size-3.5 animate-spin"
+                      />
+                    ) : isLast && isError ? (
+                      <AlertCircle aria-label="Failed" className="text-error size-3.5" />
+                    ) : (
+                      <CheckCircle2 aria-label="Completed" className="text-accent size-3.5" />
+                    )}
+                    <span className="text-foreground truncate">{step.line}</span>
+                    {isLast && isRunning && message.progress && (
+                      <div className="flex items-center gap-2">
+                        <ProgressBar
+                          className="w-16"
+                          value={message.progress.percent}
+                          aria-label={message.progress.label}
+                        />
+                        <span className="counter-nums text-muted w-[4ch] text-right">
+                          {message.progress.percent}%
+                        </span>
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
           )}
-          {message.lines.map((line, idx) => (
-            <span key={idx} className={line.isError ? "text-init-output-error-text" : undefined}>
-              {line.line}
-              {idx < message.lines.length - 1 ? "\n" : ""}
-            </span>
-          ))}
-        </pre>
+          {steps.length > 0 && (
+            <button
+              type="button"
+              aria-expanded={detailsExpanded}
+              onClick={() => setDetailsOverride(!detailsExpanded)}
+              className="text-muted flex items-center gap-1 py-1"
+            >
+              <ChevronRight
+                aria-hidden="true"
+                className={cn("size-3.5", detailsExpanded && "rotate-90")}
+              />
+              More details
+            </button>
+          )}
+          {detailsExpanded && (
+            <>
+              <div className="text-muted mt-1 truncate font-mono text-[11px]">
+                {message.hookPath}
+              </div>
+              {(rawLines.length > 0 || !!message.truncatedLines) && (
+                <pre
+                  ref={preRef}
+                  className="bg-init-output-bg text-init-output-text m-0 mt-2 max-h-[120px] overflow-auto rounded-sm px-2 py-1.5 font-mono text-[11px] leading-relaxed break-words whitespace-pre-wrap"
+                >
+                  {message.truncatedLines && (
+                    <span className="text-muted">
+                      ... {message.truncatedLines.toLocaleString()} earlier lines truncated ...
+                      {"\n"}
+                    </span>
+                  )}
+                  {rawLines.map((line, index) => (
+                    <span
+                      key={index}
+                      className={line.isError ? "text-init-output-error-text" : undefined}
+                    >
+                      {line.line}
+                      {index < rawLines.length - 1 ? "\n" : ""}
+                    </span>
+                  ))}
+                </pre>
+              )}
+            </>
+          )}
+        </div>
       )}
     </div>
   );
-});
-
-InitMessage.displayName = "InitMessage";
+}

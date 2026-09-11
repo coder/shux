@@ -591,6 +591,7 @@ export const InitStartEventSchema = z.object({
 export const InitOutputEventSchema = z.object({
   type: z.literal("init-output"),
   line: z.string(),
+  step: z.boolean().optional(),
   timestamp: z.number(),
   isError: z.boolean().optional(),
   lineNumber: z
@@ -603,6 +604,13 @@ export const InitOutputEventSchema = z.object({
     .boolean()
     .optional()
     .meta({ description: "True when this event is emitted during init replay" }),
+});
+
+export const InitProgressEventSchema = z.object({
+  type: z.literal("init-progress"),
+  label: z.string(),
+  percent: z.number().int().min(0).max(100),
+  timestamp: z.number(),
 });
 
 export const InitEndEventSchema = z.object({
@@ -621,6 +629,7 @@ export const InitEndEventSchema = z.object({
 export const WorkspaceInitEventSchema = z.discriminatedUnion("type", [
   InitStartEventSchema,
   InitOutputEventSchema,
+  InitProgressEventSchema,
   InitEndEventSchema,
 ]);
 

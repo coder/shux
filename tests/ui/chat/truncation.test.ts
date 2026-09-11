@@ -161,8 +161,13 @@ describe("Chat truncation UI", () => {
         node.textContent?.match(/some messages are hidden for performance/i)
       );
       expect(indicatorIndex).toBeGreaterThan(0);
-      expect(messageBlocks[indicatorIndex - 1]?.textContent).toContain("user-0");
-      // The earliest marker still appears at the first omission seam.
+      // The earliest marker still appears at the first omission seam: after user-0's turn
+      // (which the workspace creation card follows) and before user-1.
+      const rowsBeforeIndicator = messageBlocks
+        .slice(0, indicatorIndex)
+        .map((node) => node.textContent ?? "");
+      expect(rowsBeforeIndicator.some((text) => text.includes("user-0"))).toBe(true);
+      expect(rowsBeforeIndicator.some((text) => text.includes("user-1"))).toBe(false);
       expect(messageBlocks[indicatorIndex + 1]?.textContent).toContain("user-1");
 
       // Verify assistant meta rows survive in the recent (non-truncated) section.
