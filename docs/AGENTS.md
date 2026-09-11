@@ -79,7 +79,7 @@ Core workflow:
 
 > PR readiness is mandatory. You MUST keep iterating until the PR is fully ready.
 > A PR is fully ready only when: (1) Codex confirms approval (thumbs-up reaction on the PR description or an approval comment like "Didn't find any major issues"), (2) all Codex review threads are resolved, and (3) all required CI checks pass.
-> You MUST NOT report success or stop the loop before these conditions are met.
+> You MUST NOT report success before these conditions are met. You MUST NOT stop the loop before these conditions are met, except in the early-stop cases below. An early stop is never success. Report it as incomplete.
 
 When a PR exists, you MUST remain in this loop until the PR is fully ready:
 
@@ -90,7 +90,23 @@ When a PR exists, you MUST remain in this loop until the PR is fully ready:
 5. If Codex leaves comments, address them, resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
 6. If checks/mergeability fail, fix issues locally, push, and repeat.
 
-The only early-stop exception is when the reviewer is clearly misunderstanding the intended change and further churn would be counterproductive. In that case, leave a clarifying PR comment and pause for human direction.
+Stop the loop early in three cases. In each case, leave a PR comment that states the reason, then pause for human direction:
+
+1. The reviewer misunderstands the intended change, and more rounds will only add churn.
+2. The loop does not converge. Each round must shrink the set of findings. If the same area produces new findings round after round, the design is the problem. Do not add more mechanism. Simplify the design or reduce the scope.
+3. The next fix grows the scope (see below). Report the state with a split proposal: what you fixed, what you deferred, and how to split the PR.
+
+### Review fixes and scope
+
+The PR must stay the change it started as. Before you fix a finding, compare the fix with the original change and classify it:
+
+1. If the fix repairs a defect that this PR introduced, fix it in this PR. Size does not matter here. If that fix needs a new module, on-disk artifact, persisted field, or subsystem, remove the surface from this PR instead of growing it.
+2. If the fix is small and stays inside the behavior and files of the original change, fix it in this PR.
+3. If the fix adds a new module, on-disk artifact, persisted field, or subsystem, do not fix it here. The same applies if the fix is larger than the original change and does not repair a defect that this PR introduced. This is scope growth. Reply on the thread with the intended fix and resolve the thread. Deliver the fix as a stacked PR (`gh stack`) or a tracked follow-up.
+4. If the finding needs corrupted persisted state, a narrow crash window, or a second racing backend (for example `XUM_ALLOW_MULTIPLE_INSTANCES`), classify the defect, not its trigger. If this PR added the failing code or removed a defense, fix it here. If the defect existed before this PR, defer it the same way.
+5. If the finding is wrong, or the behavior is intended, reply with the reason and resolve the thread. A reasoned rejection is a valid resolution.
+
+Deferred does not mean fixed. Every deferred fix must have a follow-up: a stacked PR, an issue, or a note in the PR description.
 
 ## Testing: HistoryService
 
