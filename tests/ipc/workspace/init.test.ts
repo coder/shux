@@ -445,6 +445,54 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "prunes committed plugin overrides even when materialization fails after the checkout",
+    async () => {
+      // A broken submodule fails materialization after the tracked override file is on
+      // disk, and the workspace stays usable after a failed init, so the prune must not
+      // depend on materialization succeeding.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.mkdir(path.join(tempGitRepo, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempGitRepo, ".xum", "mcp.local.jsonc"),
+        JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "shots"] })
+      );
+      await fs.writeFile(
+        path.join(tempGitRepo, ".gitmodules"),
+        '[submodule "dep"]\n\tpath = dep\n\turl = /nonexistent/dep.git\n'
+      );
+      await execAsync(
+        "git add -A && git update-index --add --cacheinfo 160000,4b825dc642cb6eb9a060e54bf8d69288fbee4904,dep && git commit -m 'broken submodule'",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-sanitize-after-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        expect(initEvents.find(isInitEnd)?.exitCode).toBe(-1);
+
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+        const pruned = JSON.parse(
+          await fs.readFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "utf8")
+        ) as { enabledServers: string[] };
+        expect(pruned.enabledServers).toEqual(["shots"]);
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();

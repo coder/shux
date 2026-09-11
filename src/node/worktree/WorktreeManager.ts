@@ -201,15 +201,6 @@ export class WorktreeManager {
         if (line) initLogger.logStdout(line);
       }
 
-      // Point HEAD at an unborn ref so the checkout reports the same post-checkout hook
-      // arguments as a plain `git worktree add` (null old commit, new-worktree flag).
-      using unbornProc = execFileAsync(
-        "git",
-        ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
-        noHooksEnv
-      );
-      await unbornProc.result;
-
       // Fast-forward existing branches to origin only when local trunk can fast-forward too
       // (preserves unpushed work).
       const pending: PendingMaterialization = {
@@ -298,6 +289,15 @@ export class WorktreeManager {
     );
 
     initLogger.logStep("Checking out files...");
+    // Point HEAD at an unborn ref only now, so the checkout reports the same post-checkout hook
+    // arguments as a plain `git worktree add` (null old commit, new-worktree flag) while the
+    // worktree kept the branch reserved against other checkouts until this moment.
+    using unbornProc = execFileAsync(
+      "git",
+      ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
+      noHooksEnv
+    );
+    await unbornProc.result;
     // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
     // held until the exit status is known so a failure is reported as error output once,
     // rather than streamed as output and then repeated as the error.

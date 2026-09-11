@@ -507,6 +507,52 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("keeps the branch reserved between the deferred reservation and its checkout", async () => {
+    const branchName = "feature-reserved";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      // Another checkout of the branch must be refused while materialization is pending.
+      const rival = path.join(fixture.rootDir, "rival");
+      expect(() =>
+        execFileSync("git", ["worktree", "add", rival, branchName], {
+          cwd: fixture.projectPath,
+          stdio: "pipe",
+        })
+      ).toThrow(/already (checked out|used by worktree)/);
+
+      await fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath: result.workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("deletes a reserved worktree that was never materialized", async () => {
     const branchName = "feature-deferred-cancelled";
     const fixture = await createWorktreeManagerFixture();
@@ -521,10 +567,12 @@ describe("WorktreeManager.createWorkspace", () => {
         deferMaterialization: true,
       });
       expect(result.success).toBe(true);
+      // Cancelling creation removes with force: git reports a reserved worktree's missing
+      // files as deletions, so a plain `worktree remove` would refuse it.
       const deleteResult = await fixture.manager.deleteWorkspace(
         fixture.projectPath,
         branchName,
-        false,
+        true,
         true
       );
       expect(deleteResult.success).toBe(true);

@@ -3099,8 +3099,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Background init for a worktree announced before its files existed: populate the
    * checkout (streaming progress to the creation card), then sanitize plugin overrides
    * exactly as task worktrees do after materialization, then run the ordinary init.
-   * A checkout failure fails the init like any deferred runtime's sync failure; a
-   * sanitize failure tears the creation down, as it would have at registration time.
+   * A checkout failure fails the init like any deferred runtime's sync failure, but the
+   * checkout is still sanitized first: a later step (submodules, .xumignore) can fail after
+   * the tracked override file is already on disk, and sends proceed after a failed init.
+   * A sanitize failure tears the creation down, as it would have at registration time.
    */
   private async materializeDeferredCheckout(args: {
     workspaceId: string;
@@ -3116,16 +3118,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       runtime.materializeWorkspace !== undefined,
       "materializeDeferredCheckout: runtime cannot materialize"
     );
+    let materializeError: unknown;
     try {
       await runtime.materializeWorkspace(initParams, args.pending);
     } catch (error) {
-      log.error(`Workspace checkout failed for ${workspaceId}:`, { error });
-      const [summary, ...details] = getErrorMessage(error).split(/\r?\n/);
-      initParams.initLogger.logStderr(`Initialization failed: ${summary}`);
-      for (const line of details) {
-        if (line) initParams.initLogger.logStderr(line);
-      }
-      initParams.initLogger.logComplete(-1);
+      materializeError = error;
+    }
+    if (args.initAbortController.signal.aborted) {
+      // Removal owns the checkout now (it aborted us and awaits this settlement).
       return;
     }
     const sanitizeError = await this.sanitizeMaterializedTaskWorkspace(
@@ -3148,6 +3148,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       initParams.initLogger.logComplete(-1);
       // Already announced, unlike a registration-time abort.
       this.emit("metadata", { workspaceId, metadata: null });
+      return;
+    }
+    if (materializeError !== undefined) {
+      log.error(`Workspace checkout failed for ${workspaceId}:`, { error: materializeError });
+      const [summary, ...details] = getErrorMessage(materializeError).split(/\r?\n/);
+      initParams.initLogger.logStderr(`Initialization failed: ${summary}`);
+      for (const line of details) {
+        if (line) initParams.initLogger.logStderr(line);
+      }
+      initParams.initLogger.logComplete(-1);
       return;
     }
     await runBackgroundInit(runtime, initParams, workspaceId, log);
