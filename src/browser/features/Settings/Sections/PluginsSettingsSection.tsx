@@ -297,6 +297,8 @@ const ManageComponentsPanel: React.FC<{
         setError(
           "The installed plugin or selection changed. Inventory refreshed; review your choices and save again."
         );
+        // A rejected stale save still discovered newer counts for the surrounding card.
+        await props.onSaved();
       }
     } catch (err) {
       setError(

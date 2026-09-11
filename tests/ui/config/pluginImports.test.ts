@@ -236,6 +236,8 @@ describeIntegration("Selective plugin imports", () => {
       );
       if (failure === "selection conflict") {
         await canvas.findByRole("alert");
+        await canvas.findByText(/0 of 2 skills imported/);
+        await canvas.findByText(/1 of 1 MCP servers imported/);
         await waitFor(() =>
           expect(
             canvas.getByRole("checkbox", { name: "reference" }).getAttribute("aria-checked")
