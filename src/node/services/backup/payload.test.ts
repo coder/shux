@@ -48,6 +48,7 @@ import {
   writeBackupPayload,
   writeProjectBundle,
   writeProjectMemoryFiles,
+  type BackupManifest,
   type BackupPayload,
   type BackupProjectBundle,
 } from "./payload";
@@ -530,6 +531,62 @@ describe("backup payload", () => {
 
     const withMcp = await captureRejection(readBackupPayload(destination, { contents: CONTENTS }));
     expect((withMcp as Error).message).toContain("mcp.jsonc");
+
+    // MCP manifest metadata is skipped with the file: an oversized redaction list only matters
+    // to a selection that reads mcp.jsonc.
+    const manifestPath = path.join(destination, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as BackupManifest;
+    await fs.writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...manifest,
+        mcpRedactions: Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
+          "servers",
+          `s${index}`,
+        ]),
+      })
+    );
+    const oversizedWithoutMcp = await readBackupPayload(destination, {
+      contents: resolveBackupContents({ includeMcp: false }),
+    });
+    expect(oversizedWithoutMcp.manifest.mcpRedactions).toBeUndefined();
+    const oversizedWithMcp = await captureRejection(
+      readBackupPayload(destination, { contents: CONTENTS })
+    );
+    expect((oversizedWithMcp as Error).message).toBe(
+      `Backup has more than ${MAX_BACKUP_MCP_REDACTIONS} MCP redactions`
+    );
+  });
+
+  it("keeps a large backup restorable when deselecting a category adds many markers", async () => {
+    const servers = Object.fromEntries(
+      Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
+        `server-${index}`,
+        { url: `https://example.com/mcp/${index}` },
+      ])
+    );
+    await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers }));
+    const payload = await createBackupPayload({
+      muxRoot,
+      contents: CONTENTS,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const selected = selectBackupContents(
+      payload,
+      resolveBackupContents({ includeMcpHeaders: false })
+    );
+    expect(selected.manifest.mcpRedactions).toHaveLength(MAX_BACKUP_MCP_REDACTIONS + 1);
+    const restoreRoot = path.join(tempDir, "many-servers");
+    await fs.mkdir(restoreRoot, { recursive: true });
+    await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      contents: resolveBackupContents({ includeMcpHeaders: false }),
+      payload: selected,
+    });
+    expect(jsonc.parse(await fs.readFile(path.join(restoreRoot, "mcp.jsonc"), "utf-8"))).toEqual({
+      servers,
+    });
   });
 
   it("does not create manifests above the MCP redaction limit", async () => {

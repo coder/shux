@@ -1199,7 +1199,11 @@ export interface McpProjectionOptions {
   /**
    * Restore side only: a deselected field the backup entry does not carry still gets a marker,
    * so the local value survives the restore instead of vanishing with the entry. An export
-   * leaves the field absent, since the source machine had nothing there to keep.
+   * leaves the field absent, since the source machine had nothing there to keep. The publish
+   * caps on marker counts do not apply here: the file already passed them on read, the
+   * markers added are bounded by its server count, and the projection never leaves this
+   * machine, so a large but valid backup must not become unrestorable by deselecting a
+   * category.
    */
   markAbsent?: boolean;
 }
@@ -1278,7 +1282,7 @@ function redactMcpConfig(
     const retainedRedactionPaths = redactionPaths.filter((jsonPath) =>
       valueHasRedactionAtPath(projected.parsed, jsonPath)
     );
-    assertBackupMcpRedactions(retainedRedactionPaths);
+    if (!options.markAbsent) assertBackupMcpRedactions(retainedRedactionPaths);
     return {
       content: projected.content,
       redactionPaths: retainedRedactionPaths,
@@ -1765,7 +1769,11 @@ function assertBackupMcpRedactions(
   }
 }
 
-function parseManifest(raw: string, portable: boolean): BackupManifest {
+/**
+ * `includeMcp: false` drops `mcpRedactions` unread: the list describes a file this selection
+ * never opens, so its shape and size cannot be allowed to fail a restore of everything else.
+ */
+function parseManifest(raw: string, portable: boolean, includeMcp = true): BackupManifest {
   const tree = jsonc.parseTree(raw);
   if (!tree) throw new Error("Invalid backup manifest");
   assertNoDuplicateKeys(tree, "backup manifest");
@@ -1780,6 +1788,7 @@ function parseManifest(raw: string, portable: boolean): BackupManifest {
   ) {
     throw new Error("Invalid backup manifest");
   }
+  if (!includeMcp) delete manifest.mcpRedactions;
   const mcpRedactions: unknown = manifest.mcpRedactions;
   if (mcpRedactions !== undefined) {
     if (!Array.isArray(mcpRedactions)) throw new Error("Invalid backup manifest");
@@ -1912,7 +1921,11 @@ async function readBackupPayloadUnchecked(
   const manifestRaw = await readCheckedFile(root, BACKUP_MANIFEST_FILE, (size) => {
     budget(BACKUP_MANIFEST_FILE, size);
   });
-  const manifest = parseManifest(manifestRaw.content.toString("utf-8"), portable);
+  const manifest = parseManifest(
+    manifestRaw.content.toString("utf-8"),
+    portable,
+    contents?.includeMcp ?? true
+  );
   const files: BackupFile[] = [];
   const seen = new Set<string>();
   for (const manifestFile of manifest.files) {
@@ -1940,9 +1953,7 @@ async function readBackupPayloadUnchecked(
   const parsedMcp = mcpFile
     ? parseJsoncObjectWithTree(mcpFile.content.toString("utf-8"), "backup mcp.jsonc")
     : undefined;
-  // A deselected mcp.jsonc was never opened, so its redaction list has nothing to validate
-  // against; selectBackupContents drops the list along with the file.
-  const mcpRedactions = contents && !contents.includeMcp ? undefined : manifest.mcpRedactions;
+  const mcpRedactions = manifest.mcpRedactions;
   let payload: BackupPayload;
   if (mcpRedactions !== undefined) {
     if (!parsedMcp) throw new Error("Backup manifest lists MCP redactions without mcp.jsonc");
