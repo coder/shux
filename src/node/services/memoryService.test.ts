@@ -2355,6 +2355,39 @@ describe("MemoryService", () => {
       expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(false);
     });
 
+    it("imports a legacy edit beside an adopted copy the owner recreated with the same bytes", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const ownerCopy = path.join(ownerRoot, "note.md");
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      // The owner deletes the copy and recreates it with the adopted bytes —
+      // the owner's generation now — and, before any pass re-inspects it,
+      // the downgraded build edits the legacy source. The bytes still hash
+      // to the record's, but the stamp no longer matches: the edit must not
+      // replace the owner's note in place; it lands in the import directory.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(ownerCopy);
+      await fsPromises.writeFile(ownerCopy, "v1");
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v2");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "note.md"), "utf-8")
+      ).toBe("v2");
+      const record = (
+        await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(fixture.config.sessionsDir, "ws-child"))
+        )
+      ).get("note.md")!;
+      expect(record.target).toBe("imported/ws-child/note.md");
+      expect(record.created).toBe(true);
+    });
+
     it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

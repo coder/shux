@@ -1499,7 +1499,22 @@ export class MemoryService extends EventEmitter {
             priorContent !== null &&
             [previous.content, previous.replacementContent].includes(sha256Hex(priorContent))
           ) {
-            target = { relPath: previous.target, write: true, replaces: true };
+            // The bytes alone do not prove the copy is still this adoption's:
+            // the owner may have deleted the copy and recreated it with the
+            // very same bytes (r87) — then it is the owner's generation (the
+            // rule above), and the child's edit must not replace it in place
+            // but land elsewhere. A settled record proves its generation by
+            // stamp; a pending record without one is a fresh adoption whose
+            // write the retry finds (the identical-bytes rule), while a
+            // pending replacement keeps the overwritten generation's stamp
+            // and is held to it — the old bytes must still be that file.
+            const currentStamp =
+              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+            const ours =
+              previous.targetStamp !== undefined
+                ? previous.targetStamp === currentStamp
+                : previous.pending === true;
+            if (ours) target = { relPath: previous.target, write: true, replaces: true };
           }
         }
         if (target === null) {
