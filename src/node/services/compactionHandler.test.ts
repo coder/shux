@@ -1912,23 +1912,26 @@ describe("CompactionHandler", () => {
       // Sequences: the boundary sits at boundarySequence, the two first-epoch
       // copies at +1/+2, so the rows seeded here start at +3.
       await seedHistory(
-        createMuxMessage("p2", "user", "prelude snapshot"),
+        createMuxMessage("p2", "user", "prelude snapshot", { synthetic: true }),
+        // Listed as a prelude row but of ordinary shape: never stamped through
+        // the listing (r85).
+        createMuxMessage("px", "user", "a real turn's question listed as prelude"),
         createMuxMessage("u2", "user", "second question", {
-          requestPreludeMessageIds: ["p2"],
+          requestPreludeMessageIds: ["p2", "px"],
         }),
         createMuxMessage("a2", "assistant", "second answer", {
-          requestHistorySequence: boundarySequence + 4, // anchors on u2
+          requestHistorySequence: boundarySequence + 5, // anchors on u2
           workspaceMemoryPolicyEpoch: -1,
         }),
         createMuxMessage("u3", "user", "third question"),
         createMuxMessage("ux", "user", "foreign backend's batch"),
         createMuxMessage("a3", "assistant", "third answer", {
-          requestHistorySequence: boundarySequence + 6, // anchors on u3, not ux
+          requestHistorySequence: boundarySequence + 7, // anchors on u3, not ux
           workspaceMemoryPolicyEpoch: boundarySequence,
         }),
         createMuxMessage("u4", "user", "old-build question"),
         createMuxMessage("a4", "assistant", "old-build answer", {
-          requestHistorySequence: boundarySequence + 9, // anchors on u4
+          requestHistorySequence: boundarySequence + 10, // anchors on u4
         }),
         createMuxMessage("u5", "user", "unanswered question"),
         // A row that recorded its policy under a foreign epoch but lost its
@@ -1950,7 +1953,7 @@ describe("CompactionHandler", () => {
         // user row stays unstamped, the row itself keeps its stamp.
         createMuxMessage("u10", "user", "question behind a fractional bound"),
         createMuxMessage("a10", "assistant", "fractional bound", {
-          requestHistorySequence: boundarySequence + 17.5,
+          requestHistorySequence: boundarySequence + 18.5,
           workspaceMemoryPolicyEpoch: boundarySequence,
         }),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
@@ -1964,6 +1967,7 @@ describe("CompactionHandler", () => {
         -1, // copy(u1)
         -1, // copy(a1)
         -1, // p2 (prelude of u2)
+        undefined, // px (listed, but no prelude shape)
         -1, // u2
         -1, // a2
         boundarySequence, // u3

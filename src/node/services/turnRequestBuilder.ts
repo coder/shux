@@ -1551,17 +1551,12 @@ export class TurnRequestBuilder {
     // WorkspaceService.recordWorkspaceMemoryWritable). The turn being started
     // is its last user row plus that row's prelude snapshots; compaction
     // request rows open an epoch rather than belong to one.
-    const epochHasPriorTurns = ((): boolean => {
-      const currentBatch = new Set<string>(
-        latestUserMessage === undefined
-          ? []
-          : [
-              latestUserMessage.id,
-              ...getRequestPreludeMessageIds(latestUserMessage.metadata?.requestPreludeMessageIds),
-            ]
-      );
-      return epochHasPriorTurnRows(activeContextMessages, currentBatch);
-    })();
+    const epochHasPriorTurns = epochHasPriorTurnRows(activeContextMessages, {
+      userMessageId: latestUserMessage?.id,
+      preludeMessageIds: new Set(
+        getRequestPreludeMessageIds(latestUserMessage?.metadata?.requestPreludeMessageIds)
+      ),
+    });
     // The compaction epoch this turn's policy accumulates over: the latest
     // durable boundary's history sequence (any kind), else the history
     // segment's boundary-less identity — never reused across full clears

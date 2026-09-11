@@ -72,6 +72,7 @@ import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrel
 import {
   compactionClosingPolicyEpoch,
   duplicateUserMessageIds,
+  isRequestPreludeRow,
 } from "@/common/utils/messages/compactionBoundary";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
@@ -372,10 +373,12 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
     return "the compacted epoch holds user rows sharing one id; harvest refused (fail closed)";
   }
   const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
+  const userRowById = new Map<string, MuxMessage>();
   for (const message of messages) {
     const sequence = message.metadata?.historySequence;
-    if (message.role === "user" && typeof sequence === "number")
-      userRows.push({ message, sequence });
+    if (message.role !== "user") continue;
+    userRowById.set(message.id, message);
+    if (typeof sequence === "number") userRows.push({ message, sequence });
   }
   const covered = new Set<string>();
   for (const message of messages) {
@@ -409,8 +412,12 @@ function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: numb
     const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
     if (anchor === undefined) continue;
     covered.add(anchor.id);
+    // A listed id covers a row only when that row has prelude shape: a
+    // listing naming an ordinary user turn (raw history) would otherwise
+    // let this turn vouch for content it never consumed.
     for (const id of getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds)) {
-      covered.add(id);
+      const listed = userRowById.get(id);
+      if (listed === undefined || isRequestPreludeRow(listed)) covered.add(id);
     }
   }
   const uncovered = messages.some(

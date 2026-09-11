@@ -261,21 +261,40 @@ export function sliceMessagesForProviderFromLatestContextBoundary(
  */
 export function epochHasPriorTurnRows(
   activeContextMessages: readonly MuxMessage[],
-  currentBatch: ReadonlySet<string>
+  currentTurn: { userMessageId: string | undefined; preludeMessageIds: ReadonlySet<string> }
 ): boolean {
   // Batches are matched by row id: two user rows sharing one id (persisted
   // history is raw JSON) would both read as the current batch, hiding the
   // earlier one from this check and from the harvest gate's coverage — so a
-  // duplicated id is itself an unaccounted prior turn (fail closed).
+  // duplicated id is itself an unaccounted prior turn (fail closed). A
+  // prelude listing exempts only rows of prelude shape (isRequestPreludeRow):
+  // an ordinary user turn named there stays a prior turn.
   const duplicated = duplicateUserMessageIds(activeContextMessages);
   return activeContextMessages.some(
     (message) =>
       message.role === "user" &&
-      (duplicated.has(message.id) || !currentBatch.has(message.id)) &&
+      (duplicated.has(message.id) ||
+        !(
+          message.id === currentTurn.userMessageId ||
+          (currentTurn.preludeMessageIds.has(message.id) && isRequestPreludeRow(message))
+        )) &&
       message.metadata?.muxMetadata?.type !== "compaction-request" &&
       message.metadata?.rlmPreservedTailCopy !== true &&
       !isTokenBudgetInternalMessage(message)
   );
+}
+
+/**
+ * Whether a row has the shape of a request prelude row — one the backend
+ * appends with a turn and lists in the user row's `requestPreludeMessageIds`
+ * (@mention/skill/MCP snapshots, family payloads): always `synthetic`. The
+ * id-keyed policy accounting (prior-turn check, harvest coverage, tail-copy
+ * stamps) honors a prelude listing only for such rows, so a listing that
+ * names an ordinary user turn (persisted history is raw JSON) cannot make
+ * that turn read as accounted for.
+ */
+export function isRequestPreludeRow(message: MuxMessage): boolean {
+  return message.metadata?.synthetic === true;
 }
 
 /**

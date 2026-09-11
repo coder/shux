@@ -82,8 +82,9 @@ describe("duplicateUserMessageIds", () => {
     expect(duplicateUserMessageIds(rows.slice(0, 2)).size).toBe(0);
     // The current batch is matched by id: the duplicated id would hide the
     // earlier row from the prior-turn check, so it counts as one.
-    expect(epochHasPriorTurnRows(rows, new Set(["u1"]))).toBe(true);
-    expect(epochHasPriorTurnRows(rows.slice(0, 2), new Set(["u1"]))).toBe(false);
+    const current = { userMessageId: "u1", preludeMessageIds: new Set<string>() };
+    expect(epochHasPriorTurnRows(rows, current)).toBe(true);
+    expect(epochHasPriorTurnRows(rows.slice(0, 2), current)).toBe(false);
   });
 });
 
@@ -467,7 +468,7 @@ describe("sliceMessagesFromLatestCompactionBoundary", () => {
 });
 
 describe("epochHasPriorTurnRows", () => {
-  const current = new Set(["u-now", "p-now"]);
+  const current = { userMessageId: "u-now", preludeMessageIds: new Set(["p-now"]) };
   const withRows = (...rows: Array<Parameters<typeof createMuxMessage>>) =>
     epochHasPriorTurnRows(
       rows.map((args) => createMuxMessage(...args)),
@@ -475,9 +476,17 @@ describe("epochHasPriorTurnRows", () => {
     );
 
   it("counts an earlier user turn but not the batch being started", () => {
-    expect(withRows(["u-now", "user", "now"], ["p-now", "user", "prelude"])).toBe(false);
+    expect(
+      withRows(["u-now", "user", "now"], ["p-now", "user", "prelude", { synthetic: true }])
+    ).toBe(false);
     expect(withRows(["u-old", "user", "earlier"], ["u-now", "user", "now"])).toBe(true);
     expect(withRows(["a-old", "assistant", "answer"], ["u-now", "user", "now"])).toBe(false);
+  });
+
+  it("exempts a listed prelude id only for a row of prelude shape", () => {
+    // A prelude listing naming an ordinary user turn (raw history) must not
+    // hide that turn from the unknown-history rule.
+    expect(withRows(["u-now", "user", "now"], ["p-now", "user", "a real earlier turn"])).toBe(true);
   });
 
   it("ignores rows that are no turn of the epoch: compaction requests, tail copies, token-budget internals", () => {

@@ -43,6 +43,7 @@ import {
   isDurableContextBoundaryMarker,
   latestContextBoundaryHistorySequence,
   duplicateUserMessageIds,
+  isRequestPreludeRow,
   sliceMessagesFromLatestCompactionBoundary,
   workspaceMemoryPolicyEpochOf,
 } from "@/common/utils/messages/compactionBoundary";
@@ -1676,11 +1677,12 @@ export class CompactionHandler {
     closingPolicyEpoch: number
   ): MuxMessage[] {
     const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
+    const userRowById = new Map<string, MuxMessage>();
     for (const message of tailRows) {
       const sequence = message.metadata?.historySequence;
-      if (message.role === "user" && typeof sequence === "number") {
-        userRows.push({ message, sequence });
-      }
+      if (message.role !== "user") continue;
+      userRowById.set(message.id, message);
+      if (typeof sequence === "number") userRows.push({ message, sequence });
     }
     const coveredEpochById = new Map<string, number>();
     // An id shared by two user rows names no batch: neither copy is stamped
@@ -1699,10 +1701,15 @@ export class CompactionHandler {
       if (typeof policyEpoch !== "number" || !isNonNegativeInteger(bound)) continue;
       const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
       if (anchor === undefined) continue;
-      for (const id of [
-        anchor.id,
-        ...getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds),
-      ]) {
+      // Same prelude rule as the harvest gate: a listed id stamps a user row
+      // only when that row has prelude shape.
+      const prelude = getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds).filter(
+        (id) => {
+          const listed = userRowById.get(id);
+          return listed === undefined || isRequestPreludeRow(listed);
+        }
+      );
+      for (const id of [anchor.id, ...prelude]) {
         if (!coveredEpochById.has(id) && !duplicated.has(id)) {
           coveredEpochById.set(id, policyEpoch);
         }
