@@ -1446,6 +1446,14 @@ export class MemoryService extends EventEmitter {
       const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       const adopted = await this.readOrQuarantineAdoptionManifest(manifestPath, childId);
       const sidecarEntries = await this.metaService.getEntriesOrThrow();
+      // The owner's OTHER descendants' manifests, for the pin aggregation
+      // below; loaded once per pass, only when a note has a sidecar entry.
+      let siblingManifests: Array<{
+        workspaceId: string;
+        records: Map<string, LegacyAdoptionRecord>;
+      }> | null = null;
+      const siblings = async () =>
+        (siblingManifests ??= await this.descendantAdoptionManifests(owner, childId));
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
       // combined notebook cannot exceed it — an over-full scope is silently
@@ -1791,6 +1799,47 @@ export class MemoryService extends EventEmitter {
           // Only an actual boolean transition of the child's pin overrides
           // the owner's; an unknown prior state never does.
           const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
+          // A copy the adoption created has no owner choice behind its pin:
+          // the descendants whose notes it represents own it together, and
+          // their pins combine (OR). Two descendants with the same note, the
+          // first adopted unpinned: the second's pin must not be dropped as
+          // "the owner's choice"; both pinned, one unpinned on the old
+          // build: the other's pin still protects the note. Ownership is by
+          // LIVE generation — this record's (created: a fresh write or
+          // `ours`), or a sibling's settled record whose receipt matches the
+          // stamp of the file on disk; a target path plus flags alone would
+          // read an owner-edited or recreated copy as the descendants'.
+          // Only a true aggregate is applied: with every owning pin off, an
+          // unpin is this child's own transition (below) — a mere view never
+          // clears a pin the owner set.
+          const liveStamp =
+            record.created === true
+              ? record.targetStamp
+              : ((await adoptionTargetStamp(store.physicalPath(target.relPath))) ?? undefined);
+          let descendantsPinned = record.created === true && childEntry.pinned;
+          if (liveStamp !== undefined) {
+            for (const sibling of await siblings()) {
+              for (const [siblingRel, siblingRecord] of sibling.records) {
+                if (
+                  siblingRecord.target !== target.relPath ||
+                  siblingRecord.created !== true ||
+                  siblingRecord.deleted === true ||
+                  (siblingRecord.targetStamp !== liveStamp &&
+                    siblingRecord.replacementStamp !== liveStamp)
+                ) {
+                  continue;
+                }
+                // Adoption-owned via the sibling: this child's pin counts too.
+                const siblingEntry = sidecarEntries.get(
+                  memoryLogicalKey("workspace", siblingRel, {
+                    projectPath: ctx.projectPath,
+                    workspaceId: sibling.workspaceId,
+                  })
+                );
+                descendantsPinned ||= childEntry.pinned || siblingEntry?.pinned === true;
+              }
+            }
+          }
           try {
             await this.metaService.mergeKeys(
               childKey,
@@ -1798,7 +1847,13 @@ export class MemoryService extends EventEmitter {
                 projectPath: ctx.projectPath,
                 workspaceId: owner,
               }),
-              { pinned: childPinChanged && foldChildPin ? "source" : "target" }
+              {
+                pinned: descendantsPinned
+                  ? "on"
+                  : childPinChanged && foldChildPin
+                    ? "source"
+                    : "target",
+              }
             );
           } catch (error) {
             log.warn(
@@ -2028,6 +2083,34 @@ export class MemoryService extends EventEmitter {
       );
       return new Map();
     }
+  }
+
+  /**
+   * The settled adoption manifests of the owner's OTHER descendants (tolerant
+   * reads: an unreadable or malformed sibling manifest contributes nothing,
+   * which keeps the owner's pin — today's behavior). Used to tell whether a
+   * copy in the owner store is another descendant's adoption, and what that
+   * descendant's own pin is.
+   */
+  private async descendantAdoptionManifests(
+    owner: string,
+    childId: string
+  ): Promise<Array<{ workspaceId: string; records: Map<string, LegacyAdoptionRecord> }>> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    const manifests: Array<{ workspaceId: string; records: Map<string, LegacyAdoptionRecord> }> =
+      [];
+    for (const project of cfg.projects.values()) {
+      for (const workspace of project.workspaces) {
+        const id = workspace.id;
+        if (id === undefined || id === childId || id === owner || resolve(id) !== owner) continue;
+        const records = await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(this.config.sessionsDir, id))
+        );
+        if (records.size > 0) manifests.push({ workspaceId: id, records });
+      }
+    }
+    return manifests;
   }
 
   /**

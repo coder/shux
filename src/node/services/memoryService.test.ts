@@ -3329,6 +3329,157 @@ describe("MemoryService", () => {
       expect(settled).toMatchObject({ created: true });
       expect(settled.pendingDeletion).toBeUndefined();
     });
+
+    it("keeps the owner's pin when a downgraded build only viewed the adopted note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      const childKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-child",
+      });
+      const ownerKey = memoryLogicalKey("workspace", "note.md", {
+        projectPath: "",
+        workspaceId: "ws-owner",
+      });
+      // Adopted before the child ever had a sidecar entry (no view, no pin).
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The owner pins the shared copy...
+      await fixture.metaService.setPinned(ownerKey, true);
+      // ...then the downgraded build merely views the legacy note: the child
+      // sidecar gains a usage-only entry — the default unpinned state, not a
+      // pin transition — so the owner's pin stands.
+      await fixture.metaService.recordAccess(childKey, { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // Another view once an entry exists: usage changes, the pin bit does not.
+      await fixture.metaService.recordAccess(childKey, { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // A pin the child actually toggles on the old build is the newer intent.
+      await fixture.metaService.setPinned(ownerKey, false);
+      await fixture.metaService.setPinned(childKey, true);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      // ...but not once the copy is the OWNER's generation (deleted and
+      // recreated with identical bytes): a later child toggle no longer folds
+      // in (r79), and the record stops claiming the copy — the same rule
+      // deletion reconciliation and the rollback remapper apply.
+      const ownerCopy = path.join(fixture.config.sessionsDir, "ws-owner", "memory", "note.md");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(ownerCopy);
+      await fsPromises.writeFile(ownerCopy, "v1");
+      await fixture.metaService.setPinned(childKey, false);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(true);
+      const record = (
+        await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(fixture.config.sessionsDir, "ws-child"))
+        )
+      ).get("note.md")!;
+      expect(record.created).toBe(false);
+      expect(record.targetStamp).toBeUndefined();
+      expect(record.replaced).toBe(true);
+      expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      // The record now persists without `created`, like a note the owner had
+      // all along — but that one folds child toggles, this one must not: the
+      // next toggle (a fresh process, so nothing is remembered in memory)
+      // leaves the owner-owned replacement alone too (r80).
+      await fixture.metaService.setPinned(childKey, true);
+      await fixture.metaService.setPinned(ownerKey, false);
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({ ...fixture.ctx });
+      // (A fresh sidecar instance: the fold ran in another one.)
+      expect((await new MemoryMetaService(fixture.xumHome).getPinnedKeys()).has(ownerKey)).toBe(
+        false
+      );
+    });
+
+    it("combines the pins of the descendants whose adoption owns a shared copy", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childCtx = { ...fixture.ctx };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const key = (workspaceId: string) =>
+        memoryLogicalKey("workspace", "shared.md", { projectPath: "", workspaceId });
+      const ownerPinned = async () =>
+        (await fixture.metaService.getPinnedKeys()).has(key("ws-owner"));
+      for (const id of ["ws-child", "ws-grandchild"]) {
+        const legacyRoot = path.join(fixture.config.sessionsDir, id, "memory");
+        await fsPromises.mkdir(legacyRoot, { recursive: true });
+        await fsPromises.writeFile(path.join(legacyRoot, "shared.md"), "same note");
+      }
+      // The first descendant adopts unpinned (creating the copy); the second,
+      // pinned, folds onto that copy. No owner choice stands behind it, so
+      // the pin is not dropped as "the owner's".
+      await fixture.metaService.setPinned(key("ws-grandchild"), true);
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await ownerPinned()).toBe(false);
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await ownerPinned()).toBe(true);
+      // Both pinned; one unpins on the old build: the other's pin still
+      // protects the note. Only once every owning pin is off does the note
+      // unpin.
+      await fixture.metaService.setPinned(key("ws-child"), true);
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await ownerPinned()).toBe(true);
+      await fixture.metaService.setPinned(key("ws-grandchild"), false);
+      await fixture.service.listIndexEntries(grandchildCtx);
+      expect(await ownerPinned()).toBe(true);
+      await fixture.metaService.setPinned(key("ws-child"), false);
+      await fixture.service.listIndexEntries(childCtx);
+      expect(await ownerPinned()).toBe(false);
+    });
+
+    it("trusts a sibling's provenance only while the copy is still that adoption's generation", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
+      const grandchildCtx = { ...fixture.ctx, workspaceId: "ws-grandchild" };
+      const key = (workspaceId: string) =>
+        memoryLogicalKey("workspace", "note.md", { projectPath: "", workspaceId });
+      const childRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      const grandchildRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(childRoot, { recursive: true });
+      await fsPromises.mkdir(grandchildRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(childRoot, "note.md"), "v1");
+      await fsPromises.writeFile(path.join(childRoot, "kept.md"), "kept");
+      const keptKey = (workspaceId: string) =>
+        memoryLogicalKey("workspace", "kept.md", { projectPath: "", workspaceId });
+      // (Viewed, unpinned, on the child: its adoption folds a usage-only
+      // owner entry in — the state a later pinned sibling must not lose to.)
+      await fixture.metaService.recordAccess(keptKey("ws-child"), { write: false });
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The owner rewrites the adopted copy and leaves it unpinned: the file
+      // is the owner's generation now, although the child's settled record
+      // still names the path as created.
+      await fixture.service.strReplace(
+        ownerCtx,
+        "/memories/workspace/note.md",
+        "v1",
+        "v2",
+        "agent"
+      );
+      await fixture.metaService.setPinned(key("ws-owner"), false);
+      // A pinned sibling holding exactly the owner's bytes folds onto the
+      // file: identical, so it is reused — but the sibling record's receipt
+      // does not match the live generation, so no descendant owns the copy
+      // and the owner's unpinned choice stands.
+      await fsPromises.writeFile(path.join(grandchildRoot, "note.md"), "v2");
+      await fixture.metaService.setPinned(key("ws-grandchild"), true);
+      // The untouched sibling copy, by contrast, is still the adoption's
+      // generation: the pin folds onto it.
+      await fsPromises.writeFile(path.join(grandchildRoot, "kept.md"), "kept");
+      await fixture.metaService.setPinned(keptKey("ws-grandchild"), true);
+      await fixture.service.listIndexEntries(grandchildCtx);
+      const pinned = await fixture.metaService.getPinnedKeys();
+      expect(pinned.has(key("ws-owner"))).toBe(false);
+      expect(pinned.has(keptKey("ws-owner"))).toBe(true);
+    });
   });
 
   describe("memory index entries", () => {
