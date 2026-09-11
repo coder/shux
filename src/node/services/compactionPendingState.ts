@@ -267,7 +267,10 @@ function hasWarmthPublication(writeId: string | undefined, view: CompactionPendi
   );
 }
 
-function isCurrentState(state: PersistedState, view: CompactionPendingHistoryView): boolean {
+function isCurrentState(
+  state: PersistedState,
+  view: Pick<CompactionPendingHistoryView, "boundary" | "generation" | "boundaryPublicationId">
+): boolean {
   return (
     sameBoundary(
       state.boundaryMessageId
@@ -332,6 +335,12 @@ export class CompactionPendingState {
       published: boolean;
       startingBoundary?: CompactionPendingBoundary;
     }
+  >();
+
+  // Only held-lock committed publications can authorize later predecessor retirement.
+  private readonly predecessors = new WeakMap<
+    CompactionPendingRetention,
+    Pick<CompactionPendingRetention, "generation" | "boundary" | "boundaryPublicationId">
   >();
 
   constructor(
@@ -632,7 +641,14 @@ export class CompactionPendingState {
               input.summaryMessage.metadata = summaryMessage.metadata;
               const owner = receipt && this.receipts.get(receipt);
               if (owner) owner.published = true;
-              onCommitted(receipt, previous, this.retention(view));
+              const retention = this.retention(view);
+              if (!receipt)
+                this.predecessors.set(retention, {
+                  generation: retention.generation,
+                  boundary: structuredClone(retention.boundary),
+                  boundaryPublicationId: retention.boundaryPublicationId,
+                });
+              onCommitted(receipt, previous, retention);
             }
           );
           if (committed) return Ok(receipt);
@@ -649,6 +665,59 @@ export class CompactionPendingState {
       }
       return Err(`Failed to publish compaction pending boundary: ${getErrorMessage(error)}`);
     }
+  }
+
+  /** A known exact receipt may retain legacy authority; an inferred predecessor may not. */
+  isPredecessor(receipt: CompactionPendingReceipt, retention: CompactionPendingRetention): boolean {
+    const owner = this.receipts.get(receipt);
+    const expected = this.predecessors.get(retention);
+    return !!(
+      owner &&
+      expected &&
+      owner.generation === expected.generation &&
+      sameBoundary(
+        owner.boundaryMessageId
+          ? { kind: "identified", messageId: owner.boundaryMessageId }
+          : { kind: "none" },
+        expected.boundary
+      ) &&
+      (expected.boundaryPublicationId === undefined ||
+        owner.writeId === expected.boundaryPublicationId)
+    );
+  }
+
+  /** Recover retirement authority after unreadable preparations, without trusting local caches. */
+  consumePredecessor(
+    retentions: readonly CompactionPendingRetention[],
+    onObserved: (receipt: CompactionPendingReceipt, retention: CompactionPendingRetention) => void
+  ): Promise<boolean> {
+    const candidates = retentions.flatMap((retention) => {
+      const expected = this.predecessors.get(retention);
+      // An ambiguous legacy boundary cannot authorize newly inferred destructive work.
+      return expected?.boundary.kind === "identified" &&
+        expected.boundaryPublicationId !== undefined
+        ? [{ retention, expected }]
+        : [];
+    });
+    if (candidates.length === 0) return Promise.resolve(false);
+    return this.enqueue(async (view) => {
+      if (view.boundary.kind === "unreadable-reset") return false;
+      const state = parseState(parseJson(await this.readBytes(view.assertStillOwned)));
+      if (!state) return false;
+      for (const { retention, expected } of candidates) {
+        if (view.generation !== expected.generation) continue;
+        const candidate = [state, state.previousState].find(
+          (value) => value && isCurrentState(value, expected)
+        );
+        if (!candidate) continue;
+        await view.assertStillOwned();
+        const receipt = this.receipt(candidate, expected.generation);
+        // Preserve local retirement facts before fallible cleanup; this is never acknowledgment.
+        onObserved(receipt, retention);
+        return this.consumeUnderLock(view, receipt, state);
+      }
+      return false;
+    });
   }
 
   consume(receipt: CompactionPendingReceipt): Promise<boolean> {

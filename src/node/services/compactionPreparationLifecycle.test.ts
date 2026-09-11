@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as atomicWrite from "write-file-atomic";
 import { createMuxMessage } from "@/common/types/message";
-import { CompactionPendingState } from "./compactionPendingState";
+import { CompactionPendingState, type CompactionPendingRetention } from "./compactionPendingState";
 import { CompactionPreparationLifecycle } from "./compactionPreparationLifecycle";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -769,6 +769,222 @@ describe("inactive local compaction preparation lifecycle", () => {
       );
     }
   );
+  it("retires the locked foreign predecessor after read recovery before restart rollback", async () => {
+    assert((await publish("A")).success);
+    expect((await lifecycle.capture("pending"))?.readFiles).toEqual(["/A.ts"]);
+    assert((await publish("C", false, new CompactionPreparationLifecycle(restart()))).success);
+    const readFile = fs.readFile;
+    const unreadable = spyOn(fs, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      if (args[0] === pendingPath) throw new Error("Pending preparation read unavailable");
+      return readFile(...args);
+    }) as typeof fs.readFile);
+    const b = await publish("B", true);
+    assert(b.success);
+    unreadable.mockRestore();
+    const empty = await lifecycle.capture("pending");
+    assert(empty);
+    expect(empty.readFiles).toEqual([]);
+    await lifecycle.consume(empty, "discard");
+    const restarted = new CompactionPreparationLifecycle(restart());
+    expect(await restarted.rollbackHeartbeat(b.data.summaryMessage, () => true)).toMatchObject({
+      success: true,
+      data: { outcome: "applied" },
+    });
+    expect(await restarted.capture("pending")).toBeUndefined();
+    expect(await new CompactionPreparationLifecycle(restart()).capture("pending")).toBeUndefined();
+  });
+
+  it.each([
+    "fallback",
+    "replacement",
+    "reset",
+    "future",
+    "unmarked",
+    "unlink failure",
+    "read failure",
+  ] as const)("bounds recovered predecessor retirement (%s)", async (scenario) => {
+    assert((await publish("A")).success);
+    const foreign = new CompactionPreparationLifecycle(restart());
+    const c = await publish("C", false, foreign);
+    assert(c.success);
+    if (scenario === "unmarked") {
+      const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+      const rows = (await fs.readFile(chatPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as typeof c.data.summaryMessage);
+      for (const row of rows) if (row.metadata) delete row.metadata.compactionPublicationId;
+      await fs.writeFile(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    }
+    const cBytes = await bytes();
+    const readFile = fs.readFile;
+    let unavailable = true;
+    const reading = spyOn(fs, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      if (args[0] === pendingPath && unavailable) throw new Error("Pending read unavailable");
+      return readFile(...args);
+    }) as typeof fs.readFile);
+    const b = await publish("B", true);
+    assert(b.success);
+    unavailable = false;
+    const empty = await lifecycle.capture("pending");
+    assert(empty);
+    expect(empty.readFiles).toEqual([]);
+    let d: Awaited<ReturnType<typeof publish>> | undefined;
+    if (scenario === "fallback") {
+      assert((await foreign.rollbackHeartbeat(b.data.summaryMessage, () => true)).success);
+      d = await publish("D", true, foreign);
+      assert(d.success);
+    } else if (scenario === "replacement") {
+      assert((await publish("D", false, foreign)).success);
+      const replacement = await publish("C", false, foreign);
+      assert(replacement.success);
+      expect(replacement.data.summaryMessage.metadata?.compactionPublicationId).not.toBe(
+        c.data.summaryMessage.metadata?.compactionPublicationId
+      );
+    } else if (scenario === "reset") {
+      assert((await h.historyService.clearHistory(workspaceId)).success);
+      await fs.writeFile(pendingPath, cBytes);
+    } else if (scenario === "future") {
+      await fs.writeFile(pendingPath, JSON.stringify({ version: 2, owner: "newer version" }));
+    }
+    const before = await bytes();
+    const unlink = fs.unlink;
+    const unlinking = spyOn(fs, "unlink").mockImplementation(async (file) => {
+      if (file === pendingPath && scenario === "unlink failure")
+        throw new Error("Unlink unavailable");
+      return unlink(file);
+    });
+    unavailable = scenario === "read failure";
+    await lifecycle.consume(empty, "discard");
+    unavailable = false;
+    unlinking.mockRestore();
+    reading.mockRestore();
+    if (scenario === "fallback") {
+      const retained = JSON.parse(await bytes()) as Record<string, unknown>;
+      const original = JSON.parse(before) as Record<string, unknown>;
+      expect(retained).toEqual({
+        ...original,
+        previousState: undefined,
+        previousStateGeneration: undefined,
+        previousStateBoundary: undefined,
+      });
+      expect(
+        (await new CompactionPreparationLifecycle(restart()).capture("pending"))?.readFiles
+      ).toEqual(["/D.ts"]);
+      assert(d?.success);
+      const restarted = new CompactionPreparationLifecycle(restart());
+      assert((await restarted.rollbackHeartbeat(d.data.summaryMessage, () => true)).success);
+      expect(await restarted.capture("pending")).toBeUndefined();
+    } else {
+      expect(await bytes()).toBe(before);
+      if (scenario === "unlink failure" || scenario === "read failure") {
+        // Failed retirement is only local debt until a later successful physical cleanup.
+        assert((await lifecycle.rollbackHeartbeat(b.data.summaryMessage, () => true)).success);
+        expect(await lifecycle.capture("pending")).toBeUndefined();
+        expect(
+          await new CompactionPreparationLifecycle(restart()).capture("pending")
+        ).toBeUndefined();
+      }
+    }
+  });
+
+  it.each(["legacy receipt", "history-only chain", "irreversible boundary"] as const)(
+    "retains only rollbackable predecessor authority (%s)",
+    async (scenario) => {
+      const foreign = new CompactionPreparationLifecycle(restart());
+      const a = await publish("A", false, foreign);
+      assert(a.success);
+      if (scenario === "legacy receipt") {
+        const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+        const rows = (await fs.readFile(chatPath, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as typeof a.data.summaryMessage);
+        for (const row of rows) if (row.metadata) delete row.metadata.compactionPublicationId;
+        await fs.writeFile(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+        expect((await lifecycle.capture("pending"))?.readFiles).toEqual(["/A.ts"]);
+      }
+      const original = await bytes();
+      const readFile = fs.readFile;
+      const reading = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fs.readFile>
+      ) => {
+        if (args[0] === pendingPath) throw new Error("Pending read unavailable");
+        return readFile(...args);
+      }) as typeof fs.readFile);
+      const b = await publish("B", true);
+      assert(b.success);
+      const d =
+        scenario === "legacy receipt"
+          ? undefined
+          : await publish("D", scenario === "history-only chain");
+      if (d) assert(d.success);
+      reading.mockRestore();
+      const empty = await lifecycle.capture("pending");
+      assert(empty);
+      expect(empty.readFiles).toEqual([]);
+      await lifecycle.consume(empty, "discard");
+      if (scenario === "irreversible boundary") {
+        // A is no longer in the physical rollback horizon; old capabilities must not delete it.
+        expect(await bytes()).toBe(original);
+        return;
+      }
+      const restarted = new CompactionPreparationLifecycle(restart());
+      if (d?.success)
+        assert((await restarted.rollbackHeartbeat(d.data.summaryMessage, () => true)).success);
+      assert((await restarted.rollbackHeartbeat(b.data.summaryMessage, () => true)).success);
+      expect(await restarted.capture("pending")).toBeUndefined();
+      expect(
+        await new CompactionPreparationLifecycle(restart()).capture("pending")
+      ).toBeUndefined();
+    }
+  );
+
+  it("does not enlarge predecessor retirement authority through copied or mutated retention", async () => {
+    const foreign = new CompactionPreparationLifecycle(restart());
+    assert((await publish("C", false, foreign)).success);
+    const original = await bytes();
+    const publishBoundary = store.publishBoundary.bind(store);
+    let captured: CompactionPendingRetention | undefined;
+    spyOn(store, "publishBoundary").mockImplementationOnce((boundary) =>
+      publishBoundary({
+        ...boundary,
+        onCommitted: (receipt, previous, retention) => {
+          captured = retention;
+          boundary.onCommitted(receipt, previous, retention);
+        },
+      })
+    );
+    const readFile = fs.readFile;
+    const reading = spyOn(fs, "readFile").mockImplementation((async (
+      ...args: Parameters<typeof fs.readFile>
+    ) => {
+      if (args[0] === pendingPath) throw new Error("Pending read unavailable");
+      return readFile(...args);
+    }) as typeof fs.readFile);
+    assert((await publish("B", true)).success);
+    reading.mockRestore();
+    assert(captured);
+    const d = await publish("D", false, foreign);
+    assert(d.success);
+    const newer = await bytes();
+    captured.boundary = { kind: "identified", messageId: "D" };
+    captured.boundaryPublicationId = d.data.summaryMessage.metadata?.compactionPublicationId;
+    const observed = mock(() => undefined);
+    expect(await store.consumePredecessor([structuredClone(captured)], observed)).toBe(false);
+    expect(await store.consumePredecessor([captured], observed)).toBe(false);
+    expect(observed).not.toHaveBeenCalled();
+    expect(await bytes()).toBe(newer);
+    await fs.writeFile(pendingPath, original);
+    expect(await store.consumePredecessor([captured], observed)).toBe(true);
+    expect(observed).toHaveBeenCalledTimes(1);
+    expect(await bytes().catch(() => undefined)).toBeUndefined();
+  });
+
   it("retires a predecessor adopted by an earlier queued capture when publication reads fail", async () => {
     assert((await publish("A", false, new CompactionPreparationLifecycle(restart()))).success);
     const prepared = await input("B", true);

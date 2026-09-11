@@ -45,6 +45,7 @@ interface PublicationOwner extends OwnerFacts {
   publicationId?: string;
   historyOnly: boolean;
   surviving?: ReceiptOwner;
+  predecessors?: readonly CompactionPendingRetention[];
 }
 
 type Owner = ReceiptOwner | PublicationOwner;
@@ -97,6 +98,21 @@ export class CompactionPreparationLifecycle {
     return owner;
   }
 
+  private retainedPredecessors(
+    predecessors: readonly CompactionPendingRetention[],
+    retention: CompactionPendingRetention
+  ) {
+    return predecessors.filter(
+      (previous) =>
+        previous.generation === retention.generation &&
+        previous.boundary.kind !== "unreadable-reset" &&
+        (retention.reachableBoundaryIds?.has(
+          previous.boundary.kind === "identified" ? previous.boundary.messageId : undefined
+        ) ??
+          true)
+    );
+  }
+
   private prune(retention: CompactionPendingRetention) {
     const reachable = (id: string | undefined) => retention.reachableBoundaryIds?.has(id) ?? true;
     const retain = (owner: Owner) =>
@@ -110,7 +126,11 @@ export class CompactionPreparationLifecycle {
               : undefined
           )));
     for (const owner of this.receipts) if (!retain(owner)) this.receipts.delete(owner);
-    for (const owner of this.publications) if (!retain(owner)) this.publications.delete(owner);
+    for (const owner of this.publications) {
+      if (!retain(owner)) this.publications.delete(owner);
+      else if (owner.predecessors)
+        owner.predecessors = this.retainedPredecessors(owner.predecessors, retention);
+    }
     if (this.current && !retain(this.current)) this.current = undefined;
   }
 
@@ -230,11 +250,26 @@ export class CompactionPreparationLifecycle {
         onCommitted: (receipt, previous, retention) => {
           committed = true;
           owner.historyOnly = !receipt;
-          // Earlier queued captures have adopted their observations by this held-lock commit.
-          // Keep their exact survivor if enrichment could not read it, before pruning/resetting
-          // current; choosing before queue entry can miss a receipt still being observed.
+          // Carry an unresolved chain only through the exact local history-only predecessor.
+          // Foreign publications can supersede cached receipts without this instance observing them.
           const current = this.current;
-          const surviving = current?.kind === "receipt" ? current : current?.surviving;
+          const priorPublication =
+            current?.kind === "publication" &&
+            current.generation === retention.generation &&
+            retention.boundary.kind === "identified" &&
+            current.summaryId === retention.boundary.messageId &&
+            current.publicationId !== undefined &&
+            current.publicationId === retention.boundaryPublicationId
+              ? current
+              : undefined;
+          owner.predecessors = [
+            ...this.retainedPredecessors(priorPublication?.predecessors ?? [], retention),
+            retention,
+          ];
+          const surviving =
+            current?.kind === "receipt" && this.store.isPredecessor(current.receipt, retention)
+              ? current
+              : priorPublication?.surviving;
           owner.surviving =
             surviving &&
             !surviving.facts.consumed &&
@@ -275,12 +310,21 @@ export class CompactionPreparationLifecycle {
       // granting acknowledgment; independently earned warmth keeps its existing ack fact.
       file.facts.pendingRetired = true;
     }
-    if (file)
-      try {
-        await this.store.consume(file.receipt);
-      } catch (error) {
-        log.warn("Pending attachment consumption unavailable", error);
+    try {
+      if (owner.kind === "publication" && owner.predecessors) {
+        if (
+          await this.store.consumePredecessor(owner.predecessors, (receipt, predecessor) => {
+            const recovered = this.canonical(receipt, predecessor);
+            recovered.facts.pendingRetired = true;
+            owner.surviving = recovered;
+          })
+        )
+          return;
       }
+      if (file) await this.store.consume(file.receipt);
+    } catch (error) {
+      log.warn("Pending attachment consumption unavailable", error);
+    }
   }
 
   async rollbackHeartbeat(summaryMessage: MuxMessage, isCurrent: () => boolean) {
