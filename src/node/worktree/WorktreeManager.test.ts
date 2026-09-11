@@ -412,6 +412,75 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   });
 
+  it("runs post-checkout with the new-worktree arguments of a plain worktree add", async () => {
+    const branchName = "feature-hook-contract";
+    const fixture = await createWorktreeManagerFixture();
+    const hookLog = path.join(fixture.rootDir, "post-checkout-args");
+    try {
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      await fsPromises.writeFile(
+        hook,
+        '#!/bin/sh\nprintf "%s %s %s" "$1" "$2" "$3" >> "' + hookLog + '"\n'
+      );
+      await fsPromises.chmod(hook, 0o755);
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+      });
+      expect(result.success).toBe(true);
+      const tip = execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+        .toString()
+        .trim();
+      expect(await fsPromises.readFile(hookLog, "utf8")).toBe(`${"0".repeat(40)} ${tip} 1`);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("checks out a linked worktree when submodule.recurse is enabled", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const submodulePath = path.join(fixture.rootDir, "sub");
+      await fsPromises.mkdir(submodulePath);
+      initGitRepo(submodulePath);
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", submodulePath, "sub"],
+        { cwd: fixture.projectPath, stdio: "ignore" }
+      );
+      execFileSync("git", ["commit", "-qm", "add submodule"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "submodule.recurse", "true"], { cwd: fixture.projectPath });
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-submodules",
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        // The later submodule sync clones from a local path; git only honors this
+        // permission from command-line scope, never from repository config.
+        env: {
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "protocol.file.allow",
+          GIT_CONFIG_VALUE_0: "always",
+        },
+      });
+      expect(result).toEqual({
+        success: true,
+        workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, "feature-submodules"),
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("skips repo-configured upload-pack commands when project automation is disabled", async () => {
     const fixture = await createWorktreeManagerFixture();
     const marker = path.join(fixture.rootDir, "upload-pack-ran");

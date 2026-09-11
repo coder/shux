@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import type {
@@ -198,14 +199,32 @@ export class WorktreeManager {
       }
 
       initLogger.logStep("Checking out files...");
+      // Point HEAD at an unborn ref first so the checkout reports the same post-checkout
+      // hook arguments as a plain `git worktree add` (null old commit, new-worktree flag).
+      using unbornProc = execFileAsync(
+        "git",
+        ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
+        noHooksEnv
+      );
+      await unbornProc.result;
       const progress = new GitProgressParser(
         (stage, percent) => initLogger.logProgress?.(stage, percent),
         (line) => initLogger.logStderr(line)
       );
       try {
+        // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
+        // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
         using checkoutProc = execFileAsync(
           "git",
-          ["-C", workspacePath, "checkout", "--progress", "--force", branchName],
+          [
+            "-C",
+            workspacePath,
+            "checkout",
+            "--progress",
+            "--force",
+            "--no-recurse-submodules",
+            branchName,
+          ],
           {
             ...noHooksEnv,
             // git delays progress output by 2s, which hides it for most checkouts.
