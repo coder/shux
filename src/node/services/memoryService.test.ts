@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { Config } from "@/node/config";
+import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   extractMemoryDescription,
@@ -1243,6 +1244,249 @@ describe("MemoryService", () => {
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
       unreadable.mockRestore();
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+    });
+    it("keeps a grandchild on the root store via the pinned owner after its parent is removed", async () => {
+      using fixture = await createFixture("ws-grandchild");
+      await registerTaskTree(fixture);
+      // Removal of the intermediate "ws-child" pins memoryOwnerWorkspaceId on
+      // its children before deregistering it (WorkspaceService.remove).
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        for (const ws of project.workspaces) {
+          if (ws.parentWorkspaceId === "ws-child") ws.memoryOwnerWorkspaceId = "ws-owner";
+        }
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-child");
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-owner");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/still-shared.md",
+        "root store",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      expect(
+        await pathExists(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "still-shared.md")
+        )
+      ).toBe(true);
+      // A pinned owner that is itself gone falls back to self.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-grandchild");
+    });
+
+    it("re-resolves the owner per command and refuses reads once the owner is tombstoned", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      // One context serves a whole stream (createMemoryTool): a cached owner
+      // must not outlive the command that resolved it.
+      expect(fixture.service.ownerWorkspaceIdFor(fixture.ctx)).toBe("ws-owner");
+      const resolve = spyOn(fixture.service, "resolveWorkspaceMemoryOwnerId");
+      expect((await fixture.service.view(fixture.ctx, "/memories/workspace/n.md")).success).toBe(
+        true
+      );
+      expect(resolve).toHaveBeenCalled();
+
+      // Another backend removed the owner: its durable tombstone (no local
+      // event) must stop the child's reads of the shared notebook.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-owner" }));
+      const refused = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("was removed");
+      const root = await fixture.service.view(fixture.ctx, "/memories");
+      expect(root.success).toBe(true);
+      if (root.success) expect(root.output).toContain("unavailable");
+      // The prompt-context path is guarded too: the index no longer lists
+      // the store.
+      expect(
+        (await fixture.service.listIndexEntries(fixture.ctx)).some(
+          (entry) => entry.scope === "workspace"
+        )
+      ).toBe(false);
+    });
+
+    it("guards a context acting on a removed child's behalf like the child itself", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // A child's consolidation run sweeps under the OWNER's identity; the
+      // child's removal by another backend (tombstone, no local signal) must
+      // still refuse that run's reads and commits in every scope.
+      const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner", guardedWorkspaceId: "ws-child" };
+      await fixture.service.create(ownerCtx, "/memories/workspace/n.md", "shared", "agent");
+      await fixture.service.create(ownerCtx, "/memories/global/g.md", "global", "agent");
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+      for (const attempt of [
+        () => fixture.service.view(ownerCtx, "/memories/workspace/n.md"),
+        () =>
+          fixture.service.strReplace(ownerCtx, "/memories/workspace/n.md", "shared", "x", "agent"),
+        () => fixture.service.strReplace(ownerCtx, "/memories/global/g.md", "global", "x", "agent"),
+        () => fixture.service.create(ownerCtx, "/memories/project/p.md", "p", "agent"),
+      ]) {
+        const result = await attempt();
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("ws-child was removed");
+      }
+      expect(
+        await fsPromises.readFile(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"),
+          "utf-8"
+        )
+      ).toBe("shared");
+      // The owner's own contexts are unaffected.
+      const plainOwner = { ...fixture.ctx, workspaceId: "ws-owner" };
+      expect((await fixture.service.view(plainOwner, "/memories/workspace/n.md")).success).toBe(
+        true
+      );
+    });
+
+    it("withholds a read whose workspace was tombstoned after the pre-read check", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/g.md", "global", "agent");
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
+      // Another backend's removal lands between the check that opened the
+      // store and the read itself: every path that exposes the store's bytes
+      // or listing re-checks before returning them.
+      const service = fixture.service as unknown as {
+        openWorkspaceStore: (...args: unknown[]) => Promise<void>;
+      };
+      const original = service.openWorkspaceStore.bind(fixture.service);
+      const tombstoneAfterOpen = () =>
+        spyOn(service, "openWorkspaceStore").mockImplementationOnce(async (...args) => {
+          await original(...args);
+          await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+          await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+        });
+      const untombstone = () => fsPromises.rm(tombstonePath, { force: true });
+
+      tombstoneAfterOpen();
+      const file = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(file.success).toBe(false);
+      if (!file.success) expect(file.error).toContain("was removed");
+      await untombstone();
+
+      // The usage record waits for the owner-store lock, which a removal
+      // holds while it publishes the tombstone: landing there, after the
+      // bytes were read, must still withhold them.
+      const usageService = fixture.service as unknown as {
+        recordUsage: (...args: unknown[]) => Promise<void>;
+      };
+      const originalUsage = usageService.recordUsage.bind(fixture.service);
+      const usage = spyOn(usageService, "recordUsage").mockImplementationOnce(async (...args) => {
+        await originalUsage(...args);
+        await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+        await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+      });
+      const lateFile = await fixture.service.view(fixture.ctx, "/memories/workspace/n.md");
+      expect(usage).toHaveBeenCalledTimes(1);
+      expect(lateFile.success).toBe(false);
+      if (!lateFile.success) expect(lateFile.error).toContain("was removed");
+      usage.mockRestore();
+      await untombstone();
+
+      tombstoneAfterOpen();
+      const dir = await fixture.service.view(fixture.ctx, "/memories/workspace");
+      expect(dir.success).toBe(false);
+      if (!dir.success) expect(dir.error).toContain("was removed");
+      await untombstone();
+
+      tombstoneAfterOpen();
+      const root = await fixture.service.view(fixture.ctx, "/memories");
+      expect(root.success).toBe(true);
+      if (root.success) {
+        expect(root.output).toContain("unavailable");
+        expect(root.output).not.toContain("n.md");
+      }
+      await untombstone();
+
+      tombstoneAfterOpen();
+      const entries = await fixture.service.listIndexEntries(fixture.ctx);
+      expect(entries.map((entry) => entry.scope)).toEqual(["global"]);
+      await untombstone();
+
+      tombstoneAfterOpen();
+      const ui = await fixture.service.readFileWithSha(fixture.ctx, "/memories/workspace/n.md");
+      expect(ui.success).toBe(false);
+      await untombstone();
+
+      // Hot-set reads happen after the index enumeration passed: the
+      // tombstone landing before the file read drops the item.
+      const hotBefore = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens: (text) => Promise.resolve(text.length),
+      });
+      expect(hotBefore.some((item) => item.path === "/memories/workspace/n.md")).toBe(true);
+      // Interleaving: the tombstone lands after listIndexEntries built the
+      // candidate list and before the hot-set file reads.
+      const originalList = fixture.service.listIndexEntries.bind(fixture.service);
+      const listIndex = spyOn(fixture.service, "listIndexEntries").mockImplementationOnce(
+        async (ctx) => {
+          const result = await originalList(ctx);
+          await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+          await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          return result;
+        }
+      );
+      try {
+        const hot = await fixture.service.listHotMemories(fixture.ctx, {
+          countTokens: (text) => Promise.resolve(text.length),
+        });
+        expect(hot.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
+        expect(hot.some((item) => item.path === "/memories/global/g.md")).toBe(true);
+      } finally {
+        listIndex.mockRestore();
+        await untombstone();
+      }
+      // Selection keeps awaiting token counts after the file reads: a
+      // tombstone landing there still withholds the workspace items.
+      let counted = 0;
+      const hotAfterCount = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens: async (text) => {
+          if (counted++ === 0) {
+            await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+            await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
+          }
+          return text.length;
+        },
+      });
+      expect(counted).toBeGreaterThan(0);
+      expect(hotAfterCount.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
+      expect(hotAfterCount.some((item) => item.path === "/memories/global/g.md")).toBe(true);
+      await untombstone();
+    });
+
+    it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "shared", "agent");
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+      // Owner removed by another backend between the tab's owner resolution
+      // and the pin's lock acquisition: the pin must not be committed under
+      // the dead owner's logical key while the route reports success.
+      const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-owner" }));
+      const refused = await fixture.service
+        .setPinned(fixture.ctx, "/memories/workspace/n.md", true)
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(refused).toBeInstanceOf(Error);
+      expect(getErrorMessage(refused)).toContain("was removed");
+      expect((await fixture.metaService.getPinnedKeys()).size).toBe(0);
+      expect(events).toEqual([]);
     });
   });
 

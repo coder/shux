@@ -88,6 +88,15 @@ export interface MemoryScopeContext {
    * and sidecar logical keys; empty when no project identity is available.
    */
   projectPath: string;
+  /**
+   * A further workspace on whose behalf this context acts, guarded like the
+   * acting one: a sub-agent's consolidation run sweeps the OWNER's notebook
+   * under the owner's identity (`workspaceId`), and the child's removal —
+   * possibly by another backend, which cannot abort this run — must refuse
+   * every read and commit of that run at the tombstone check, not only its
+   * start (r77).
+   */
+  guardedWorkspaceId?: string;
 }
 
 export type MemoryActor = "agent" | "user";
@@ -739,7 +748,7 @@ export class MemoryService extends EventEmitter {
    * index+hot-set build and reused for every entry within it, so the stamp
    * stat behind resolveWorkspaceMemoryOwnerId runs once per operation instead
    * of once per candidate file. Staleness is bounded to that one operation;
-   * writes are still gated by the commit check (assertMutationCommittable).
+   * writes are still gated by the store-bound tombstone check.
    */
   private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
 
@@ -947,9 +956,83 @@ export class MemoryService extends EventEmitter {
     relPath: string
   ): Promise<MemoryStore> {
     const store = this.getStore(ctx, scope);
+    if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
     await store.assertRootSafe();
     await store.assertContained(relPath);
     return store;
+  }
+
+  /**
+   * Every workspace-scope entry point (commands, root listing, index build)
+   * goes through here: refuse revoked access.
+   */
+  private async openWorkspaceStore(ctx: MemoryScopeContext, store: MemoryStore): Promise<void> {
+    await this.assertWorkspaceStoreReadable(ctx, store);
+  }
+
+  /**
+   * The workspace whose session dir physically holds `store` (the memory
+   * owner a workspace-scope store was resolved to), or null for stores that
+   * are not session-bound (global/project), which live elsewhere.
+   */
+  private storeOwnerWorkspaceId(store: MemoryStore): string | null {
+    const rel = path.relative(this.config.sessionsDir, store.physicalRoot);
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    return rel.split(path.sep)[0];
+  }
+
+  /** Acting workspace plus the store's owner: both must be alive to touch the store. */
+  private guardedWorkspaceIds(ctx: MemoryScopeContext, store: MemoryStore): string[] {
+    const owner = this.storeOwnerWorkspaceId(store);
+    return [
+      ...new Set([
+        ctx.workspaceId,
+        ...(owner === null ? [] : [owner]),
+        ...(ctx.guardedWorkspaceId === undefined || ctx.guardedWorkspaceId === ""
+          ? []
+          : [ctx.guardedWorkspaceId]),
+      ]),
+    ];
+  }
+
+  /**
+   * Reads have no commit guard, so a removed child's stream in ANOTHER backend
+   * (which the remover cannot cancel) could keep viewing its former owner's
+   * notebook — including notes written after the removal — through the
+   * shared store. Refuse workspace-scope reads once the acting workspace or
+   * the store's owner is tombstoned (the tombstone is durable and
+   * cross-process; see workspaceRemoval.ts).
+   */
+  private async assertWorkspaceStoreReadable(
+    ctx: MemoryScopeContext,
+    store: MemoryStore
+  ): Promise<void> {
+    if (ctx.workspaceId === "") return;
+    for (const workspaceId of this.guardedWorkspaceIds(ctx, store)) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new MemoryCommandError(
+          `Workspace ${workspaceId} was removed; the workspace memory store is no longer available`
+        );
+      }
+    }
+  }
+
+  /**
+   * Post-read gate for workspace-scope reads. openWorkspaceStore checks the
+   * tombstones BEFORE the read; another backend can publish the acting
+   * workspace's (or the owner's) removal tombstone while the read is in
+   * flight, and the bytes would then be exposed on behalf of a workspace that
+   * no longer exists. Re-checked after every read whose result leaves the
+   * service (view, listings, index/hot-set builds, UI reads), before the
+   * result is returned. Other scopes are never shared and have no tombstone.
+   */
+  private async assertWorkspaceReadExposable(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    store: MemoryStore
+  ): Promise<void> {
+    if (scope !== "workspace") return;
+    await this.assertWorkspaceStoreReadable(ctx, store);
   }
 
   private requireFilePath(parsed: ParsedMemoryPath, virtualPath: string): MemoryScope {
@@ -1021,15 +1104,24 @@ export class MemoryService extends EventEmitter {
    *   removal here at commit time and refuses instead of recreating the
    *   deleted session directory via its write or journal append.
    *
-   * The owner the command's store was bound to is then compared with a fresh
-   * resolution: the per-context cache (ownerWorkspaceIdFor) may hold a
-   * self-fallback taken while config.json was missing or malformed, and if
-   * the file recovers before this command commits, the write would land in
-   * the child's private store although the tree is shared again. Refused as
-   * a recoverable error; the retried command resolves the owner anew.
+   * Both the acting workspace and the workspace that physically owns the
+   * RESOLVED store are checked: a removed sub-agent must not keep writing
+   * into its parent's notebook, and a removed owner must not have its session
+   * directory recreated by a lingering child's write. The owner is derived
+   * from the store the command already bound to — not re-resolved — so an
+   * ownership change between resolution and lock acquisition cannot make the
+   * check pass for the new owner while the write lands in the old one.
+   *
+   * The bound owner is then compared with a fresh resolution: the
+   * per-context cache (ownerWorkspaceIdFor) may hold a self-fallback taken
+   * while config.json was missing or malformed, and if the file recovers
+   * before this command commits, the write would land in the child's private
+   * store although the tree is shared again. Refused as a recoverable error;
+   * the retried command resolves the owner anew.
    */
   private async assertMutationCommittable(
     ctx: MemoryScopeContext,
+    store: MemoryStore,
     signal: AbortSignal | undefined,
     virtualPath: string
   ): Promise<void> {
@@ -1039,8 +1131,8 @@ export class MemoryService extends EventEmitter {
       );
     }
     if (ctx.workspaceId === "") return;
-    const boundOwner = this.ownerByContext.get(ctx);
-    if (boundOwner !== undefined) {
+    const boundOwner = this.storeOwnerWorkspaceId(store);
+    if (boundOwner !== null) {
       const currentOwner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
       if (currentOwner !== boundOwner) {
         throw new MemoryCommandError(
@@ -1048,16 +1140,7 @@ export class MemoryService extends EventEmitter {
         );
       }
     }
-    // The acting workspace AND, for the workspace scope, the store owner: a
-    // child's mutation waits on the owner's store lock while the owner is
-    // removed (tombstone published, session dir deleted), then resumes and
-    // would recreate the owner's directory. Global/project stores are not
-    // the owner's, so a removed owner does not refuse those.
-    const storeOwner =
-      parseMemoryPath(virtualPath).scope === "workspace"
-        ? this.ownerWorkspaceIdFor(ctx)
-        : undefined;
-    for (const workspaceId of new Set([ctx.workspaceId, storeOwner ?? ctx.workspaceId])) {
+    for (const workspaceId of this.guardedWorkspaceIds(ctx, store)) {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         throw new MemoryCommandError(
           `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
@@ -1216,7 +1299,7 @@ export class MemoryService extends EventEmitter {
         // the owner the context resolved BEFORE the lock. If ownership moved
         // meanwhile, the pin would land under a dead logical key and the
         // route would still report success. Refuse instead.
-        await this.assertMutationCommittable(ctx, undefined, virtualPath);
+        await this.assertMutationCommittable(ctx, store, undefined, virtualPath);
         await this.metaService.setPinned(key, pinned);
       });
     } else {
@@ -1264,9 +1347,11 @@ export class MemoryService extends EventEmitter {
           sections.push(`- ${scope}/`);
           try {
             const store = this.getStore(ctx, scope);
+            if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
             // Read-only: never create roots just to list (missing ⇒ empty).
             await store.assertRootSafe();
             const files = await store.listFiles();
+            await this.assertWorkspaceReadExposable(ctx, scope, store);
             sections.push(...renderTree(files, MEMORY_VIEW_MAX_DEPTH - 1, "  "));
           } catch (error) {
             // Self-healing: an unavailable scope must not break the whole view.
@@ -1283,6 +1368,7 @@ export class MemoryService extends EventEmitter {
       // write — but the scope itself always exists in the protocol.
       if (kind === "dir" || (kind === null && parsed.relPath === "")) {
         const files = await store.listFiles();
+        await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
         const prefix = parsed.relPath === "" ? "" : `${parsed.relPath}/`;
         const scopedFiles = files
           .filter((file) => file.startsWith(prefix))
@@ -1300,6 +1386,9 @@ export class MemoryService extends EventEmitter {
       const content = await this.readBoundedTextFile(store, parsed.relPath, virtualPath);
       const output = renderFileView(content, options);
       await this.recordUsage(ctx, parsed.scope, parsed.relPath, { write: false });
+      // AFTER recordUsage — the last await before the content leaves: a
+      // tombstone published meanwhile must still withhold the bytes.
+      await this.assertWorkspaceReadExposable(ctx, parsed.scope, store);
       return { success: true, output };
     });
   }
@@ -1322,7 +1411,7 @@ export class MemoryService extends EventEmitter {
         // only INSIDE the lock and after the removal check (r62), so the
         // mkdir serializes with removal's locked deletion and cannot
         // recreate a removed session directory.
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.ensureRoot();
         const existing = await store.kind(parsed.relPath);
         if (existing !== null) {
@@ -1336,7 +1425,7 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1377,7 +1466,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1430,7 +1519,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1490,7 +1579,7 @@ export class MemoryService extends EventEmitter {
       }
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.ensureRoot();
         const kind = await store.kind(parsed.relPath);
         if (kind === "dir") {
@@ -1525,7 +1614,7 @@ export class MemoryService extends EventEmitter {
                   mutation.insertText
                 ).updated;
         assertWithinFileSizeCap(updated, maxFileBytes);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         const physicalPath = store.physicalPath(parsed.relPath);
         // Row is written before the write is acknowledged (mutation → row → ack).
@@ -1702,7 +1791,7 @@ export class MemoryService extends EventEmitter {
         // Prior contents must be captured before removal; the row itself is
         // written after the mutation succeeds and before it is acknowledged.
         const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
-        await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
         await store.remove(parsed.relPath);
         if (inverse !== null) {
           await this.journalRefinement(
@@ -1768,7 +1857,7 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
-        await this.assertMutationCommittable(ctx, abortSignal, oldVirtualPath);
+        await this.assertMutationCommittable(ctx, store, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1851,6 +1940,7 @@ export class MemoryService extends EventEmitter {
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
+      await this.assertWorkspaceReadExposable(ctx, scope, store);
       // Deliberately NOT recorded as a use: this is a human browsing the
       // Memory tab/settings, and usage stats must reflect agent reads only so
       // UI browsing never inflates hot-set ranking. (UI saves still count —
@@ -1892,7 +1982,7 @@ export class MemoryService extends EventEmitter {
         async () => {
           // UI save can create new files: materialize the scope root on
           // first use — in-lock, after the removal check (r62; see create).
-          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.ensureRoot();
           const kind = await store.kind(parsed.relPath);
           if (kind === "dir") {
@@ -1919,7 +2009,7 @@ export class MemoryService extends EventEmitter {
               );
             }
           }
-          await this.assertMutationCommittable(ctx, abortSignal, virtualPath);
+          await this.assertMutationCommittable(ctx, store, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -1947,8 +2037,17 @@ export class MemoryService extends EventEmitter {
   async listIndexEntries(ctx: MemoryScopeContext): Promise<MemoryIndexEntry[]> {
     const entries: MemoryIndexEntry[] = [];
     for (const scope of MEMORY_SCOPES) {
+      // Per-scope buffer: the scope's entries join the result only once the
+      // post-read gate below passed, so a tombstone published mid-enumeration
+      // drops the whole scope rather than a prefix of it.
+      const scopeEntries: MemoryIndexEntry[] = [];
       try {
         const store = this.getStore(ctx, scope);
+        // Prompt context is a read of the (possibly shared) store: a removed
+        // child's stream in another backend must not keep indexing / hot-set
+        // reading its former owner's notes. Refused here (skipped below) like
+        // any other scope failure.
+        if (scope === "workspace") await this.openWorkspaceStore(ctx, store);
         // Read-only enumeration (stream startup, Memory tab) must not create
         // scope roots unnecessarily. Missing roots list as empty.
         await store.assertRootSafe();
@@ -1996,8 +2095,10 @@ export class MemoryService extends EventEmitter {
           } catch {
             // Unreadable file: list it without a description.
           }
-          entries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
+          scopeEntries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
         }
+        await this.assertWorkspaceReadExposable(ctx, scope, store);
+        entries.push(...scopeEntries);
       } catch (error) {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
@@ -2031,24 +2132,41 @@ export class MemoryService extends EventEmitter {
         lastAccessedAt: stats?.lastAccessedAt ?? null,
       };
     });
-    return selectHotMemories({
+    const selected = await selectHotMemories({
       candidates,
       countTokens: options.countTokens,
       tokenBudgetActive: options.tokenBudgetActive,
       onlyContextNotes: options.onlyContextNotes,
-      readFile: (virtualPath) => {
+      readFile: async (virtualPath) => {
         const parsed = parseMemoryPath(virtualPath);
         const scope = this.requireFilePath(parsed, virtualPath);
         // Paths come from listIndexEntries (already enumerated under the scope
         // roots), so no extra containment walk is needed for these reads.
         // Bounded prefix: selection truncates to MEMORY_HOT_SET_MAX_ITEM_BYTES
         // anyway; +1 byte preserves its over-budget (truncation marker) check.
-        return this.getStore(ctx, scope).readFilePrefix(
+        const store = this.getStore(ctx, scope);
+        const content = await store.readFilePrefix(
           parsed.relPath,
           MEMORY_HOT_SET_MAX_ITEM_BYTES + 1
         );
+        await this.assertWorkspaceReadExposable(ctx, scope, store);
+        return content;
       },
     });
+    // Selection keeps awaiting (token counting, repeatedly) after the last
+    // per-file gate: a tombstone published meanwhile must still withhold the
+    // buffered owner notes. Final check once selection is done; the workspace
+    // items are dropped (the scope reads as unavailable, like in the index).
+    const isWorkspaceItem = (item: MemoryHotSetItem): boolean =>
+      parseMemoryPath(item.path).scope === "workspace";
+    if (selected.some(isWorkspaceItem)) {
+      try {
+        await this.assertWorkspaceStoreReadable(ctx, this.getStore(ctx, "workspace"));
+      } catch {
+        return selected.filter((item) => !isWorkspaceItem(item));
+      }
+    }
+    return selected;
   }
 }
 
