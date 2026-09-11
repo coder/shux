@@ -76,6 +76,15 @@ async function readWorkspaceMemoryRevisionStrict(ownerSessionDir: string): Promi
 export async function advanceWorkspaceMemoryRevision(ownerSessionDir: string): Promise<number> {
   const previous = (await readWorkspaceMemoryRevisionStrict(ownerSessionDir)) ?? 0;
   const next = Math.max(Date.now(), previous + 1);
+  // A persisted clock at 2^53 - 1 reads as valid but cannot advance: writing
+  // `previous + 1` would persist a value the strict reader rejects forever
+  // and hand out a malformed `sourceTs`. Refuse instead (callers treat the
+  // throw as "order unknown"), leaving the file as it is.
+  if (!Number.isSafeInteger(next)) {
+    throw new Error(
+      `workspace memory revision at ${workspaceMemoryRevisionPath(ownerSessionDir)} is exhausted: ${previous}`
+    );
+  }
   // Atomic: a crash mid-write must not leave a truncated value the strict
   // reader would reject forever (every later row order-unknown).
   await writeFileAtomic(workspaceMemoryRevisionPath(ownerSessionDir), String(next));

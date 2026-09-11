@@ -28,8 +28,11 @@ describe("pinDescendantWorkspaceMemoryOwners", () => {
       // Stale pin (its owner is gone): the resolver walks past it today, but
       // once ws-mid is removed that walk would dangle — replaced.
       { id: "ws-stale", parentWorkspaceId: "ws-mid", memoryOwnerWorkspaceId: "ws-gone" },
-      // Valid pin to another live notebook: that is the notebook this child
-      // uses; kept (continuity), not redirected to ws-mid's owner.
+      // Pin to another live notebook while the parent is still registered:
+      // a state this code never writes (pins are recorded as an ancestor is
+      // removed). The live chain wins — the child has been using ws-owner's
+      // notebook — and the removal re-pins it to that (r84), rather than
+      // letting corrupt raw config redirect it across task trees.
       { id: "ws-pinned", parentWorkspaceId: "ws-mid", memoryOwnerWorkspaceId: "ws-other" },
       // Not a child of the removed node: untouched.
       { id: "ws-sibling", parentWorkspaceId: "ws-owner" },
@@ -43,7 +46,7 @@ describe("pinDescendantWorkspaceMemoryOwners", () => {
     expect(before).toEqual({
       "ws-plain": "ws-owner",
       "ws-stale": "ws-owner",
-      "ws-pinned": "ws-other",
+      "ws-pinned": "ws-owner",
     });
 
     const pinned = pinDescendantWorkspaceMemoryOwners(cfg, "ws-mid");
@@ -52,7 +55,7 @@ describe("pinDescendantWorkspaceMemoryOwners", () => {
     const pinOf = (id: string) => entries.find((ws) => ws.id === id)!.memoryOwnerWorkspaceId;
     expect(pinOf("ws-plain")).toBe("ws-owner");
     expect(pinOf("ws-stale")).toBe("ws-owner");
-    expect(pinOf("ws-pinned")).toBe("ws-other");
+    expect(pinOf("ws-pinned")).toBe("ws-owner");
     expect(pinOf("ws-sibling")).toBeUndefined();
 
     // With ws-mid gone, every pinned child still resolves as before.
@@ -72,5 +75,28 @@ describe("pinDescendantWorkspaceMemoryOwners", () => {
     for (const [id, owner] of Object.entries(before)) {
       expect(resolveWorkspaceMemoryOwnerId(after, id)).toBe(owner);
     }
+  });
+
+  it("honors a pin only once the recorded parent is gone", () => {
+    const live = topology([
+      { id: "ws-owner" },
+      { id: "ws-other" },
+      { id: "ws-child", parentWorkspaceId: "ws-owner", memoryOwnerWorkspaceId: "ws-other" },
+      { id: "ws-grand", parentWorkspaceId: "ws-child" },
+    ]);
+    // Parent registered: the chain decides, for the child and everything below it.
+    expect(resolveWorkspaceMemoryOwnerId(live, "ws-child")).toBe("ws-owner");
+    expect(resolveWorkspaceMemoryOwnerId(live, "ws-grand")).toBe("ws-owner");
+    // Parent gone: the (live) pin decides; a pin whose owner is gone too
+    // leaves the child on its own store.
+    const dangling = topology([
+      { id: "ws-other" },
+      { id: "ws-child", parentWorkspaceId: "ws-owner", memoryOwnerWorkspaceId: "ws-other" },
+      { id: "ws-grand", parentWorkspaceId: "ws-child" },
+      { id: "ws-orphan", parentWorkspaceId: "ws-owner", memoryOwnerWorkspaceId: "ws-gone" },
+    ]);
+    expect(resolveWorkspaceMemoryOwnerId(dangling, "ws-child")).toBe("ws-other");
+    expect(resolveWorkspaceMemoryOwnerId(dangling, "ws-grand")).toBe("ws-other");
+    expect(resolveWorkspaceMemoryOwnerId(dangling, "ws-orphan")).toBe("ws-orphan");
   });
 });

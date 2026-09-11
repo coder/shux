@@ -1268,6 +1268,25 @@ describe("MemoryService", () => {
         );
         expect(await foreign.workspaceMemoryRevision("ws-owner")).not.toBe(afterRootWrite);
         expect(nestedStats()).toBe(0);
+        // A redirected child's token also fingerprints its legacy notebook:
+        // that scan is memoized the same way (r84) — the first probe walks
+        // it, a repeated probe does not, a new legacy note is seen at once.
+        const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+        await fsPromises.mkdir(path.join(legacyRoot, "dir"), { recursive: true });
+        await fsPromises.writeFile(path.join(legacyRoot, "dir", "old.md"), "legacy");
+        const legacyStats = () =>
+          lstatSpy.mock.calls.filter(([target]) => String(target).startsWith(legacyRoot + path.sep))
+            .length;
+        lstatSpy.mockClear();
+        const childToken = await foreign.workspaceMemoryRevision("ws-child");
+        expect(legacyStats()).toBeGreaterThan(0);
+        lstatSpy.mockClear();
+        expect(await foreign.workspaceMemoryRevision("ws-child")).toBe(childToken);
+        expect(legacyStats()).toBe(0);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await fsPromises.writeFile(path.join(legacyRoot, "new.md"), "downgraded write");
+        expect(await foreign.workspaceMemoryRevision("ws-child")).not.toBe(childToken);
+        expect(legacyStats()).toBeGreaterThan(0);
       } finally {
         lstatSpy.mockRestore();
       }
@@ -2570,6 +2589,66 @@ describe("MemoryService", () => {
       >;
       expect(readopted["note.md"]).toMatchObject({ created: true });
       expect(readopted["note.md"].deleted).toBeUndefined();
+    });
+
+    it("refuses to restore a deleted legacy note while its owner target cannot be inspected", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(childSessionDir, "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      // The pre-sharing delete: its inverse restores the legacy path.
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "delete", path: "/memories/workspace/note.md" },
+          inverse: {
+            op: "restore-files",
+            files: [{ path: path.join(legacyRoot, "note.md"), text: "v1" }],
+          },
+        },
+      });
+      const deleteRow = (await readRefinementEvents(childSessionDir)).at(-1)!;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
+      const target = path.join(ownerRoot, "note.md");
+      const rollback = () =>
+        rollbackRefinement({
+          sessionDir: childSessionDir,
+          sharedWorkspaceMemorySessionDir: path.dirname(ownerRoot),
+          id: deleteRow.id,
+          evidence: { toolName: "test", actor: "user" },
+        });
+      // The tombstoned record is current only while the target is PROVEN
+      // absent: a stat failure that proves nothing (EACCES) may hide an
+      // owner-created replacement, so the restore is refused rather than
+      // landing on it.
+      const realLstat = fsPromises.lstat.bind(fsPromises);
+      const unreadable = spyOn(fsPromises, "lstat").mockImplementation(((
+        p: Parameters<typeof fsPromises.lstat>[0],
+        ...rest: unknown[]
+      ) =>
+        String(p) === target
+          ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+          : (realLstat as (...args: unknown[]) => unknown)(p, ...rest)) as never);
+      try {
+        const refused = await rollback();
+        expect(refused.success).toBe(false);
+        expect(await pathExists(target)).toBe(false);
+      } finally {
+        unreadable.mockRestore();
+      }
+      // Proven absent: the restore lands in the shared store.
+      const restored = await rollback();
+      expect(restored.success).toBe(true);
+      expect(await fsPromises.readFile(target, "utf-8")).toBe("v1");
     });
 
     it("ignores a manifest a downgraded child wrote into its model-writable legacy root", async () => {

@@ -70,14 +70,21 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
         }
         return workspaceId;
       }
-      // A pinned owner (recorded when an intermediate ancestor was removed)
-      // short-circuits the walk; if that owner is itself gone, fall through to
-      // the parent chain, which then dangles and resolves to self.
-      const pinned = entry.memoryOwnerWorkspaceId;
-      if (pinned !== undefined && pinned !== "" && byId.has(pinned)) {
-        return pinned;
-      }
+      // A pinned owner is recorded when an intermediate ancestor is removed
+      // (pinDescendantWorkspaceMemoryOwners), so it only speaks for a chain
+      // that DANGLES: while the recorded parent is still registered the walk
+      // follows it, and a pin that disagrees with a live parent (raw config,
+      // never produced by this code) heals on the next removal instead of
+      // redirecting the child into an unrelated tree's notebook. With the
+      // parent gone, a live pin decides; a pin whose owner is gone too leaves
+      // the child on its own store.
       const parentWorkspaceId = entry.parentWorkspaceId;
+      const parentLive =
+        parentWorkspaceId !== undefined && parentWorkspaceId !== "" && byId.has(parentWorkspaceId);
+      if (!parentLive) {
+        const pinned = entry.memoryOwnerWorkspaceId;
+        if (pinned !== undefined && pinned !== "" && byId.has(pinned)) return pinned;
+      }
       if (parentWorkspaceId === undefined || parentWorkspaceId === "") return current;
       current = parentWorkspaceId;
     }
@@ -93,12 +100,12 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
 /**
  * Removal of `removedWorkspaceId`: pin each surviving direct child to the
  * owner it resolves to NOW, so the notebook it uses stays the same once the
- * chain through the removed node dangles. A child's own valid pin already
- * decides its owner and is kept; one that is absent — or stale (its owner
- * gone, which the resolver walks past today but could not once this node is
- * gone: the child would drop to a private store) — is replaced by the walk
- * through the removed node (r77). Mutates the entries in place; returns the
- * pins written, for the caller's verified read-back.
+ * chain through the removed node dangles. The pin is whatever the walk
+ * resolves to while the node is still registered — an existing pin is
+ * overwritten by it (a live parent takes precedence over a pin in the
+ * resolver, so that IS the notebook the child has been using), and a stale
+ * one (its owner gone) is replaced likewise. Mutates the entries in place;
+ * returns the pins written, for the caller's verified read-back.
  */
 export function pinDescendantWorkspaceMemoryOwners(
   cfg: ProjectsConfig,

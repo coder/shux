@@ -188,16 +188,30 @@ export async function readLegacyAdoptionManifest(
 }
 
 /**
+ * The file identity a LegacyAdoptionRecord.targetStamp records, or why there
+ * is none: "absent" only when the stat PROVES the path is gone (ENOENT /
+ * ENOTDIR); any other failure (EACCES, EIO) is "unreadable" — it says
+ * nothing about the path, so callers deciding on absence must refuse.
+ */
+export async function adoptionTargetPresence(
+  absPath: string
+): Promise<{ stamp: string } | "absent" | "unreadable"> {
+  try {
+    const stat = await fsPromises.lstat(absPath, { bigint: true });
+    return { stamp: `${stat.ino}:${stat.size}:${stat.mtimeNs}` };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unreadable";
+  }
+}
+
+/**
  * The file identity a LegacyAdoptionRecord.targetStamp records; null when the
  * file cannot be stat'ed (the record then carries no stamp: preserved).
  */
 export async function adoptionTargetStamp(absPath: string): Promise<string | null> {
-  try {
-    const stat = await fsPromises.lstat(absPath, { bigint: true });
-    return `${stat.ino}:${stat.size}:${stat.mtimeNs}`;
-  } catch {
-    return null;
-  }
+  const presence = await adoptionTargetPresence(absPath);
+  return typeof presence === "string" ? null : presence.stamp;
 }
 
 /**
@@ -301,14 +315,24 @@ export async function createLegacyPathRemapper(args: {
   // retargeted rollback recreated there (re-stamped below); anything else at
   // that path is the owner's.
   // Value: whether that generation is a file on disk (a tombstoned record
-  // whose copy a rollback restored counts as present).
+  // whose copy a rollback restored counts as present). Absence must be
+  // PROVEN (ENOENT/ENOTDIR): a target that merely cannot be stat'ed right
+  // now (EACCES, EIO) may well hold an owner-created replacement, and
+  // calling it absent would let a restore or rename land on it — such a
+  // record is simply not current (the rollback is refused as owner-owned).
   const currentGeneration = new Map<string, "present" | "absent">();
   for (const [rel, record] of adopted) {
     if (record.created !== true || record.pending === true) continue;
-    const stamp = await adoptionTargetStamp(path.join(ownerRoot, ...record.target.split("/")));
-    if (record.targetStamp !== undefined && stamp === record.targetStamp) {
+    const presence = await adoptionTargetPresence(
+      path.join(ownerRoot, ...record.target.split("/"))
+    );
+    if (
+      record.targetStamp !== undefined &&
+      typeof presence !== "string" &&
+      presence.stamp === record.targetStamp
+    ) {
       currentGeneration.set(rel, "present");
-    } else if (record.deleted === true && stamp === null) {
+    } else if (record.deleted === true && presence === "absent") {
       currentGeneration.set(rel, "absent");
     }
   }

@@ -881,7 +881,7 @@ export class MemoryService extends EventEmitter {
    */
   private readonly legacyStoreCheckedAgainst = new Map<string, string>();
 
-  /** Last owner-store file scan per owner (see ownerStoreStamp). */
+  /** Last file scan per store (owner notebooks and redirected children's legacy notebooks; see throttledStoreStamp). */
   private readonly ownerStoreStampMemo = new Map<
     string,
     { rootMtime: string; stamp: string; scannedAt: number }
@@ -1260,7 +1260,15 @@ export class MemoryService extends EventEmitter {
    */
   private async legacyAdoptionCheckKey(
     childId: string,
-    owner: string
+    owner: string,
+    options?: {
+      /**
+       * Probe-token use: the legacy file scan is memoized like the owner
+       * store's (throttledStoreStamp). The adoption pass itself must stay
+       * exact (it decides whether to re-run) and never passes this.
+       */
+      throttled: boolean;
+    }
   ): Promise<{ legacyRootKind: Awaited<ReturnType<typeof lstatKind>>; checkKey: string }> {
     const childSessionDir = path.join(this.config.sessionsDir, childId);
     const legacyRoot = path.join(childSessionDir, "memory");
@@ -1278,9 +1286,13 @@ export class MemoryService extends EventEmitter {
               .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
           )
         : "";
-    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${
-      legacyRootKind === "dir" ? await legacyStoreStamp(childSessionDir, legacyRoot) : ""
-    }\u0000${childSidecarFingerprint}`;
+    const legacyStamp =
+      legacyRootKind !== "dir"
+        ? ""
+        : options?.throttled === true
+          ? await this.throttledStoreStamp(`legacy\u0000${childId}`, childSessionDir, legacyRoot)
+          : await legacyStoreStamp(childSessionDir, legacyRoot);
+    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${legacyStamp}\u0000${childSidecarFingerprint}`;
     return { legacyRootKind, checkKey };
   }
 
@@ -2263,7 +2275,9 @@ export class MemoryService extends EventEmitter {
     // (see legacyAdoptionCheckKey): its next store access adopts the change,
     // so the cached context must miss as soon as the legacy state moves.
     if (owner === workspaceId) return token;
-    return `${token}\u0000${(await this.legacyAdoptionCheckKey(workspaceId, owner)).checkKey}`;
+    return `${token}\u0000${
+      (await this.legacyAdoptionCheckKey(workspaceId, owner, { throttled: true })).checkKey
+    }`;
   }
 
   /**
@@ -2275,19 +2289,35 @@ export class MemoryService extends EventEmitter {
    * existing note waits for the interval; this build's writes advance the
    * clock segment.
    */
-  private async ownerStoreStamp(owner: string, ownerSessionDir: string): Promise<string> {
-    const root = workspaceMemoryStorePath(this.config.sessionsDir, owner);
+  private ownerStoreStamp(owner: string, ownerSessionDir: string): Promise<string> {
+    return this.throttledStoreStamp(
+      `owner\u0000${owner}`,
+      ownerSessionDir,
+      workspaceMemoryStorePath(this.config.sessionsDir, owner)
+    );
+  }
+
+  /**
+   * legacyStoreStamp with the per-store memo described at ownerStoreStamp;
+   * also used for a redirected child's legacy notebook in its probe token,
+   * which otherwise walks that directory on every probe as well.
+   */
+  private async throttledStoreStamp(
+    memoKey: string,
+    sessionDir: string,
+    root: string
+  ): Promise<string> {
     const rootMtime = await fsPromises
       .stat(root)
       .then((stat) => String(stat.mtimeMs))
       .catch(() => "missing");
-    const memo = this.ownerStoreStampMemo.get(owner);
+    const memo = this.ownerStoreStampMemo.get(memoKey);
     const now = Date.now();
     if (memo?.rootMtime === rootMtime && now - memo.scannedAt < OWNER_STORE_SCAN_INTERVAL_MS) {
       return memo.stamp;
     }
-    const stamp = await legacyStoreStamp(ownerSessionDir, root);
-    this.ownerStoreStampMemo.set(owner, { rootMtime, stamp, scannedAt: now });
+    const stamp = await legacyStoreStamp(sessionDir, root);
+    this.ownerStoreStampMemo.set(memoKey, { rootMtime, stamp, scannedAt: now });
     return stamp;
   }
 
