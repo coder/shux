@@ -22,11 +22,16 @@ export function formatJsonSchemaValidationErrors(
 }
 
 /**
- * Deepest schema nesting the validator walks. Every traversal of a schema in
- * this module and its callers is bounded by this, so a third-party schema
- * cannot overflow the stack before it is judged.
+ * Bounds of the schemas the validator judges. Every traversal of a schema in
+ * this module and its callers is bounded by the depth, so a third-party schema
+ * cannot overflow the stack before it is judged. Compiling a schema is linear
+ * in its node count (every object, array, and primitive in the document), and
+ * the contract layer compiles each optional property's sub-schema on top, so
+ * the node bound keeps one schema's synchronous work on the main process
+ * bounded too. Past either bound the schema is outside the subset.
  */
 export const JSON_SCHEMA_SUBSET_MAX_DEPTH = 64;
+export const JSON_SCHEMA_SUBSET_MAX_NODES = 2048;
 
 /**
  * The dialects this validator speaks. A schema is judged in the dialect its
@@ -122,9 +127,9 @@ function compileJsonSchema(
       ],
     };
   }
-  const refError = findRefKeyword(schema, "$", 0);
-  if (refError != null) {
-    return { success: false, errors: [refError] };
+  const subsetError = findSubsetViolation(schema, "$", 0, { nodes: 0 });
+  if (subsetError != null) {
+    return { success: false, errors: [subsetError] };
   }
   const target = toValidatorTarget(schema);
   if (target == null) {
@@ -327,17 +332,23 @@ function unescapePointer(part: string): string {
 // keyword is outside the subset.
 const REFERENCE_KEYWORDS = ["$ref", "$dynamicRef", "$recursiveRef"] as const;
 
-function findRefKeyword(
+/** The first way `schema` falls outside the subset: too deep, too large, or a reference. */
+function findSubsetViolation(
   schema: unknown,
   path: string,
-  depth: number
+  depth: number,
+  visited: { nodes: number }
 ): JsonSchemaValidationError | null {
   if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH) {
     return { path, message: "Schema is too deeply nested" };
   }
+  visited.nodes += 1;
+  if (visited.nodes > JSON_SCHEMA_SUBSET_MAX_NODES) {
+    return { path, message: "Schema is too large" };
+  }
   if (Array.isArray(schema)) {
     for (const [index, item] of schema.entries()) {
-      const error = findRefKeyword(item, `${path}[${index}]`, depth + 1);
+      const error = findSubsetViolation(item, `${path}[${index}]`, depth + 1, visited);
       if (error != null) return error;
     }
     return null;
@@ -351,7 +362,7 @@ function findRefKeyword(
     }
   }
   for (const [key, value] of Object.entries(schema)) {
-    const error = findRefKeyword(value, `${path}.${key}`, depth + 1);
+    const error = findSubsetViolation(value, `${path}.${key}`, depth + 1, visited);
     if (error != null) return error;
   }
   return null;

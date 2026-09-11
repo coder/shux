@@ -662,6 +662,54 @@ describe("optional null JSON Schema contract", () => {
     expect(contract.restore({ a: { a: "" } })).toEqual({ a: {} });
   });
 
+  test("leaves a schema too large to judge alone without compiling its properties", () => {
+    // Every optional property costs one validator compilation when widened, so
+    // an MCP server's schema width must not set the main process's work.
+    const source = {
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: 10_000 }, (_, i) => [`p${i}`, { type: "string", description: `${i}` }])
+      ),
+    };
+    const contract = createOptionalNullSchemaContract(source, MCP);
+
+    expect(contract.strict).toBe(false);
+    expect(contract.modelSchema).toBe(source);
+    expect(contract.restore({ p0: "", p1: "x" })).toEqual({ p1: "x" });
+  });
+
+  test("widens optional properties wherever the schema declares them", () => {
+    const entry = { type: "object", properties: { note: { type: "string" } } };
+    const widened = {
+      type: "object",
+      properties: { note: { anyOf: [{ type: "string" }, { type: "null" }] } },
+    };
+    const source = {
+      type: "object",
+      required: ["byId", "byPrefix", "rows", "tuple"],
+      properties: {
+        byId: { type: "object", additionalProperties: entry },
+        byPrefix: { type: "object", patternProperties: { "^x-": entry } },
+        rows: { type: "array", items: [{ type: "string" }], additionalItems: entry },
+        tuple: { type: "array", prefixItems: [entry] },
+      },
+      if: { required: ["byId"] },
+      then: { properties: { extra: entry } },
+    };
+
+    expect(widenOptionalPropertiesToNullable(source)).toMatchObject({
+      properties: {
+        byId: { additionalProperties: widened },
+        byPrefix: { patternProperties: { "^x-": widened } },
+        rows: { additionalItems: widened },
+        tuple: { prefixItems: [widened] },
+      },
+      // `if` is a test, not a contract: widening it would change what it matches.
+      if: { required: ["byId"] },
+      then: { properties: { extra: widened } },
+    });
+  });
+
   test("falls back to the required list when the schema is outside the validator subset", () => {
     const source = {
       type: "object",

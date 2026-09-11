@@ -33,7 +33,7 @@ function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
  * Whether the schema provably rejects `null`. The validator evaluates every
  * keyword it supports (type, enum, const, composition, not, if/then/else), so
  * this is exact for schemas in its subset. A schema outside it (a reference,
- * an unknown dialect, too deep) proves nothing, so it does not reject.
+ * an unknown dialect, too deep, too large) proves nothing, so it does not reject.
  */
 function rejectsNull(schema: unknown): boolean {
   if (schema === true) {
@@ -58,6 +58,50 @@ function makeNullableSchema(schema: unknown): Record<string, unknown> {
   return { ...annotations, anyOf: [schema, { type: "null" }] };
 }
 
+function getUnionBranches(schema: Record<string, unknown>): unknown[] {
+  const branches: unknown[] = [];
+  for (const keyword of ["anyOf", "oneOf"] as const) {
+    if (Array.isArray(schema[keyword])) {
+      branches.push(...(schema[keyword] as unknown[]));
+    }
+  }
+  return branches;
+}
+
+function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
+  return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
+}
+
+/** Sub-schemas that apply to the same instance as `schema` when a condition holds. */
+function getConditionalSubSchemas(schema: Record<string, unknown>): unknown[] {
+  const dependents = [schema.dependentSchemas, schema.dependencies].flatMap((keyword) =>
+    isRecord(keyword) ? Object.values(keyword).filter(isRecord) : []
+  );
+  return [...getUnionBranches(schema), schema.then, schema.else, ...dependents];
+}
+
+/** Sub-schemas that govern the properties `schema` does not name. */
+function getDictionarySchemas(schema: Record<string, unknown>): unknown[] {
+  return [
+    ...(isRecord(schema.patternProperties) ? Object.values(schema.patternProperties) : []),
+    schema.additionalProperties,
+  ];
+}
+
+/** Sub-schemas that govern array items, whichever index each applies to. */
+function getItemSchemas(schema: Record<string, unknown>): unknown[] {
+  return [
+    ...(Array.isArray(schema.prefixItems) ? (schema.prefixItems as unknown[]) : []),
+    ...(Array.isArray(schema.items) ? (schema.items as unknown[]) : [schema.items]),
+    schema.additionalItems,
+  ];
+}
+
+/**
+ * Widen every optional property the schema declares by name, wherever it
+ * declares it. This walks the structure stripOmissionPlaceholders walks, so
+ * every placeholder the model contract invites is one `restore` removes.
+ */
 function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>()): void {
   if (!isRecord(schema)) {
     return;
@@ -74,23 +118,11 @@ function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>())
       widenSchemaNode(modelSchema);
     }
   }
-
-  const items = schema.items;
-  if (Array.isArray(items)) {
-    for (const itemSchema of items) {
-      widenSchemaNode(itemSchema);
-    }
-  } else {
-    widenSchemaNode(items);
+  for (const subSchema of [...getDictionarySchemas(schema), ...getItemSchemas(schema)]) {
+    widenSchemaNode(subSchema);
   }
-
-  for (const keyword of ["anyOf", "oneOf", "allOf"] as const) {
-    const branches = schema[keyword];
-    if (Array.isArray(branches)) {
-      for (const branch of branches) {
-        widenSchemaNode(branch, required);
-      }
-    }
+  for (const subSchema of [...getAllOfBranches(schema), ...getConditionalSubSchemas(schema)]) {
+    widenSchemaNode(subSchema, required);
   }
 }
 
@@ -121,11 +153,12 @@ export function createOptionalNullSchemaContract(
   const restore = (value: unknown) => stripOmissionPlaceholders(schema, value, options);
   if (!validateJsonSchemaSubsetSchema(schema).success) {
     // The validator cannot judge this schema (a reference, an unknown dialect,
-    // too deep, invalid), so nothing here can either: the model sees the
-    // source schema as is, and the provider decodes without strict mode.
-    // `restore` stays: it only removes placeholders the source schema
+    // too deep, too large, invalid), so nothing here can either: the model
+    // sees the source schema as is, and the provider decodes without strict
+    // mode. `restore` stays: it only removes placeholders the source schema
     // provably rejects. The check is bounded, so no walk below runs on a
-    // schema that could overflow it.
+    // schema that could overflow the stack or, through one compilation per
+    // optional property, hold the main process (the schema is server-authored).
     return { modelSchema: schema, strict: false, restore };
   }
   return { modelSchema: widenOptionalPropertiesToNullable(schema), strict: undefined, restore };
@@ -174,28 +207,6 @@ interface Declaration {
 
 /** Placeholder sites by the object that holds them, then by property name. */
 type PlaceholderSites = Map<Record<string, unknown>, Map<string, PlaceholderSite>>;
-
-function getUnionBranches(schema: Record<string, unknown>): unknown[] {
-  const branches: unknown[] = [];
-  for (const keyword of ["anyOf", "oneOf"] as const) {
-    if (Array.isArray(schema[keyword])) {
-      branches.push(...(schema[keyword] as unknown[]));
-    }
-  }
-  return branches;
-}
-
-function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
-  return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
-}
-
-/** Sub-schemas that apply to the same instance as `schema` when a condition holds. */
-function getConditionalSubSchemas(schema: Record<string, unknown>): unknown[] {
-  const dependents = [schema.dependentSchemas, schema.dependencies].flatMap((keyword) =>
-    isRecord(keyword) ? Object.values(keyword).filter(isRecord) : []
-  );
-  return [...getUnionBranches(schema), schema.then, schema.else, ...dependents];
-}
 
 function getStaticRequired(schema: unknown): Set<string> {
   return isRecord(schema) ? getRequiredProperties(schema) : new Set<string>();

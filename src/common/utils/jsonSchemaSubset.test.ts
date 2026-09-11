@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { validateJsonSchemaSubset, validateJsonSchemaSubsetSchema } from "./jsonSchemaSubset";
+import {
+  JSON_SCHEMA_SUBSET_MAX_NODES,
+  validateJsonSchemaSubset,
+  validateJsonSchemaSubsetSchema,
+} from "./jsonSchemaSubset";
 
 describe("validateJsonSchemaSubset", () => {
   test("validates schemas without requiring an example value", () => {
@@ -206,6 +210,26 @@ describe("validateJsonSchemaSubset", () => {
     if (!result.success) {
       expect(result.errors[0]?.message).toBe("Schema is too deeply nested");
     }
+  });
+
+  test("rejects a schema with more nodes than it will compile", () => {
+    // Compilation is linear in the node count, and a server-authored schema
+    // can be as wide as it likes; a shallow schema must be bounded too.
+    const wide = (properties: number) => ({
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: properties }, (_, i) => [`p${i}`, { type: "string" }])
+      ),
+    });
+
+    const result = validateJsonSchemaSubsetSchema(wide(JSON_SCHEMA_SUBSET_MAX_NODES));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errors[0]?.message).toBe("Schema is too large");
+    }
+    expect(validateJsonSchemaSubsetSchema(wide(JSON_SCHEMA_SUBSET_MAX_NODES / 4))).toEqual({
+      success: true,
+    });
   });
 
   test("supports enum, integer, and additionalProperties false", () => {
