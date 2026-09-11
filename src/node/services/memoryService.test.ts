@@ -3554,6 +3554,46 @@ describe("MemoryService", () => {
       // Strict removal agrees the handover is complete.
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
     });
+
+    it("writes tombstones the previous build reads as unsettled, so a reappearing source is re-adopted there too", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(path.join(ownerRoot, "note.md"))).toBe(false);
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
+      const tombstone = (
+        JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as Record<
+          string,
+          Record<string, unknown>
+        >
+      )["note.md"];
+      expect(tombstone).toMatchObject({ deleted: true, pending: true });
+      // The previous build knows only content/sidecar/target/created/pending/
+      // targetStamp: this is the record as it parses (and rewrites) it. With
+      // the source recreated identically, its forced handover must NOT read
+      // the settled hash as "folded in earlier" and delete the child session
+      // while no copy exists — pending, it re-adopts.
+      const asPreviousBuild = Object.fromEntries(
+        Object.entries(tombstone).filter(([field]) =>
+          ["content", "sidecar", "target", "created", "pending", "targetStamp"].includes(field)
+        )
+      );
+      expect(asPreviousBuild.pending).toBe(true);
+      await fsPromises.writeFile(manifestPath, JSON.stringify({ "note.md": asPreviousBuild }));
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v1");
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
+    });
   });
 
   describe("memory index entries", () => {

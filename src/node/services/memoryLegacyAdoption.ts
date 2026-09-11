@@ -89,7 +89,12 @@ export interface LegacyAdoptionRecord {
    * refinement rows for this note (a delete's restore inverse, a rename's
    * mirrored rename) still address the legacy path and need the mapping to
    * be rolled back into the shared store; a reappearing source is adopted
-   * afresh (the record's other fields are stale then).
+   * afresh (the record's other fields are stale then). Written together
+   * with `pending: true`: a build that knows neither this flag nor the
+   * reconciliation ignores it and would otherwise read the settled hash as
+   * "folded in earlier" — reporting a complete handover for a reappearing
+   * source while no copy exists. Pending, it re-adopts instead. Here,
+   * `deleted` takes precedence: a tombstone is not an interrupted adoption.
    */
   deleted?: boolean;
 }

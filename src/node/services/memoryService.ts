@@ -1602,10 +1602,15 @@ export class MemoryService extends EventEmitter {
         // Destructive provenance survives only while the target was still
         // this adoption's copy: a copy the owner edited is not the old
         // path's to delete or restore any more.
+        // `pending` too (see LegacyAdoptionRecord.deleted): a build that
+        // predates the tombstone reads it as an unsettled adoption and
+        // re-adopts a reappearing source, instead of taking the settled hash
+        // for "folded in earlier" while no copy exists.
         adopted.set(relPath, {
           ...previous,
           pendingDeletion: undefined,
           deleted: true,
+          pending: true,
           created: previous.created === true && unchangedForTombstone,
         });
         manifestDirty = true;
