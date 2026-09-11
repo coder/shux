@@ -573,6 +573,7 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    workspaceService.setSharedWorkspaceMemoryStore(memoryService);
     // Workspace-scope change events carry the memory OWNER (task-tree root);
     // every live session resolving to that owner reads the same notebook.
     memoryService.on("change", (event: MemoryChangeEvent) => {

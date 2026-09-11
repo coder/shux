@@ -59,6 +59,7 @@ import type {
 } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
+import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -14676,6 +14677,169 @@ describe("WorkspaceService remove timing rollup", () => {
   });
 });
 
+describe("WorkspaceService remove sub-agent handover ordering", () => {
+  // A sub-agent's final shared-memory handover + removal tombstone are sealed
+  // under the removal locks BEFORE the checkout is deleted: a handover the
+  // owner store cannot take aborts with the checkout intact, and a refused
+  // checkout deletion rolls the tombstone back.
+  const projectPath = "/tmp/proj-handover";
+  const workspaceId = "child-handover";
+  const ownerId = "owner-handover";
+  const workspacePath = path.join(projectPath, "child-ws");
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  let rootDir: string;
+
+  beforeEach(async () => {
+    rootDir = path.join(tmpdir(), "mux-handover-order", `root-${crypto.randomUUID()}`);
+    await fsPromises.mkdir(path.join(rootDir, "sessions", workspaceId), { recursive: true });
+  });
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  function buildConfig(): Partial<Config> {
+    const topology = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: ownerId,
+                name: "owner",
+                path: path.join(projectPath, "owner-ws"),
+                runtimeConfig,
+              },
+              {
+                id: workspaceId,
+                name: "child",
+                path: workspacePath,
+                runtimeConfig,
+                parentWorkspaceId: ownerId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    return {
+      rootDir,
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(rootDir, "sessions"),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      editConfig: mock((edit: (cfg: typeof topology) => typeof topology) =>
+        Promise.resolve(edit(topology))
+      ),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildAiService(): AIService {
+    return {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: "child",
+            projectPath,
+            projectName: "proj",
+            runtimeConfig,
+            parentWorkspaceId: ownerId,
+          })
+        )
+      ),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+  }
+
+  test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let adoptions = 0;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
+          adoptions++;
+          // The unlocked pre-pass succeeds; the late note appears for the
+          // locked pass, which cannot place it.
+          return options?.locksHeld
+            ? Promise.reject(new Error("1 legacy note could not be folded"))
+            : Promise.resolve();
+        },
+      });
+      const result = await workspaceService.remove(workspaceId);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("could not be folded");
+      expect(adoptions).toBe(2);
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      // force accepts the loss and completes the removal.
+      expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a refused checkout deletion rolls the sealed tombstone back", async () => {
+    let refuse = true;
+    const deleteWorkspace = mock(() =>
+      Promise.resolve(
+        refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath }
+      )
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(),
+        aiService: buildAiService(),
+      });
+      let sealedTombstone = false;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      deleteWorkspace.mockImplementation(async () => {
+        // Runtime deletion runs with the tombstone already sealed.
+        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
+        return refuse
+          ? { success: false as const, error: "Workspace has uncommitted changes" }
+          : { success: true as const, deletedPath: workspacePath };
+      });
+      const refused = await workspaceService.remove(workspaceId);
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("uncommitted changes");
+      expect(sealedTombstone).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      refuse = false;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+});
+
 describe("WorkspaceService remove shared-workspace guard", () => {
   const projectPath = "/tmp/proj-shared";
   const workspaceId = "child-shared";
@@ -15159,12 +15323,51 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const aborted = await workspaceService.remove(workspaceId);
     expect(aborted.success).toBe(false);
     expect(calls).toEqual(["release"]);
-    // Committed removal: cancelled (drained), harvest records finalized once
-    // the session directory is gone, and never released.
+    // Aborted inside the locked handover (a late legacy note the owner store
+    // cannot take), i.e. after the drain but BEFORE the tombstone: the session
+    // directory survives, so the gate is lifted too.
     descendants = false;
     calls.length = 0;
     const sessionDir = path.join(tempRoot, "sessions", workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
+    const topology = {
+      projects: new Map([
+        [
+          "/tmp/src/project",
+          {
+            workspaces: [
+              { path: "/tmp/src/project/owner", id: "ws-owner" },
+              { path: "/tmp/src/project/child", id: workspaceId, parentWorkspaceId: "ws-owner" },
+            ],
+          },
+        ],
+      ]),
+    };
+    // The service holds its own copy of the mock config (createWorkspaceServiceForTest).
+    const config = (workspaceService as unknown as { config: MockWorkspaceConfig }).config;
+    const previousLoad = config.loadConfigOrDefault;
+    config.loadConfigOrDefault = (() => topology) as MockWorkspaceConfig["loadConfigOrDefault"];
+    workspaceService.setSharedWorkspaceMemoryStore({
+      adoptLegacyPrivateStoreForRemoval: () =>
+        Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
+    });
+    try {
+      const lockedAbort = await workspaceService.remove(workspaceId);
+      expect(lockedAbort.success).toBe(false);
+      if (!lockedAbort.success) expect(lockedAbort.error).toContain("tombstone could be published");
+      expect(existsSync(sessionDir)).toBe(true);
+      expect(calls).toContain("cancel");
+      expect(calls).toContain("release");
+      expect(calls).not.toContain("finalize");
+    } finally {
+      config.loadConfigOrDefault = previousLoad;
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+    }
+    // Committed removal: cancelled (drained), harvest records finalized once
+    // the session directory is gone, and never released.
+    calls.length = 0;
     const removed = await workspaceService.remove(workspaceId);
     expect(removed.success).toBe(true);
     expect(existsSync(sessionDir)).toBe(false);
