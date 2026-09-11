@@ -1987,8 +1987,9 @@ export class MCPServerManager {
 
   private cleanupIdleServers(): void {
     const now = Date.now();
+    let retryRetiredComponents = false;
     for (const [workspaceId, entry] of this.workspaceServers) {
-      if (entry.instances.size === 0) continue;
+      if (entry.instances.size === 0 && !entry.retiredPluginInstances?.size) continue;
 
       // Never tear down a workspace's MCP servers while a stream is running.
       if (this.getLeaseCount(workspaceId) > 0) {
@@ -1997,12 +1998,23 @@ export class MCPServerManager {
 
       const idleMs = now - entry.lastActivity;
       if (idleMs >= IDLE_TIMEOUT_MS) {
+        // Do not evict retry ownership while retired clients still fail to close.
+        // Once they close, a later idle sweep resumes normal workspace eviction.
+        if (entry.retiredPluginInstances?.size) {
+          retryRetiredComponents = true;
+          continue;
+        }
         log.info("[MCP] Stopping idle servers", {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
+    }
+    if (retryRetiredComponents) {
+      this.retireCrossProcessPluginInstances().catch((error: unknown) => {
+        log.warn("Failed to retry idle plugin component cleanup", { error });
+      });
     }
   }
 
@@ -4074,6 +4086,18 @@ export class MCPServerManager {
     // on an unrelated healthy client, so tearing down the whole workspace
     // set here would close it underneath them.
     for (const [workspaceId, entry] of this.workspaceServers) {
+      // Tree replacement also stops deselected clients held by active leases,
+      // but those clients must never become restart candidates.
+      for (const instance of entry.retiredPluginInstances ?? []) {
+        if (!instance.name.startsWith(prefix)) continue;
+        try {
+          await instance.close();
+          entry.retiredPluginInstances?.delete(instance);
+        } catch (error) {
+          log.warn("Failed to stop retired MCP server", { error, name: instance.name });
+        }
+      }
+      if (entry.retiredPluginInstances?.size === 0) delete entry.retiredPluginInstances;
       const removedKeys: string[] = [];
       for (const [serverKey, instance] of [...entry.instances]) {
         if (!serverKey.startsWith(prefix)) {
@@ -4372,13 +4396,26 @@ export class MCPServerManager {
       if (server.transport !== "stdio" && server.managed === "claude-design") {
         return this.configService.claudeDesign.test();
       }
+      const testNamedServer = async (
+        launch: Parameters<typeof runServerTest>[0]
+      ): Promise<MCPTestResult> => {
+        // Admit the named test after disk/OAuth preparation, before its connection
+        // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
+        const plugin = this.managedPluginServers.get(trimmedName) ?? server.plugin;
+        if (
+          plugin?.componentPolicy !== undefined &&
+          !this.componentAllowed(trimmedName, server, await this.readComponentPolicy())
+        ) {
+          return {
+            success: false,
+            error: `MCP server '${trimmedName}' is disabled by component policy`,
+          };
+        }
+        return runServerTest(launch, projectPath, `server "${trimmedName}"`);
+      };
       if (server.transport === "stdio") {
         const launch = await prepareStdioLaunch(server);
-        return runServerTest(
-          { transport: "stdio", ...launch },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({ transport: "stdio", ...launch });
       }
 
       try {
@@ -4389,16 +4426,12 @@ export class MCPServerManager {
           serverUrl: server.url,
         });
 
-        return runServerTest(
-          {
-            transport: server.transport,
-            url: server.url,
-            headers: resolved.headers,
-            ...(authProvider ? { authProvider } : {}),
-          },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({
+          transport: server.transport,
+          url: server.url,
+          headers: resolved.headers,
+          ...(authProvider ? { authProvider } : {}),
+        });
       } catch (error) {
         const message = getErrorMessage(error);
         return { success: false, error: message };

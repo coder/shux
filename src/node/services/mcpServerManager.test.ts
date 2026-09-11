@@ -27,6 +27,7 @@ import { MCPConfigService } from "./mcpConfigService";
 import { Config } from "@/node/config";
 import type { TelemetryService } from "./telemetryService";
 import type { Runtime } from "@/node/runtime/Runtime";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -400,6 +401,155 @@ describe("MCPServerManager", () => {
         }
       } finally {
         close.mockRestore();
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "prefix stops include retired leased clients without reviving removals (readd: %s)",
+    async (readd) => {
+      using tmp = new DisposableTempDir("mcp-retired-prefix");
+      const f = await componentFixture(tmp.path);
+      const request = workspaceRequest("retired-prefix");
+      const first = await manager.getToolsForWorkspace(request);
+      const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
+      const retained = f.started.filter((instance) => instance !== removed);
+      manager.acquireLease(request.workspaceId);
+      try {
+        await f.write(["keep"]);
+        await manager.getToolsForWorkspace(request);
+        if (readd) {
+          await f.write(["keep", "remove"]);
+          await manager.getToolsForWorkspace(request);
+        }
+        const entry = access.workspaceServers.get(request.workspaceId) as {
+          instances: Map<string, unknown>;
+          retiredPluginInstances?: Set<unknown>;
+          timedOutServerNames: string[];
+        };
+        expect(entry.retiredPluginInstances?.has(removed)).toBe(true);
+        await manager.stopServersWithKeyPrefix(removed.name);
+        expect(removed.close).toHaveBeenCalledTimes(1);
+        expect(entry.retiredPluginInstances?.has(removed) ?? false).toBe(false);
+        expect(entry.timedOutServerNames.includes(removed.name)).toBe(readd);
+        for (const instance of retained) {
+          expect(entry.instances.get(instance.name)).toBe(instance);
+          expect(instance.close).not.toHaveBeenCalled();
+        }
+        if (!readd) {
+          const toolName = Object.keys(first.toolServerNames).find(
+            (key) => first.toolServerNames[key] === removed.name
+          )!;
+          const error: unknown = await Promise.resolve(
+            first.tools[toolName].execute!({}, { toolCallId: "stopped", messages: [], context: {} })
+          ).catch((error: unknown) => error);
+          expect(error).toBeInstanceOf(Error);
+          expect(removed.tools.echo.execute).not.toHaveBeenCalled();
+        }
+      } finally {
+        manager.releaseLease(request.workspaceId);
+        await manager.reconcilePluginComponents();
+      }
+      expect(removed.close).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test("idle cleanup retries retired-only failures without another MCP request", async () => {
+    using tmp = new DisposableTempDir("mcp-retired-idle");
+    const f = await componentFixture(tmp.path);
+    delete f.configs.ordinary;
+    const request = workspaceRequest("retired-idle");
+    await manager.getToolsForWorkspace(request);
+    const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
+    let fail = true;
+    const close = spyOn(removed as { close: () => Promise<void> }, "close").mockImplementation(
+      () => (fail ? Promise.reject(new Error("close failed")) : Promise.resolve())
+    );
+    const sweep = spyOn(
+      manager as unknown as { retireCrossProcessPluginInstances: () => Promise<void> },
+      "retireCrossProcessPluginInstances"
+    );
+    try {
+      await f.write([]);
+      await manager.reconcilePluginComponents().catch(() => undefined);
+      const entry = access.workspaceServers.get(request.workspaceId) as {
+        instances: Map<string, unknown>;
+        retiredPluginInstances?: Set<unknown>;
+        lastActivity: number;
+      };
+      expect(entry.instances.size).toBe(0);
+      entry.lastActivity = Date.now() - 11 * 60_000;
+      for (const shouldFail of [true, false]) {
+        fail = shouldFail;
+        sweep.mockClear();
+        const attempts = close.mock.calls.length;
+        access.cleanupIdleServers();
+        expect(sweep).toHaveBeenCalledTimes(1);
+        await sweep.mock.results[0].value;
+        expect(close).toHaveBeenCalledTimes(attempts + 1);
+        expect(entry.retiredPluginInstances?.has(removed) ?? false).toBe(shouldFail);
+        if (shouldFail) expect(access.workspaceServers.get(request.workspaceId)).toBe(entry);
+      }
+    } finally {
+      close.mockRestore();
+      sweep.mockRestore();
+    }
+  });
+
+  test.each(["stdio", "http", "sse", "auto"] as const)(
+    "named Test connection rechecks current policy before %s launch",
+    async (transport) => {
+      using tmp = new DisposableTempDir("mcp-named-test-policy");
+      const f = await componentFixture(tmp.path);
+      const key = "plugin:instance:remove";
+      const plugin = f.configs[key].plugin;
+      f.configs[key] =
+        transport === "stdio"
+          ? {
+              ...stdioConfig("removed"),
+              plugin,
+              env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+            }
+          : { transport, url: "https://mcp.example.test/removed", disabled: false, plugin };
+      configService.listServers.mockImplementation(async () => {
+        const snapshot = { ...f.configs };
+        await f.write(["keep"]);
+        return snapshot;
+      });
+      const exec = mock(() => Promise.reject(new Error("launch reached")));
+      const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        exec,
+      } as unknown as Runtime);
+      const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+        Promise.reject(new Error("connection reached"))
+      );
+      try {
+        const named = await manager.test({ projectPath: tmp.path, name: key });
+        expect(named.success).toBe(false);
+        if (named.success) throw new Error("Expected revoked named test to fail");
+        expect(named.error).toMatch(/disabled|unavailable/);
+        expect(exec).not.toHaveBeenCalled();
+        expect(client).not.toHaveBeenCalled();
+        f.read.mockClear();
+        // Explicit user drafts are not managed descriptors, even when their name matches.
+        await manager.test({
+          projectPath: tmp.path,
+          name: key,
+          ...(transport === "stdio"
+            ? { command: "draft" }
+            : { transport, url: "https://mcp.example.test/draft" }),
+        });
+        expect(transport === "stdio" ? exec : client).toHaveBeenCalledTimes(1);
+        expect(f.read).not.toHaveBeenCalled();
+        exec.mockClear();
+        client.mockClear();
+        delete f.configs[key].plugin!.componentPolicy;
+        await manager.test({ projectPath: tmp.path, name: key });
+        expect(transport === "stdio" ? exec : client).toHaveBeenCalledTimes(1);
+        expect(f.read).not.toHaveBeenCalled();
+      } finally {
+        runtime.mockRestore();
+        client.mockRestore();
       }
     }
   );
