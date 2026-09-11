@@ -1400,10 +1400,26 @@ export class MCPServerManager {
     dispatch: () => T,
     options: { signal?: AbortSignal; timeoutMs?: number } = {}
   ): Promise<{ pending: T }> {
+    const release = await this.acquireComponentPolicyFence(name, info, options);
+    try {
+      const pending = dispatch();
+      // Observe early rejection while admission locks are being released.
+      Promise.resolve(pending).catch(() => undefined);
+      return { pending };
+    } finally {
+      await release();
+    }
+  }
+
+  private async acquireComponentPolicyFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<() => Promise<void>> {
     // Ownership comes from the served provenance, never an unfenced policy read:
     // a missing registry row must not turn a managed client into a legacy one.
     const plugin = this.managedPluginServers.get(name) ?? info?.plugin;
-    if (plugin?.componentPolicy === undefined) return { pending: dispatch() };
+    if (plugin?.componentPolicy === undefined) return () => Promise.resolve();
     const read = this.pluginInvalidation?.readComponentPolicy;
     const acquire = this.pluginInvalidation?.tryAcquireComponentPolicyLock;
     const unavailable = () =>
@@ -1442,19 +1458,16 @@ export class MCPServerManager {
     }
     try {
       // Atomic rename alone is insufficient: readFile may still own the old inode.
-      // Hold the writer lock BEFORE opening policy, through synchronous dispatch.
+      // Acquire BEFORE opening policy; the caller releases after admission.
       checkActive();
       const policy = await bounded(read());
       checkActive();
       if (!this.componentAllowed(name, info, policy))
         throw new Error(`MCP server '${name}' is disabled by component policy`);
-      const pending = dispatch();
-      // Dispatch may reject before the filesystem releases finish. Observe it now,
-      // but return the original result only after both admission locks are released.
-      Promise.resolve(pending).catch(() => undefined);
-      return { pending };
-    } finally {
+      return release;
+    } catch (error) {
       await release();
+      throw error;
     }
   }
 
@@ -5403,10 +5416,13 @@ export class MCPServerManager {
    * the epoch) before the read — observed here, the launch refused — or
    * waits until the process exists, after which the bracket's postflight
    * closes it. The lock is released as soon as exec returned; the MCP
-   * handshake never runs under it. Without cross-process tracking there is
-   * nothing to fence: plain launch.
+   * handshake never runs under it. Managed components also acquire the
+   * plugin writer lock after overrides, through the same launch interval.
+   * Untracked, unmanaged servers retain their plain launch path.
    */
   private async launchUnderOverrideFence<T>(
+    name: string,
+    info: MCPServerInfo,
     /** `launchSignal` aborts with the startup signal AND at an `abortAfterMs` deadline. */
     launch: (launchSignal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
@@ -5434,19 +5450,20 @@ export class MCPServerManager {
   ): Promise<T> {
     const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
     const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
-    if (
-      acquireOverridesLock === undefined ||
-      readOverridesEpoch === undefined ||
-      !this.pluginInvalidationTokenSeen
-    ) {
-      return launch(signal);
-    }
-    // ONE deadline for acquisition and the fenced read (see getPrompt).
+    const trackOverrides =
+      acquireOverridesLock !== undefined &&
+      readOverridesEpoch !== undefined &&
+      this.pluginInvalidationTokenSeen;
+    const plugin = this.managedPluginServers.get(name) ?? info.plugin;
+    if (!trackOverrides && plugin?.componentPolicy === undefined) return launch(signal);
+    // ONE deadline for acquisition and the fenced reads (see getPrompt).
     const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
-    const release = await acquireOverridesLock({
-      timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
-      signal,
-    });
+    const release = trackOverrides
+      ? await acquireOverridesLock({
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        })
+      : () => Promise.resolve();
     let released = false;
     const releaseOnce = async () => {
       if (!released) {
@@ -5455,26 +5472,36 @@ export class MCPServerManager {
       }
     };
     let pending: Promise<T> | undefined;
+    let releaseComponents: (() => Promise<void>) | undefined;
     try {
-      const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
-        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+      if (trackOverrides) {
+        const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        });
+        if (epochRead.kind !== "ok") {
+          throw new Error(
+            epochRead.kind === "aborted"
+              ? "MCP server startup was aborted"
+              : "MCP server startup could not read the workspace MCP settings marker in time; retry"
+          );
+        }
+        if (
+          epochRead.value !== this.lastOverridesEpochToken ||
+          isWorkspaceOverridesEpochUnreadable(epochRead.value)
+        ) {
+          throw new Error(
+            "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+          );
+        }
+      }
+      // Try the plugin writer lock SECOND: uninstall holds it while pruning
+      // overrides. Keep it through actual exec/connection initiation, not the
+      // earlier discovery or semaphore wait, so removal cannot precede a spawn.
+      releaseComponents = await this.acquireComponentPolicyFence(name, info, {
         signal,
+        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
       });
-      if (epochRead.kind !== "ok") {
-        throw new Error(
-          epochRead.kind === "aborted"
-            ? "MCP server startup was aborted"
-            : "MCP server startup could not read the workspace MCP settings marker in time; retry"
-        );
-      }
-      if (
-        epochRead.value !== this.lastOverridesEpochToken ||
-        isWorkspaceOverridesEpochUnreadable(epochRead.value)
-      ) {
-        throw new Error(
-          "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
-        );
-      }
       if (options?.abortAfterMs !== undefined) {
         const { ms, serverName } = options.abortAfterMs;
         const launchAbort = new AbortController();
@@ -5516,7 +5543,11 @@ export class MCPServerManager {
       // Released here — BEFORE the remaining wait on a still-pending remote
       // handshake below: every settings save and prune would otherwise queue
       // behind an endpoint-controlled request for the whole startup deadline.
-      await releaseOnce();
+      try {
+        await releaseComponents?.();
+      } finally {
+        await releaseOnce();
+      }
     }
     return await pending;
   }
@@ -5539,6 +5570,8 @@ export class MCPServerManager {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
       const execStream = await this.launchUnderOverrideFence(
+        name,
+        info,
         (launchSignal) =>
           runtime.exec(launch.command, {
             cwd: launch.cwd ?? workspacePath,
@@ -5824,6 +5857,8 @@ export class MCPServerManager {
     // client but cannot undo traffic or credentials already sent.
     const tryHttp = () =>
       this.launchUnderOverrideFence(
+        name,
+        info,
         () =>
           createMCPClient({
             transport: {
@@ -5839,6 +5874,8 @@ export class MCPServerManager {
 
     const trySse = () =>
       this.launchUnderOverrideFence(
+        name,
+        info,
         () =>
           createMCPClient({
             transport: {

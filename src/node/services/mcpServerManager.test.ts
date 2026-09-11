@@ -568,6 +568,148 @@ describe("MCPServerManager", () => {
     }
   );
 
+  test.each(["stdio", "http", "sse", "auto"] as const)(
+    "normal %s startup rechecks components after waiting for the override fence",
+    async (transport) => {
+      using tmp = new DisposableTempDir("mcp-start-component-fence");
+      const f = await componentFixture(tmp.path);
+      f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
+      f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+      let removeAtFence = false;
+      let overrideHeld = false;
+      f.invalidation.acquireOverridesLock = async () => {
+        if (removeAtFence) await f.write(["keep"]);
+        overrideHeld = true;
+        return () => {
+          overrideHeld = false;
+          return Promise.resolve();
+        };
+      };
+      await manager.getToolsForWorkspace(workspaceRequest("startup-baseline"));
+      removeAtFence = true;
+      const key = "plugin:instance:remove";
+      const info: MCPServerInfo =
+        transport === "stdio"
+          ? f.configs[key]
+          : {
+              transport,
+              url: "https://mcp.example.test",
+              disabled: false,
+              plugin: f.configs[key].plugin,
+            };
+      const exec = mock(() => Promise.reject(new Error("spawn reached")));
+      const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+        Promise.reject(new Error("connection reached"))
+      );
+      try {
+        const error: unknown = await access
+          .startSingleServerImpl(
+            key,
+            info,
+            { exec } as unknown as Runtime,
+            PROJECT_PATH,
+            WORKSPACE_PATH,
+            undefined,
+            () => undefined,
+            new AbortController().signal
+          )
+          .catch((error: unknown) => error);
+        expect(exec).not.toHaveBeenCalled();
+        expect(client).not.toHaveBeenCalled();
+        expect(String(error)).toMatch(/disabled|unavailable/);
+        expect(overrideHeld).toBe(false);
+      } finally {
+        client.mockRestore();
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "normal startup fails closed on component writer contention (overrides tracked: %s)",
+    async (trackOverrides) => {
+      using tmp = new DisposableTempDir("mcp-start-component-contention");
+      const f = await componentFixture(tmp.path);
+      let overrideHeld = false;
+      if (trackOverrides) {
+        f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
+        f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+        f.invalidation.acquireOverridesLock = () => {
+          overrideHeld = true;
+          return Promise.resolve(() => {
+            overrideHeld = false;
+            return Promise.resolve();
+          });
+        };
+      }
+      await manager.getToolsForWorkspace(workspaceRequest("contention-baseline"));
+      const exec = mock(() => Promise.reject(new Error("spawn reached")));
+      const start = () =>
+        access
+          .startSingleServerImpl(
+            "plugin:instance:remove",
+            f.configs["plugin:instance:remove"],
+            { exec } as unknown as Runtime,
+            PROJECT_PATH,
+            WORKSPACE_PATH,
+            undefined,
+            () => undefined,
+            new AbortController().signal
+          )
+          .catch((error: unknown) => error);
+      const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
+      try {
+        expect(String(await start())).toContain("unavailable");
+        expect(exec).not.toHaveBeenCalled();
+        // Uninstall can now prune overrides without waiting on this startup.
+        expect(overrideHeld).toBe(false);
+      } finally {
+        await release();
+      }
+      await f.write(["keep"]);
+      expect(String(await start())).toContain("disabled");
+      expect(exec).not.toHaveBeenCalled();
+    }
+  );
+
+  test("normal auto startup rechecks components before its SSE fallback", async () => {
+    using tmp = new DisposableTempDir("mcp-fallback-component-fence");
+    const f = await componentFixture(tmp.path);
+    f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
+    f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+    const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("HTTP not supported"), { status: 404 }))
+    );
+    f.invalidation.acquireOverridesLock = async () => {
+      if (client.mock.calls.length > 0) await f.write(["keep"]);
+      return () => Promise.resolve();
+    };
+    try {
+      await manager.getToolsForWorkspace(workspaceRequest("fallback-baseline"));
+      const key = "plugin:instance:remove";
+      const error: unknown = await access
+        .startSingleServerImpl(
+          key,
+          {
+            transport: "auto",
+            url: "https://mcp.example.test",
+            disabled: false,
+            plugin: f.configs[key].plugin,
+          },
+          TEST_RUNTIME,
+          PROJECT_PATH,
+          WORKSPACE_PATH,
+          undefined,
+          () => undefined,
+          new AbortController().signal
+        )
+        .catch((error: unknown) => error);
+      expect(client).toHaveBeenCalledTimes(1);
+      expect(String(error)).toMatch(/disabled|unavailable/);
+    } finally {
+      client.mockRestore();
+    }
+  });
+
   test("component policy rejects a held tool in a second manager without local notification", async () => {
     using tmp = new DisposableTempDir("mcp-components-sibling");
     const f = await componentFixture(tmp.path);
@@ -2401,28 +2543,33 @@ describe("MCPServerManager", () => {
   test("a remote launch fence releases the writer's lock at its initiation deadline while the handshake is pending", async () => {
     // Every settings save and prune would otherwise queue behind an
     // endpoint-controlled handshake for the whole startup deadline.
-    manager.dispose();
+    using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
+    const f = await componentFixture(tmp.path);
     let lockHeld = false;
-    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
-      pluginInvalidation: {
-        keyPrefix: "plugin:",
-        readToken: () => Promise.resolve("plugins-1"),
-        readOverridesEpoch: () => Promise.resolve("epoch-1"),
-        readWorkspaceOverrides: () => Promise.resolve({}),
-        acquireOverridesLock: () => {
-          lockHeld = true;
-          return Promise.resolve(() => {
-            lockHeld = false;
-            return Promise.resolve();
-          });
-        },
-      },
-    });
-    access = manager as unknown as MCPServerManagerTestAccess;
-    configService.listServers = mock(() => Promise.resolve({}));
+    let componentLockHeld = false;
+    const acquireComponentLock = f.invalidation.tryAcquireComponentPolicyLock!;
+    f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
+      const release = await acquireComponentLock(options);
+      componentLockHeld = true;
+      return async () => {
+        await release();
+        componentLockHeld = false;
+      };
+    };
+    f.invalidation.readOverridesEpoch = () => Promise.resolve("epoch-1");
+    f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+    f.invalidation.acquireOverridesLock = () => {
+      lockHeld = true;
+      return Promise.resolve(() => {
+        lockHeld = false;
+        return Promise.resolve();
+      });
+    };
     await manager.getToolsForWorkspace(workspaceRequest("ws-remote-fence-baseline"));
     const fence = access as unknown as {
       launchUnderOverrideFence: <T>(
+        name: string,
+        info: MCPServerInfo,
         launch: () => Promise<T>,
         signal: AbortSignal,
         options?: { releaseAfterMs?: number }
@@ -2431,8 +2578,10 @@ describe("MCPServerManager", () => {
     const handshake = Promise.withResolvers<string>();
     let heldAtLaunch: boolean | undefined;
     const launched = fence.launchUnderOverrideFence(
+      "plugin:instance:remove",
+      f.configs["plugin:instance:remove"],
       () => {
-        heldAtLaunch = lockHeld;
+        heldAtLaunch = lockHeld && componentLockHeld;
         return handshake.promise;
       },
       new AbortController().signal,
@@ -2440,7 +2589,9 @@ describe("MCPServerManager", () => {
     );
     expect(heldAtLaunch).toBeUndefined();
     await waitFor(() => !lockHeld && heldAtLaunch === true);
-    // The handshake is still pending; the lock is already released.
+    // A real component writer can commit while the admitted handshake is pending.
+    await f.write(["keep"]);
+    expect(componentLockHeld).toBe(false);
     handshake.resolve("connected");
     expect(await launched).toBe("connected");
   });
@@ -2448,28 +2599,33 @@ describe("MCPServerManager", () => {
   test("a stdio launch still awaiting its exec at the fence deadline is aborted, not released", async () => {
     // Releasing would let an SSH exec still acquiring its connection send the
     // repository-configured command after a sibling's revocation committed.
-    manager.dispose();
+    using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
+    const f = await componentFixture(tmp.path);
     let lockHeld = false;
-    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
-      pluginInvalidation: {
-        keyPrefix: "plugin:",
-        readToken: () => Promise.resolve("plugins-1"),
-        readOverridesEpoch: () => Promise.resolve("epoch-1"),
-        readWorkspaceOverrides: () => Promise.resolve({}),
-        acquireOverridesLock: () => {
-          lockHeld = true;
-          return Promise.resolve(() => {
-            lockHeld = false;
-            return Promise.resolve();
-          });
-        },
-      },
-    });
-    access = manager as unknown as MCPServerManagerTestAccess;
-    configService.listServers = mock(() => Promise.resolve({}));
+    let componentLockHeld = false;
+    const acquireComponentLock = f.invalidation.tryAcquireComponentPolicyLock!;
+    f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
+      const release = await acquireComponentLock(options);
+      componentLockHeld = true;
+      return async () => {
+        await release();
+        componentLockHeld = false;
+      };
+    };
+    f.invalidation.readOverridesEpoch = () => Promise.resolve("epoch-1");
+    f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+    f.invalidation.acquireOverridesLock = () => {
+      lockHeld = true;
+      return Promise.resolve(() => {
+        lockHeld = false;
+        return Promise.resolve();
+      });
+    };
     await manager.getToolsForWorkspace(workspaceRequest("ws-stdio-fence-baseline"));
     const fence = access as unknown as {
       launchUnderOverrideFence: <T>(
+        name: string,
+        info: MCPServerInfo,
         launch: (launchSignal: AbortSignal) => Promise<T>,
         signal: AbortSignal,
         options?: { abortAfterMs?: { ms: number; serverName: string } }
@@ -2478,9 +2634,11 @@ describe("MCPServerManager", () => {
     let launchSignal: AbortSignal | undefined;
     let heldWhilePending: boolean | undefined;
     const launched = fence.launchUnderOverrideFence(
+      "plugin:instance:remove",
+      f.configs["plugin:instance:remove"],
       (signal) => {
         launchSignal = signal;
-        heldWhilePending = lockHeld;
+        heldWhilePending = lockHeld && componentLockHeld;
         // Mirrors RemoteRuntime.exec: settles only through the abort.
         return new Promise<never>((_resolve, reject) => {
           signal.addEventListener("abort", () => reject(new Error("Operation aborted")), {
@@ -2496,15 +2654,19 @@ describe("MCPServerManager", () => {
     expect(heldWhilePending).toBe(true);
     expect(launchSignal?.aborted).toBe(true);
     expect(lockHeld).toBe(false);
+    expect(componentLockHeld).toBe(false);
 
     // A launch that hands back its stream in time is unaffected and released.
     const quick = await fence.launchUnderOverrideFence(
+      "plugin:instance:remove",
+      f.configs["plugin:instance:remove"],
       (signal) => Promise.resolve(signal.aborted ? "aborted" : "spawned"),
       new AbortController().signal,
       { abortAfterMs: { ms: 1_000, serverName: "quick" } }
     );
     expect(quick).toBe("spawned");
     expect(lockHeld).toBe(false);
+    expect(componentLockHeld).toBe(false);
   });
 
   test("startSingleServerImpl cleans up client that resolves after abort", async () => {
