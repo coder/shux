@@ -2063,6 +2063,64 @@ describe("MemoryService", () => {
       expect(await pathExists(importedCopy)).toBe(false);
     });
 
+    it("transfers the installed generation to the successor across an interrupted replacement", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "a.md"), "owner's a");
+      await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "child's a");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const importedCopy = path.join(ownerRoot, "imported", "ws-child", "a.md");
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
+      const settled = (await readLegacyAdoptionManifest(manifestPath)).get("a.md")!;
+      // The downgraded build edits a.md; the replacement pass installed the
+      // new bytes (a new generation) but crashed before settling: the record
+      // is pending with the OVERWRITTEN generation's targetStamp and the
+      // installed one's replacementStamp.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fsPromises.writeFile(path.join(legacyRoot, "a.md"), "child's a2");
+      await fsPromises.rm(importedCopy);
+      await fsPromises.writeFile(importedCopy, "child's a2");
+      const installed = (await adoptionTargetStamp(importedCopy))!;
+      expect(installed).not.toBe(settled.targetStamp);
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({
+          "a.md": {
+            ...settled,
+            pending: true,
+            replacementContent: sha256Hex("child's a2"),
+            replacementStamp: installed,
+          },
+        })
+      );
+      // Before the retry, the source is renamed onto the conflict-copy path:
+      // the successor record reuses the installed file, and must inherit the
+      // generation actually on disk — not the overwritten one, which would
+      // make the copy read as replaced by the owner at once.
+      await fsPromises.mkdir(path.join(legacyRoot, "imported", "ws-child"), { recursive: true });
+      await fsPromises.rename(
+        path.join(legacyRoot, "a.md"),
+        path.join(legacyRoot, "imported", "ws-child", "a.md")
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({ ...fixture.ctx });
+      const successor = (await readLegacyAdoptionManifest(manifestPath)).get(
+        "imported/ws-child/a.md"
+      )!;
+      expect(successor).toMatchObject({ target: "imported/ws-child/a.md", created: true });
+      expect(successor.targetStamp).toBe(installed);
+      // With the right generation, deleting the renamed source removes the copy.
+      await fsPromises.rm(path.join(legacyRoot, "imported", "ws-child", "a.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await pathExists(importedCopy)).toBe(false);
+    });
+
     it("keeps an owner-edited conflict copy the owner's when a renamed legacy note lands on it", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

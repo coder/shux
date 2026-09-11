@@ -1795,9 +1795,14 @@ export class MemoryService extends EventEmitter {
             // Only a copy still holding the adopted bytes is ours to hand
             // over; one the owner edited since is the owner's, and the
             // successor keeps its own (non-created) provenance.
-            if (unchanged && successor[1].created !== true) {
+            if (unchanged && stamp !== null && successor[1].created !== true) {
               successor[1].created = true;
-              successor[1].targetStamp = previous.targetStamp;
+              // The generation observed on disk — the receipt `unchanged`
+              // matched (r90: on the far side of an interrupted replacement
+              // that is `replacementStamp`, not the overwritten generation's
+              // `targetStamp`, which would make the successor read as
+              // replaced by the owner at once).
+              successor[1].targetStamp = stamp;
               manifestDirty = true;
             }
           } else if (unchanged) {
