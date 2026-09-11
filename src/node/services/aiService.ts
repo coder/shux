@@ -1026,12 +1026,10 @@ export class AIService extends EventEmitter {
           startupState.pendingRunMetadataId = null;
         }
         buildOutcome.logStartOutcome("stream_start_failed", streamResult.error.type);
-        // No stream ran for this turn. Its placeholder already carries the
-        // request bound and the policy epoch stamp (they must be on the row
-        // StreamManager finalizes), which would present the user batch to the
-        // harvest gate as covered by a turn — remove it like an aborted
-        // startup's, so the never-started turn stays excluded until a retry
-        // actually runs it.
+        // No stream ran for this turn: discard its placeholder like an
+        // aborted startup's (TurnRequestBuilder denies the epoch when the row
+        // cannot be removed), so the never-started turn stays excluded from
+        // the harvest until a retry actually runs it.
         await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId);
         return Err(streamResult.error);
       }

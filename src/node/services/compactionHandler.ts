@@ -42,6 +42,7 @@ import {
   isDurableCompactedMarker,
   isDurableContextBoundaryMarker,
   latestContextBoundaryHistorySequence,
+  duplicateUserMessageIds,
   sliceMessagesFromLatestCompactionBoundary,
   workspaceMemoryPolicyEpochOf,
 } from "@/common/utils/messages/compactionBoundary";
@@ -1682,6 +1683,10 @@ export class CompactionHandler {
       }
     }
     const coveredEpochById = new Map<string, number>();
+    // An id shared by two user rows names no batch: neither copy is stamped
+    // (the harvest gate refuses such an epoch; the copies must not present
+    // either row as covered to the next one).
+    const duplicated = duplicateUserMessageIds(tailRows);
     for (const message of tailRows) {
       if (message.role !== "assistant") continue;
       const bound = message.metadata?.requestHistorySequence;
@@ -1698,7 +1703,9 @@ export class CompactionHandler {
         anchor.id,
         ...getRequestPreludeMessageIds(anchor.metadata?.requestPreludeMessageIds),
       ]) {
-        if (!coveredEpochById.has(id)) coveredEpochById.set(id, policyEpoch);
+        if (!coveredEpochById.has(id) && !duplicated.has(id)) {
+          coveredEpochById.set(id, policyEpoch);
+        }
       }
     }
     return tailRows.map((row) => {

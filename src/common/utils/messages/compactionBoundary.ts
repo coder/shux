@@ -263,12 +263,35 @@ export function epochHasPriorTurnRows(
   activeContextMessages: readonly MuxMessage[],
   currentBatch: ReadonlySet<string>
 ): boolean {
+  // Batches are matched by row id: two user rows sharing one id (persisted
+  // history is raw JSON) would both read as the current batch, hiding the
+  // earlier one from this check and from the harvest gate's coverage — so a
+  // duplicated id is itself an unaccounted prior turn (fail closed).
+  const duplicated = duplicateUserMessageIds(activeContextMessages);
   return activeContextMessages.some(
     (message) =>
       message.role === "user" &&
-      !currentBatch.has(message.id) &&
+      (duplicated.has(message.id) || !currentBatch.has(message.id)) &&
       message.metadata?.muxMetadata?.type !== "compaction-request" &&
       message.metadata?.rlmPreservedTailCopy !== true &&
       !isTokenBudgetInternalMessage(message)
   );
+}
+
+/**
+ * Ids carried by more than one user row of `messages`. The policy checks
+ * account for user rows by id (a turn's batch is its user row plus the
+ * prelude ids that row lists), so an id shared by two rows would let the
+ * accounting of one vouch for the other; callers treat such ids as
+ * unaccounted for.
+ */
+export function duplicateUserMessageIds(messages: readonly MuxMessage[]): ReadonlySet<string> {
+  const seen = new Set<string>();
+  const duplicated = new Set<string>();
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    if (seen.has(message.id)) duplicated.add(message.id);
+    else seen.add(message.id);
+  }
+  return duplicated;
 }

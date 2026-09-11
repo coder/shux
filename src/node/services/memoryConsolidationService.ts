@@ -69,7 +69,10 @@ import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
-import { compactionClosingPolicyEpoch } from "@/common/utils/messages/compactionBoundary";
+import {
+  compactionClosingPolicyEpoch,
+  duplicateUserMessageIds,
+} from "@/common/utils/messages/compactionBoundary";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -363,6 +366,11 @@ class HarvestRefusedError extends Error {
  * carrying neither agent nor repository content.
  */
 function epochHarvestRefusal(messages: readonly MuxMessage[], closingEpoch: number): string | null {
+  // Coverage is keyed by row id: a duplicated user id (raw-JSON history)
+  // would let one row's turn vouch for the other, so it refuses outright.
+  if (duplicateUserMessageIds(messages).size > 0) {
+    return "the compacted epoch holds user rows sharing one id; harvest refused (fail closed)";
+  }
   const userRows: Array<{ message: MuxMessage; sequence: number }> = [];
   for (const message of messages) {
     const sequence = message.metadata?.historySequence;

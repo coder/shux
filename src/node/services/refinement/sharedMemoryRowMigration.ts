@@ -197,11 +197,29 @@ export async function migrateSharedMemoryRefinementRows(args: {
       if (row.data.rollbackOf === undefined) {
         if (isLive(row.id) !== true) continue;
         const parsed = MemoryRefinementActionSchema.safeParse(row.data.action);
-        if (!parsed.success) continue;
+        if (!parsed.success) {
+          // A live edit whose action is corrupt but whose inverse still
+          // parses is evidence conflict detection needs (its inverse paths
+          // mark the child's later mutation over the same files); the owner
+          // journal cannot carry it without an action, so removal must not
+          // delete the only copy — throw, like a row that cannot be
+          // persisted. A forced removal accepts the loss explicitly.
+          if (RefinementInverseSchema.safeParse(row.data.inverse).success) {
+            throw new Error(
+              `refinement row ${row.id} of ${args.childWorkspaceId} is live but its action is malformed; it cannot be handed over to the owner journal`
+            );
+          }
+          continue;
+        }
         action = parsed.data;
       } else {
         // Child journal order puts a rollback row after its target, so the
         // target's copy (from an earlier pass or this loop) is known here.
+        // The engine's own usability rule applies to the SOURCE row too: a
+        // row whose parseable action names another target than `rollbackOf`
+        // is corrupt and must not be turned into a usable owner rollback by
+        // rewriting `of` (that would suppress a possibly live mutation).
+        if (!isUsableRollbackRow(row)) continue;
         rollbackOf = ownerIdBySource.get(`${args.childWorkspaceId}:${row.data.rollbackOf}`);
         if (rollbackOf === undefined || ownerRollbackTargets.has(rollbackOf)) continue;
         const parsed = RollbackRefinementActionSchema.safeParse(row.data.action);

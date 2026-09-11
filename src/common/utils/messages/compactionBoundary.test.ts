@@ -4,6 +4,7 @@ import { createMuxMessage } from "@/common/types/message";
 
 import {
   compactionClosingPolicyEpoch,
+  duplicateUserMessageIds,
   epochHasPriorTurnRows,
   findLatestCompactionBoundaryIndex,
   findLatestContextBoundaryIndex,
@@ -67,6 +68,22 @@ describe("workspaceMemoryPolicyEpochOf", () => {
         createMuxMessage("u1", "user", "a", { historySequence: 6, historySegment: 5 }),
       ])
     ).toBe(5);
+  });
+});
+
+describe("duplicateUserMessageIds", () => {
+  it("names ids shared by several user rows and makes them prior turns", () => {
+    const rows = [
+      createMuxMessage("u1", "user", "first", { historySequence: 0 }),
+      createMuxMessage("a1", "assistant", "reply", { historySequence: 1 }),
+      createMuxMessage("u1", "user", "same id again", { historySequence: 2 }),
+    ];
+    expect([...duplicateUserMessageIds(rows)]).toEqual(["u1"]);
+    expect(duplicateUserMessageIds(rows.slice(0, 2)).size).toBe(0);
+    // The current batch is matched by id: the duplicated id would hide the
+    // earlier row from the prior-turn check, so it counts as one.
+    expect(epochHasPriorTurnRows(rows, new Set(["u1"]))).toBe(true);
+    expect(epochHasPriorTurnRows(rows.slice(0, 2), new Set(["u1"]))).toBe(false);
   });
 });
 

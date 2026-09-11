@@ -3783,6 +3783,66 @@ describe("MemoryService", () => {
       expect(recopied).toHaveLength(1);
     });
 
+    it("never turns a corrupt source rollback row into a usable owner rollback", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "v1", "agent");
+      const [createRow] = await readRefinementEvents(childSessionDir);
+      // A rollback row whose parseable action names ANOTHER target than
+      // `rollbackOf`: the engine rejects it (isUsableRollbackRow); remapping
+      // `of` to the create's copy would make the owner believe the create was
+      // rolled back while its bytes are still on disk.
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "rollback", of: "someone-else" },
+          inverse: { op: "delete-files", paths: [path.join(ownerSessionDir, "memory", "n.md")] },
+          rollbackOf: createRow.id,
+        },
+      });
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      const ownerRows = await readRefinementEvents(ownerSessionDir);
+      expect(ownerRows.filter((row) => row.data.rollbackOf !== undefined)).toHaveLength(0);
+    });
+
+    it("refuses to hand over a live row whose action is malformed instead of dropping it", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      // A live edit with a usable inverse but a corrupt action: its inverse
+      // paths are the evidence conflict detection needs, and the owner journal
+      // cannot carry it without an action — removal must not delete the only
+      // copy (a forced removal accepts the loss explicitly).
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "memory",
+          action: { op: "bogus" },
+          inverse: { op: "delete-files", paths: [path.join(ownerSessionDir, "memory", "n.md")] },
+        },
+      });
+      const attempt = migrateSharedMemoryRefinementRows({
+        childSessionDir,
+        childWorkspaceId: "ws-child",
+        ownerSessionDir,
+        ownerWorkspaceId: "ws-owner",
+      });
+      expect(await attempt.then(() => null, getErrorMessage)).toContain("action is malformed");
+    });
+
     it("a peer's corrupt rollback row does not hide the peer's live edit from conflict detection", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

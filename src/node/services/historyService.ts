@@ -1802,6 +1802,10 @@ export class HistoryService {
         Ok({
           archive: await this.readExistingFile(this.getChatArchivePath(sourceWorkspaceId)),
           chat: await this.readExistingFile(this.getChatHistoryPath(sourceWorkspaceId)),
+          // The copied rows carry the source's segment stamp; the target must
+          // continue that segment (same floor, same stamp) or its own appends
+          // would sit unstamped beside stamped rows.
+          segment: await this.readExistingFile(this.getHistorySegmentPath(sourceWorkspaceId)),
         })
     );
     if (!snapshot.success) {
@@ -1816,6 +1820,7 @@ export class HistoryService {
         for (const [targetPath, contents] of [
           [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
           [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
+          [this.getHistorySegmentPath(targetWorkspaceId), snapshot.data.segment],
         ] as const) {
           if (contents === null) {
             await fs.rm(targetPath, { force: true });
@@ -1823,6 +1828,7 @@ export class HistoryService {
             await writeFileAtomic(targetPath, contents);
           }
         }
+        this.historySegmentStarts.delete(targetWorkspaceId);
         return Ok(undefined);
       }
     );
@@ -1894,30 +1900,78 @@ export class HistoryService {
   }
 
   /**
-   * Current segment start from `history-segment.json` (0 when absent),
-   * refreshing the cache. Unreadable or malformed content throws rather
-   * than reading as 0: a cleared workspace whose file cannot be read would
-   * otherwise restart at 0 and reuse the sequences the clear retired.
+   * Current segment start from `history-segment.json` (0 when absent), or
+   * null when the file is present but malformed. Unreadable (EACCES, EIO)
+   * throws: a cleared workspace whose file cannot be read would otherwise
+   * restart at 0 and reuse the sequences the clear retired. Only a safe
+   * integer is a usable start — above 2^53, `start + 1` can equal `start`
+   * and a clear would fail to open a strictly newer segment.
    */
-  private async readHistorySegmentStart(workspaceId: string): Promise<number> {
+  private async readHistorySegmentStart(workspaceId: string): Promise<number | null> {
     let raw: string;
     try {
       raw = await fs.readFile(this.getHistorySegmentPath(workspaceId), "utf-8");
     } catch (error) {
       if (!isErrnoWithCode(error, "ENOENT")) throw error;
-      this.historySegmentStarts.set(workspaceId, 0);
       return 0;
     }
-    const parsed: unknown = JSON.parse(raw);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
     const start: unknown =
       typeof parsed === "object" && parsed !== null
         ? (parsed as { start?: unknown }).start
         : undefined;
-    if (!isNonNegativeInteger(start)) {
-      throw new Error(`Malformed history segment file for ${workspaceId}: ${raw}`);
-    }
-    this.historySegmentStarts.set(workspaceId, start);
+    return isNonNegativeInteger(start) && Number.isSafeInteger(start) ? start : null;
+  }
+
+  /**
+   * Self-healing for a malformed `history-segment.json` (under the history
+   * write lock): the file is quarantined next to itself and reseeded with a
+   * start above every sequence still visible (the rows, the cached counter
+   * and the cached start), so appends and clears keep working instead of
+   * failing on every attempt until someone deletes the file by hand. The
+   * retired range a corrupt file may have named is not recoverable; rows
+   * appended after the reseed carry the new stamp, so the segment's
+   * boundary-less epoch identity changes and any policy recorded under the
+   * old one is simply never consulted again (harvests of that epoch fail
+   * closed rather than reading a stale record).
+   */
+  private async reseedHistorySegmentUnderHistoryLock(
+    workspaceId: string,
+    visibleMaxSequence: number
+  ): Promise<number> {
+    const segmentPath = this.getHistorySegmentPath(workspaceId);
+    const quarantinePath = `${segmentPath}.corrupt-${Date.now()}`;
+    log.warn("Quarantining malformed history segment file and reseeding the segment", {
+      workspaceId,
+      quarantinePath,
+    });
+    await fs.rename(segmentPath, quarantinePath);
+    const start =
+      Math.max(
+        visibleMaxSequence,
+        (this.sequenceCounters.get(workspaceId) ?? 0) - 1,
+        this.historySegmentStarts.get(workspaceId) ?? 0
+      ) + 1;
+    await this.writeHistorySegmentStart(workspaceId, start);
     return start;
+  }
+
+  private async writeHistorySegmentStart(workspaceId: string, start: number): Promise<void> {
+    // Reachable from persisted data (an absurd sequence in a hand-edited row):
+    // refuse rather than persist a start that `+ 1` cannot move past.
+    if (!isNonNegativeInteger(start) || !Number.isSafeInteger(start)) {
+      throw new Error(
+        `Cannot open a new history segment for ${workspaceId}: start ${start} is not a safe integer`
+      );
+    }
+    await ensurePrivateDir(this.getSessionDir(workspaceId));
+    await writeFileAtomic(this.getHistorySegmentPath(workspaceId), JSON.stringify({ start }));
+    this.historySegmentStarts.set(workspaceId, start);
   }
 
   /**
@@ -1942,10 +1996,7 @@ export class HistoryService {
         (max, sequence) => (sequence > max ? sequence : max),
         Math.max(persistedMax, (this.sequenceCounters.get(workspaceId) ?? 0) - 1, previousStart)
       ) + 1;
-    assert(isNonNegativeInteger(start), "history segment start must be a non-negative integer");
-    await ensurePrivateDir(this.getSessionDir(workspaceId));
-    await writeFileAtomic(this.getHistorySegmentPath(workspaceId), JSON.stringify({ start }));
-    this.historySegmentStarts.set(workspaceId, start);
+    await this.writeHistorySegmentStart(workspaceId, start);
     this.sequenceCounters.set(workspaceId, start);
   }
 
@@ -1960,10 +2011,16 @@ export class HistoryService {
     return start === 0 ? metadata : { ...metadata, historySegment: start };
   }
 
+  /**
+   * Called under the history write lock only (every caller assigns
+   * sequences): a malformed segment file is repaired in place here.
+   */
   private async getMaxHistorySequence(workspaceId: string): Promise<number> {
     // Floor: a cleared history has no rows, but its sequences continue above
     // the retired segment (see HISTORY_SEGMENT_FILE).
-    let maxSequence = (await this.readHistorySegmentStart(workspaceId)) - 1;
+    const segmentStart = await this.readHistorySegmentStart(workspaceId);
+    if (segmentStart !== null) this.historySegmentStarts.set(workspaceId, segmentStart);
+    let maxSequence = (segmentStart ?? this.historySegmentStarts.get(workspaceId) ?? 0) - 1;
 
     // Full scan of the active file (cheap post-rotation; see getNextHistorySequence
     // for why we don't trust the tail alone).
@@ -1977,8 +2034,11 @@ export class HistoryService {
     // The archive holds strictly-older sequences than chat.jsonl, so it only
     // decides the counter when chat.jsonl is missing/hand-edited.
     const archiveMax = await this.getArchiveTailMaxSequence(workspaceId);
-
-    return Math.max(maxSequence, archiveMax);
+    const max = Math.max(maxSequence, archiveMax);
+    if (segmentStart === null) {
+      return (await this.reseedHistorySegmentUnderHistoryLock(workspaceId, max)) - 1;
+    }
+    return max;
   }
 
   /**

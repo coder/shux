@@ -935,7 +935,7 @@ export class TurnRequestBuilder {
     const recordStartupPhaseTiming = context.recordStartupPhaseTiming;
     let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
 
-    const deleteAbortedPlaceholder = async (messageId: string): Promise<void> => {
+    const deleteAbortedPlaceholder = async (messageId: string): Promise<boolean> => {
       const deleteResult = await this.dependencies.historyService.deleteMessage(
         workspaceId,
         messageId
@@ -948,6 +948,7 @@ export class TurnRequestBuilder {
             deleteResult.error
         );
       }
+      return deleteResult.success;
     };
     // Mode (plan|exec|compact) is derived from the selected agent definition.
     const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
@@ -1623,6 +1624,16 @@ export class TurnRequestBuilder {
         workspaceId,
       });
       return true;
+    };
+    // Placeholder of a turn that never ran (startup aborted or failed): it
+    // carries the request bound and the policy stamp the finalized row needs,
+    // so left behind it would present the user batch to the harvest gate as
+    // covered by a turn. When its removal fails (I/O, a concurrent rewrite)
+    // the epoch is denied instead — fail closed rather than trust a row
+    // nobody can confirm is gone.
+    const discardPlaceholder = async (messageId: string): Promise<void> => {
+      if (await deleteAbortedPlaceholder(messageId)) return;
+      await persistWorkspaceMemoryWritable(false);
     };
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
@@ -3171,7 +3182,7 @@ export class TurnRequestBuilder {
       }
 
       if (combinedAbortSignal.aborted) {
-        await deleteAbortedPlaceholder(assistantMessageId);
+        await discardPlaceholder(assistantMessageId);
         return {
           type: "finished",
           result: Ok(
@@ -3393,7 +3404,7 @@ export class TurnRequestBuilder {
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);
-            await deleteAbortedPlaceholder(assistantMessageId);
+            await discardPlaceholder(assistantMessageId);
             return { type: "finished", result: Err(error.details) };
           }
           throw error;
@@ -3492,7 +3503,7 @@ export class TurnRequestBuilder {
         type: "ready",
         turnExecutionOptions,
         assistantMessageId,
-        deleteAbortedPlaceholder,
+        deleteAbortedPlaceholder: discardPlaceholder,
         logStartOutcome,
         ...(finalWorkspaceMemoryWritable
           ? {

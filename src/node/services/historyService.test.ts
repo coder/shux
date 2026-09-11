@@ -2619,22 +2619,75 @@ describe("HistoryService", () => {
       expect(messages[0].metadata?.historySegment).toBe(1);
     });
 
-    it("refuses to append when the segment file is unreadable", async () => {
+    it("quarantines a malformed segment file and reseeds above the visible rows", async () => {
       const workspaceId = "workspace1";
       await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
       await service.clearHistory(workspaceId);
-      await fs.writeFile(
-        path.join(config.sessionsDir, workspaceId, "history-segment.json"),
-        "not json"
-      );
+      const msg2 = createMuxMessage("msg2", "user", "Second");
+      await service.appendToHistory(workspaceId, msg2);
+      expect(msg2.metadata?.historySegment).toBe(1);
+      const segmentPath = path.join(config.sessionsDir, workspaceId, "history-segment.json");
+      await fs.writeFile(segmentPath, "not json");
 
-      // Reading a corrupt segment as 0 would restart at the retired sequences.
+      // Self-healing rather than refusing every append until the file is
+      // deleted by hand: the corrupt file is quarantined and the segment
+      // reseeded above every sequence still visible, so the row lands and
+      // carries a fresh stamp (the epoch identity moves on — fail closed for
+      // the policy recorded under the old one, never a reused sequence).
       const restarted = new HistoryService(config);
-      const result = await restarted.appendToHistory(
-        workspaceId,
-        createMuxMessage("msg2", "user", "Second")
+      const msg3 = createMuxMessage("msg3", "user", "Third");
+      expect((await restarted.appendToHistory(workspaceId, msg3)).success).toBe(true);
+      expect(msg3.metadata?.historySequence).toBe(2);
+      expect(msg3.metadata?.historySegment).toBe(2);
+      expect(JSON.parse(await fs.readFile(segmentPath, "utf-8"))).toEqual({ start: 2 });
+      const quarantined = (await fs.readdir(path.dirname(segmentPath))).filter((name) =>
+        name.startsWith("history-segment.json.corrupt-")
       );
+      expect(quarantined).toHaveLength(1);
+      // A clear after the repair opens the next segment as usual.
+      await restarted.clearHistory(workspaceId);
+      const msg4 = createMuxMessage("msg4", "user", "Fourth");
+      await restarted.appendToHistory(workspaceId, msg4);
+      expect(msg4.metadata?.historySegment).toBe(3);
+    });
+
+    it("refuses to open a segment above an unsafe persisted sequence", async () => {
+      const workspaceId = "workspace1";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      // `start + 1` cannot move past 2^53: a clear that pretended to would
+      // hand the new segment the old one's identity.
+      await fs.writeFile(
+        path.join(workspaceDir, "chat.jsonl"),
+        JSON.stringify({
+          ...createMuxMessage("huge", "user", "absurd sequence", {
+            historySequence: Number.MAX_SAFE_INTEGER + 1,
+          }),
+          workspaceId,
+        }) + "\n"
+      );
+      const result = await service.clearHistory(workspaceId);
       expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("safe integer");
+      expect(await fs.readFile(path.join(workspaceDir, "chat.jsonl"), "utf-8")).toContain("huge");
+    });
+
+    it("forks the current segment along with the history snapshot", async () => {
+      await service.appendToHistory("source", createMuxMessage("msg1", "user", "Hello"));
+      await service.clearHistory("source");
+      const kept = createMuxMessage("msg2", "user", "Kept");
+      await service.appendToHistory("source", kept);
+      expect(kept.metadata?.historySegment).toBe(1);
+
+      // The copied rows carry the source's stamp: the fork continues that
+      // segment instead of appending unstamped rows (segment 0) beside them.
+      expect((await service.copyHistorySnapshotToNewWorkspace("source", "fork")).success).toBe(
+        true
+      );
+      const forked = createMuxMessage("msg3", "user", "In the fork");
+      await service.appendToHistory("fork", forked);
+      expect(forked.metadata?.historySequence).toBe(2);
+      expect(forked.metadata?.historySegment).toBe(1);
     });
   });
 

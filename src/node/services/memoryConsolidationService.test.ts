@@ -1303,6 +1303,52 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls.length).toBeGreaterThan(0);
   });
 
+  it("refuses to harvest an epoch whose user rows share an id", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    // Coverage is keyed by id: covering the later row would mark the earlier
+    // (never-covered) row covered too, so a duplicated id refuses outright.
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("pref-1", "user", "Read-only agent's prompt, never answered")
+    );
+    const prompt = createMuxMessage(
+      "pref-1",
+      "user",
+      "Please remember that I prefer concise tests."
+    );
+    await fixture.historyService.appendToHistory("ws-dream", prompt);
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("reply-1", "assistant", "Noted.", {
+        requestHistorySequence: prompt.metadata?.historySequence,
+        workspaceMemoryPolicyEpoch: -1,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      "ws-dream",
+      createMuxMessage("compact-request", "user", "Please compact", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+    });
+    await fixture.historyService.appendToHistory("ws-dream", summary);
+    const result = await fixture.service.maybeHarvestThenSweep({
+      workspaceId: "ws-dream",
+      workspaceMemoryWritable: true,
+      summaryMessageId: "summary-1",
+      summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+      compactionEpoch: 1,
+      compactionRequestMessageId: "compact-request",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("sharing one id");
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
   it("refuses to harvest an epoch holding user rows no turn's request snapshot covers", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     // Backend A snapshots its request through pref-1; backend B appends a
