@@ -470,12 +470,45 @@ describe("MemoryConsolidationService", () => {
         }),
     });
     await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    await fixture.addWorkspace("ws-sib", { parentWorkspaceId: "ws-dream" });
+    const siblingMetadata = await seedCompactionEpoch(fixture, "ws-sib");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sib": {
+            [siblingMetadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: siblingMetadata.summaryMessageId,
+              compactionEpoch: siblingMetadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: siblingMetadata,
+            },
+          },
+        },
+      })
+    );
     const run = fixture.service.maybeRun("ws-sub", "manual");
     await started;
     await fixture.service.cancelInFlightConsolidation("ws-sub");
     const result = await run;
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toContain("stream failed");
+    // The run was keyed by the owner, but the ACTING child is the one being
+    // torn down: its continuation must not start recovery of a sibling's
+    // retryable harvest (fresh provider work during the child's teardown).
+    const siblingRecords = (
+      JSON.parse(
+        await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+      ) as { harvestsByWorkspace: Record<string, Record<string, { attemptCount: number }>> }
+    ).harvestsByWorkspace["ws-sib"];
+    expect(Object.values(siblingRecords).map((record) => record.attemptCount)).toEqual([1]);
     // Locally cancelled child: neither its own trigger nor an owner run made
     // on its behalf may start while teardown is under way.
     const refused = await fixture.service.maybeRun("ws-dream", "manual", {

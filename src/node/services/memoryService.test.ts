@@ -25,6 +25,7 @@ import {
 } from "@/common/types/refinement";
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
 import { rollbackRefinement } from "./refinement/refinementRollback";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { TestTempDir } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
@@ -964,15 +965,16 @@ describe("MemoryService", () => {
 
       // Change events name the owner so the owner's Memory tab (and every
       // tree member's) refreshes; sidecar stats are keyed by the owner too.
-      expect(events).toEqual([
-        {
-          scope: "workspace",
-          path: "/memories/workspace/context-notes.md",
-          actor: "agent",
-          workspaceId: "ws-owner",
-          projectPath: FIXTURE_PROJECT_PATH,
-        },
-      ]);
+      // The two tree-member views publish as well: a read re-ranks the shared
+      // hot set, so sibling sessions must drop their cached memory context.
+      const ownerEvent = {
+        scope: "workspace",
+        path: "/memories/workspace/context-notes.md",
+        actor: "agent",
+        workspaceId: "ws-owner",
+        projectPath: FIXTURE_PROJECT_PATH,
+      };
+      expect(events).toEqual([ownerEvent, ownerEvent, ownerEvent]);
       const meta = await fixture.metaService.getEntries();
       expect(
         meta.get(
@@ -990,6 +992,36 @@ describe("MemoryService", () => {
           })
         )
       ).toBe(false);
+    });
+
+    it("refuses a sub-agent's mutation once the owner's removal tombstone exists", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const tombstone = workspaceRemovalTombstonePath(fixture.config.rootDir, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstone), { recursive: true });
+      await fsPromises.writeFile(tombstone, "");
+
+      // The child itself is alive, but its notebook is the removed owner's:
+      // committing would recreate the deleted owner directory.
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/n.md",
+        "shared",
+        "agent"
+      );
+      expect(created.success).toBe(false);
+      if (!created.success) expect(created.error).toContain("ws-owner was removed");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"))
+      ).toBe(false);
+      // Global scope is not the owner's store and stays writable.
+      const globalCreate = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/n.md",
+        "mine",
+        "agent"
+      );
+      expect(globalCreate.success).toBe(true);
     });
 
     it("journals a sub-agent's workspace-scope mutation in its own session", async () => {

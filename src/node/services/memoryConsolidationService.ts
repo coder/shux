@@ -777,7 +777,14 @@ export class MemoryConsolidationService extends EventEmitter {
     // Removal cancelled this run: recovery would spawn child harvests outside
     // the cancellation registry being drained (their controllers were never
     // registered), mutating the shared inbox during destructive teardown.
-    if (options.skipHarvestRecovery !== true && !this.removalCancelled.has(workspaceId)) {
+    // A child-initiated run is keyed by the OWNER, so the acting child's own
+    // cancellation must gate it too.
+    if (
+      options.skipHarvestRecovery !== true &&
+      !this.removalCancelled.has(workspaceId) &&
+      (options.actingWorkspaceId === undefined ||
+        !this.removalCancelled.has(options.actingWorkspaceId))
+    ) {
       await Effect.runPromise(this.recoverRetryableHarvestsEffect(workspaceId));
     }
     return result;

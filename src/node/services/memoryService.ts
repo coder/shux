@@ -809,6 +809,13 @@ export class MemoryService extends EventEmitter {
       const key = this.logicalKeyFor(ctx, scope, relPath);
       if (key === null) return;
       await this.metaService.recordAccess(key, options);
+      if (scope === "workspace" && !options.write) {
+        // A read-side access (view, recall) re-ranks the shared hot set the
+        // whole task tree derives from the owner's sidecar entries, so it is
+        // published like a pin: the other live sessions of the tree drop
+        // their cached memory context. Writes publish with their mutation.
+        this.emitChange(ctx, scope, relPath, "agent");
+      }
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
     }
@@ -1041,10 +1048,21 @@ export class MemoryService extends EventEmitter {
         );
       }
     }
-    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, ctx.workspaceId)) {
-      throw new MemoryCommandError(
-        `Workspace ${ctx.workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
-      );
+    // The acting workspace AND, for the workspace scope, the store owner: a
+    // child's mutation waits on the owner's store lock while the owner is
+    // removed (tombstone published, session dir deleted), then resumes and
+    // would recreate the owner's directory. Global/project stores are not
+    // the owner's, so a removed owner does not refuse those.
+    const storeOwner =
+      parseMemoryPath(virtualPath).scope === "workspace"
+        ? this.ownerWorkspaceIdFor(ctx)
+        : undefined;
+    for (const workspaceId of new Set([ctx.workspaceId, storeOwner ?? ctx.workspaceId])) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new MemoryCommandError(
+          `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
+        );
+      }
     }
   }
 
