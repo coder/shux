@@ -169,11 +169,20 @@ else:
             .replace('"status":"running"', '"status":"completed"')
             .replace("🔄 **Running** since", "✅ **Completed**")
         )
+        # Codex keeps resolved advisories on the board; only its own Resolved marker,
+        # not a bare bullet, an unknown section, or a non-thread link, is informational.
+        resolved_findings = completed_findings.replace(
+            ") · **Medium**", ") · **Medium** · **Resolved**"
+        )
         for body, expected in (
             (completed.replace('"status":"completed"', '"status":"running"'), 1),
             (completed.replace("✅ **Completed**", "🔄 **Running** since", 1), 1),
             (completed_pr_opened, 0),
             (completed_findings, 1),
+            (resolved_findings, 0),
+            (resolved_findings.replace("#### Advisory findings", "#### Blocking findings"), 1),
+            (resolved_findings.replace("#discussion_r3960253571", "#issuecomment-1"), 1),
+            (resolved_findings.replace("· **Resolved**", "· **Resolved** see below"), 1),
         ):
             for cached in (False, True):
                 with self.subTest(body=body, cached=cached):
