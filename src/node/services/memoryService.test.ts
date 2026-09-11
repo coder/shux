@@ -3816,6 +3816,40 @@ describe("MemoryService", () => {
       expect(ownerRows.filter((row) => row.data.rollbackOf !== undefined)).toHaveLength(0);
     });
 
+    it("does not let a non-memory rollback row kill a memory row's liveness during migration", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/n.md", "v1", "agent");
+      const [createRow] = await readRefinementEvents(childSessionDir);
+      // A well-formed rollback row whose `kind` is not "memory": the copy loop
+      // skips it, so it must not count as a completed rollback either — or
+      // removal would delete the journal without copying the live create.
+      await sharedDurableEventJournal(childSessionDir).append({
+        workspaceId: "ws-child",
+        kind: "refinement",
+        data: {
+          kind: "skill",
+          action: { op: "rollback", of: createRow.id },
+          inverse: { op: "delete-files", paths: [path.join(ownerSessionDir, "memory", "n.md")] },
+          rollbackOf: createRow.id,
+        },
+      });
+      expect(
+        await migrateSharedMemoryRefinementRows({
+          childSessionDir,
+          childWorkspaceId: "ws-child",
+          ownerSessionDir,
+          ownerWorkspaceId: "ws-owner",
+        })
+      ).toBe(1);
+      const copy = (await readRefinementEvents(ownerSessionDir)).find(
+        (row) => row.data.migratedFrom === `ws-child:${createRow.id}`
+      );
+      expect(copy).toBeDefined();
+    });
+
     it("refuses to hand over a live row whose action is malformed instead of dropping it", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);

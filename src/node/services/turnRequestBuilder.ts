@@ -552,7 +552,13 @@ type TurnRequestBuildOutcome =
       type: "ready";
       turnExecutionOptions: TurnExecutionOptions;
       assistantMessageId: string;
-      deleteAbortedPlaceholder: (messageId: string) => Promise<void>;
+      /**
+       * Remove the never-run turn's stamped placeholder, or deny its epoch
+       * when that fails; false when neither could be made durable — the
+       * caller must report WORKSPACE_MEMORY_POLICY_PERSIST_ERROR instead of
+       * its own outcome.
+       */
+      deleteAbortedPlaceholder: (messageId: string) => Promise<boolean>;
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
       /**
        * Durable side effects that must only land once the stream has actually
@@ -572,7 +578,7 @@ export interface PreparedTurnRequest extends AsyncDisposable {
 }
 
 /** Turn refused because a memory-policy DENY could not be made durable (see persistWorkspaceMemoryWritable). */
-const WORKSPACE_MEMORY_POLICY_PERSIST_ERROR =
+export const WORKSPACE_MEMORY_POLICY_PERSIST_ERROR =
   "Could not persist this workspace's read-only memory policy; refusing to start the turn so a restart cannot fall back to a stale write permission. Retry once the config directory is writable.";
 
 type PreparedTurnRequestOutcome =
@@ -1631,9 +1637,12 @@ export class TurnRequestBuilder {
     // covered by a turn. When its removal fails (I/O, a concurrent rewrite)
     // the epoch is denied instead — fail closed rather than trust a row
     // nobody can confirm is gone.
-    const discardPlaceholder = async (messageId: string): Promise<void> => {
-      if (await deleteAbortedPlaceholder(messageId)) return;
-      await persistWorkspaceMemoryWritable(false);
+    // Returns false only when neither the deletion nor the deny could be made
+    // durable: the caller must then surface that instead of its own outcome,
+    // since a stamped placeholder nobody could remove or deny stays behind.
+    const discardPlaceholder = async (messageId: string): Promise<boolean> => {
+      if (await deleteAbortedPlaceholder(messageId)) return true;
+      return persistWorkspaceMemoryWritable(false);
     };
     const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
@@ -3182,7 +3191,12 @@ export class TurnRequestBuilder {
       }
 
       if (combinedAbortSignal.aborted) {
-        await discardPlaceholder(assistantMessageId);
+        if (!(await discardPlaceholder(assistantMessageId))) {
+          return {
+            type: "finished",
+            result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+          };
+        }
         return {
           type: "finished",
           result: Ok(
@@ -3404,7 +3418,12 @@ export class TurnRequestBuilder {
         } catch (error) {
           if (error instanceof ContextBudgetExceededError) {
             runLanguageModelCleanup(modelResult.data.model);
-            await discardPlaceholder(assistantMessageId);
+            if (!(await discardPlaceholder(assistantMessageId))) {
+              return {
+                type: "finished",
+                result: Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR }),
+              };
+            }
             return { type: "finished", result: Err(error.details) };
           }
           throw error;

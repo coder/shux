@@ -2634,12 +2634,19 @@ describe("HistoryService", () => {
       // reseeded above every sequence still visible, so the row lands and
       // carries a fresh stamp (the epoch identity moves on — fail closed for
       // the policy recorded under the old one, never a reused sequence).
+      // The reseeded start is floored by the wall clock: an empty history
+      // after a restart has no row, counter or cached start to prove a
+      // segment identity was never used before, and a small reseed could
+      // repeat one a late backend still names.
+      const before = Date.now();
       const restarted = new HistoryService(config);
       const msg3 = createMuxMessage("msg3", "user", "Third");
       expect((await restarted.appendToHistory(workspaceId, msg3)).success).toBe(true);
-      expect(msg3.metadata?.historySequence).toBe(2);
-      expect(msg3.metadata?.historySegment).toBe(2);
-      expect(JSON.parse(await fs.readFile(segmentPath, "utf-8"))).toEqual({ start: 2 });
+      const reseeded = msg3.metadata?.historySegment;
+      if (reseeded === undefined) throw new Error("expected a reseeded stamp");
+      expect(reseeded).toBeGreaterThan(before);
+      expect(msg3.metadata?.historySequence).toBe(reseeded);
+      expect(JSON.parse(await fs.readFile(segmentPath, "utf-8"))).toEqual({ start: reseeded });
       const quarantined = (await fs.readdir(path.dirname(segmentPath))).filter((name) =>
         name.startsWith("history-segment.json.corrupt-")
       );
@@ -2648,7 +2655,23 @@ describe("HistoryService", () => {
       await restarted.clearHistory(workspaceId);
       const msg4 = createMuxMessage("msg4", "user", "Fourth");
       await restarted.appendToHistory(workspaceId, msg4);
-      expect(msg4.metadata?.historySegment).toBe(3);
+      expect(msg4.metadata?.historySegment).toBe(reseeded + 1);
+    });
+
+    it("reseeds an empty workspace's corrupt segment above any identity used before", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      await service.clearHistory(workspaceId);
+      // Segment 1 (identity -2) was used; the file is corrupted with nothing
+      // else surviving: no rows, and a fresh process has no cached state.
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "history-segment.json"),
+        "{broken"
+      );
+      const restarted = new HistoryService(config);
+      const msg = createMuxMessage("msg2", "user", "After repair");
+      expect((await restarted.appendToHistory(workspaceId, msg)).success).toBe(true);
+      expect(msg.metadata?.historySegment).toBeGreaterThan(1);
     });
 
     it("refuses to open a segment above an unsafe persisted sequence", async () => {

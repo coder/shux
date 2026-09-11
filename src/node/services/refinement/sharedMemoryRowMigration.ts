@@ -21,7 +21,7 @@ import {
   type RefinementFileReference,
   type RefinementInverseDraft,
 } from "./refinementJournal";
-import { isUsableRollbackRow, listRefinements } from "./refinementRollback";
+import { isUsableRollbackRow, listRefinements, type RefinementEvent } from "./refinementRollback";
 import {
   createLegacyPathRemapper,
   LegacyPathNotAdoptedError,
@@ -122,8 +122,14 @@ export async function migrateSharedMemoryRefinementRows(args: {
   // target would delete the child journal with neither inverse preserved.
   // The copied target is then live on the owner side; its divergence checks
   // refuse a re-apply that no longer matches the tree (force overrides).
+  // Only rollback rows this migration can carry count: a rollback row whose
+  // `kind` is not "memory" (corrupted, or another taxonomy's) is skipped by
+  // the copy loop below, so counting it here would mark its memory target
+  // dead and let removal delete the journal without copying either.
+  const isMigratableRollbackRow = (row: RefinementEvent): boolean =>
+    row.data.kind === "memory" && isUsableRollbackRow(row);
   const rollbackByTarget = new Map(
-    rows.filter(isUsableRollbackRow).map((row) => [row.data.rollbackOf!, row] as const)
+    rows.filter(isMigratableRollbackRow).map((row) => [row.data.rollbackOf!, row] as const)
   );
   // Returns null on a corrupted (cyclic / absurdly long) lineage: such a row
   // is treated as non-migratable instead of hanging removal.
@@ -186,7 +192,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
     // very corruption, or the retry would leave the owner with an unusable
     // rollback record over a target the engine then reads as live.
     const ownerRollbackTargets = new Set(
-      ownerRows.filter(isUsableRollbackRow).map((ownerRow) => ownerRow.data.rollbackOf!)
+      ownerRows.filter(isMigratableRollbackRow).map((ownerRow) => ownerRow.data.rollbackOf!)
     );
     for (const row of rows) {
       if (row.data.kind !== "memory") continue;
@@ -219,7 +225,7 @@ export async function migrateSharedMemoryRefinementRows(args: {
         // row whose parseable action names another target than `rollbackOf`
         // is corrupt and must not be turned into a usable owner rollback by
         // rewriting `of` (that would suppress a possibly live mutation).
-        if (!isUsableRollbackRow(row)) continue;
+        if (!isMigratableRollbackRow(row)) continue;
         rollbackOf = ownerIdBySource.get(`${args.childWorkspaceId}:${row.data.rollbackOf}`);
         if (rollbackOf === undefined || ownerRollbackTargets.has(rollbackOf)) continue;
         const parsed = RollbackRefinementActionSchema.safeParse(row.data.action);

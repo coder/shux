@@ -23,6 +23,7 @@ import {
   type PreparedStreamMessage,
   type PreparedTurnRequest,
   type TurnRequestBuildContext,
+  WORKSPACE_MEMORY_POLICY_PERSIST_ERROR,
 } from "./turnRequestBuilder";
 export { replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -1029,8 +1030,17 @@ export class AIService extends EventEmitter {
         // No stream ran for this turn: discard its placeholder like an
         // aborted startup's (TurnRequestBuilder denies the epoch when the row
         // cannot be removed), so the never-started turn stays excluded from
-        // the harvest until a retry actually runs it.
-        await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId);
+        // the harvest until a retry actually runs it. When neither could be
+        // made durable, that failure — not the startup error — is the result:
+        // the stamped row is still there, vouching for a batch no model saw.
+        if (!(await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId))) {
+          return Err({
+            type: "unknown",
+            raw: `${WORKSPACE_MEMORY_POLICY_PERSIST_ERROR} (stream startup failed first: ${
+              streamResult.error.type
+            })`,
+          });
+        }
         return Err(streamResult.error);
       }
 
@@ -1039,7 +1049,9 @@ export class AIService extends EventEmitter {
           this.clearTrackedPendingDevToolsRunMetadata(buildOutcome.assistantMessageId);
           startupState.pendingRunMetadataId = null;
         }
-        await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId);
+        if (!(await buildOutcome.deleteAbortedPlaceholder(buildOutcome.assistantMessageId))) {
+          return Err({ type: "unknown", raw: WORKSPACE_MEMORY_POLICY_PERSIST_ERROR });
+        }
       } else {
         // The stream is live: durable effects gated on "actually started"
         // (memory harvest grant) may land now.

@@ -1951,11 +1951,18 @@ export class HistoryService {
       quarantinePath,
     });
     await fs.rename(segmentPath, quarantinePath);
+    // An empty history after a restart leaves no row, counter or cached start
+    // to floor at, and a small reseed (1) could repeat the identity of an
+    // earlier segment that a late backend still names in its policy records.
+    // The wall clock is the one monotone source that survives all of that:
+    // sequences only need to compare, so the jump is harmless, and every
+    // later clear continues above it.
     const start =
       Math.max(
         visibleMaxSequence,
         (this.sequenceCounters.get(workspaceId) ?? 0) - 1,
-        this.historySegmentStarts.get(workspaceId) ?? 0
+        this.historySegmentStarts.get(workspaceId) ?? 0,
+        Date.now()
       ) + 1;
     await this.writeHistorySegmentStart(workspaceId, start);
     return start;
