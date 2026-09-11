@@ -169,6 +169,30 @@ describe("agent_report tool", () => {
     });
   });
 
+  it("merges a property's allOf declarations before widening it for providers", () => {
+    using tempDir = new TestTempDir("test-agent-report-tool-allof-widening");
+    const tool = createAgentReportTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "task-workspace" }),
+      taskService: {
+        reportAgentProgress: mock(() => Promise.resolve()),
+      } as unknown as TaskService,
+      workflowAgentOutputSchema: {
+        type: "object",
+        properties: { code: { type: "string", pattern: "^a" } },
+        allOf: [{ properties: { code: { enum: ["a", "b"] } } }],
+      },
+    });
+
+    // Both declarations constrain `code`; a provider schema that keeps only the
+    // later one accepts "b", which host validation then rejects.
+    const inputSchema = tool.inputSchema as {
+      jsonSchema?: { properties: Record<string, unknown> };
+    };
+    expect(inputSchema.jsonSchema?.properties.code).toEqual({
+      anyOf: [{ type: "string", pattern: "^a", enum: ["a", "b"] }, { type: "null" }],
+    });
+  });
+
   it("treats strict-provider nulls for optional workflow fields as omitted", async () => {
     using tempDir = new TestTempDir("test-agent-report-tool-optional-null-fields");
     const tool = createAgentReportTool({

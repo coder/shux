@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { createMCPToolContract, createMCPToolInputSchema } from "./mcpClient";
+import { createMCPTool, createMCPToolContract, createMCPToolInputSchema } from "./mcpClient";
 
 describe("createMCPToolInputSchema", () => {
   test("exposes a nullable model contract and restores the server contract", async () => {
@@ -89,5 +89,33 @@ describe("createMCPToolInputSchema", () => {
       properties: {},
       additionalProperties: { type: "string" },
     });
+  });
+});
+
+describe("createMCPTool", () => {
+  test("restores arguments at the execute boundary", async () => {
+    const calls: unknown[] = [];
+    const tool = createMCPTool(
+      {
+        name: "search",
+        inputSchema: {
+          type: "object",
+          properties: { q: { type: "string" }, limit: { type: "integer" } },
+        },
+      },
+      (args) => {
+        calls.push(args);
+        return Promise.resolve({ content: [] });
+      }
+    );
+
+    // Input parsing did not run: a direct caller, or middleware that rewrites
+    // parsed arguments, hands execute the placeholders themselves.
+    await tool.execute?.(
+      { q: "", limit: null },
+      { toolCallId: "call", messages: [], context: undefined }
+    );
+
+    expect(calls).toEqual([{}]);
   });
 });

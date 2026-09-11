@@ -248,12 +248,39 @@ export function createMCPToolContract(inputSchema: Record<string, unknown> | und
         value: contract.restore(value),
       }),
     }),
+    restore: contract.restore,
   };
 }
 
 /** Build the provider contract and restore the MCP server contract during input parsing. */
 export function createMCPToolInputSchema(inputSchema: Record<string, unknown> | undefined) {
   return createMCPToolContract(inputSchema).inputSchema;
+}
+
+type MCPToolDefinition = Awaited<ReturnType<Client["listTools"]>>["tools"][number];
+
+type CallMCPTool = (
+  args: Record<string, unknown>,
+  options: { abortSignal?: AbortSignal }
+) => ReturnType<Client["callTool"]>;
+
+/** An AI SDK tool over one MCP tool definition and the call that runs it. */
+export function createMCPTool(definition: MCPToolDefinition, callTool: CallMCPTool): Tool {
+  const contract = createMCPToolContract(definition.inputSchema);
+  return dynamicTool({
+    description: definition.description,
+    title: definition.title ?? definition.annotations?.title,
+    strict: contract.strict,
+    inputSchema: contract.inputSchema,
+    execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
+      options.abortSignal?.throwIfAborted();
+      // Input parsing restored SDK-parsed arguments; restoring again is
+      // idempotent and covers direct execute callers and middleware that
+      // rewrites arguments after parsing.
+      return await callTool(contract.restore(args) as Record<string, unknown>, options);
+    },
+    toModelOutput: mcpToModelOutput,
+  });
 }
 
 /**
@@ -291,27 +318,15 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
       const tools: Record<string, Tool> = {};
       for (const definition of listResult.tools) {
-        const contract = createMCPToolContract(definition.inputSchema);
-        tools[definition.name] = dynamicTool({
-          description: definition.description,
-          title: definition.title ?? definition.annotations?.title,
-          strict: contract.strict,
-          inputSchema: contract.inputSchema,
-          execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
-            options.abortSignal?.throwIfAborted();
-            return await client.callTool(
-              {
-                name: definition.name,
-                arguments: args as Record<string, unknown>,
-              },
-              {
-                timeout: SDK_TOOL_CALL_TIMEOUT_MS,
-                ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
-              }
-            );
-          },
-          toModelOutput: mcpToModelOutput,
-        });
+        tools[definition.name] = createMCPTool(definition, (args, options) =>
+          client.callTool(
+            { name: definition.name, arguments: args },
+            {
+              timeout: SDK_TOOL_CALL_TIMEOUT_MS,
+              ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
+            }
+          )
+        );
       }
       return tools;
     },

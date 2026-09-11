@@ -133,8 +133,10 @@ const OPENAI_WORKFLOW_REPORT_UNSUPPORTED_SCHEMA_PROPERTIES = new Set([
  * object schemas for OpenAI tool parameters.
  *
  * This is a lossless-as-possible dialect fix only. Optional-property nullability
- * is the optional-null schema contract's job (see optionalNullSchema.ts), so the
- * caller passes that contract's model schema here.
+ * is the optional-null schema contract's job (see optionalNullSchema.ts), which
+ * the caller applies to this sanitizer's output: `allOf` declarations of one
+ * property are merged here keyword by keyword, and each declaration widened
+ * first would be one `anyOf` keyword replacing another.
  */
 export function sanitizeWorkflowAgentReportSchemaForOpenAI<T>(schema: T): T {
   const clonedSchema = JSON.parse(JSON.stringify(schema)) as T;

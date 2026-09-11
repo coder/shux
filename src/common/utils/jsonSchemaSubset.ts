@@ -27,13 +27,16 @@ export function formatJsonSchemaValidationErrors(
  * Bounds of the schemas the validator judges. Every traversal of a schema in
  * this module and its callers is bounded by the depth, so a third-party schema
  * cannot overflow the stack before it is judged. Compiling a schema is linear
- * in its node count (every object, array, and primitive in the document), and
- * the contract layer compiles each optional property's sub-schema on top, so
- * the node bound keeps one schema's synchronous work on the main process
- * bounded too. Past either bound the schema is outside the subset.
+ * in its size: its node count (every object, array, and primitive in the
+ * document) and its text (every key and string value, which the cache key,
+ * the clone the contract layer widens, and each compiled pattern copy). The
+ * contract layer compiles each optional property's sub-schema on top, so the
+ * size bounds keep one schema's synchronous work on the main process bounded
+ * too. Past any bound the schema is outside the subset.
  */
 export const JSON_SCHEMA_SUBSET_MAX_DEPTH = 64;
 export const JSON_SCHEMA_SUBSET_MAX_NODES = 2048;
+export const JSON_SCHEMA_SUBSET_MAX_CHARS = 256 * 1024;
 
 /**
  * The dialects this validator speaks. A schema is judged in the dialect its
@@ -45,7 +48,7 @@ export const JSON_SCHEMA_SUBSET_MAX_NODES = 2048;
  * dialect is draft-07, the default of the JSON Schema emitters this app meets
  * (zod v3, OpenAPI tooling).
  */
-type Dialect = "draft-07" | "2019-09" | "2020-12";
+export type Dialect = "draft-07" | "2019-09" | "2020-12";
 
 const DIALECT_BY_SCHEMA_URI = new Map<string, Dialect>([
   ["json-schema.org/draft-07/schema", "draft-07"],
@@ -87,9 +90,11 @@ class LruCache<V> {
 // for minutes. A pattern outside RE2's syntax (backreferences, lookarounds,
 // which JSON Schema itself recommends against) does not compile, so a schema
 // that carries one is outside the subset. Compiled patterns are cached like
-// compiled schemas: the walk in the contract layer matches every key of a
-// dictionary against every pattern.
-const PATTERN_CACHE_MAX_ENTRIES = 512;
+// compiled schemas, and the cache holds every pattern of a schema in the
+// subset (a schema has fewer patterns than nodes), so compiling a schema, or
+// matching every key of a payload against its patterns in order, never evicts
+// its own patterns.
+const PATTERN_CACHE_MAX_ENTRIES = JSON_SCHEMA_SUBSET_MAX_NODES;
 const patternCache = new LruCache<RE2JS>(PATTERN_CACHE_MAX_ENTRIES);
 
 function compilePattern(pattern: string): RE2JS {
@@ -103,14 +108,15 @@ function compilePattern(pattern: string): RE2JS {
 }
 
 /**
- * Whether `text` matches a JSON Schema pattern, by the validator's own engine.
- * A pattern the validator cannot compile matches nothing.
+ * Compile a JSON Schema pattern into a verdict on text, by the validator's own
+ * engine. A pattern the validator cannot compile matches nothing.
  */
-export function matchesJsonSchemaPattern(pattern: string, text: string): boolean {
+export function compileJsonSchemaPattern(pattern: string): (text: string) => boolean {
   try {
-    return compilePattern(pattern).matcher(text).find();
+    const compiled = compilePattern(pattern);
+    return (text) => compiled.matcher(text).find();
   } catch {
-    return false;
+    return () => false;
   }
 }
 
@@ -150,6 +156,17 @@ function getDialect(schema: Record<string, unknown>): Dialect | null {
   }
   const uri = schema.$schema.replace(/^https?:\/\//u, "").replace(/#$/u, "");
   return DIALECT_BY_SCHEMA_URI.get(uri) ?? null;
+}
+
+/**
+ * The dialect a caller walking `schema` reads its keywords in: the one its
+ * `$schema` declares, else draft-07. A schema in a dialect this validator does
+ * not speak is outside the subset, and its walk reads it as draft-07 too, the
+ * dialect the keywords it shares with (draft-04's `items` and
+ * `additionalItems`) are spelled in.
+ */
+export function getJsonSchemaDialect(schema: unknown): Dialect {
+  return (isPlainRecord(schema) ? getDialect(schema) : null) ?? "draft-07";
 }
 
 /** A schema as its dialect's Ajv sees it (see toValidatorTarget). */
@@ -207,7 +224,7 @@ function compileJsonSchema(
       ],
     };
   }
-  const subsetError = findSubsetViolation(schema, "$", 0, { nodes: 0 });
+  const subsetError = findSubsetViolation(schema, "$", 0, { nodes: 0, chars: 0 });
   if (subsetError != null) {
     return { success: false, errors: [subsetError] };
   }
@@ -403,23 +420,32 @@ function unescapePointer(part: string): string {
 // keyword is outside the subset.
 const REFERENCE_KEYWORDS = ["$ref", "$dynamicRef", "$recursiveRef"] as const;
 
+/** The size of the schema walked so far (see JSON_SCHEMA_SUBSET_MAX_NODES). */
+interface SchemaSize {
+  nodes: number;
+  chars: number;
+}
+
 /** The first way `schema` falls outside the subset: too deep, too large, or a reference. */
 function findSubsetViolation(
   schema: unknown,
   path: string,
   depth: number,
-  visited: { nodes: number }
+  size: SchemaSize
 ): JsonSchemaValidationError | null {
   if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH) {
     return { path, message: "Schema is too deeply nested" };
   }
-  visited.nodes += 1;
-  if (visited.nodes > JSON_SCHEMA_SUBSET_MAX_NODES) {
+  size.nodes += 1;
+  if (typeof schema === "string") {
+    size.chars += schema.length;
+  }
+  if (size.nodes > JSON_SCHEMA_SUBSET_MAX_NODES || size.chars > JSON_SCHEMA_SUBSET_MAX_CHARS) {
     return { path, message: "Schema is too large" };
   }
   if (Array.isArray(schema)) {
     for (const [index, item] of schema.entries()) {
-      const error = findSubsetViolation(item, `${path}[${index}]`, depth + 1, visited);
+      const error = findSubsetViolation(item, `${path}[${index}]`, depth + 1, size);
       if (error != null) return error;
     }
     return null;
@@ -433,7 +459,9 @@ function findSubsetViolation(
     }
   }
   for (const [key, value] of Object.entries(schema)) {
-    const error = findSubsetViolation(value, `${path}.${key}`, depth + 1, visited);
+    // The value is a node, so its visit judges the key's length too.
+    size.chars += key.length;
+    const error = findSubsetViolation(value, `${path}.${key}`, depth + 1, size);
     if (error != null) return error;
   }
   return null;

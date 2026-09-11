@@ -311,6 +311,70 @@ describe("optional null JSON Schema contract", () => {
     expect(restoreMcp(draft2020, { rows })).toEqual({ rows: ["head", {}, {}] });
   });
 
+  test("reads tuple keywords in the schema's dialect", () => {
+    // Draft-07 has no `prefixItems`, so its validator ignores one; reading it
+    // anyway would let a schema that governs nothing delete a null the
+    // schema that does govern accepts.
+    const strict = { type: "object", properties: { note: { type: "string" } } };
+    const nullable = { type: "object", properties: { note: { type: ["string", "null"] } } };
+    const draft07 = {
+      type: "object",
+      properties: { rows: { type: "array", prefixItems: [strict], items: nullable } },
+    };
+    const draft2020 = { $schema: "https://json-schema.org/draft/2020-12/schema", ...draft07 };
+    const rows = [{ note: null }];
+
+    expect(restoreMcp(draft07, { rows })).toEqual({ rows });
+    expect(restoreMcp(draft2020, { rows })).toEqual({ rows: [{}] });
+  });
+
+  test("restores a placeholder named __proto__ as an own property", () => {
+    // Once the own property is deleted, `parent.__proto__ = ""` reaches
+    // Object.prototype's accessor and the key never returns.
+    const source = {
+      type: "object",
+      minProperties: 2,
+      properties: { ["__proto__"]: { type: "string" }, other: { type: "string" } },
+    };
+    const restored = restoreMcp(source, JSON.parse('{"__proto__":"","other":"x"}'));
+
+    expect(Object.getOwnPropertyDescriptor(restored, "__proto__")?.value).toBe("");
+  });
+
+  test("returns placeholders to the omitted reading until the root accepts", () => {
+    // Every branch requires `a`, and only the first accepts it as null, so the
+    // model's payload, the omitted reading, and any reading without `a` are
+    // rejected: judging from the model's payload would omit `a` first.
+    const source = {
+      anyOf: [
+        {
+          type: "object",
+          required: ["a"],
+          properties: {
+            a: { type: ["string", "null"] },
+            b: { type: "string" },
+            c: { type: "string" },
+          },
+        },
+        { type: "object", required: ["a"], properties: { a: { type: "string" } } },
+      ],
+    };
+
+    expect(restoreMcp(source, { a: null, b: null, c: null })).toEqual({ a: null });
+  });
+
+  test("judges a named property by the patterns that match it too", () => {
+    const source = {
+      type: "object",
+      properties: { "x-id": { type: ["string", "null"] } },
+      patternProperties: { "^x-": { type: "string" } },
+    };
+
+    // The named declaration accepts null; the pattern that also governs the
+    // name does not, so the payload is rejected while the null stays.
+    expect(restoreMcp(source, { "x-id": null })).toEqual({});
+  });
+
   test("restores optional placeholders inside the union branch that accepts the raw value", () => {
     const source = {
       anyOf: [
@@ -702,12 +766,11 @@ describe("optional null JSON Schema contract", () => {
     };
     const source = {
       type: "object",
-      required: ["byId", "byPrefix", "rows", "tuple"],
+      required: ["byId", "byPrefix", "rows"],
       properties: {
         byId: { type: "object", additionalProperties: entry },
         byPrefix: { type: "object", patternProperties: { "^x-": entry } },
         rows: { type: "array", items: [{ type: "string" }], additionalItems: entry },
-        tuple: { type: "array", prefixItems: [entry] },
       },
       if: { required: ["byId"] },
       then: { properties: { extra: entry } },
@@ -718,11 +781,41 @@ describe("optional null JSON Schema contract", () => {
         byId: { additionalProperties: widened },
         byPrefix: { patternProperties: { "^x-": widened } },
         rows: { additionalItems: widened },
-        tuple: { prefixItems: [widened] },
       },
       // `if` is a test, not a contract: widening it would change what it matches.
       if: { required: ["byId"] },
       then: { properties: { extra: widened } },
+    });
+  });
+
+  test("widens tuple items in the schema's dialect", () => {
+    const entry = { type: "object", properties: { note: { type: "string" } } };
+    const widened = {
+      type: "object",
+      properties: { note: { anyOf: [{ type: "string" }, { type: "null" }] } },
+    };
+    // One object per keyword: the clone keeps shared references shared.
+    const draft07 = {
+      type: "object",
+      required: ["tuple"],
+      properties: {
+        tuple: {
+          type: "array",
+          prefixItems: [structuredClone(entry)],
+          items: structuredClone(entry),
+          additionalItems: structuredClone(entry),
+        },
+      },
+    };
+    const draft2020 = { $schema: "https://json-schema.org/draft/2020-12/schema", ...draft07 };
+
+    // Each dialect's validator ignores the other's tuple keywords, so widening
+    // them would invite placeholders `restore` never sees.
+    expect(widenOptionalPropertiesToNullable(draft07)).toMatchObject({
+      properties: { tuple: { prefixItems: [entry], items: widened, additionalItems: entry } },
+    });
+    expect(widenOptionalPropertiesToNullable(draft2020)).toMatchObject({
+      properties: { tuple: { prefixItems: [widened], items: widened, additionalItems: entry } },
     });
   });
 

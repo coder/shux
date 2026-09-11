@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  JSON_SCHEMA_SUBSET_MAX_CHARS,
   JSON_SCHEMA_SUBSET_MAX_NODES,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
@@ -230,6 +231,28 @@ describe("validateJsonSchemaSubset", () => {
     expect(validateJsonSchemaSubsetSchema(wide(JSON_SCHEMA_SUBSET_MAX_NODES / 4))).toEqual({
       success: true,
     });
+  });
+
+  test("rejects a schema with more text than it will compile", () => {
+    // A string is one node however long it is, and the cache key, the clone,
+    // and a compiled pattern each copy every character of it.
+    const text = "x".repeat(JSON_SCHEMA_SUBSET_MAX_CHARS);
+    for (const schema of [
+      { type: "string", description: text },
+      { type: "object", properties: { [text]: { type: "string" } } },
+    ]) {
+      const result = validateJsonSchemaSubsetSchema(schema);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.errors[0]?.message).toBe("Schema is too large");
+      }
+    }
+    expect(
+      validateJsonSchemaSubsetSchema({
+        type: "string",
+        description: text.slice(0, JSON_SCHEMA_SUBSET_MAX_CHARS / 4),
+      })
+    ).toEqual({ success: true });
   });
 
   test("supports enum, integer, and additionalProperties false", () => {

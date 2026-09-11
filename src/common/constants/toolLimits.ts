@@ -46,11 +46,11 @@ export const MCP_TOOL_RESULT_MAX_TOTAL_BYTES = 256 * 1024;
 // so it must not grow with a server-controlled `mimeType`.
 export const MCP_MEDIA_TYPE_MAX_BYTES = 255;
 
-// Restoring a third-party tool payload judges each optional "" the schema may
-// still need with one validator verdict, each linear in the payload. Beyond
-// this many such placeholders in one payload, they are all kept instead: a
-// valid payload stays valid, and a server-authored schema cannot make one tool
-// call block the main process for seconds.
+// Restoring a third-party tool payload judges each optional placeholder the
+// schema may still need with at most two validator verdicts, each linear in
+// the payload. Beyond this many such placeholders in one payload, they are all
+// kept instead: a valid payload stays valid, and a server-authored schema
+// cannot make one tool call block the main process for seconds.
 export const OPTIONAL_PLACEHOLDER_MAX_JUDGED = 256;
 
 // MCP prompt expansions are server-controlled; bound them like web_fetch output.

@@ -1,14 +1,29 @@
 import { OPTIONAL_PLACEHOLDER_MAX_JUDGED } from "@/common/constants/toolLimits";
 import {
   JSON_SCHEMA_SUBSET_MAX_DEPTH,
+  compileJsonSchemaPattern,
   compileJsonSchemaSubset,
-  matchesJsonSchemaPattern,
+  getJsonSchemaDialect,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
+  type Dialect,
 } from "@/common/utils/jsonSchemaSubset";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** `fn` computed once per distinct argument, for as long as the result lives. */
+function memoize<K, V>(fn: (key: K) => V): (key: K) => V {
+  const results = new Map<K, V>();
+  return (key) => {
+    let result = results.get(key);
+    if (result === undefined) {
+      result = fn(key);
+      results.set(key, result);
+    }
+    return result;
+  };
 }
 
 function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
@@ -89,13 +104,23 @@ function getDictionarySchemas(schema: Record<string, unknown>): unknown[] {
   ];
 }
 
+/**
+ * The keywords a dialect spells a tuple with: the positional schemas, then the
+ * schema of every item past them. A schema is read in its own dialect, as its
+ * validator reads it, so the other spelling is an extension it ignores: a
+ * `prefixItems` in a draft-07 schema governs nothing.
+ */
+function getTupleKeywords(dialect: Dialect): { positional: string; rest: string } {
+  return dialect === "2020-12"
+    ? { positional: "prefixItems", rest: "items" }
+    : { positional: "items", rest: "additionalItems" };
+}
+
 /** Sub-schemas that govern array items, whichever index each applies to. */
-function getItemSchemas(schema: Record<string, unknown>): unknown[] {
-  return [
-    ...(Array.isArray(schema.prefixItems) ? (schema.prefixItems as unknown[]) : []),
-    ...(Array.isArray(schema.items) ? (schema.items as unknown[]) : [schema.items]),
-    schema.additionalItems,
-  ];
+function getItemSchemas(schema: Record<string, unknown>, dialect: Dialect): unknown[] {
+  const { positional, rest } = getTupleKeywords(dialect);
+  const tuple = schema[positional];
+  return Array.isArray(tuple) ? [...(tuple as unknown[]), schema[rest]] : [schema.items];
 }
 
 /**
@@ -103,27 +128,36 @@ function getItemSchemas(schema: Record<string, unknown>): unknown[] {
  * declares it. This walks the structure stripOmissionPlaceholders walks, so
  * every placeholder the model contract invites is one `restore` removes.
  */
-function widenSchemaNode(schema: unknown, inheritedRequired = new Set<string>()): void {
+function widenSchemaNode(
+  schema: unknown,
+  dialect: Dialect,
+  inheritedRequired = new Set<string>()
+): void {
   if (!isRecord(schema)) {
     return;
   }
 
   const required = new Set([...inheritedRequired, ...getRequiredProperties(schema)]);
   if (isRecord(schema.properties)) {
+    // A matching `patternProperties` entry governs the name too. It is not
+    // widened: it is a dictionary's contract, and the dictionary's entries
+    // are data. The named declaration is, so a provider that drops or ignores
+    // patterns still sees the invitation, and `restore` removes a null the
+    // pattern rejects.
     for (const [propertyName, propertySchema] of Object.entries(schema.properties)) {
       const modelSchema =
         !required.has(propertyName) && rejectsNull(propertySchema)
           ? makeNullableSchema(propertySchema)
           : propertySchema;
       schema.properties[propertyName] = modelSchema;
-      widenSchemaNode(modelSchema);
+      widenSchemaNode(modelSchema, dialect);
     }
   }
-  for (const subSchema of [...getDictionarySchemas(schema), ...getItemSchemas(schema)]) {
-    widenSchemaNode(subSchema);
+  for (const subSchema of [...getDictionarySchemas(schema), ...getItemSchemas(schema, dialect)]) {
+    widenSchemaNode(subSchema, dialect);
   }
   for (const subSchema of [...getAllOfBranches(schema), ...getConditionalSubSchemas(schema)]) {
-    widenSchemaNode(subSchema, required);
+    widenSchemaNode(subSchema, dialect, required);
   }
 }
 
@@ -171,7 +205,7 @@ export function createOptionalNullSchemaContract(
  */
 export function widenOptionalPropertiesToNullable(schema: unknown): unknown {
   const modelSchema = structuredClone(schema);
-  widenSchemaNode(modelSchema);
+  widenSchemaNode(modelSchema, getJsonSchemaDialect(schema));
   return modelSchema;
 }
 
@@ -209,6 +243,18 @@ interface Declaration {
 /** Placeholder sites by the object that holds them, then by property name. */
 type PlaceholderSites = Map<Record<string, unknown>, Map<string, PlaceholderSite>>;
 
+/** What one walk over a payload carries along. */
+interface SiteWalk {
+  dialect: Dialect;
+  /**
+   * Whether a key matches a pattern of the schema. Every key of a dictionary
+   * meets every pattern, so each pattern is compiled at most once per payload,
+   * whatever the shared pattern cache holds.
+   */
+  matches: (pattern: string, key: string) => boolean;
+  sites: PlaceholderSites;
+}
+
 function getStaticRequired(schema: unknown): Set<string> {
   return isRecord(schema) ? getRequiredProperties(schema) : new Set<string>();
 }
@@ -218,14 +264,18 @@ function getStaticRequired(schema: unknown): Set<string> {
  * defines them: `properties[name]` and every matching `patternProperties`
  * entry, or else `additionalProperties`.
  */
-function getPropertySchemas(schema: Record<string, unknown>, name: string): unknown[] {
+function getPropertySchemas(
+  schema: Record<string, unknown>,
+  name: string,
+  matches: SiteWalk["matches"]
+): unknown[] {
   const governing: unknown[] = [];
   if (isRecord(schema.properties) && Object.hasOwn(schema.properties, name)) {
     governing.push(schema.properties[name]);
   }
   if (isRecord(schema.patternProperties)) {
     for (const [pattern, patternSchema] of Object.entries(schema.patternProperties)) {
-      if (matchesJsonSchemaPattern(pattern, name)) {
+      if (matches(pattern, name)) {
         governing.push(patternSchema);
       }
     }
@@ -234,38 +284,47 @@ function getPropertySchemas(schema: Record<string, unknown>, name: string): unkn
 }
 
 /**
- * The sub-schema of `schema` that governs the array item at `index`. A tuple
- * is `prefixItems` then `items` (2020-12) or `items` then `additionalItems`
- * (draft-07); otherwise `items` governs every item.
+ * The sub-schema of `schema` that governs the array item at `index`: the
+ * tuple's positional schema, the schema of the items past it, or `items` when
+ * there is no tuple (see getTupleKeywords).
  */
-function getItemSchema(schema: Record<string, unknown>, index: number): unknown {
-  const tuple = Array.isArray(schema.prefixItems)
-    ? schema.prefixItems
-    : Array.isArray(schema.items)
-      ? schema.items
-      : null;
-  if (tuple == null) {
-    return schema.items;
+function getItemSchema(schema: Record<string, unknown>, index: number, dialect: Dialect): unknown {
+  const { positional, rest } = getTupleKeywords(dialect);
+  const tuple = schema[positional];
+  if (Array.isArray(tuple)) {
+    return index < tuple.length ? (tuple as unknown[])[index] : schema[rest];
   }
-  if (index < tuple.length) {
-    return tuple[index];
-  }
-  return Array.isArray(schema.items) ? schema.additionalItems : schema.items;
+  return schema.items;
+}
+
+/**
+ * Set an own property, as JSON.parse does. `parent[name] = value` on a name
+ * like `__proto__` reaches the prototype's accessor once the own property is
+ * deleted, and the key never returns to the payload.
+ */
+function setOwnProperty(parent: Record<string, unknown>, name: string, value: unknown): void {
+  Object.defineProperty(parent, name, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }
 
 /**
  * Walk the schema and payload together and record every property the schema
  * declares by name whose value is `null` or `""`, with each declaration: allOf,
  * anyOf/oneOf branches, then/else, and dependent schemas all apply to the same
- * instance, so one property can have several. A declaration reached through a
- * union branch, then/else, or a dependent schema is conditional. Properties a
- * dictionary holds (`additionalProperties`, `patternProperties`) are data, not
- * declared optional properties, so they are walked but are not sites
- * themselves. `required` is what this level requires unconditionally (the
- * node's own list and its allOf's); those properties are never placeholders. A
- * branch's own `required` is conditional, so the root verdict judges it
- * instead. The walk is bounded like the validator's, so a schema too deep to
- * judge is also too deep to restore.
+ * instance, so one property can have several, and a matching
+ * `patternProperties` entry governs the name alongside `properties[name]`. A
+ * declaration reached through a union branch, then/else, or a dependent schema
+ * is conditional. Properties a dictionary holds (`additionalProperties`,
+ * `patternProperties`) are data, not declared optional properties, so they are
+ * walked but are not sites themselves. `required` is what this level requires
+ * unconditionally (the node's own list and its allOf's); those properties are
+ * never placeholders. A branch's own `required` is conditional, so the root
+ * verdict judges it instead. The walk is bounded like the validator's, so a
+ * schema too deep to judge is also too deep to restore.
  */
 function collectPlaceholderSites(
   schema: unknown,
@@ -273,59 +332,62 @@ function collectPlaceholderSites(
   required: ReadonlySet<string>,
   conditional: boolean,
   depth: number,
-  sites: PlaceholderSites
+  walk: SiteWalk
 ): void {
   if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH || !isRecord(schema)) {
     return;
   }
   if (Array.isArray(value)) {
     value.forEach((item, index) => {
-      const itemSchema = getItemSchema(schema, index);
+      const itemSchema = getItemSchema(schema, index, walk.dialect);
       collectPlaceholderSites(
         itemSchema,
         item,
         getStaticRequired(itemSchema),
         conditional,
         depth + 1,
-        sites
+        walk
       );
     });
   } else if (isRecord(value)) {
     for (const [name, propertyValue] of Object.entries(value)) {
+      const governing = getPropertySchemas(schema, name, walk.matches);
       if (
         isRecord(schema.properties) &&
         Object.hasOwn(schema.properties, name) &&
         !required.has(name) &&
         (propertyValue === null || propertyValue === "")
       ) {
-        const siblings = sites.get(value) ?? new Map<string, PlaceholderSite>();
+        const siblings = walk.sites.get(value) ?? new Map<string, PlaceholderSite>();
         const site = siblings.get(name) ?? {
           parent: value,
           name,
           value: propertyValue,
           declarations: [],
         };
-        site.declarations.push({ schema: schema.properties[name], conditional });
+        for (const declaration of governing) {
+          site.declarations.push({ schema: declaration, conditional });
+        }
         siblings.set(name, site);
-        sites.set(value, siblings);
+        walk.sites.set(value, siblings);
       }
-      for (const propertySchema of getPropertySchemas(schema, name)) {
+      for (const propertySchema of governing) {
         collectPlaceholderSites(
           propertySchema,
           propertyValue,
           getStaticRequired(propertySchema),
           conditional,
           depth + 1,
-          sites
+          walk
         );
       }
     }
   }
   for (const subSchema of getAllOfBranches(schema)) {
-    collectPlaceholderSites(subSchema, value, required, conditional, depth + 1, sites);
+    collectPlaceholderSites(subSchema, value, required, conditional, depth + 1, walk);
   }
   for (const subSchema of getConditionalSubSchemas(schema)) {
-    collectPlaceholderSites(subSchema, value, required, true, depth + 1, sites);
+    collectPlaceholderSites(subSchema, value, required, true, depth + 1, walk);
   }
 }
 
@@ -360,13 +422,17 @@ function compileAcceptance(schema: unknown): (value: unknown) => boolean {
  * omission, and when the root accepts that, it is the answer, with any
  * remaining `null` standing where the schema accepts it. Otherwise the
  * remaining `null`s go too, and if that is not accepted either, each
- * placeholder is judged alone: a `null` stays while the payload is accepted, a
- * deletion that would turn an accepted payload into a rejected one is undone.
- * Cost: the root is compiled once, then at most one verdict per judged
- * placeholder plus three, each linear in the payload; past
- * OPTIONAL_PLACEHOLDER_MAX_JUDGED they are kept, which never invalidates a
- * valid payload. A root the validator cannot judge accepts nothing, so only
- * the static `required` lists protect a `""` there.
+ * placeholder is judged alone, from a reading the root accepts: the model's
+ * payload, or else the omitted reading with its placeholders returned one at a
+ * time, in payload order, until the root accepts (a union whose branches
+ * disagree about several placeholders at once needs this). From there a `""`
+ * goes and a `null` stands while the root keeps accepting; a change it rejects
+ * is undone. When the root accepts no reading, the omitted one stands. Cost:
+ * the root is compiled once, then at most two verdicts per judged placeholder
+ * plus three, each linear in the payload; past OPTIONAL_PLACEHOLDER_MAX_JUDGED
+ * they are kept, which never invalidates a valid payload. A root the validator
+ * cannot judge accepts nothing, so only the static `required` lists protect a
+ * `""` there.
  */
 export function stripOmissionPlaceholders(
   schema: unknown,
@@ -374,18 +440,28 @@ export function stripOmissionPlaceholders(
   options: OmissionPlaceholderOptions
 ): unknown {
   const restored: unknown = structuredClone(value);
-  const sites: PlaceholderSites = new Map();
-  collectPlaceholderSites(schema, restored, getStaticRequired(schema), false, 0, sites);
+  const compilePatternOnce = memoize(compileJsonSchemaPattern);
+  const walk: SiteWalk = {
+    dialect: getJsonSchemaDialect(schema),
+    matches: (pattern, key) => compilePatternOnce(pattern)(key),
+    sites: new Map(),
+  };
+  collectPlaceholderSites(schema, restored, getStaticRequired(schema), false, 0, walk);
+  // Every item of an array and every entry of a dictionary repeats the same
+  // declaration, and each verdict walks and serializes its schema.
+  const rejectsNullOnce = memoize(rejectsNull);
   const emptyStrings: PlaceholderSite[] = [];
   const nulls: PlaceholderSite[] = [];
-  for (const site of [...sites.values()].flatMap((siblings) => [...siblings.values()])) {
+  for (const site of [...walk.sites.values()].flatMap((siblings) => [...siblings.values()])) {
     if (site.value === "") {
       if (options.emptyStringIsOmission) {
         emptyStrings.push(site);
       }
       continue;
     }
-    const rejecting = site.declarations.filter((declaration) => rejectsNull(declaration.schema));
+    const rejecting = site.declarations.filter((declaration) =>
+      rejectsNullOnce(declaration.schema)
+    );
     if (rejecting.some((declaration) => !declaration.conditional)) {
       delete site.parent[site.name];
     } else if (rejecting.length > 0) {
@@ -397,37 +473,53 @@ export function stripOmissionPlaceholders(
     return restored;
   }
   const accepts = compileAcceptance(schema);
-  for (const site of emptyStrings) {
-    delete site.parent[site.name];
-  }
+  const omit = (sites: PlaceholderSite[]) => {
+    for (const site of sites) {
+      delete site.parent[site.name];
+    }
+  };
+  const keep = (sites: PlaceholderSite[]) => {
+    for (const site of sites) {
+      setOwnProperty(site.parent, site.name, site.value);
+    }
+  };
+  omit(emptyStrings);
   if (accepts(restored)) {
     return restored;
   }
   if (nulls.length > 0) {
-    for (const site of nulls) {
-      delete site.parent[site.name];
-    }
+    omit(nulls);
     if (accepts(restored)) {
       return restored;
     }
   }
-  for (const site of judged) {
-    site.parent[site.name] = site.value;
-  }
+  keep(judged);
   if (judged.length > OPTIONAL_PLACEHOLDER_MAX_JUDGED) {
     return restored;
   }
   let accepted = accepts(restored);
+  if (!accepted) {
+    omit(judged);
+    for (const site of judged) {
+      keep([site]);
+      accepted = accepts(restored);
+      if (accepted) {
+        break;
+      }
+    }
+  }
+  if (!accepted) {
+    omit(judged);
+    return restored;
+  }
   for (const site of judged) {
-    if (site.value === null && accepted) {
+    const stands = site.value === null;
+    if (Object.hasOwn(site.parent, site.name) === stands) {
       continue;
     }
-    delete site.parent[site.name];
-    const stillAccepted = accepts(restored);
-    if (accepted && !stillAccepted) {
-      site.parent[site.name] = site.value;
-    } else {
-      accepted = stillAccepted;
+    (stands ? keep : omit)([site]);
+    if (!accepts(restored)) {
+      (stands ? omit : keep)([site]);
     }
   }
   return restored;

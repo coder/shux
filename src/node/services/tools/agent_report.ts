@@ -7,8 +7,8 @@ import {
   type JsonSchemaValidationError,
 } from "@/common/utils/jsonSchemaSubset";
 import {
-  createOptionalNullSchemaContract,
-  type OptionalNullSchemaContract,
+  stripOmissionPlaceholders,
+  widenOptionalPropertiesToNullable,
 } from "@/common/utils/tools/optionalNullSchema";
 import { WORKFLOW_REPORT_OMISSION_PLACEHOLDERS } from "@/common/constants/workflowReports";
 import { sanitizeWorkflowAgentReportSchemaForOpenAI } from "@/common/utils/tools/schemaSanitizer";
@@ -61,12 +61,14 @@ function zodValidationFailure(
 
 /**
  * A workflow output schema is the host contract (Ajv validation, persistence).
- * The model sees the optional-null contract's widened schema; its `restore`
- * returns the payload to the host contract before validation.
+ * The model sees it in OpenAI's dialect with its optional properties widened
+ * to nullable; `restore` returns a payload to the host contract before
+ * validation.
  */
 interface WorkflowOutputContract {
   outputSchema: Record<string, unknown>;
-  contract: OptionalNullSchemaContract;
+  modelSchema: JSONSchema7;
+  restore: (value: unknown) => unknown;
 }
 
 function getWorkflowOutputContract(config: ToolConfiguration): WorkflowOutputContract | undefined {
@@ -81,7 +83,14 @@ function getWorkflowOutputContract(config: ToolConfiguration): WorkflowOutputCon
     const hostSchema = outputSchema as Record<string, unknown>;
     return {
       outputSchema: hostSchema,
-      contract: createOptionalNullSchemaContract(hostSchema, WORKFLOW_REPORT_OMISSION_PLACEHOLDERS),
+      // The sanitizer merges a property's `allOf` declarations into one
+      // keyword by keyword, so it runs before widening wraps each of them in
+      // `anyOf`, where the last wrapper would replace the others.
+      modelSchema: widenOptionalPropertiesToNullable(
+        sanitizeWorkflowAgentReportSchemaForOpenAI(hostSchema)
+      ) as JSONSchema7,
+      restore: (value) =>
+        stripOmissionPlaceholders(hostSchema, value, WORKFLOW_REPORT_OMISSION_PLACEHOLDERS),
     };
   }
   if (config.allowLegacyInvalidWorkflowAgentOutputSchema === true) {
@@ -101,14 +110,9 @@ function validateStructuredOutput(
 }
 
 function buildInlineInputSchema(workflow: WorkflowOutputContract) {
-  // Expose an OpenAI-compatible schema to providers while keeping the richer
-  // Ajv schema for host-side validation in executeInlineReport.
-  const providerFacingSchema = sanitizeWorkflowAgentReportSchemaForOpenAI(
-    workflow.contract.modelSchema
-  ) as JSONSchema7;
-  return jsonSchema(providerFacingSchema, {
+  return jsonSchema(workflow.modelSchema, {
     validate: (value) => {
-      const restoredValue = workflow.contract.restore(value);
+      const restoredValue = workflow.restore(value);
       const validation = validateStructuredOutput(workflow.outputSchema, restoredValue);
       if (validation) {
         return { success: false, error: new Error(validation.message) };
@@ -125,7 +129,7 @@ function parseProgressReport(
   if (workflow != null) {
     // The AI SDK already restored SDK-parsed input; restoring again is idempotent
     // and covers direct execute callers.
-    const restoredArgs = workflow.contract.restore(rawArgs);
+    const restoredArgs = workflow.restore(rawArgs);
     const structuredValidation = validateStructuredOutput(workflow.outputSchema, restoredArgs);
     if (structuredValidation) {
       return { failure: structuredValidation };
