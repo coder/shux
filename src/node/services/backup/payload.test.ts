@@ -558,6 +558,67 @@ describe("backup payload", () => {
     );
   });
 
+  it("restores a backup that redacted header values one by one with headers deselected", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { api: { url: "https://example.com/mcp" } } })
+    );
+    const destination = path.join(tempDir, "per-header");
+    await writeBackupPayload(
+      destination,
+      await createBackupPayload({
+        muxRoot,
+        contents: CONTENTS,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+      })
+    );
+    // The preceding format: each literal header value is its own marker and listed path.
+    await tamperPayloadFile(
+      destination,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          api: {
+            url: "https://example.com/mcp",
+            headers: { Authorization: REDACTED_BACKUP_VALUE },
+          },
+        },
+      })
+    );
+    const manifestPath = path.join(destination, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as BackupManifest;
+    await fs.writeFile(
+      manifestPath,
+      JSON.stringify({
+        ...manifest,
+        mcpRedactions: [["servers", "api", "headers", "Authorization"]],
+      })
+    );
+
+    const contents = resolveBackupContents({ includeMcpHeaders: false });
+    const payload = await readBackupPayload(destination, { contents });
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "api", "headers"]]);
+
+    const restoreRoot = path.join(tempDir, "per-header-restore");
+    await writeFixtureFile(
+      restoreRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          api: { url: "https://example.com/mcp", headers: { Authorization: "Bearer local" } },
+        },
+      })
+    );
+    await restoreBackupPayload({ muxRoot: restoreRoot, contents, payload });
+    expect(jsonc.parse(await fs.readFile(path.join(restoreRoot, "mcp.jsonc"), "utf-8"))).toEqual({
+      servers: {
+        api: { url: "https://example.com/mcp", headers: { Authorization: "Bearer local" } },
+      },
+    });
+  });
+
   it("keeps a large backup restorable when deselecting a category adds many markers", async () => {
     const servers = Object.fromEntries(
       Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [

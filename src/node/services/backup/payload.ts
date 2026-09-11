@@ -2003,9 +2003,18 @@ export function selectBackupContents(
       );
     const redacted = redactMcpConfig(mcpFile.content, projection);
     files[files.indexOf(mcpFile)] = { ...mcpFile, content: redacted.content };
+    // A listed path under a value this pass replaced whole (a backup written when header
+    // values were redacted one by one, restored with headers deselected) no longer names a
+    // marker, and the restore rejects paths it cannot find.
+    const projected = parseJsoncObjectWithTree(
+      redacted.content.toString("utf-8"),
+      "backup mcp.jsonc"
+    ).parsed;
     const merged = new Map<string, BackupRedactionPath>();
     for (const jsonPath of [...listed, ...redacted.redactionPaths]) {
-      merged.set(redactionPathKey(jsonPath), jsonPath);
+      if (valueHasRedactionAtPath(projected, jsonPath)) {
+        merged.set(redactionPathKey(jsonPath), jsonPath);
+      }
     }
     manifest.mcpRedactions = [...merged.values()];
     redactions = manifest.mcpRedactions.map(redactionPathLabel);
