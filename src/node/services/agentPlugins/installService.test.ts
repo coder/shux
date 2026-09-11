@@ -1094,7 +1094,44 @@ describe("AgentPluginInstallService", () => {
         })
       ).success
     ).toBe(false);
-    expect((await service.getComponents({ name: "demo-plugin" })).skills).toEqual([]);
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    expect(inventory.skills).toEqual([]);
+    expect(inventory.importedComponents).toEqual({ skills: ["greet"], mcpServers: [] });
+    const request = {
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: inventory.importedComponents ?? null,
+    };
+    // Update preservation does not authorize importing an unavailable name on a later explicit save.
+    expect(
+      (
+        await service.setComponentsResult({
+          ...request,
+          importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+        })
+      ).success
+    ).toBe(false);
+    expect((await service.getComponents({ name: request.name })).importedComponents).toEqual(
+      inventory.importedComponents
+    );
+    const selection = { skills: [], mcpServers: ["echo"] };
+    expect(
+      await service.setComponentsResult({ ...request, importedComponents: selection })
+    ).toMatchObject({
+      success: true,
+      data: { importedComponents: selection },
+    });
+    await writePluginFixture(remoteDir, { version: "3.0.0" });
+    await commitAll(remoteDir, "restore the removed skill");
+    const restored = await service.previewUpdate({ name: request.name });
+    await service.update({
+      name: request.name,
+      consent: { fromSha: restored.fromSha, toSha: restored.toSha },
+    });
+    const after = await service.getComponents({ name: request.name });
+    expect(after.skills.map((skill) => skill.name)).toEqual(["greet"]);
+    expect(after.importedComponents).toEqual(selection);
   });
 
   test("unchanged legacy selection remains import-all; changing it becomes explicit", async () => {

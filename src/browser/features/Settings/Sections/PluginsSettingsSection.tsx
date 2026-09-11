@@ -161,6 +161,7 @@ const ComponentChooser: React.FC<{
 );
 
 function effectiveImports(inventory: AgentPluginComponents): AgentPluginImportedComponents {
+  // Manage saves replace the selection; carrying unavailable names would defeat Clear/empty consent.
   return {
     skills: inventory.skills
       .map((skill) => skill.name)
