@@ -8,6 +8,7 @@ import type {
   WorkspaceInitResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
+  WorkspaceMaterializeParams,
 } from "./Runtime";
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
@@ -109,7 +110,7 @@ export class WorktreeRuntime extends LocalBaseRuntime {
   }
 
   async materializeWorkspace(
-    params: WorkspaceInitParams,
+    params: WorkspaceMaterializeParams,
     pending: PendingMaterialization
   ): Promise<void> {
     return this.worktreeManager.materializeWorkspace(
@@ -120,6 +121,7 @@ export class WorktreeRuntime extends LocalBaseRuntime {
         trunkBranch: params.trunkBranch,
         initLogger: params.initLogger,
         abortSignal: params.abortSignal,
+        checkoutAbortSignal: params.checkoutAbortSignal,
         env: params.env,
         trusted: params.trusted,
       },

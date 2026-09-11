@@ -184,7 +184,7 @@ describe("WorktreeManager.createWorkspace", () => {
       let checkoutStarted = false;
       const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
         (file, args, options) => {
-          if (file === "git" && args[2] === "checkout") {
+          if (file === "git" && args.includes("checkout") && !checkoutStarted) {
             checkoutStarted = true;
             expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
           }
@@ -548,6 +548,88 @@ describe("WorktreeManager.createWorkspace", () => {
           .toString()
           .trim()
       ).toBe(branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps the branch reserved while the checkout streams", async () => {
+    const branchName = "feature-reserved-while-streaming";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      // A smudge filter that waits to be released holds the checkout open mid-stream.
+      const started = path.join(fixture.rootDir, "smudge-started");
+      const release = path.join(fixture.rootDir, "smudge-release");
+      const shim = path.join(fixture.rootDir, "gated-smudge.sh");
+      await fsPromises.writeFile(
+        shim,
+        `#!/bin/sh\n: > "${started}"\nwhile [ ! -e "${release}" ]; do sleep 0.05; done\ncat\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(shim, 0o755);
+      await fsPromises.writeFile(
+        path.join(fixture.projectPath, ".gitattributes"),
+        "README.md filter=gate\n"
+      );
+      execFileSync("git", ["add", ".gitattributes"], { cwd: fixture.projectPath, stdio: "ignore" });
+      execFileSync("git", ["commit", "-qm", "gate the checkout"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "filter.gate.smudge", shim], { cwd: fixture.projectPath });
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const materialize = fixture.manager.materializeWorkspace(
+        {
+          projectPath: fixture.projectPath,
+          workspacePath: result.workspacePath,
+          branchName,
+          trunkBranch: "main",
+          trusted: true,
+          initLogger: fixture.initLogger,
+        },
+        result.pendingMaterialization!
+      );
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !existsSync(started)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(existsSync(started)).toBe(true);
+      // The files are still landing: another worktree must not be able to claim the branch.
+      const rival = path.join(fixture.rootDir, "rival");
+      let rivalError: unknown;
+      try {
+        execFileSync("git", ["worktree", "add", "--no-checkout", rival, branchName], {
+          cwd: fixture.projectPath,
+          stdio: "pipe",
+        });
+      } catch (error) {
+        rivalError = error;
+      }
+      await fsPromises.writeFile(release, "");
+      expect(rivalError).toBeInstanceOf(Error);
+      expect((rivalError as Error).message).toMatch(/already (checked out|used by worktree)/);
+
+      await materialize;
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: result.workspacePath })
+          .toString()
+          .trim()
+      ).toBe(branchName);
+      expect(await fsPromises.readFile(path.join(result.workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
     } finally {
       await fixture.cleanup();
     }

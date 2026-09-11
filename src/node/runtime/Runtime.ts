@@ -219,6 +219,15 @@ export interface PendingMaterialization {
   fastForwardFromOrigin: boolean;
 }
 
+/** Init params for materializeWorkspace(), plus how far a cancellation may reach. */
+export interface WorkspaceMaterializeParams extends WorkspaceInitParams {
+  /**
+   * When given, the only signal the file checkout honours; abortSignal still cancels every
+   * later phase, so an owner that keeps a cancelled checkout gets whole files.
+   */
+  checkoutAbortSignal?: AbortSignal;
+}
+
 /**
  * Result from workspace creation
  */
@@ -558,7 +567,7 @@ export interface Runtime {
    * Streams progress via initLogger; throws on failure and leaves the checkout registered.
    */
   materializeWorkspace?(
-    params: WorkspaceInitParams,
+    params: WorkspaceMaterializeParams,
     pending: PendingMaterialization
   ): Promise<void>;
 

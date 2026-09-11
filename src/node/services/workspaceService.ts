@@ -3118,20 +3118,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       runtime.materializeWorkspace !== undefined,
       "materializeDeferredCheckout: runtime cannot materialize"
     );
-    // Only removal may interrupt the checkout itself: archive aborts init too but keeps
+    // Only removal may interrupt the file checkout itself: archive aborts init too but keeps
     // the checkout registered and never reruns it, so parking a half-populated worktree
-    // would strand it. Archive awaits this settlement, so it parks a complete checkout;
-    // the hook phase below still honours its abort.
-    const materializeAbort = new AbortController();
+    // would strand it. Archive awaits this settlement, so it parks complete files; every
+    // phase after them (hooks, .xumignore, fast-forward, submodules) honours its abort.
+    const checkoutAbort = new AbortController();
     const forwardRemovalAbort = () => {
-      if (this.removingWorkspaces.has(workspaceId)) materializeAbort.abort();
+      if (this.removingWorkspaces.has(workspaceId)) checkoutAbort.abort();
     };
     args.initAbortController.signal.addEventListener("abort", forwardRemovalAbort);
     let materializeError: unknown;
     try {
       forwardRemovalAbort();
       await runtime.materializeWorkspace(
-        { ...initParams, abortSignal: materializeAbort.signal },
+        { ...initParams, checkoutAbortSignal: checkoutAbort.signal },
         args.pending
       );
     } catch (error) {

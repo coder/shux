@@ -267,6 +267,9 @@ export class WorktreeManager {
    * Populate a worktree reserved by createWorkspace: streamed checkout, .xumignore sync,
    * optional fast-forward, submodules. Throws on failure without touching the worktree; a
    * deferred checkout is already registered, so its owner decides what happens to it.
+   * abortSignal cancels every phase; when checkoutAbortSignal is given it is the only signal
+   * the file checkout honours, so an owner that keeps a cancelled worktree gets complete files
+   * while everything after them still stops.
    */
   async materializeWorkspace(
     params: {
@@ -276,6 +279,7 @@ export class WorktreeManager {
       trunkBranch: string;
       initLogger: InitLogger;
       abortSignal?: AbortSignal;
+      checkoutAbortSignal?: AbortSignal;
       env?: Record<string, string>;
       trusted?: boolean;
     },
@@ -289,15 +293,6 @@ export class WorktreeManager {
     );
 
     initLogger.logStep("Checking out files...");
-    // Point HEAD at an unborn ref only now, so the checkout reports the same post-checkout hook
-    // arguments as a plain `git worktree add` (null old commit, new-worktree flag) while the
-    // worktree kept the branch reserved against other checkouts until this moment.
-    using unbornProc = execFileAsync(
-      "git",
-      ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
-      noHooksEnv
-    );
-    await unbornProc.result;
     // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
     // held until the exit status is known so a failure is reported as error output once,
     // rather than streamed as output and then repeated as the error.
@@ -306,32 +301,66 @@ export class WorktreeManager {
       (stage, percent) => initLogger.logProgress?.(stage, percent),
       (line) => output.push(line)
     );
+    const stdout: string[] = [];
+    const checkoutOptions = {
+      ...noHooksEnv,
+      onStderrData: (chunk: string) => progress.push(chunk),
+      // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
+      killTreeOnTermination: true,
+    };
     try {
+      // Populate the files while HEAD still holds the branch, so no other worktree can claim it
+      // for as long as the checkout streams. Hooks stay off here: the switch below reruns the
+      // checkout for them.
       // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
       // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
       // No --force: a deferred checkout runs in an announced workspace, so anything written
       // there meanwhile (a terminal, an editor) must fail the checkout, not be overwritten.
-      using checkoutProc = execFileAsync(
+      using populateProc = execFileAsync(
         "git",
-        ["-C", workspacePath, "checkout", "--progress", "--no-recurse-submodules", branchName],
+        [
+          "-C",
+          workspacePath,
+          "-c",
+          "core.hooksPath=/dev/null",
+          "checkout",
+          "--quiet",
+          "--progress",
+          "--no-recurse-submodules",
+          branchName,
+        ],
         {
-          ...noHooksEnv,
+          ...checkoutOptions,
+          signal: params.checkoutAbortSignal ?? params.abortSignal,
           // git delays progress output by 2s, which hides it for most checkouts.
           env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
-          onStderrData: (chunk) => progress.push(chunk),
-          // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
-          killTreeOnTermination: true,
         }
       );
-      const { stdout } = await checkoutProc.result;
+      stdout.push((await populateProc.result).stdout);
+      // The files are in place; switch onto the branch from an unborn ref so trusted
+      // post-checkout hooks receive the same arguments as a plain `git worktree add` (null old
+      // commit, new-worktree flag). Nothing is written, so the branch is unclaimed only for the
+      // instant between these two commands.
+      using unbornProc = execFileAsync(
+        "git",
+        ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
+        noHooksEnv
+      );
+      await unbornProc.result;
+      using switchProc = execFileAsync(
+        "git",
+        ["-C", workspacePath, "checkout", "--no-recurse-submodules", branchName],
+        checkoutOptions
+      );
+      stdout.push((await switchProc.result).stdout);
       progress.flush();
-      for (const line of [...output, ...stdout.split(/[\r\n]/)]) {
+      for (const line of [...output, ...stdout.flatMap((text) => text.split(/[\r\n]/))]) {
         if (line) initLogger.logStdout(line);
       }
     } catch (error) {
       progress.flush();
-      // A retained (deferred) workspace must not be left on the placeholder ref with the empty
-      // pre-checkout index: a later commit would land on the placeholder or record every
+      // A retained (deferred) workspace must not be left on the placeholder ref or with the
+      // empty pre-checkout index: a later commit would land on the placeholder or record every
       // tracked file as deleted. Put HEAD back on the branch and rebuild the index from it,
       // leaving the working tree alone. Runs without the caller's signal because an aborted
       // checkout needs the restore most.

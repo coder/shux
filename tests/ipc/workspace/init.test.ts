@@ -552,6 +552,58 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "archiving once the files have landed stops the rest of materialization",
+    async () => {
+      // Only the file checkout may outlive an archive; what follows it (here a trusted
+      // post-checkout hook standing in for submodule or fast-forward work) must stop instead
+      // of holding the archive for as long as it runs.
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      const hookStarted = path.join(tempGitRepo, ".git", "post-checkout-started");
+      await fs.writeFile(
+        path.join(tempGitRepo, ".git", "hooks", "post-checkout"),
+        `#!/bin/sh\n: > "${hookStarted}"\nsleep 600\n`,
+        { mode: 0o755 }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-archive-after-checkout");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+        const workspaceId = createResult.metadata.id;
+        const workspacePath = createResult.metadata.namedWorkspacePath;
+
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(hookStarted);
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        const client = resolveOrpcClient(env);
+        const archiveResult = await client.workspace.archive({ workspaceId });
+        expect(archiveResult.success).toBe(true);
+
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
+        const { stdout: head } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
+        expect(head.trim()).toBe(`refs/heads/${branchName}`);
+        const { stdout: status } = await execAsync("git status --porcelain", {
+          cwd: workspacePath,
+        });
+        expect(status).toBe("");
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    20000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();
