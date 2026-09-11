@@ -236,16 +236,14 @@ export class MemoryMetaService {
      * downgraded build under its child key, so its pin/stats must too. A
      * missing target entry is copied; an existing one keeps the larger
      * counters/timestamps, and its pin either stands (`pinned: "target"`, a
-     * first adoption must not override the owner's own choice), follows the
+     * first adoption must not override the owner's own choice) or follows the
      * source (`pinned: "source"`, the child changed it since the last
-     * adoption) or is set (`pinned: "on"`, the copy is the descendants' and
-     * one of them pins it — see MemoryService.adoptLegacyPrivateStore).
-     * Idempotent.
+     * adoption — see MemoryService.adoptLegacyPrivateStore). Idempotent.
      */
     mergeKeys: (
       sourceLogicalKey: string,
       targetLogicalKey: string,
-      options: { pinned: "target" | "source" | "on" }
+      options: { pinned: "target" | "source" }
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
         for (const [key, source] of Object.entries(entries)) {
@@ -254,11 +252,9 @@ export class MemoryMetaService {
           const target = entries[targetKey];
           entries[targetKey] =
             target === undefined
-              ? { ...source, pinned: options.pinned === "on" || source.pinned }
+              ? { ...source }
               : {
-                  pinned:
-                    options.pinned === "on" ||
-                    (options.pinned === "source" ? source.pinned : target.pinned),
+                  pinned: options.pinned === "source" ? source.pinned : target.pinned,
                   accessCount: Math.max(target.accessCount, source.accessCount),
                   lastAccessedAt: maxTimestamp(target.lastAccessedAt, source.lastAccessedAt),
                   lastWriteAt: maxTimestamp(target.lastWriteAt, source.lastWriteAt),
@@ -442,7 +438,7 @@ export class MemoryMetaService {
   async mergeKeys(
     sourceLogicalKey: string,
     targetLogicalKey: string,
-    options: { pinned: "target" | "source" | "on" }
+    options: { pinned: "target" | "source" }
   ): Promise<void> {
     await Effect.runPromise(this.effects.mergeKeys(sourceLogicalKey, targetLogicalKey, options));
   }
