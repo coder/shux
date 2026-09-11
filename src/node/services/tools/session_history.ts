@@ -23,13 +23,7 @@ import {
 import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import { Config } from "@/node/config";
-import { HistoryService } from "@/node/services/historyService";
-import {
-  decodeHistoryCursor,
-  encodeHistoryCursor,
-  type HistoryScanState,
-} from "@/node/services/historyCursor";
+import type { HistoryScanState } from "@/node/services/historyCursor";
 
 export type SessionHistoryArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_history.resultSchema>;
@@ -178,7 +172,8 @@ function surrogateSafeOffset(text: string, offset: number): number {
 export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration) => {
   const workspaceId = config.workspaceId;
   assert(workspaceId && workspaceId.trim().length > 0, "session_history requires workspaceId");
-  const history = config.historyService ?? new HistoryService(new Config());
+  const history = config.historyService;
+  assert(history, "session_history requires a persistent HistoryService");
   const taskService = config.taskService;
   return tool({
     description: TOOL_DEFINITIONS.session_history.description,
@@ -294,7 +289,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           args.action === "search"
             ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
             : null;
-        const cursor = args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined;
+        const cursor = args.cursor != null ? history.cursors.load(args.cursor, binding) : undefined;
         // One page budget is shared by the authorization scan and the target scan.
         const budget = {
           maxBytes: SESSION_HISTORY_MAX_SCAN_BYTES,
@@ -332,7 +327,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               authorization = { ...authorization, scan: proofState(auth.state) };
               if (auth.cursor) {
                 result.exhausted = false;
-                result.nextCursor = encodeHistoryCursor({
+                result.nextCursor = history.cursors.save({
                   ...binding,
                   scan: cursor?.scan ?? null,
                   authorization,
@@ -346,7 +341,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               authorization = { branchRoot, scan: auth.cursor, proven: false };
               result.exhausted = false;
               // Keep any target progress made while the in-flight receipt still authorized.
-              result.nextCursor = encodeHistoryCursor({
+              result.nextCursor = history.cursors.save({
                 ...binding,
                 scan: cursor?.scan ?? null,
                 authorization,
@@ -370,7 +365,7 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             budget.maxRows <= 0
           ) {
             result.exhausted = false;
-            result.nextCursor = encodeHistoryCursor({
+            result.nextCursor = history.cursors.save({
               ...binding,
               scan: cursor?.scan ?? null,
               authorization,
@@ -471,25 +466,42 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
         result.exhausted = foundItem || scan.cursor == null;
         result.malformedLines = scan.malformedLines;
         if (scan.cursor && !foundItem)
-          result.nextCursor = encodeHistoryCursor({ ...binding, scan: scan.cursor, authorization });
+          result.nextCursor = history.cursors.save({
+            ...binding,
+            scan: scan.cursor,
+            authorization,
+          });
         if (args.action === "read_item" && !foundItem && !scan.cursor) {
           result.success = false;
           result.error = "item_not_found";
         }
-        assert(
-          Buffer.byteLength(JSON.stringify(result)) <= SESSION_HISTORY_MAX_RESULT_BYTES,
-          "session_history aggregate result exceeds budget"
-        );
         return result;
       };
       try {
-        return foreign ? await history.withHistoryScanLocks(workspaceId, run) : await run();
+        const response = foreign
+          ? await history.withHistoryScanLocks(workspaceId, run)
+          : await run();
+        if (response.success)
+          response.status = response.exhausted
+            ? "complete"
+            : response.items?.length || response.windows?.length
+              ? "partial"
+              : "scanning";
+        assert(
+          Buffer.byteLength(JSON.stringify(response)) <= SESSION_HISTORY_MAX_RESULT_BYTES,
+          "session_history aggregate result exceeds budget"
+        );
+        return response;
       } catch (error) {
         const message = error instanceof Error ? error.message : "history_unavailable";
         return {
           success: false,
           exhausted: false,
           skipped_oversized_rows: 0,
+          notice:
+            message === "invalid_cursor" || message === "stale_cursor"
+              ? "Restart the query without a cursor."
+              : undefined,
           error: ["stale_cursor", "invalid_cursor", "session_unavailable"].includes(message)
             ? message
             : "history_unavailable",

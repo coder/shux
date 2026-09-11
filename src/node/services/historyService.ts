@@ -1,3 +1,4 @@
+import { HistoryCursorStore } from "./historyCursor";
 import {
   HistoryAppendProvenance,
   HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
@@ -317,6 +318,8 @@ interface SubagentTranscriptDependencies {
 }
 
 export class HistoryService {
+  readonly cursors = new HistoryCursorStore();
+
   private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
     return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
   }
