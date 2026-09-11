@@ -1945,6 +1945,14 @@ describe("CompactionHandler", () => {
         createMuxMessage("a9", "assistant", "old-build turn with a corrupted bound", {
           requestHistorySequence: null as unknown as number,
         }),
+        // A stamped turn whose bound is outside the sequence domain covers
+        // nothing (the harvest gate applies the same rule, r79/r80): its
+        // user row stays unstamped, the row itself keeps its stamp.
+        createMuxMessage("u10", "user", "question behind a fractional bound"),
+        createMuxMessage("a10", "assistant", "fractional bound", {
+          requestHistorySequence: boundarySequence + 17.5,
+          workspaceMemoryPolicyEpoch: boundarySequence,
+        }),
         createStampedCompactionRequest("compact-req-2", boundarySequence + 1)
       );
       expect(await handler.handleCompletion(createStreamEndEvent("Summary 2"))).toBe(true);
@@ -1968,6 +1976,8 @@ describe("CompactionHandler", () => {
         undefined, // a7 (malformed stamp)
         boundarySequence, // a8 (no stamp, no bound: synthetic payload row)
         undefined, // a9 (no stamp, malformed bound: not a synthetic row)
+        undefined, // u10 (its turn's bound is fractional: never covered)
+        boundarySequence, // a10 (recorded stamp kept)
       ]);
     });
 

@@ -8,6 +8,7 @@ import * as path from "node:path";
 
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
+import { Err } from "@/common/types/result";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
 import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
@@ -2501,6 +2502,45 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const initialMetadata = initialMetadataFromStartStreamCall(startStreamCall);
     expect(initialMetadata.routeProvider).toBe("openrouter");
+  });
+
+  it("removes the assistant placeholder when stream startup fails", async () => {
+    using xumHome = new DisposableTempDir("ai-service-startup-failure-placeholder");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-startup-failure-placeholder";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const harness = createHarness(xumHome.path, metadata);
+    const internals = harness.service as unknown as {
+      historyService: HistoryService;
+      streamManager: StreamManager;
+    };
+    const deleted: string[] = [];
+    spyOn(internals.historyService, "deleteMessage").mockImplementation((_workspaceId, id) => {
+      deleted.push(id);
+      return Promise.resolve({ success: true, data: undefined });
+    });
+    spyOn(internals.streamManager, "startStream").mockResolvedValue(
+      Err({ type: "unknown", raw: "temp dir creation failed" })
+    );
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "medium",
+    });
+
+    expect(result.success).toBe(false);
+    // The placeholder carried the request bound and policy epoch stamp of a
+    // turn that never ran; left behind it would vouch for the user batch at
+    // the harvest gate (epochHarvestRefusal).
+    const appended = (internals.historyService.appendToHistory as ReturnType<typeof mock>).mock
+      .calls as unknown as Array<[string, { id: string; role: string }]>;
+    const placeholder = appended.find(([, message]) => message.role === "assistant")?.[1];
+    if (!placeholder) throw new Error("Expected an appended assistant placeholder");
+    expect(deleted).toEqual([placeholder.id]);
   });
 
   it("passes muxMetadata into initial stream metadata", async () => {

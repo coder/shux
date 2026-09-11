@@ -480,6 +480,16 @@ async function legacyStoreStamp(childSessionDir: string, legacyRoot: string): Pr
   return `${revision ?? "none"}:${rootMtime}:${fileStamps.join("\u0001")}`;
 }
 
+/**
+ * Minimum spacing of the owner-store file scan a workspaceMemoryRevision
+ * token carries (legacyStoreStamp over the shared notebook). The scan exists
+ * only for a DOWNGRADED build's in-place edits, which move no clock; this
+ * build's writers — local or another backend — advance the store clock,
+ * which every token reads fresh. Unthrottled, each cached-context probe (every
+ * turn) and every Memory tab interval would list and lstat the whole notebook.
+ */
+const OWNER_STORE_SCAN_INTERVAL_MS = 60_000;
+
 /** A stat failure that proves the path is absent (vs. one that says nothing about it). */
 function isMissingPathError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | null)?.code;
@@ -870,6 +880,12 @@ export class MemoryService extends EventEmitter {
    * state observed at the time (see adoptLegacyPrivateStore).
    */
   private readonly legacyStoreCheckedAgainst = new Map<string, string>();
+
+  /** Last owner-store file scan per owner (see ownerStoreStamp). */
+  private readonly ownerStoreStampMemo = new Map<
+    string,
+    { rootMtime: string; stamp: string; scannedAt: number }
+  >();
 
   /**
    * Owner of the workspace scope for this context ("" when there is no
@@ -1409,8 +1425,10 @@ export class MemoryService extends EventEmitter {
         }
         let target: { relPath: string; write: boolean; replaces?: boolean } | null = null;
         // A child's pin toggle folds into the copy only while the copy is
-        // this adoption's generation (see below); an owner-owned file keeps
-        // the owner's pin.
+        // this adoption's generation (see below) or the owner's identical
+        // note it was folded into at first adoption; a copy the owner
+        // replaced since keeps the owner's pin — recorded as `replaced`, so
+        // the next pass still knows (its `created` is gone either way).
         let foldChildPin = true;
         if (previous !== undefined) {
           // The recorded target is reused only while it still holds bytes
@@ -1461,7 +1479,9 @@ export class MemoryService extends EventEmitter {
               : previous.pending === true
                 ? currentStamp
                 : previous.targetStamp;
-            foldChildPin = previous.created !== true || ours;
+            const replaced = previous.replaced === true || (previous.created === true && !ours);
+            if (replaced) record.replaced = true;
+            foldChildPin = !replaced;
           } else if (
             previous.created === true &&
             priorContent !== null &&
@@ -2235,15 +2255,40 @@ export class MemoryService extends EventEmitter {
         .filter(([key]) => key.startsWith(ownerKeyPrefix))
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     );
-    const token = `${revision === null ? "missing" : String(revision)}\u0000${await legacyStoreStamp(
-      ownerSessionDir,
-      workspaceMemoryStorePath(this.config.sessionsDir, owner)
+    const token = `${revision === null ? "missing" : String(revision)}\u0000${await this.ownerStoreStamp(
+      owner,
+      ownerSessionDir
     )}\u0000${ownerSidecar}`;
     // A redirected sub-agent's token also tracks its legacy private notebook
     // (see legacyAdoptionCheckKey): its next store access adopts the change,
     // so the cached context must miss as soon as the legacy state moves.
     if (owner === workspaceId) return token;
     return `${token}\u0000${(await this.legacyAdoptionCheckKey(workspaceId, owner)).checkKey}`;
+  }
+
+  /**
+   * The token's downgrade-compatibility segment. The per-file scan reruns
+   * when the notebook root's mtime moved (one stat: a note created, deleted
+   * or renamed at the top level by any build) and otherwise at most once per
+   * OWNER_STORE_SCAN_INTERVAL_MS per owner, shared by every session and tab
+   * probing that store. Only a downgraded build's in-place edit of an
+   * existing note waits for the interval; this build's writes advance the
+   * clock segment.
+   */
+  private async ownerStoreStamp(owner: string, ownerSessionDir: string): Promise<string> {
+    const root = workspaceMemoryStorePath(this.config.sessionsDir, owner);
+    const rootMtime = await fsPromises
+      .stat(root)
+      .then((stat) => String(stat.mtimeMs))
+      .catch(() => "missing");
+    const memo = this.ownerStoreStampMemo.get(owner);
+    const now = Date.now();
+    if (memo?.rootMtime === rootMtime && now - memo.scannedAt < OWNER_STORE_SCAN_INTERVAL_MS) {
+      return memo.stamp;
+    }
+    const stamp = await legacyStoreStamp(ownerSessionDir, root);
+    this.ownerStoreStampMemo.set(owner, { rootMtime, stamp, scannedAt: now });
+    return stamp;
   }
 
   /** The store clock segment of a workspaceMemoryRevision token (tests, diagnostics). */

@@ -39,7 +39,7 @@ import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/type
 import { createMuxMessage } from "@/common/types/message";
 import {
   epochHasPriorTurnRows,
-  latestContextBoundaryHistorySequence,
+  workspaceMemoryPolicyEpochOf,
 } from "@/common/utils/messages/compactionBoundary";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -1534,11 +1534,13 @@ export class TurnRequestBuilder {
       return epochHasPriorTurnRows(activeContextMessages, currentBatch);
     })();
     // The compaction epoch this turn's policy accumulates over: the latest
-    // durable boundary's history sequence (any kind), -1 before any boundary
-    // — the same identity compaction completion reports as
-    // previousBoundaryHistorySequence, so the completion-side observation
-    // and every backend's turn records agree on which epoch a value belongs to.
-    const policyEpoch = latestContextBoundaryHistorySequence(messages) ?? -1;
+    // durable boundary's history sequence (any kind), else the history
+    // segment's boundary-less identity — never reused across full clears
+    // (see workspaceMemoryPolicyEpochOf) — the same identity compaction
+    // completion reports as closingPolicyEpoch, so the completion-side
+    // observation and every backend's turn records agree on which epoch a
+    // value belongs to.
+    const policyEpoch = workspaceMemoryPolicyEpochOf(messages);
     // A preserved-tail boundary (RLM keep-recent copies follow it) re-appends
     // rows produced under EARLIER epochs' policies: those accumulators are
     // part of this epoch. The compacting session re-binds the closing one to
@@ -1554,9 +1556,10 @@ export class TurnRequestBuilder {
     const tailCopies = activeContextMessages.filter(
       (message) => message.metadata?.rlmPreservedTailCopy === true
     );
-    // A usable source epoch is an integer in [-1, policyEpoch) — -1 before
-    // any boundary, else a boundary's history sequence (persisted history is
-    // unvalidated). A copy without one — persisted by a build
+    // A usable source epoch is an integer below policyEpoch — a segment's
+    // boundary-less identity (negative), else a boundary's history sequence,
+    // both earlier than this epoch's (persisted history is unvalidated). A
+    // copy without one — persisted by a build
     // before the field, a re-copy of such a copy, or a malformed value —
     // carries a policy nobody can look up: it is excluded from the prior-turn
     // check like every copy, so without this the epoch would grant on the
@@ -1565,10 +1568,7 @@ export class TurnRequestBuilder {
     // such copy in the active context.
     const usableSourceEpoch = (message: MuxMessage): number | undefined => {
       const epoch = message.metadata?.rlmPreservedTailSourcePolicyEpoch;
-      return typeof epoch === "number" &&
-        Number.isInteger(epoch) &&
-        epoch >= -1 &&
-        epoch < policyEpoch
+      return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch < policyEpoch
         ? epoch
         : undefined;
     };

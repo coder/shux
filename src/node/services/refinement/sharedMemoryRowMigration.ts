@@ -163,14 +163,19 @@ export async function migrateSharedMemoryRefinementRows(args: {
     // is corrupted would otherwise make a retried removal skip its intact
     // source, delete the child session, and leave the owner with nothing
     // but an unusable rollback record. Such a source is copied again (the
-    // corrupted row stays behind as an audit record).
+    // corrupted row stays behind as an audit record). A rollback copy is
+    // judged by the engine's own predicate (isUsableRollbackRow): its action
+    // must also name the `rollbackOf` target, or the engine rejects the copy
+    // while this pass would have counted it — and a retried removal would
+    // then skip the intact child source and delete its journal.
     const ownerIdBySource = new Map<string, string>();
     for (const ownerRow of ownerRows) {
       if (ownerRow.data.migratedFrom === undefined || ownerRow.data.kind !== "memory") continue;
       const usable =
-        RefinementInverseSchema.safeParse(ownerRow.data.inverse).success &&
-        (MemoryRefinementActionSchema.safeParse(ownerRow.data.action).success ||
-          RollbackRefinementActionSchema.safeParse(ownerRow.data.action).success);
+        ownerRow.data.rollbackOf === undefined
+          ? RefinementInverseSchema.safeParse(ownerRow.data.inverse).success &&
+            MemoryRefinementActionSchema.safeParse(ownerRow.data.action).success
+          : isUsableRollbackRow(ownerRow);
       if (usable) ownerIdBySource.set(ownerRow.data.migratedFrom, ownerRow.id);
     }
     // Owner rows already rolled back (by anyone): a second rollback row for

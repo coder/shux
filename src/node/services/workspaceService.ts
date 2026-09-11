@@ -120,6 +120,7 @@ import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFil
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import {
   CONTEXT_BOUNDARY_KINDS,
+  compactionClosingPolicyEpoch,
   hasProviderEligibleMessages,
   isDurableCompactedMarker,
   sliceMessagesForProviderFromLatestContextBoundary,
@@ -4640,7 +4641,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // silently drop another backend's persisted deny, letting this
         // session's own writable mirror grant the harvest — skip it instead
         // (fail closed; nothing is recorded, the epoch is simply not harvested).
-        const closingEpoch = metadata.previousBoundaryHistorySequence ?? -1;
+        const closingEpoch = compactionClosingPolicyEpoch(metadata);
         let persistedWritable: boolean | undefined;
         try {
           const entry = findWorkspaceEntry(

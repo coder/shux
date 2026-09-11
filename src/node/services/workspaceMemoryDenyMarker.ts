@@ -101,13 +101,13 @@ async function readMarkerRecord(
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return null;
     const { epochs, wildcard } = parsed as { epochs?: unknown; wildcard?: unknown };
-    // Epochs are -1 (before any boundary) or a boundary's history sequence:
-    // anything outside that domain is corruption, read as malformed (deny).
+    // Epochs are a segment's boundary-less identity (negative) or a
+    // boundary's history sequence (workspaceMemoryPolicyEpochOf): anything
+    // outside the integer domain is corruption, read as malformed (deny).
     if (
       !Array.isArray(epochs) ||
       !epochs.every(
-        (epoch): epoch is number =>
-          typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= -1
+        (epoch): epoch is number => typeof epoch === "number" && Number.isSafeInteger(epoch)
       )
     ) {
       return null;

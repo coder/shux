@@ -69,6 +69,7 @@ import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { compactionClosingPolicyEpoch } from "@/common/utils/messages/compactionBoundary";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
 import { runMemoryConsolidation } from "@/node/services/memoryConsolidation";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -1358,7 +1359,7 @@ export class MemoryConsolidationService extends EventEmitter {
       // was recorded for THIS epoch (see epochHarvestRefusal). Uncovered rows
       // have an unknown policy the grant evaluated at completion could not
       // have accounted for. Terminal refusal: a retry would replay that grant.
-      const refusal = epochHarvestRefusal(messages, metadata.previousBoundaryHistorySequence ?? -1);
+      const refusal = epochHarvestRefusal(messages, compactionClosingPolicyEpoch(metadata));
       if (refusal !== null) {
         yield* Effect.promise(() => self.recordRefusedHarvest(metadata, refusal));
         return yield* Effect.fail(new HarvestRefusedError(refusal));

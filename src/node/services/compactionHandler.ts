@@ -43,6 +43,7 @@ import {
   isDurableContextBoundaryMarker,
   latestContextBoundaryHistorySequence,
   sliceMessagesFromLatestCompactionBoundary,
+  workspaceMemoryPolicyEpochOf,
 } from "@/common/utils/messages/compactionBoundary";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import {
@@ -1270,7 +1271,7 @@ export class CompactionHandler {
     );
     const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
     // Same closing epoch the completion metadata reports below.
-    const closingPolicyEpoch = latestContextBoundaryHistorySequence(params.messages) ?? -1;
+    const closingPolicyEpoch = workspaceMemoryPolicyEpochOf(params.messages);
     const copies = this.buildCoveredTailCopies(params.tail, idMap, closingPolicyEpoch).map(
       (copy) => {
         // Continuous compaction prunes the just-finished answer too. Keep recent pages
@@ -1339,6 +1340,7 @@ export class CompactionHandler {
       summaryHistorySequence: sequence,
       compactionEpoch: epoch,
       previousBoundaryHistorySequence: latestContextBoundaryHistorySequence(params.messages),
+      closingPolicyEpoch: workspaceMemoryPolicyEpochOf(params.messages),
       compactionRequestMessageId: boundary.id,
       preservedTailMessageCount: copies.length,
     });
@@ -1402,6 +1404,9 @@ export class CompactionHandler {
     assert(Number.isInteger(nextCompactionEpoch), "next compaction epoch must be an integer");
 
     const previousBoundaryHistorySequence = latestContextBoundaryHistorySequence(messages);
+    // The policy epoch the compacted rows belong to: the key their turns
+    // recorded under (TurnRequestBuilder) and the one the harvest reads.
+    const closingPolicyEpoch = workspaceMemoryPolicyEpochOf(messages);
     const maxExistingHistorySequence = this.getMaxExistingHistorySequence(messages);
 
     // For idle compaction, preserve the original recency timestamp so the workspace
@@ -1509,7 +1514,7 @@ export class CompactionHandler {
       messages,
       compactionRequestMessageId,
       summaryMessage.id,
-      previousBoundaryHistorySequence ?? -1
+      closingPolicyEpoch
     );
 
     const persistenceResult =
@@ -1578,6 +1583,7 @@ export class CompactionHandler {
       summaryHistorySequence: persistedSequence,
       compactionEpoch: nextCompactionEpoch,
       previousBoundaryHistorySequence,
+      closingPolicyEpoch,
       compactionRequestMessageId,
       preservedTailMessageCount: preservedTailCopies.length,
     });
@@ -1680,7 +1686,12 @@ export class CompactionHandler {
       if (message.role !== "assistant") continue;
       const bound = message.metadata?.requestHistorySequence;
       const policyEpoch = message.metadata?.workspaceMemoryPolicyEpoch;
-      if (typeof bound !== "number" || typeof policyEpoch !== "number") continue;
+      // Same domain check as the harvest gate (epochHarvestRefusal, r79): a
+      // fractional or negative bound covers nothing there, so it must not
+      // stamp a batch here either — the copies would then carry an epoch
+      // without ever having been covered, and the association would grant
+      // in a later epoch what the gate refused in this one.
+      if (typeof policyEpoch !== "number" || !isNonNegativeInteger(bound)) continue;
       const anchor = userRows.findLast((row) => row.sequence <= bound)?.message;
       if (anchor === undefined) continue;
       for (const id of [

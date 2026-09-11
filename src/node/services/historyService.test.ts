@@ -1409,13 +1409,15 @@ describe("HistoryService", () => {
         const cachedNext = counters.sequenceCounters.get(nextWorkspace);
         const next = row("next");
         expect((await restarted.appendToHistory(nextWorkspace, next)).success).toBe(true);
-        expect(next.metadata?.historySequence).toBe(method === "clear" ? 0 : 101);
+        // A clear opens a new history segment above every cleared sequence
+        // (history-segment.json) rather than restarting at 0.
+        expect(next.metadata?.historySequence).toBe(101);
         const reloaded = new HistoryService(config);
         const later = row("later");
         expect((await reloaded.appendToHistory(nextWorkspace, later)).success).toBe(true);
-        expect(later.metadata?.historySequence).toBe(method === "clear" ? 1 : 102);
+        expect(later.metadata?.historySequence).toBe(102);
         if (method !== "archive delete") {
-          expect(cachedNext).toBe(method === "clear" ? 0 : 101);
+          expect(cachedNext).toBe(101);
         }
       }
     );
@@ -2548,18 +2550,49 @@ describe("HistoryService", () => {
       expect(exists).toBe(false);
     });
 
-    it("should reset sequence counter", async () => {
+    it("continues sequences above the cleared history in a new segment", async () => {
       const workspaceId = "workspace1";
-      const msg1 = createMuxMessage("msg1", "user", "Hello");
-
-      await service.appendToHistory(workspaceId, msg1);
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      await service.appendToHistory(workspaceId, createMuxMessage("msg2", "user", "Second"));
       await service.clearHistory(workspaceId);
 
-      const msg2 = createMuxMessage("msg2", "user", "New message");
-      await service.appendToHistory(workspaceId, msg2);
+      // A sequence — or a policy epoch identity derived from one — must never
+      // name rows of two different conversations, so the cleared segment's
+      // sequences are retired for good and the new rows carry their segment.
+      const msg3 = createMuxMessage("msg3", "user", "New message");
+      await service.appendToHistory(workspaceId, msg3);
+      expect(msg3.metadata?.historySequence).toBe(2);
+      expect(msg3.metadata?.historySegment).toBe(2);
 
-      const messages = await collectFullHistory(service, workspaceId);
-      expect(messages[0].metadata?.historySequence).toBe(0);
+      // Durable across a restart: a fresh service scanning the (short) new
+      // history must not fall back to the cleared sequences.
+      const restarted = new HistoryService(config);
+      const msg4 = createMuxMessage("msg4", "user", "After restart");
+      await restarted.appendToHistory(workspaceId, msg4);
+      expect(msg4.metadata?.historySequence).toBe(3);
+      expect(msg4.metadata?.historySegment).toBe(2);
+
+      // A second clear opens a segment strictly above the previous one even
+      // though only the new segment's rows were cleared.
+      await restarted.clearHistory(workspaceId);
+      const msg5 = createMuxMessage("msg5", "user", "Third conversation");
+      await restarted.appendToHistory(workspaceId, msg5);
+      expect(msg5.metadata?.historySequence).toBe(4);
+      expect(msg5.metadata?.historySegment).toBe(4);
+    });
+
+    it("stamps rows appended by a foreign backend after a clear with the new segment", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      // A second backend with a stale cached counter (multi-instance).
+      const foreign = new HistoryService(config);
+      await foreign.appendToHistory(workspaceId, createMuxMessage("msg2", "user", "Foreign"));
+      await service.clearHistory(workspaceId);
+
+      const late = createMuxMessage("msg3", "assistant", "in flight before the clear");
+      expect((await foreign.appendToHistory(workspaceId, late)).success).toBe(true);
+      expect(late.metadata?.historySequence).toBe(2);
+      expect(late.metadata?.historySegment).toBe(2);
     });
 
     it("should succeed when clearing non-existent history", async () => {
@@ -2570,16 +2603,38 @@ describe("HistoryService", () => {
       expect(result.success).toBe(true);
     });
 
-    it("should reset sequence counter even when file doesn't exist", async () => {
+    it("opens a new segment even when clearing an empty history", async () => {
       const workspaceId = "workspace-no-history";
 
+      // A turn admitted before the clear may still persist its policy under
+      // the boundary-less identity of the segment being cleared; the new
+      // segment must not share it, so the segment moves on regardless.
       await service.clearHistory(workspaceId);
 
       const msg = createMuxMessage("msg1", "user", "First");
       await service.appendToHistory(workspaceId, msg);
 
       const messages = await collectFullHistory(service, workspaceId);
-      expect(messages[0].metadata?.historySequence).toBe(0);
+      expect(messages[0].metadata?.historySequence).toBe(1);
+      expect(messages[0].metadata?.historySegment).toBe(1);
+    });
+
+    it("refuses to append when the segment file is unreadable", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      await service.clearHistory(workspaceId);
+      await fs.writeFile(
+        path.join(config.sessionsDir, workspaceId, "history-segment.json"),
+        "not json"
+      );
+
+      // Reading a corrupt segment as 0 would restart at the retired sequences.
+      const restarted = new HistoryService(config);
+      const result = await restarted.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg2", "user", "Second")
+      );
+      expect(result.success).toBe(false);
     });
   });
 

@@ -8,7 +8,10 @@ import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import {
+  compactionClosingPolicyEpoch,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { applyToolPolicyToNames, isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
@@ -1132,11 +1135,14 @@ export class AgentSession {
   /**
    * Destructive boundary (/clear, context reset, history replace): the
    * in-memory mirror and every durable epoch record forget the discarded
-   * transcript. Durable-or-throw like the other boundary invalidations: a
-   * stale persisted deny would refuse harvests of the new, possibly
-   * all-writable epoch forever (a destructive boundary reuses epoch -1, so a
-   * surviving `-1: false` would pin the new segment). Nothing to do when the
-   * field is already absent.
+   * transcript. The new segment's epoch identities never recur (a full clear
+   * continues history sequences above the cleared segment, so neither a
+   * boundary's sequence nor the boundary-less `-(segmentStart + 1)` is
+   * reused; workspaceMemoryPolicyEpochOf), so the discarded records are
+   * inert to the new segment's readers — dropping them is hygiene, kept
+   * durable-or-throw like the other boundary invalidations so a reported
+   * success never leaves stale state behind. Nothing to do when the field is
+   * already absent.
    *
    * A COMPACTION boundary clears nothing durable (r77): its closing epoch's
    * record and deny marker stay until the next destructive boundary. Two
@@ -1439,7 +1445,7 @@ export class AgentSession {
         // records are left in place (resetWorkspaceMemoryWritable explains
         // why); every durable value is bound to its epoch, so they are
         // invisible to the new epoch's turns on any backend.
-        const closingEpoch = metadata.previousBoundaryHistorySequence ?? -1;
+        const closingEpoch = compactionClosingPolicyEpoch(metadata);
         const preservedTail = (metadata.preservedTailMessageCount ?? 0) > 0;
         if (!preservedTail) this.workspaceMemoryWritable = undefined;
         const reset = observed

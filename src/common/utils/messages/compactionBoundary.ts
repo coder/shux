@@ -93,6 +93,53 @@ export function latestContextBoundaryHistorySequence(
 }
 
 /**
+ * Start sequence of the history segment `messages` belong to (the largest
+ * `historySegment` stamp among them; 0 for legacy rows and the first
+ * segment). Every row of a segment carries the same stamp, so any non-empty
+ * subset of the segment yields the same value; a full clear opens a segment
+ * with a strictly larger start (HistoryService).
+ */
+export function historySegmentStart(messages: readonly MuxMessage[]): number {
+  let start = 0;
+  for (const message of messages) {
+    const segment = message.metadata?.historySegment;
+    if (typeof segment !== "number" || !Number.isSafeInteger(segment) || segment < 0) continue;
+    if (segment > start) start = segment;
+  }
+  return start;
+}
+
+/**
+ * The compaction epoch `messages` (an active-context read) belong to, as the
+ * workspace-memory write policy keys it: the latest durable boundary's
+ * history sequence, or `-(segmentStart + 1)` before any boundary of the
+ * segment (-1 in the first segment, as before the stamp existed). Sequences
+ * never recur across full clears (each clear opens a segment above every
+ * sequence used so far), so neither identity is ever reused for a different
+ * conversation: a turn that recorded its policy under the pre-clear identity
+ * cannot pass as one of the post-clear epoch, however the clear and its
+ * appends interleave across backends. Compaction completion reports the same
+ * value as `closingPolicyEpoch`, so the completion-side observation and every
+ * backend's turn records agree on which epoch a value belongs to.
+ */
+export function workspaceMemoryPolicyEpochOf(messages: readonly MuxMessage[]): number {
+  return latestContextBoundaryHistorySequence(messages) ?? -(historySegmentStart(messages) + 1);
+}
+
+/**
+ * The policy epoch a compaction closed: `closingPolicyEpoch` when the
+ * completion recorded it, else the identity older builds used (the previous
+ * boundary's sequence, -1 before any) so persisted legacy records still key
+ * their turns' stamps.
+ */
+export function compactionClosingPolicyEpoch(metadata: {
+  closingPolicyEpoch?: number;
+  previousBoundaryHistorySequence?: number;
+}): number {
+  return metadata.closingPolicyEpoch ?? metadata.previousBoundaryHistorySequence ?? -1;
+}
+
+/**
  * Locate the latest durable context boundary in reverse chronological order.
  *
  * Returns the index of the newest message tagged with valid boundary metadata,

@@ -1242,6 +1242,67 @@ describe("MemoryConsolidationService", () => {
     expect(harvested?.status).toBe("completed");
   });
 
+  it("keys the harvest by the recorded closing epoch, refusing a turn stamped before a clear", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-stale");
+    // A full clear opens a new history segment: the boundary-less identity
+    // becomes -(segmentStart + 1) (workspaceMemoryPolicyEpochOf) and a turn
+    // admitted before the clear, stamped -1, can no longer pass as one of the
+    // new segment even though its row landed after the clear.
+    const seed = async (workspaceId: string, staleStamp: boolean) => {
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("old-1", "user", "before the clear")
+      );
+      await fixture.historyService.clearHistory(workspaceId);
+      const prompt = createMuxMessage(
+        "pref-1",
+        "user",
+        "Please remember that I prefer concise tests."
+      );
+      await fixture.historyService.appendToHistory(workspaceId, prompt);
+      const segmentStart = prompt.metadata?.historySegment;
+      if (segmentStart === undefined || segmentStart <= 0)
+        throw new Error("expected a new segment");
+      const closingPolicyEpoch = -(segmentStart + 1);
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("reply-1", "assistant", "Noted.", {
+          requestHistorySequence: prompt.metadata?.historySequence,
+          workspaceMemoryPolicyEpoch: staleStamp ? -1 : closingPolicyEpoch,
+        })
+      );
+      await fixture.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("compact-request", "user", "Please compact", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      const summary = createMuxMessage("summary-1", "assistant", "Summary.", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+      });
+      await fixture.historyService.appendToHistory(workspaceId, summary);
+      return fixture.service.maybeHarvestThenSweep({
+        workspaceId,
+        workspaceMemoryWritable: true,
+        summaryMessageId: "summary-1",
+        summaryHistorySequence: summary.metadata?.historySequence ?? -1,
+        compactionEpoch: 1,
+        compactionRequestMessageId: "compact-request",
+        closingPolicyEpoch,
+      });
+    };
+    const stale = await seed("ws-stale", true);
+    expect(stale.success).toBe(false);
+    if (!stale.success) expect(stale.error).toContain("another epoch");
+    expect(fixture.modelCalls).toHaveLength(0);
+    const current = await seed("ws-dream", false);
+    expect(current.success).toBe(true);
+    expect(fixture.modelCalls.length).toBeGreaterThan(0);
+  });
+
   it("refuses to harvest an epoch holding user rows no turn's request snapshot covers", async () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     // Backend A snapshots its request through pref-1; backend B appends a

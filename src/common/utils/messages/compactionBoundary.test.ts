@@ -3,13 +3,82 @@ import { describe, expect, it } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 
 import {
+  compactionClosingPolicyEpoch,
   epochHasPriorTurnRows,
   findLatestCompactionBoundaryIndex,
   findLatestContextBoundaryIndex,
   hasProviderEligibleMessages,
   sliceMessagesForProviderFromLatestContextBoundary,
   sliceMessagesFromLatestCompactionBoundary,
+  workspaceMemoryPolicyEpochOf,
 } from "./compactionBoundary";
+
+describe("workspaceMemoryPolicyEpochOf", () => {
+  const boundary = (id: string, historySequence: number) =>
+    createMuxMessage(id, "assistant", "summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+      historySequence,
+    });
+
+  it("is -1 before any boundary for legacy and first-segment rows", () => {
+    expect(workspaceMemoryPolicyEpochOf([])).toBe(-1);
+    expect(
+      workspaceMemoryPolicyEpochOf([
+        createMuxMessage("u1", "user", "a", { historySequence: 0 }),
+        createMuxMessage("u2", "user", "b", { historySequence: 1, historySegment: 0 }),
+      ])
+    ).toBe(-1);
+  });
+
+  it("derives a segment-unique boundary-less identity from the segment stamp", () => {
+    // Rows of a later segment (after a full clear) never share the cleared
+    // segment's -1; any subset of the segment yields the same identity.
+    const rows = [
+      createMuxMessage("u1", "user", "a", { historySequence: 7, historySegment: 7 }),
+      createMuxMessage("a1", "assistant", "b", { historySequence: 8, historySegment: 7 }),
+    ];
+    expect(workspaceMemoryPolicyEpochOf(rows)).toBe(-8);
+    expect(workspaceMemoryPolicyEpochOf(rows.slice(1))).toBe(-8);
+    // A row that lost its stamp (rewritten in place by an older build)
+    // cannot pull the segment back to the legacy identity.
+    expect(
+      workspaceMemoryPolicyEpochOf([
+        ...rows,
+        createMuxMessage("a2", "assistant", "c", { historySequence: 9 }),
+      ])
+    ).toBe(-8);
+  });
+
+  it("ignores malformed stamps and prefers the latest boundary's sequence", () => {
+    expect(
+      workspaceMemoryPolicyEpochOf([
+        createMuxMessage("u1", "user", "a", {
+          historySequence: 3,
+          historySegment: -4 as unknown as number,
+        }),
+        createMuxMessage("u2", "user", "b", { historySequence: 4, historySegment: 2.5 }),
+      ])
+    ).toBe(-1);
+    expect(
+      workspaceMemoryPolicyEpochOf([
+        boundary("s1", 5),
+        createMuxMessage("u1", "user", "a", { historySequence: 6, historySegment: 5 }),
+      ])
+    ).toBe(5);
+  });
+});
+
+describe("compactionClosingPolicyEpoch", () => {
+  it("prefers the recorded closing epoch and falls back to the legacy identity", () => {
+    expect(
+      compactionClosingPolicyEpoch({ closingPolicyEpoch: -8, previousBoundaryHistorySequence: 3 })
+    ).toBe(-8);
+    expect(compactionClosingPolicyEpoch({ previousBoundaryHistorySequence: 3 })).toBe(3);
+    expect(compactionClosingPolicyEpoch({})).toBe(-1);
+  });
+});
 
 describe("findLatestCompactionBoundaryIndex", () => {
   it("returns the newest compaction boundary via reverse scan", () => {

@@ -195,6 +195,12 @@ function stripContextUsage(message: MuxMessage): MuxMessage {
   };
 }
 
+/** The persisted row's segment stamp, kept across in-place replacement (see MuxMetadata.historySegment). */
+function preservedHistorySegment(existing: MuxMessage): { historySegment?: number } {
+  const segment = existing.metadata?.historySegment;
+  return segment === undefined ? {} : { historySegment: segment };
+}
+
 function getCompactionMetadataToPreserve(
   workspaceId: string,
   existingMessage: MuxMessage,
@@ -414,8 +420,22 @@ export class HistoryService {
   private readonly CHAT_FILE = CHAT_FILE_NAME;
   private readonly CHAT_ARCHIVE_FILE = CHAT_ARCHIVE_FILE_NAME;
   private readonly PARTIAL_FILE = "partial.json";
+  /**
+   * `{ start }`: the first history sequence of the current history segment.
+   * A full clear does not restart sequences at 0 — it opens a new segment
+   * above every sequence the cleared history used (advanceHistorySegment),
+   * so no sequence, and no epoch identity derived from one (a boundary's
+   * sequence, or `-(start + 1)` before any boundary; see
+   * workspaceMemoryPolicyEpochOf), is ever reused for a different
+   * conversation. Rows appended in a later segment carry its start as
+   * `metadata.historySegment`. Absent = first segment (start 0).
+   */
+  private readonly HISTORY_SEGMENT_FILE = "history-segment.json";
   // Track next sequence number per workspace in memory
   private sequenceCounters = new Map<string, number>();
+  // Current segment start per workspace, loaded with the counter
+  // (getMaxHistorySequence) and advanced by full clears under the history lock.
+  private historySegmentStarts = new Map<string, number>();
   // Workspaces whose chat.jsonl was already checked for a sealed (pre-boundary)
   // prefix this process. Guards the lazy one-time migration of legacy files;
   // new boundaries rotate eagerly at write time.
@@ -1808,8 +1828,81 @@ export class HistoryService {
     return newest;
   }
 
+  private getHistorySegmentPath(workspaceId: string): string {
+    return path.join(this.getSessionDir(workspaceId), this.HISTORY_SEGMENT_FILE);
+  }
+
+  /**
+   * Current segment start from `history-segment.json` (0 when absent),
+   * refreshing the cache. Unreadable or malformed content throws rather
+   * than reading as 0: a cleared workspace whose file cannot be read would
+   * otherwise restart at 0 and reuse the sequences the clear retired.
+   */
+  private async readHistorySegmentStart(workspaceId: string): Promise<number> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(this.getHistorySegmentPath(workspaceId), "utf-8");
+    } catch (error) {
+      if (!isErrnoWithCode(error, "ENOENT")) throw error;
+      this.historySegmentStarts.set(workspaceId, 0);
+      return 0;
+    }
+    const parsed: unknown = JSON.parse(raw);
+    const start: unknown =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as { start?: unknown }).start
+        : undefined;
+    if (!isNonNegativeInteger(start)) {
+      throw new Error(`Malformed history segment file for ${workspaceId}: ${raw}`);
+    }
+    this.historySegmentStarts.set(workspaceId, start);
+    return start;
+  }
+
+  /**
+   * Open the next history segment (full clear, under the history write
+   * lock, BEFORE the files are rewritten): its start is above every sequence
+   * the history being cleared used, the cached counter, AND the previous
+   * start — an already-empty history still moves on, because a turn admitted
+   * before the clear can otherwise persist its policy under the boundary-less
+   * identity the cleared segment and the new one would share. Persisted
+   * before the rows are removed so a crash in between leaves the history
+   * intact rather than an empty history whose counter restarts at 0.
+   */
+  private async advanceHistorySegmentUnderHistoryLock(
+    workspaceId: string,
+    clearedSequences: readonly number[]
+  ): Promise<void> {
+    // Loads the segment cache as a side effect and floors at previousStart - 1.
+    const persistedMax = await this.getMaxHistorySequence(workspaceId);
+    const previousStart = this.historySegmentStarts.get(workspaceId) ?? 0;
+    const start =
+      clearedSequences.reduce(
+        (max, sequence) => (sequence > max ? sequence : max),
+        Math.max(persistedMax, (this.sequenceCounters.get(workspaceId) ?? 0) - 1, previousStart)
+      ) + 1;
+    assert(isNonNegativeInteger(start), "history segment start must be a non-negative integer");
+    await ensurePrivateDir(this.getSessionDir(workspaceId));
+    await writeFileAtomic(this.getHistorySegmentPath(workspaceId), JSON.stringify({ start }));
+    this.historySegmentStarts.set(workspaceId, start);
+    this.sequenceCounters.set(workspaceId, start);
+  }
+
+  /**
+   * Stamp a freshly sequenced row with the segment it is appended in (first
+   * segment rows stay unstamped, byte-identical to legacy rows). The cache is
+   * loaded by the in-lock counter refresh every append path runs first.
+   */
+  private stampHistorySegment(workspaceId: string, metadata: MuxMetadata): MuxMetadata {
+    const start = this.historySegmentStarts.get(workspaceId);
+    assert(start !== undefined, "history segment start must be loaded before rows are stamped");
+    return start === 0 ? metadata : { ...metadata, historySegment: start };
+  }
+
   private async getMaxHistorySequence(workspaceId: string): Promise<number> {
-    let maxSequence = -1;
+    // Floor: a cleared history has no rows, but its sequences continue above
+    // the retired segment (see HISTORY_SEGMENT_FILE).
+    let maxSequence = (await this.readHistorySegmentStart(workspaceId)) - 1;
 
     // Full scan of the active file (cheap post-rotation; see getNextHistorySequence
     // for why we don't trust the tail alone).
@@ -2643,9 +2736,9 @@ export class HistoryService {
           isNonNegativeInteger(nextSeqNum),
           "getNextHistorySequence must return a non-negative integer"
         );
-        message.metadata = {
+        message.metadata = this.stampHistorySegment(workspaceId, {
           historySequence: nextSeqNum,
-        };
+        });
         this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
       } else {
         // Message already has metadata, but may need historySequence assigned
@@ -2670,6 +2763,9 @@ export class HistoryService {
             );
           }
           this.sequenceCounters.set(workspaceId, existingSeqNum + 1);
+          // A pre-sequenced row (recovered partial) is appended in the
+          // current segment like any other.
+          message.metadata = this.stampHistorySegment(workspaceId, message.metadata);
         } else {
           // Has metadata but no historySequence, assign one
           const nextSeqNum = await this.getNextHistorySequence(workspaceId);
@@ -2677,10 +2773,10 @@ export class HistoryService {
             isNonNegativeInteger(nextSeqNum),
             "getNextHistorySequence must return a non-negative integer"
           );
-          message.metadata = {
+          message.metadata = this.stampHistorySegment(workspaceId, {
             ...message.metadata,
             historySequence: nextSeqNum,
-          };
+          });
           this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
         }
       }
@@ -3019,7 +3115,10 @@ export class HistoryService {
           isNonNegativeInteger(nextSeqNum),
           "getNextHistorySequence must return a non-negative integer"
         );
-        message.metadata = { ...message.metadata, historySequence: nextSeqNum };
+        message.metadata = this.stampHistorySegment(workspaceId, {
+          ...message.metadata,
+          historySequence: nextSeqNum,
+        });
         this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
       }
       // Atomic all-or-nothing commit (r48): fs.appendFile is not
@@ -3331,12 +3430,15 @@ export class HistoryService {
             message
           );
 
-          // Preserve the historySequence, update everything else.
+          // Preserve the historySequence (and the segment the row was appended
+          // in: the replacement was built from an in-memory copy that may
+          // predate the stamp), update everything else.
           messages[i] = {
             ...message,
             metadata: {
               ...message.metadata,
               ...(preservedCompactionMetadata ?? {}),
+              ...preservedHistorySegment(existingMessage),
               historySequence: targetSequence,
             },
           };
@@ -3457,6 +3559,7 @@ export class HistoryService {
                 metadata: {
                   ...summaryMessage.metadata,
                   ...(preservedCompactionMetadata ?? {}),
+                  ...preservedHistorySegment(messages[i]),
                   historySequence: targetSequence,
                 },
               };
@@ -3475,10 +3578,10 @@ export class HistoryService {
               "persistBoundaryWithTailCopies append expects an unsequenced summary"
             );
             const nextSeqNum = await this.getNextHistorySequence(workspaceId);
-            summaryMessage.metadata = {
+            summaryMessage.metadata = this.stampHistorySegment(workspaceId, {
               ...summaryMessage.metadata,
               historySequence: nextSeqNum,
-            };
+            });
             this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
             persistedSummary = summaryMessage;
             messages.push(summaryMessage);
@@ -3490,7 +3593,10 @@ export class HistoryService {
               "persistBoundaryWithTailCopies expects unsequenced tail copies"
             );
             const seq = await this.getNextHistorySequence(workspaceId);
-            copy.metadata = { ...copy.metadata, historySequence: seq };
+            copy.metadata = this.stampHistorySegment(workspaceId, {
+              ...copy.metadata,
+              historySequence: seq,
+            });
             this.sequenceCounters.set(workspaceId, seq + 1);
             messages.push(copy);
           }
@@ -4038,8 +4144,8 @@ export class HistoryService {
                 workspaceId
               ).advanceGenerationUnderHistoryLock();
             }
+            await this.advanceHistorySegmentUnderHistoryLock(workspaceId, allSequences);
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
-            this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
           }
 
@@ -4097,8 +4203,8 @@ export class HistoryService {
             await this.getContinuousCompactionJournal(
               workspaceId
             ).advanceGenerationUnderHistoryLock();
+            await this.advanceHistorySegmentUnderHistoryLock(workspaceId, allSequences);
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
-            this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);
           }
 
@@ -4260,6 +4366,7 @@ export class HistoryService {
             const archiveFloor = (await this.getArchiveTailMaxSequence(newWorkspaceId)) + 1;
             this.sequenceCounters.set(newWorkspaceId, Math.max(oldCounter, archiveFloor));
             this.sequenceCounters.delete(oldWorkspaceId);
+            this.historySegmentStarts.delete(oldWorkspaceId);
             return Ok(undefined);
           }
 
@@ -4273,6 +4380,9 @@ export class HistoryService {
           // Transfer sequence counter to new workspace ID
           this.sequenceCounters.set(newWorkspaceId, oldCounter);
           this.sequenceCounters.delete(oldWorkspaceId);
+          // The segment file moved with the session directory; the new id's
+          // cache is loaded on its next append.
+          this.historySegmentStarts.delete(oldWorkspaceId);
 
           log.debug(
             `Migrated ${messages.length} messages from ${oldWorkspaceId} to ${newWorkspaceId}`

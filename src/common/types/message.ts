@@ -975,6 +975,18 @@ export interface MuxMetadata {
    */
   workspaceMemoryPolicyEpoch?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
+  /**
+   * Start sequence of the history segment this row was appended in
+   * (HistoryService, `history-segment.json`). A full clear opens a new
+   * segment whose sequences continue above every sequence the cleared
+   * history ever used, so a boundary's history sequence — and the
+   * boundary-less epoch identity `-(segmentStart + 1)` derived from this
+   * stamp (workspaceMemoryPolicyEpochOf) — never recurs across destructive
+   * clears: a turn started before a clear cannot be mistaken for one of the
+   * segment that replaced it. Omitted in the first segment (start 0), which
+   * legacy rows without the stamp belong to as well.
+   */
+  historySegment?: number;
   /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
   stepStartPartIndices?: number[];
   duration?: number;

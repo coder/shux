@@ -56,6 +56,15 @@ export interface LegacyAdoptionRecord {
    */
   targetStamp?: string;
   /**
+   * The copy this adoption created was since replaced outside it (rewritten,
+   * or deleted and recreated to identical bytes: `targetStamp` no longer
+   * matches), so the file is the owner's own. Kept apart from a note the
+   * owner already had when it was first adopted (`created` never set): that
+   * one still folds the child's pin toggles, a replaced copy never does —
+   * `created` alone cannot tell the two apart once provenance is lost.
+   */
+  replaced?: boolean;
+  /**
    * Hash of the bytes an in-place replacement is about to write (set on the
    * pending prior record, cleared once the pass completes). With `content`
    * (the pre-write bytes) this lets a retry recognize the copy as this
@@ -84,8 +93,9 @@ export interface LegacyAdoptionRecord {
  * Parse one manifest record. Lifecycle flags are raw JSON: a value that is
  * neither absent nor boolean fails CLOSED — `pending`/`pendingDeletion` read
  * as set (the pass is redone), `created`/`deleted` as unset (no destructive
- * provenance; the source is reconciled as a plain unlisted note) — so a
- * corrupted flag can never make an interrupted pass look settled.
+ * provenance; the source is reconciled as a plain unlisted note), `replaced`
+ * as set (the child's pin no longer reaches the file) — so a corrupted flag
+ * can never make an interrupted pass look settled.
  */
 function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null {
   if (typeof value !== "object" || value === null) return null;
@@ -117,6 +127,7 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     pending: flag(record.pending, true),
     pendingDeletion: flag(record.pendingDeletion, true),
     deleted: flag(record.deleted, false),
+    replaced: flag(record.replaced, true),
     replacementContent: record.replacementContent,
     targetStamp: record.targetStamp,
   };

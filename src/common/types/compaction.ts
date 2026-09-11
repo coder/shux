@@ -12,6 +12,14 @@ export interface CompactionCompletionMetadata {
   summaryHistorySequence: number;
   compactionEpoch: number;
   previousBoundaryHistorySequence?: number;
+  /**
+   * The workspace-memory policy epoch the compacted rows belonged to
+   * (workspaceMemoryPolicyEpochOf over the compacted history): the key their
+   * turns recorded under and the one the harvest and the policy carry read.
+   * Absent on records persisted by builds before the history segment stamp
+   * (compactionClosingPolicyEpoch derives their legacy identity).
+   */
+  closingPolicyEpoch?: number;
   compactionRequestMessageId: string;
   /**
    * RLM keep-recent floor: number of preserved-tail copies appended after the

@@ -1232,6 +1232,47 @@ describe("MemoryService", () => {
       expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
     });
 
+    it("rescans the owner notebook for the revision token only on root changes or per interval", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      await fixture.service.create(fixture.ctx, "/memories/workspace/dir/nested.md", "v1", "agent");
+      const foreign = new MemoryService(fixture.config, new MemoryMetaService(fixture.xumHome));
+      const nestedStats = () =>
+        lstatSpy.mock.calls.filter(([target]) => String(target).startsWith(ownerRoot)).length;
+      const lstatSpy = spyOn(fsPromises, "lstat");
+      try {
+        const first = await foreign.workspaceMemoryRevision("ws-owner");
+        expect(nestedStats()).toBeGreaterThan(0);
+        // A cached-context probe on every turn (and every Memory tab interval)
+        // must not walk the notebook again: the clock and sidecar segments
+        // carry this build's writes, the scan only exists for downgraded ones.
+        lstatSpy.mockClear();
+        expect(await foreign.workspaceMemoryRevision("ws-owner")).toBe(first);
+        expect(nestedStats()).toBe(0);
+        // A note added at the root moves the root mtime (one stat): rescanned
+        // at once, token changed — a downgraded build's new note shows up.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await fsPromises.writeFile(path.join(ownerRoot, "old-build.md"), "downgraded write");
+        const afterRootWrite = await foreign.workspaceMemoryRevision("ws-owner");
+        expect(afterRootWrite).not.toBe(first);
+        expect(nestedStats()).toBeGreaterThan(0);
+        // This build's own writes need no rescan to be seen: the clock moved.
+        lstatSpy.mockClear();
+        await fixture.service.strReplace(
+          fixture.ctx,
+          "/memories/workspace/dir/nested.md",
+          "v1",
+          "v2",
+          "agent"
+        );
+        expect(await foreign.workspaceMemoryRevision("ws-owner")).not.toBe(afterRootWrite);
+        expect(nestedStats()).toBe(0);
+      } finally {
+        lstatSpy.mockRestore();
+      }
+    });
+
     it("advances the owner store's revision token on shared writes, visible to another backend", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -2280,7 +2321,19 @@ describe("MemoryService", () => {
       ).get("note.md")!;
       expect(record.created).toBe(false);
       expect(record.targetStamp).toBeUndefined();
+      expect(record.replaced).toBe(true);
       expect(await fsPromises.readFile(ownerCopy, "utf-8")).toBe("v1");
+      // The record now persists without `created`, like a note the owner had
+      // all along — but that one folds child toggles, this one must not: the
+      // next toggle (a fresh process, so nothing is remembered in memory)
+      // leaves the owner-owned replacement alone too (r80).
+      await fixture.metaService.setPinned(childKey, true);
+      await fixture.metaService.setPinned(ownerKey, false);
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({ ...fixture.ctx });
+      expect((await fixture.metaService.getPinnedKeys()).has(ownerKey)).toBe(false);
     });
 
     it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {
@@ -3708,6 +3761,26 @@ describe("MemoryService", () => {
         undoCopies.filter((row) => (row.data.action as { op: string }).op === "rollback")
       ).toHaveLength(1);
       expect(undoCopies.every((row) => row.data.rollbackOf === createCopy.id)).toBe(true);
+      // A copy whose action still PARSES but names another target is corrupt
+      // by the engine's own rule (isUsableRollbackRow, r79): the migration
+      // must judge copies by that same predicate (r80), or a retried removal
+      // skips the intact source and the lineage is lost.
+      const disagreeing = (await fsPromises.readFile(journalPath, "utf-8"))
+        .split("\n")
+        .map((line) => {
+          if (!line.includes(`"migratedFrom":"ws-child:${undo.id}"`)) return line;
+          const row = JSON.parse(line) as { data: { action: { op: string; of?: string } } };
+          if (row.data.action.op === "rollback") row.data.action.of = "someone-else";
+          return JSON.stringify(row);
+        });
+      await fsPromises.writeFile(journalPath, disagreeing.join("\n"));
+      expect(await migrate()).toBe(1);
+      const recopied = (await readRefinementEvents(ownerSessionDir)).filter(
+        (row) =>
+          row.data.migratedFrom === `ws-child:${undo.id}` &&
+          (row.data.action as { op: string; of?: string }).of === createCopy.id
+      );
+      expect(recopied).toHaveLength(1);
     });
 
     it("a peer's corrupt rollback row does not hide the peer's live edit from conflict detection", async () => {
