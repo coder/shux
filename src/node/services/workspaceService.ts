@@ -4317,7 +4317,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // A no-tail compaction's durable epoch reset may still be in flight: read
     // nothing of the closing epoch (accumulator, marker) before it settled.
     await session?.settleWorkspaceMemoryPolicyEpoch();
-    const mirror = session?.workspaceMemoryWritableMirror();
+    const mirror = session?.workspaceMemoryWritableMirror(policyEpoch);
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     // A deny that config.json cannot hold falls back to the session dir: the
     // turn's user row is already durable in chat.jsonl there, so the deny
@@ -4343,7 +4343,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         if (!written) {
           log.debug("Skipping workspace memory deny marker for removed workspace", { workspaceId });
-          session?.recordWorkspaceMemoryWritable(false);
+          session?.recordWorkspaceMemoryWritable(false, policyEpoch);
           return true;
         }
       } catch (markerError: unknown) {
@@ -4354,10 +4354,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         // Process-local floor: this session at least keeps refusing until
         // the next successful persist writes the false it now mirrors.
-        session?.recordWorkspaceMemoryWritable(false);
+        session?.recordWorkspaceMemoryWritable(false, policyEpoch);
         return false;
       }
-      session?.recordWorkspaceMemoryWritable(false);
+      session?.recordWorkspaceMemoryWritable(false, policyEpoch);
       return true;
     };
     // Strict load of an EXISTING file: a config.json that is missing (strict
@@ -4384,7 +4384,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // Unregistered workspace: nothing durable to update and no stale
     // permission to invalidate (harvests fail closed on the missing value).
     if (before === null) {
-      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable);
+      session?.recordWorkspaceMemoryWritable((mirror ?? true) && writable, policyEpoch);
       return true;
     }
     // The persisted bit is the epoch accumulator, fail-closed: the harvest
@@ -4471,7 +4471,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       !hasMalformedWorkspaceMemoryPolicyRecords(before.workspace) &&
       (stored === false || (stored === true && conjunction(stored, carriedFor(before.workspace))))
     ) {
-      session?.recordWorkspaceMemoryWritable(stored);
+      session?.recordWorkspaceMemoryWritable(stored, policyEpoch);
       return true;
     }
     effective = conjunction(stored, carriedFor(before.workspace));
@@ -4495,7 +4495,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
       return denyDurableFallback(getErrorMessage(error));
     }
-    session?.recordWorkspaceMemoryWritable(effective);
+    session?.recordWorkspaceMemoryWritable(effective, policyEpoch);
     const persistedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     const persisted = persistedEntry === null ? undefined : storedFor(persistedEntry.workspace);
     if (persisted !== effective) {

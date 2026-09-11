@@ -286,15 +286,27 @@ export function epochHasPriorTurnRows(
 
 /**
  * Whether a row has the shape of a request prelude row — one the backend
- * appends with a turn and lists in the user row's `requestPreludeMessageIds`
- * (@mention/skill/MCP snapshots, family payloads): always `synthetic`. The
- * id-keyed policy accounting (prior-turn check, harvest coverage, tail-copy
- * stamps) honors a prelude listing only for such rows, so a listing that
- * names an ordinary user turn (persisted history is raw JSON) cannot make
- * that turn read as accounted for.
+ * appends with a turn and lists in the user row's `requestPreludeMessageIds`:
+ * a synthetic USER row carrying the snapshot it materializes (@mention file
+ * snapshot, agent skill snapshot, MCP prompt snapshot), or a synthetic
+ * ASSISTANT row (family payloads). `synthetic` alone is not enough: the
+ * backend also persists synthetic user TURNS (auto-resume, CLI goal
+ * continuations), which are turns of their own. The id-keyed policy
+ * accounting (prior-turn check, harvest coverage, tail-copy stamps) honors a
+ * prelude listing only for prelude-shaped rows, so a listing that names any
+ * other user row (persisted history is raw JSON) cannot make that turn read
+ * as accounted for.
  */
 export function isRequestPreludeRow(message: MuxMessage): boolean {
-  return message.metadata?.synthetic === true;
+  const metadata = message.metadata;
+  if (metadata?.synthetic !== true) return false;
+  if (message.role === "assistant") return true;
+  return (
+    message.role === "user" &&
+    (metadata.fileAtMentionSnapshot !== undefined ||
+      metadata.agentSkillSnapshot !== undefined ||
+      metadata.mcpPromptSnapshot !== undefined)
+  );
 }
 
 /**

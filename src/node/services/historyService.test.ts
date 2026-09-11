@@ -2674,7 +2674,7 @@ describe("HistoryService", () => {
       expect(msg.metadata?.historySegment).toBeGreaterThan(1);
     });
 
-    it("treats a segment start at the safe-integer boundary as malformed and refuses unsafe next sequences", async () => {
+    it("treats a segment start at the safe-integer boundary as malformed", async () => {
       const workspaceId = "workspace1";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(workspaceDir, { recursive: true });
@@ -2689,43 +2689,49 @@ describe("HistoryService", () => {
       if (reseeded === undefined) throw new Error("expected a reseeded stamp");
       expect(Number.isSafeInteger(reseeded + 1)).toBe(true);
       expect(reseeded).toBeLessThan(Number.MAX_SAFE_INTEGER);
-      // A persisted row at the boundary leaves no safe next sequence: the
-      // append refuses rather than assign a value `+ 1` cannot move past.
-      const other = "workspace2";
-      await fs.mkdir(path.join(config.sessionsDir, other), { recursive: true });
-      await fs.writeFile(
-        path.join(config.sessionsDir, other, "chat.jsonl"),
-        JSON.stringify({
-          ...createMuxMessage("edge", "user", "at the edge", {
-            historySequence: Number.MAX_SAFE_INTEGER,
-          }),
-          workspaceId: other,
-        }) + "\n"
-      );
-      const refused = await service.appendToHistory(other, createMuxMessage("m", "user", "x"));
-      expect(refused.success).toBe(false);
-      if (!refused.success) expect(refused.error).toContain("safe integer");
     });
 
-    it("refuses to open a segment above an unsafe persisted sequence", async () => {
-      const workspaceId = "workspace1";
+    it("ignores persisted sequences without a safe successor for the append and clear floors", async () => {
+      const workspaceId = "workspace2";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(workspaceDir, { recursive: true });
-      // `start + 1` cannot move past 2^53: a clear that pretended to would
-      // hand the new segment the old one's identity.
+      // Hand-edited rows at and past 2^53 - 1 cannot floor a counter that
+      // has to move; they are skipped like fractional sequences (never
+      // refused), so the user can still send and /clear removes them.
       await fs.writeFile(
         path.join(workspaceDir, "chat.jsonl"),
-        JSON.stringify({
-          ...createMuxMessage("huge", "user", "absurd sequence", {
-            historySequence: Number.MAX_SAFE_INTEGER + 1,
-          }),
-          workspaceId,
-        }) + "\n"
+        [
+          { ...createMuxMessage("sane", "user", "sane", { historySequence: 4 }), workspaceId },
+          {
+            ...createMuxMessage("edge", "user", "at the edge", {
+              historySequence: Number.MAX_SAFE_INTEGER,
+            }),
+            workspaceId,
+          },
+          {
+            ...createMuxMessage("huge", "user", "past the edge", {
+              historySequence: Number.MAX_SAFE_INTEGER + 1,
+            }),
+            workspaceId,
+          },
+        ]
+          .map((row) => JSON.stringify(row))
+          .join("\n") + "\n"
       );
-      const result = await service.clearHistory(workspaceId);
-      expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toContain("safe integer");
-      expect(await fs.readFile(path.join(workspaceDir, "chat.jsonl"), "utf-8")).toContain("huge");
+      const appended = createMuxMessage("m", "user", "x");
+      expect((await service.appendToHistory(workspaceId, appended)).success).toBe(true);
+      expect(appended.metadata?.historySequence).toBe(5);
+      expect((await service.clearHistory(workspaceId)).success).toBe(true);
+      expect(
+        await fs.access(path.join(workspaceDir, "chat.jsonl")).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+      const next = createMuxMessage("n", "user", "y");
+      expect((await service.appendToHistory(workspaceId, next)).success).toBe(true);
+      expect(next.metadata?.historySequence).toBe(6);
+      expect(next.metadata?.historySegment).toBe(6);
     });
 
     it("forks the current segment along with the history snapshot", async () => {

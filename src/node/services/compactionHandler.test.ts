@@ -1912,7 +1912,10 @@ describe("CompactionHandler", () => {
       // Sequences: the boundary sits at boundarySequence, the two first-epoch
       // copies at +1/+2, so the rows seeded here start at +3.
       await seedHistory(
-        createMuxMessage("p2", "user", "prelude snapshot", { synthetic: true }),
+        createMuxMessage("p2", "user", "prelude snapshot", {
+          synthetic: true,
+          fileAtMentionSnapshot: ["@notes.md"],
+        }),
         // Listed as a prelude row but of ordinary shape: never stamped through
         // the listing (r85).
         createMuxMessage("px", "user", "a real turn's question listed as prelude"),

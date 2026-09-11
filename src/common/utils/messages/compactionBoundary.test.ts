@@ -477,7 +477,10 @@ describe("epochHasPriorTurnRows", () => {
 
   it("counts an earlier user turn but not the batch being started", () => {
     expect(
-      withRows(["u-now", "user", "now"], ["p-now", "user", "prelude", { synthetic: true }])
+      withRows(
+        ["u-now", "user", "now"],
+        ["p-now", "user", "prelude", { synthetic: true, fileAtMentionSnapshot: ["@a.md"] }]
+      )
     ).toBe(false);
     expect(withRows(["u-old", "user", "earlier"], ["u-now", "user", "now"])).toBe(true);
     expect(withRows(["a-old", "assistant", "answer"], ["u-now", "user", "now"])).toBe(false);
@@ -487,6 +490,28 @@ describe("epochHasPriorTurnRows", () => {
     // A prelude listing naming an ordinary user turn (raw history) must not
     // hide that turn from the unknown-history rule.
     expect(withRows(["u-now", "user", "now"], ["p-now", "user", "a real earlier turn"])).toBe(true);
+    // Nor a synthetic user TURN (auto-resume, CLI goal continuation): no snapshot.
+    expect(
+      withRows(["u-now", "user", "now"], ["p-now", "user", "continue", { synthetic: true }])
+    ).toBe(true);
+    for (const marker of [
+      { agentSkillSnapshot: { skillName: "s", scope: "project" as const, sha256: "x" } },
+      {
+        mcpPromptSnapshot: {
+          serverName: "srv",
+          promptName: "p",
+          commandKey: "srv:p",
+          invokingMessageId: "u-now",
+        },
+      },
+    ]) {
+      expect(
+        withRows(
+          ["u-now", "user", "now"],
+          ["p-now", "user", "snapshot", { synthetic: true, ...marker }]
+        )
+      ).toBe(false);
+    }
   });
 
   it("ignores rows that are no turn of the epoch: compaction requests, tail copies, token-budget internals", () => {

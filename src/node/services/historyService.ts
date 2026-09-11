@@ -197,6 +197,14 @@ function stripContextUsage(message: MuxMessage): MuxMessage {
   };
 }
 
+/**
+ * A persisted history sequence the counter can be floored at: a nonnegative
+ * integer whose successor is still a safe integer (see getNewestHistorySequence).
+ */
+function isUsableHistorySequence(value: unknown): value is number {
+  return isNonNegativeInteger(value) && Number.isSafeInteger(value + 1);
+}
+
 /** The persisted row's segment stamp, kept across in-place replacement (see MuxMetadata.historySegment). */
 function preservedHistorySegment(existing: MuxMessage): { historySegment?: number } {
   const segment = existing.metadata?.historySegment;
@@ -1883,7 +1891,11 @@ export class HistoryService {
 
     for (const message of messages) {
       const sequence = message.metadata?.historySequence;
-      if (!isNonNegativeInteger(sequence)) {
+      // A sequence without a safe successor (>= 2^53 - 1; a hand-edited row)
+      // is malformed like a fraction: it cannot floor a counter that has to
+      // move, so it is skipped — appends continue from the sane rows and a
+      // clear removes it — rather than refusing every append and clear.
+      if (!isUsableHistorySequence(sequence)) {
         continue;
       }
 
@@ -2003,7 +2015,7 @@ export class HistoryService {
     const previousStart = this.historySegmentStarts.get(workspaceId) ?? 0;
     const start =
       clearedSequences.reduce(
-        (max, sequence) => (sequence > max ? sequence : max),
+        (max, sequence) => (isUsableHistorySequence(sequence) && sequence > max ? sequence : max),
         Math.max(persistedMax, (this.sequenceCounters.get(workspaceId) ?? 0) - 1, previousStart)
       ) + 1;
     await this.writeHistorySegmentStart(workspaceId, start);

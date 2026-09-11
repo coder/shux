@@ -1732,7 +1732,10 @@ describe("MemoryConsolidationService", () => {
         );
       }
       const snapshots = [`${ids.summary}-snap-a`, `${ids.summary}-snap-b`].map((id) =>
-        createMuxMessage(id, "user", "Snapshot content", { synthetic: true })
+        createMuxMessage(id, "user", "Snapshot content", {
+          synthetic: true,
+          fileAtMentionSnapshot: ["@notes.md"],
+        })
       );
       for (const snapshot of snapshots) {
         await fixture.historyService.appendToHistory("ws-dream", snapshot);

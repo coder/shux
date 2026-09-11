@@ -1110,15 +1110,31 @@ export class AgentSession {
    * context boundary (compaction without a preserved tail, /clear, context
    * reset, destructive history replace) via resetWorkspaceMemoryWritable.
    */
-  private workspaceMemoryWritable: boolean | undefined;
+  private workspaceMemoryWritable: { epoch: number; writable: boolean } | undefined;
 
-  recordWorkspaceMemoryWritable(effective: boolean): void {
-    this.workspaceMemoryWritable = effective;
+  /**
+   * Record the mirror for `epoch` (the policy epoch the turn was recorded
+   * under). Keyed like the durable records: with several backends over one
+   * chat.jsonl, another backend's no-tail compaction or destructive clear
+   * opens a new epoch without any callback here, so an unkeyed mirror would
+   * carry the previous epoch's value into the new one — a stale deny would
+   * pin its first writable turn, a stale grant would keep the unknown-history
+   * rule from failing closed.
+   */
+  recordWorkspaceMemoryWritable(effective: boolean, epoch: number): void {
+    assert(Number.isInteger(epoch), "workspace memory policy mirror epoch must be an integer");
+    this.workspaceMemoryWritable = { epoch, writable: effective };
   }
 
-  /** The mirror, for WorkspaceService's conjunction (undefined until a turn recorded). */
-  workspaceMemoryWritableMirror(): boolean | undefined {
-    return this.workspaceMemoryWritable;
+  /**
+   * The mirror for `epoch`, for WorkspaceService's conjunction and the
+   * completion observation: undefined until a turn of THAT epoch recorded
+   * (a value recorded for another epoch says nothing about this one).
+   */
+  workspaceMemoryWritableMirror(epoch: number): boolean | undefined {
+    return this.workspaceMemoryWritable?.epoch === epoch
+      ? this.workspaceMemoryWritable.writable
+      : undefined;
   }
 
   /** In-flight durable epoch reset started by a no-tail compaction (see the completion callback). */
@@ -1428,7 +1444,8 @@ export class AgentSession {
         this.coordinator.recordCompactionSummary(
           (metadata.preservedTailMessageCount ?? 0) > 0 ? metadata.summaryMessageId : null
         );
-        const closing = this.workspaceMemoryWritable;
+        const closingEpoch = compactionClosingPolicyEpoch(metadata);
+        const closing = this.workspaceMemoryWritableMirror(closingEpoch);
         const observed = Promise.resolve(
           onCompactionComplete?.({
             ...metadata,
@@ -1446,9 +1463,14 @@ export class AgentSession {
         // records are left in place (resetWorkspaceMemoryWritable explains
         // why); every durable value is bound to its epoch, so they are
         // invisible to the new epoch's turns on any backend.
-        const closingEpoch = compactionClosingPolicyEpoch(metadata);
         const preservedTail = (metadata.preservedTailMessageCount ?? 0) > 0;
-        if (!preservedTail) this.workspaceMemoryWritable = undefined;
+        // The mirror follows the durable carry: a preserved tail re-binds the
+        // closing epoch's value to the new epoch (the copies were produced
+        // under it); otherwise the new epoch starts without one.
+        this.workspaceMemoryWritable =
+          preservedTail && closing !== undefined
+            ? { epoch: metadata.summaryHistorySequence, writable: closing }
+            : undefined;
         const reset = observed
           .catch(() => undefined)
           .then(() =>
