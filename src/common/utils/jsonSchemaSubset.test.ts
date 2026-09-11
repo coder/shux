@@ -273,13 +273,17 @@ describe("validateJsonSchemaSubset", () => {
   });
 
   test("rejects a schema in a dialect it does not speak", () => {
-    const result = validateJsonSchemaSubsetSchema({
-      $schema: "http://json-schema.org/draft-04/schema#",
-      type: "string",
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.errors[0]?.path).toBe("$.$schema");
+    // Draft-06 lacks `if`/`then`/`else`, so a draft-07 verdict would enforce
+    // keywords a draft-06 server ignores; no loaded dialect stands in for it.
+    for (const uri of [
+      "http://json-schema.org/draft-04/schema#",
+      "http://json-schema.org/draft-06/schema#",
+    ]) {
+      const result = validateJsonSchemaSubsetSchema({ $schema: uri, type: "string" });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.errors[0]?.path).toBe("$.$schema");
+      }
     }
   });
 

@@ -32,14 +32,15 @@ export const JSON_SCHEMA_SUBSET_MAX_DEPTH = 64;
  * The dialects this validator speaks. A schema is judged in the dialect its
  * `$schema` declares: draft-07 Ajv would silently ignore 2020-12 keywords such
  * as `dependentRequired` and `prefixItems`, and a verdict in the wrong dialect
- * is worse than none. Draft-06 is judged as draft-07, which only adds
- * keywords. An undeclared dialect is draft-07, the default of the JSON Schema
- * emitters this app meets (zod v3, OpenAPI tooling).
+ * is worse than none. That cuts both ways, so no dialect stands in for
+ * another: draft-06 has no `if`/`then`/`else`, and a draft-07 verdict on a
+ * draft-06 schema would enforce keywords its server ignores. An undeclared
+ * dialect is draft-07, the default of the JSON Schema emitters this app meets
+ * (zod v3, OpenAPI tooling).
  */
 type Dialect = "draft-07" | "2019-09" | "2020-12";
 
 const DIALECT_BY_SCHEMA_URI = new Map<string, Dialect>([
-  ["json-schema.org/draft-06/schema", "draft-07"],
   ["json-schema.org/draft-07/schema", "draft-07"],
   ["json-schema.org/draft/2019-09/schema", "2019-09"],
   ["json-schema.org/draft/2020-12/schema", "2020-12"],

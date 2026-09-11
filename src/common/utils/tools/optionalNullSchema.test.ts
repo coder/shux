@@ -219,6 +219,82 @@ describe("optional null JSON Schema contract", () => {
     expect(restoreMcp(source, { kind: "optional", value: null })).toEqual({ kind: "optional" });
   });
 
+  test("keeps a null that an open union branch accepts", () => {
+    const source = {
+      anyOf: [
+        {
+          type: "object",
+          required: ["kind"],
+          properties: { kind: { const: "typed" }, value: { type: "string" } },
+        },
+        // Declares no `value`, so any `value` satisfies it.
+        { type: "object", required: ["kind"], properties: { kind: { const: "untyped" } } },
+      ],
+    };
+
+    expect(restoreMcp(source, { kind: "untyped", value: null })).toEqual({
+      kind: "untyped",
+      value: null,
+    });
+    expect(restoreMcp(source, { kind: "typed", value: null })).toEqual({ kind: "typed" });
+  });
+
+  test("tells a property whose name contains a slash apart from a nested property", () => {
+    const source = {
+      type: "object",
+      properties: {
+        "a/b": { type: "string" },
+        a: { type: "object", properties: { b: { type: "string" } } },
+      },
+    };
+
+    expect(restoreMcp(source, { "a/b": "", a: { b: "" } })).toEqual({ a: {} });
+    expect(restoreMcp(source, { "a/b": null, a: { b: null } })).toEqual({ a: {} });
+  });
+
+  test("restores placeholders inside dictionary values", () => {
+    const entry = { type: "object", properties: { note: { type: "string" } } };
+    const source = {
+      type: "object",
+      properties: {
+        byId: { type: "object", additionalProperties: entry },
+        byPrefix: { type: "object", patternProperties: { "^x-": entry } },
+        env: { type: "object", additionalProperties: { type: "string" } },
+      },
+    };
+
+    expect(
+      restoreMcp(source, {
+        byId: { first: { note: "" }, second: { note: null } },
+        byPrefix: { "x-a": { note: "" }, other: { note: "" } },
+        env: { DEBUG: "" },
+      })
+    ).toEqual({
+      byId: { first: {}, second: {} },
+      // `other` matches no pattern, so nothing declares its `note`.
+      byPrefix: { "x-a": {}, other: { note: "" } },
+      // A dictionary entry is data the model chose, not a declared optional property.
+      env: { DEBUG: "" },
+    });
+  });
+
+  test("restores placeholders in tuple items past the prefix", () => {
+    const tail = { type: "object", properties: { note: { type: "string" } } };
+    const rows = ["head", { note: "" }, { note: null }];
+    const draft07 = {
+      type: "object",
+      properties: { rows: { type: "array", items: [{ type: "string" }], additionalItems: tail } },
+    };
+    const draft2020 = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { rows: { type: "array", prefixItems: [{ type: "string" }], items: tail } },
+    };
+
+    expect(restoreMcp(draft07, { rows })).toEqual({ rows: ["head", {}, {}] });
+    expect(restoreMcp(draft2020, { rows })).toEqual({ rows: ["head", {}, {}] });
+  });
+
   test("restores optional placeholders inside the union branch that accepts the raw value", () => {
     const source = {
       anyOf: [
