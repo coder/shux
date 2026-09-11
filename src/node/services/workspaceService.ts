@@ -4012,12 +4012,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         this.initStateManager.appendOutput(workspaceId, message, false, true);
       },
-      logProgress: (label: string, percent: number) => {
-        if (!hasInitState()) {
-          return;
-        }
-        this.initStateManager.reportProgress(workspaceId, label, percent);
-      },
+      logProgress: (label: string, percent: number) =>
+        this.initStateManager.reportProgress(workspaceId, label, percent),
       logStdout: (line: string) => {
         if (!hasInitState()) {
           return;

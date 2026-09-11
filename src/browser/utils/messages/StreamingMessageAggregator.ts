@@ -3069,26 +3069,26 @@ export class StreamingMessageAggregator {
         this.initState.lines.shift();
         this.initState.truncatedLines = (this.initState.truncatedLines ?? 0) + 1;
       }
-      this.initState.lines.push({ line, isError, ...(data.step === true ? { step: true } : {}) });
+      this.initState.lines.push({ line, isError, step: data.step ? true : undefined });
       if (data.step === true) {
         this.initState.progress = null;
       }
 
       // Throttle cache invalidation during fast streaming to avoid re-render per line.
-      this.initOutputThrottleTimer ??= setTimeout(() => {
-        this.initOutputThrottleTimer = null;
-        this.invalidateCache();
-      }, StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS);
+      this.initOutputThrottleTimer ??= setTimeout(
+        () => this.flushPendingInitOutput(),
+        StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+      );
       return true;
     }
 
     if (isInitProgress(data)) {
       if (this.initState?.status === "running") {
         this.initState.progress = { label: data.label, percent: data.percent };
-        this.initOutputThrottleTimer ??= setTimeout(() => {
-          this.initOutputThrottleTimer = null;
-          this.invalidateCache();
-        }, StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS);
+        this.initOutputThrottleTimer ??= setTimeout(
+          () => this.flushPendingInitOutput(),
+          StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS
+        );
       }
       return true;
     }
@@ -3873,11 +3873,8 @@ export class StreamingMessageAggregator {
         };
         // Creation belongs to the first user turn, even though init starts before it is persisted.
         const insertionIndex = resultMessages.findIndex((message) => message.type === "user") + 1;
-        resultMessages = [
-          ...resultMessages.slice(0, insertionIndex),
-          initMessage,
-          ...resultMessages.slice(insertionIndex),
-        ];
+        resultMessages = resultMessages.slice();
+        resultMessages.splice(insertionIndex, 0, initMessage);
       }
 
       // Return the full array

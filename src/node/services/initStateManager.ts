@@ -142,7 +142,7 @@ export class InitStateManager extends EventEmitter {
         workspaceId,
         line: timedLine.line,
         isError: timedLine.isError,
-        ...(timedLine.step ? { step: true } : {}),
+        step: timedLine.step ? true : undefined,
         timestamp: timedLine.timestamp, // Use original timestamp for replay
         lineNumber: truncatedLines + index,
         replay: true,
@@ -257,7 +257,7 @@ export class InitStateManager extends EventEmitter {
 
     const timestamp = Date.now();
     const lineNumber = (state.truncatedLines ?? 0) + state.lines.length;
-    const timedLine: TimedLine = { line, isError, timestamp, ...(step ? { step: true } : {}) };
+    const timedLine: TimedLine = { line, isError, timestamp, step: step || undefined };
 
     // Truncation: keep only the most recent MAX_LINES
     if (state.lines.length >= INIT_HOOK_MAX_LINES) {
@@ -270,10 +270,7 @@ export class InitStateManager extends EventEmitter {
     this.emit("init-output", {
       type: "init-output",
       workspaceId,
-      line,
-      isError,
-      ...(step ? { step: true } : {}),
-      timestamp,
+      ...timedLine,
       lineNumber,
     } satisfies WorkspaceInitEvent & { workspaceId: string });
   }
