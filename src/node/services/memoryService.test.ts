@@ -2386,6 +2386,74 @@ describe("MemoryService", () => {
       ).get("note.md")!;
       expect(record.target).toBe("imported/ws-child/note.md");
       expect(record.created).toBe(true);
+      expect(record.targetStamp).toBe(
+        (await adoptionTargetStamp(path.join(ownerRoot, "imported", "ws-child", "note.md"))) ??
+          undefined
+      );
+      // The staged bytes were installed by rename; nothing lingers.
+      expect(await pathExists(path.join(ownerRoot, ".adoption-staging"))).toBe(false);
+    });
+
+    it("never claims a copy by byte match alone: a pending record without its receipt's generation", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "same bytes");
+      // A fresh adoption crashed after recording its pending manifest but
+      // BEFORE installing the copy — the receipt names staged bytes that
+      // never reached the target. Another backend (or the owner) then created
+      // an owner note with the very same bytes at the planned target.
+      const manifestPath = legacyAdoptionManifestPath(path.dirname(legacyRoot));
+      await fsPromises.mkdir(path.dirname(manifestPath), { recursive: true });
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({
+          "note.md": {
+            content: sha256Hex("same bytes"),
+            sidecar: "",
+            target: "note.md",
+            created: true,
+            pending: true,
+            targetStamp: "1:10:1",
+          },
+        })
+      );
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "same bytes");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      const record = (await readLegacyAdoptionManifest(manifestPath)).get("note.md")!;
+      expect(record.pending).toBeUndefined();
+      expect(record.created).toBe(false);
+      expect(record.targetStamp).toBeUndefined();
+      // The same for an older build's stamp-less pending record: ambiguous,
+      // so it claims nothing.
+      await fsPromises.writeFile(
+        manifestPath,
+        JSON.stringify({
+          "note.md": {
+            content: sha256Hex("same bytes"),
+            sidecar: "",
+            target: "note.md",
+            created: true,
+            pending: true,
+          },
+        })
+      );
+      await new MemoryService(
+        fixture.config,
+        new MemoryMetaService(fixture.xumHome)
+      ).listIndexEntries({ ...fixture.ctx });
+      expect((await readLegacyAdoptionManifest(manifestPath)).get("note.md")!.created).toBe(false);
+      // Deleting the legacy source therefore leaves the owner's note alone.
+      await fsPromises.rm(path.join(legacyRoot, "note.md"));
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe(
+        "same bytes"
+      );
+      // No staged bytes linger in the owner store.
+      expect(await pathExists(path.join(ownerRoot, ".adoption-staging"))).toBe(false);
     });
 
     it("keeps adoption provenance when the pass is interrupted between copy and manifest", async () => {
@@ -2841,10 +2909,17 @@ describe("MemoryService", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "v3-replaced");
       await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "v3-replaced");
+      // The receipt the pass took on the staged bytes (a rename keeps it).
+      const receipt = async () => (await adoptionTargetStamp(path.join(ownerRoot, "note.md")))!;
       await fsPromises.writeFile(
         manifestPath,
         JSON.stringify({
-          "note.md": { ...settled2, pending: true, replacementContent: sha256Hex("v3-replaced") },
+          "note.md": {
+            ...settled2,
+            pending: true,
+            replacementContent: sha256Hex("v3-replaced"),
+            replacementStamp: await receipt(),
+          },
         })
       );
       await new MemoryService(
@@ -2878,7 +2953,12 @@ describe("MemoryService", () => {
       await fsPromises.writeFile(
         manifestPath,
         JSON.stringify({
-          "note.md": { ...settled3, pending: true, replacementContent: sha256Hex("v4") },
+          "note.md": {
+            ...settled3,
+            pending: true,
+            replacementContent: sha256Hex("v4"),
+            replacementStamp: await receipt(),
+          },
         })
       );
       await new Promise((resolve) => setTimeout(resolve, 5));

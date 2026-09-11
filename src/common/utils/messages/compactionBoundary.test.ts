@@ -512,6 +512,28 @@ describe("epochHasPriorTurnRows", () => {
         )
       ).toBe(false);
     }
+    // Raw history: a snapshot field holding `null` or a value without the
+    // backend's shape is no snapshot — the row stays a turn of its own.
+    for (const malformed of [
+      { fileAtMentionSnapshot: null },
+      { fileAtMentionSnapshot: "@a.md" },
+      { fileAtMentionSnapshot: [1] },
+      { agentSkillSnapshot: null },
+      { agentSkillSnapshot: { skillName: "s" } },
+      { mcpPromptSnapshot: {} },
+      { mcpPromptSnapshot: { serverName: "srv", promptName: "p" } },
+    ]) {
+      const row = createMuxMessage("p-now", "user", "looks like a prelude", { synthetic: true });
+      expect(
+        epochHasPriorTurnRows(
+          [
+            createMuxMessage("u-now", "user", "now"),
+            { ...row, metadata: { ...row.metadata, ...(malformed as object) } },
+          ],
+          current
+        )
+      ).toBe(true);
+    }
   });
 
   it("ignores rows that are no turn of the epoch: compaction requests, tail copies, token-budget internals", () => {

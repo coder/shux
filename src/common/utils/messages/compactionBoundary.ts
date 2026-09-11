@@ -6,7 +6,7 @@ import {
 import { isPositiveInteger } from "@/common/utils/numbers";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
 
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessage, MuxMetadata } from "@/common/types/message";
 import { isTokenBudgetInternalMessage } from "@/common/types/message";
 
 export { CONTEXT_BOUNDARY_KINDS };
@@ -295,7 +295,9 @@ export function epochHasPriorTurnRows(
  * accounting (prior-turn check, harvest coverage, tail-copy stamps) honors a
  * prelude listing only for prelude-shaped rows, so a listing that names any
  * other user row (persisted history is raw JSON) cannot make that turn read
- * as accounted for.
+ * as accounted for. The snapshot must have the shape the backend writes
+ * (r89): a `null` or arbitrary value under the field — corruption, or a
+ * turn hand-edited to look like a prelude — grants nothing.
  */
 export function isRequestPreludeRow(message: MuxMessage): boolean {
   const metadata = message.metadata;
@@ -303,9 +305,33 @@ export function isRequestPreludeRow(message: MuxMessage): boolean {
   if (message.role === "assistant") return true;
   return (
     message.role === "user" &&
-    (metadata.fileAtMentionSnapshot !== undefined ||
-      metadata.agentSkillSnapshot !== undefined ||
-      metadata.mcpPromptSnapshot !== undefined)
+    (isFileAtMentionSnapshotShape(metadata.fileAtMentionSnapshot) ||
+      isAgentSkillSnapshotShape(metadata.agentSkillSnapshot) ||
+      isMcpPromptSnapshotShape(metadata.mcpPromptSnapshot))
+  );
+}
+
+function isFileAtMentionSnapshotShape(value: unknown): boolean {
+  return Array.isArray(value) && value.every((token) => typeof token === "string");
+}
+
+function isAgentSkillSnapshotShape(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const snapshot = value as Partial<NonNullable<MuxMetadata["agentSkillSnapshot"]>>;
+  return (
+    typeof snapshot.skillName === "string" &&
+    typeof snapshot.scope === "string" &&
+    typeof snapshot.sha256 === "string"
+  );
+}
+
+function isMcpPromptSnapshotShape(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const snapshot = value as Partial<NonNullable<MuxMetadata["mcpPromptSnapshot"]>>;
+  return (
+    typeof snapshot.serverName === "string" &&
+    typeof snapshot.promptName === "string" &&
+    typeof snapshot.commandKey === "string"
   );
 }
 

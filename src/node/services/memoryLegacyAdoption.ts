@@ -72,6 +72,13 @@ export interface LegacyAdoptionRecord {
    */
   replacementContent?: string;
   /**
+   * Identity (`ino:size:mtimeNs`) of the staged bytes an in-place replacement
+   * is about to install, taken on the staging entry before the install (a
+   * rename keeps it) and set together with `replacementContent`. A retry
+   * finds the installed copy by this stamp; a byte match alone never counts.
+   */
+  replacementStamp?: string;
+  /**
    * Reconciliation of a deleted source is under way: the copy is about to be
    * (or was just) removed. Set before the removal so a crash between the
    * removal and the tombstone write is recovered as "removed by us" rather
@@ -117,6 +124,9 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     return null;
   }
   if (record.targetStamp !== undefined && typeof record.targetStamp !== "string") return null;
+  if (record.replacementStamp !== undefined && typeof record.replacementStamp !== "string") {
+    return null;
+  }
   const flag = (raw: unknown, malformed: boolean): boolean | undefined =>
     raw === undefined ? undefined : typeof raw === "boolean" ? raw : malformed;
   return {
@@ -129,6 +139,7 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     deleted: flag(record.deleted, false),
     replaced: flag(record.replaced, true),
     replacementContent: record.replacementContent,
+    replacementStamp: record.replacementStamp,
     targetStamp: record.targetStamp,
   };
 }

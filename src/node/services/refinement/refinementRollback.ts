@@ -628,8 +628,12 @@ function orderUnknown(
   if (sameOriginOrder(row, target) !== null) return false;
   if (row.data.orderUnknown === true || target.data.orderUnknown === true) return true;
   if (hasMalformedSourceClock(row) || hasMalformedSourceClock(target)) return true;
-  // A retargeted target (see wasRetargeted) vs. a row of another journal.
-  return targetRetargeted && row.workspaceId !== target.workspaceId;
+  // A retargeted target (see wasRetargeted) vs. any row not proven to share
+  // its origin: the target's clock is a private store's, so no other clock
+  // orders it. Not decided by persisted `workspaceId`s (r79): a peer row's
+  // corrupted to the target's would otherwise be ordered by clock and a
+  // later peer mutation overwritten by the rollback.
+  return targetRetargeted;
 }
 
 /**

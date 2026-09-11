@@ -1275,6 +1275,63 @@ describe("refinementRollback", () => {
     expect(await pathExists(path.join(ownerRoot, "c.md"))).toBe(false);
   });
 
+  it("keeps a retargeted row order-unknown against a peer row whose workspaceId is corrupted to its own", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/workspace/note.md", "v1\n", "agent");
+    await fixture.service.strReplace(
+      fixture.ctx,
+      "/memories/workspace/note.md",
+      "v1",
+      "v2",
+      "agent"
+    );
+    const editRow = await lastRow(fixture.sessionDir);
+    const ownerSessionDir = path.join(path.dirname(fixture.sessionDir), "ws-owner");
+    const ownerRoot = path.join(ownerSessionDir, "memory");
+    await fsPromises.mkdir(path.join(ownerRoot, "sub"), { recursive: true });
+    await fsPromises.writeFile(path.join(ownerRoot, "sub", "note.md"), "v2\n");
+    const record: LegacyAdoptionRecord = {
+      content: "x",
+      sidecar: "",
+      target: "sub/note.md",
+      created: true,
+      targetStamp: (await adoptionTargetStamp(path.join(ownerRoot, "sub", "note.md"))) ?? undefined,
+    };
+    await fsPromises.writeFile(
+      legacyAdoptionManifestPath(fixture.sessionDir),
+      JSON.stringify({ "note.md": record })
+    );
+    // The owner's row persisted with THIS workspace's id (corruption): it is
+    // still another journal's row, with the shared store's clock — a
+    // comparison of that clock against the retargeted row's private one
+    // would order the peer edit "earlier" and let the rollback overwrite it.
+    await sharedDurableEventJournal(ownerSessionDir).append({
+      workspaceId: path.basename(fixture.sessionDir),
+      kind: "refinement",
+      data: {
+        kind: "memory",
+        action: { op: "str_replace", path: "/memories/workspace/sub/note.md" },
+        inverse: {
+          op: "restore-files",
+          files: [{ path: path.join(ownerSessionDir, "memory", "sub", "note.md"), text: "v2\n" }],
+        },
+        sourceTs: 1,
+      },
+    });
+    const unordered = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: editRow.id,
+      evidence: EVIDENCE,
+      sharedWorkspaceMemorySessionDir: ownerSessionDir,
+      listSharedWorkspaceMemoryPeerSessionDirs: () => [ownerSessionDir],
+    });
+    expect(unordered.success).toBe(false);
+    expect(unordered.success ? "" : unordered.error).toContain(
+      "order relative to this row is unknown"
+    );
+    expect(await fsPromises.readFile(path.join(ownerRoot, "sub", "note.md"), "utf-8")).toBe("v2\n");
+  });
+
   it("journals the rollback row before releasing the target locks (no durable-order inversion)", async () => {
     using fixture = await createFixture();
     const virtualPath = "/memories/global/order.md";

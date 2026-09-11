@@ -17,7 +17,7 @@
  * documented limitation.
  */
 import { EventEmitter } from "events";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -431,6 +431,12 @@ interface MemoryStore {
  * relPath the owner already uses with different content (adoptLegacyPrivateStore).
  */
 const LEGACY_IMPORT_DIR = "imported";
+/**
+ * Hidden (dot-entry: never listed, never indexed) owner-store directory the
+ * adoption pass stages a copy's bytes in before installing them by rename
+ * (adoptLegacyPrivateStoreOrThrow); emptied at the start of every pass.
+ */
+const LEGACY_ADOPTION_STAGING_DIR = ".adoption-staging";
 
 /**
  * Pin bit of a manifest record's child sidecar fingerprint. No child entry at
@@ -1386,6 +1392,9 @@ export class MemoryService extends EventEmitter {
       // the cap and hide an adopted note's only copy once readable again.
       let remainingCapacity =
         MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles({ strict: true })).length;
+      // Staged bytes a crashed pass never installed: their records claim
+      // nothing (no file carries the receipt), so they are simply dropped.
+      await store.remove(LEGACY_ADOPTION_STAGING_DIR);
       let capacityExhausted = false;
       let manifestDirty = false;
       let imported = 0;
@@ -1435,7 +1444,14 @@ export class MemoryService extends EventEmitter {
         ) {
           continue; // folded in earlier, nothing changed since
         }
-        let target: { relPath: string; write: boolean; replaces?: boolean } | null = null;
+        // `generation`: the stamp of the copy an in-place replacement installs
+        // over, re-checked right before the install.
+        let target: {
+          relPath: string;
+          write: boolean;
+          replaces?: boolean;
+          generation?: string;
+        } | null = null;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
         // note it was folded into at first adoption; a copy the owner
@@ -1466,55 +1482,44 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
+          // Ours only while the copy is a generation this adoption installed
+          // (LegacyAdoptionRecord.targetStamp / replacementStamp — receipts
+          // taken on the staged bytes BEFORE they appear at the target, so
+          // even a pass interrupted between manifest and install left one).
+          // Identical bytes in another generation are the owner's (r79: the
+          // same rule deletion reconciliation and the rollback remapper
+          // apply): the owner may have deleted and recreated the note with
+          // the very same bytes, or — a pass interrupted before its install
+          // — another backend may have created it at the planned target
+          // (r89). `pending` alone is never provenance: a stamp-less pending
+          // record (an older build's) is ambiguous and claims nothing.
+          const currentStamp =
+            (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+          const ours =
+            previous.created === true &&
+            currentStamp !== undefined &&
+            (currentStamp === previous.targetStamp || currentStamp === previous.replacementStamp);
           if (priorContent === content) {
             target = { relPath: previous.target, write: false };
-            // A pending record is a copy this adoption wrote but could not
-            // finish recording (crash or sidecar failure after the write):
-            // the file holding exactly those bytes now is that write, so its
-            // current identity is the generation to bind — also when the
-            // record carries a stamp, which is then the generation an
-            // interrupted in-place replacement OVERWROTE (r75). A settled
-            // record keeps the stamp it recorded — identical bytes in a
-            // different generation are the owner's (r79: the same rule
-            // deletion reconciliation and the rollback remapper apply), so
-            // the record stops claiming the copy and the child's sidecar
-            // changes no longer reach it.
-            const currentStamp =
-              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
-            const ours =
-              previous.created === true &&
-              (previous.pending === true ||
-                (previous.targetStamp !== undefined && previous.targetStamp === currentStamp));
             record.created = ours;
-            record.targetStamp = !ours
-              ? undefined
-              : previous.pending === true
-                ? currentStamp
-                : previous.targetStamp;
+            record.targetStamp = ours ? currentStamp : undefined;
             const replaced = previous.replaced === true || (previous.created === true && !ours);
             if (replaced) record.replaced = true;
             foldChildPin = !replaced;
           } else if (
-            previous.created === true &&
+            ours &&
             priorContent !== null &&
             [previous.content, previous.replacementContent].includes(sha256Hex(priorContent))
           ) {
-            // The bytes alone do not prove the copy is still this adoption's:
-            // the owner may have deleted the copy and recreated it with the
-            // very same bytes (r87) — then it is the owner's generation (the
-            // rule above), and the child's edit must not replace it in place
-            // but land elsewhere. A settled record proves its generation by
-            // stamp; a pending record without one is a fresh adoption whose
-            // write the retry finds (the identical-bytes rule), while a
-            // pending replacement keeps the overwritten generation's stamp
-            // and is held to it — the old bytes must still be that file.
-            const currentStamp =
-              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
-            const ours =
-              previous.targetStamp !== undefined
-                ? previous.targetStamp === currentStamp
-                : previous.pending === true;
-            if (ours) target = { relPath: previous.target, write: true, replaces: true };
+            // Legacy bytes edited on the downgraded build while the copy is
+            // still this adoption's (either side of an interrupted
+            // replacement): replaced in place.
+            target = {
+              relPath: previous.target,
+              write: true,
+              replaces: true,
+              generation: currentStamp,
+            };
           }
         }
         if (target === null) {
@@ -1546,27 +1551,88 @@ export class MemoryService extends EventEmitter {
             skipped++;
             continue;
           }
-          // Provenance BEFORE the copy: interrupted here (crash, or the
-          // sidecar fold below failing), the retry finds the owner file
-          // already identical and takes the no-write path — without this
-          // record it would read as the owner's own note, and a legacy
-          // deletion could then never follow it out of the shared store.
-          // A replacement keeps the PRIOR record (old hash, same target)
-          // while pending: interrupted before the write, the retry must still
-          // recognize the surviving old bytes as this adoption's copy and
-          // replace them, not import the new bytes elsewhere.
+          // Staged install: the bytes are written to a hidden staging entry
+          // of the owner store first and their identity taken there (a
+          // rename keeps ino, size and mtime), so the manifest can record the
+          // receipt of the copy BEFORE the copy appears at the target. A pass
+          // interrupted at any point then leaves a record that either names
+          // a file not yet there (nothing claimed) or names the installed
+          // generation by stamp; a plain byte match never has to stand in
+          // for provenance. Without the record, an installed copy would read
+          // as the owner's own note, and a legacy deletion could then never
+          // follow it out of the shared store. A replacement keeps the PRIOR
+          // record (old hash and stamp, same target) while pending: on either
+          // side of the install the retry recognizes the file by its stamp.
+          const stagingRelPath = `${LEGACY_ADOPTION_STAGING_DIR}/${randomUUID()}`;
+          try {
+            await store.assertContained(stagingRelPath);
+            await store.writeFile(stagingRelPath, content);
+          } catch (error) {
+            log.warn("[MemoryService] cannot stage a legacy note for adoption; retrying later", {
+              childId,
+              relPath,
+              error,
+            });
+            skipped++;
+            continue;
+          }
+          const stagedStamp = await adoptionTargetStamp(store.physicalPath(stagingRelPath));
+          if (stagedStamp === null) {
+            await store.remove(stagingRelPath);
+            skipped++;
+            continue;
+          }
           adopted.set(
             relPath,
             target.replaces === true && previous !== undefined
-              ? { ...previous, pending: true, replacementContent: record.content }
-              : { ...record, target: target.relPath, created: true, pending: true }
+              ? {
+                  ...previous,
+                  pending: true,
+                  replacementContent: record.content,
+                  replacementStamp: stagedStamp,
+                }
+              : {
+                  ...record,
+                  target: target.relPath,
+                  created: true,
+                  pending: true,
+                  targetStamp: stagedStamp,
+                }
           );
           await writeManifest();
-          await store.writeFile(target.relPath, content);
+          // The destination as decided above, re-checked under the lock right
+          // before the install: a fresh placement must still be free, a
+          // replacement must still be the generation it was decided against.
+          // Anything else is owner state the rename must not clobber — the
+          // staged bytes are dropped, the record restored, and the note is
+          // placed on the next pass.
+          const installable =
+            target.replaces === true
+              ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
+                target.generation
+              : (await store.kind(target.relPath, { strict: true })) === null;
+          if (!installable) {
+            await store.remove(stagingRelPath);
+            if (previous === undefined) adopted.delete(relPath);
+            else adopted.set(relPath, previous);
+            await writeManifest();
+            log.warn(
+              "[MemoryService] adoption destination changed before install; retrying later",
+              {
+                childId,
+                relPath,
+                target: target.relPath,
+              }
+            );
+            skipped++;
+            continue;
+          }
+          await store.rename(stagingRelPath, target.relPath);
           if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
-          // The generation of the file just written (see targetStamp).
+          // The generation of the file just installed (see targetStamp): the
+          // staged receipt, unless the filesystem re-stamped the rename.
           record.targetStamp =
             (await adoptionTargetStamp(store.physicalPath(target.relPath))) ?? undefined;
         }
@@ -1694,24 +1760,21 @@ export class MemoryService extends EventEmitter {
               }
             }
           }
-          // Ours only while it is THIS generation of the file (targetStamp,
-          // taken right after this adoption's write): identical bytes in a
-          // file the owner deleted and recreated, or edited and restored, are
-          // the owner's, and a record without a stamp preserves. The one
-          // exception is the far side of an interrupted in-place replacement:
-          // the pending record names the bytes about to be written, and a
-          // file holding exactly those (never before in the store) is that
-          // write, whose stamp the crash kept from being recorded.
+          // Ours only while it is a generation this adoption installed
+          // (targetStamp; replacementStamp on the far side of an interrupted
+          // in-place replacement — both receipts taken on the staged bytes,
+          // so a crash cannot have kept them from being recorded): identical
+          // bytes in a file the owner deleted and recreated, or edited and
+          // restored, are the owner's, and a record without a stamp preserves.
           const currentHash = current === null ? null : sha256Hex(current);
+          const stamp = await adoptionTargetStamp(store.physicalPath(previous.target));
           const unchanged =
             currentHash !== null &&
-            ((previous.pending === true &&
-              previous.replacementContent !== undefined &&
-              currentHash === previous.replacementContent) ||
-              (currentHash === previous.content &&
-                previous.targetStamp !== undefined &&
-                (await adoptionTargetStamp(store.physicalPath(previous.target))) ===
-                  previous.targetStamp));
+            stamp !== null &&
+            ((currentHash === previous.content && stamp === previous.targetStamp) ||
+              (previous.pending === true &&
+                currentHash === previous.replacementContent &&
+                stamp === previous.replacementStamp));
           // A listed note may now point at this very target (the downgraded
           // build renamed `a.md` to the path its conflict copy was adopted
           // under, and the new record reused the identical file): the target
@@ -1780,6 +1843,7 @@ export class MemoryService extends EventEmitter {
         manifestDirty = true;
       }
       if (manifestDirty) await writeManifest();
+      await store.remove(LEGACY_ADOPTION_STAGING_DIR);
       if (capacityExhausted) {
         log.warn(
           "[MemoryService] shared workspace notebook is full; legacy notes left in the sub-agent's private directory until space frees up",
