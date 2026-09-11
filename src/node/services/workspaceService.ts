@@ -4207,8 +4207,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * clears its own cache on tool-call-end). `isAffected` decides membership.
    */
   invalidateMemoryContextWhere(isAffected: (workspaceId: string) => boolean): void {
-    for (const [workspaceId, session] of this.sessions) {
-      if (isAffected(workspaceId)) session.invalidateMemoryContext();
+    // Startup-recovery sessions are live too and may be promoted with their cache.
+    for (const registry of [this.sessions, this.transientStartupRecoverySessions]) {
+      for (const [workspaceId, session] of registry) {
+        if (isAffected(workspaceId)) session.invalidateMemoryContext();
+      }
     }
   }
 

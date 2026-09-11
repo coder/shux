@@ -577,10 +577,20 @@ export const CoreWiringLive: Layer.Layer<
     // every live session resolving to that owner reads the same notebook.
     memoryService.on("change", (event: MemoryChangeEvent) => {
       if (event.scope !== "workspace" || event.workspaceId === "") return;
+      // One config snapshot for the whole pass: cold owner lookups would
+      // otherwise parse the config once per live session, synchronously.
+      let cfg: ReturnType<typeof config.loadConfigOrDefault> | undefined;
+      const snapshot = () => (cfg ??= config.loadConfigOrDefault());
       workspaceService.invalidateMemoryContextWhere(
         (workspaceId) =>
-          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId) === event.workspaceId
+          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, snapshot) === event.workspaceId
       );
+    });
+    // Ownership itself changed (an owner was removed while its sub-agents
+    // live on): those sessions' cached contexts still describe the old store.
+    memoryService.on("ownersInvalidated", (workspaceIds: string[]) => {
+      const affected = new Set(workspaceIds);
+      workspaceService.invalidateMemoryContextWhere((workspaceId) => affected.has(workspaceId));
     });
     if (opts.devToolsService) {
       // DevTools debug-log cleanup when workspaces are archived/removed.

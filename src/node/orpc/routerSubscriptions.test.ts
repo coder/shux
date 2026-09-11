@@ -48,12 +48,13 @@ test("memory subscriptions match workspace-scope events on the shared memory own
   const memoryService = new EventEmitter();
   const memoryConsolidationService = new EventEmitter();
   const controller = new AbortController();
+  const ownerOf = new Map([["ws-child", "ws-owner"]]);
   const context = {
     "effect/context": app.context,
     workspaceService: { getInfo: () => Promise.resolve(null) },
     memoryService: Object.assign(memoryService, {
       resolveWorkspaceMemoryOwnerId: (workspaceId: string) =>
-        workspaceId === "ws-child" ? "ws-owner" : workspaceId,
+        ownerOf.get(workspaceId) ?? workspaceId,
     }),
     memoryConsolidationService,
   } as unknown as ORPCContext;
@@ -79,6 +80,24 @@ test("memory subscriptions match workspace-scope events on the shared memory own
     memoryService.emit("change", marker);
     expect((await first).value).toEqual({ ...base, workspaceId: "ws-owner" });
     expect((await stream.next()).value).toEqual(marker);
+
+    // Ownership change for THIS workspace (owner removed): synthesized
+    // root-addressed refresh + status refresh, now addressed to the new owner.
+    ownerOf.set("ws-child", "ws-child");
+    memoryService.emit("ownersInvalidated", ["ws-unrelated"]);
+    memoryService.emit("ownersInvalidated", ["ws-child"]);
+    expect((await stream.next()).value).toEqual({
+      scope: "workspace",
+      path: "/memories/workspace",
+      actor: "user",
+      workspaceId: "ws-child",
+      projectPath: "",
+    });
+    expect((await stream.next()).value).toEqual({
+      kind: "consolidation_status",
+      workspaceId: "ws-child",
+      projectPath: "",
+    });
   } finally {
     controller.abort();
     await stream.return(undefined);
