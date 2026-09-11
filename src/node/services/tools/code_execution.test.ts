@@ -202,6 +202,45 @@ describe("createCodeExecutionTool", () => {
     });
   });
 
+  describe("project skill provenance", () => {
+    const skillResult = (scope: "project" | "global") => ({
+      success: true,
+      skill: {
+        scope,
+        directoryName: "repo-conventions",
+        frontmatter: { name: "repo-conventions", description: "Repository conventions" },
+        body: "SKILL BODY",
+      },
+    });
+
+    it("stamps the output when a nested skill read returned project content, not for global", async () => {
+      // The guest can copy the nested result anywhere in the output, so the
+      // routed-request consent scan classifies the WHOLE execution by this
+      // stamp rather than by the nested record alone.
+      for (const scope of ["project", "global"] as const) {
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge({
+            agent_skill_read: createMockTool(
+              "agent_skill_read",
+              z.object({ name: z.string() }),
+              mock(() => skillResult(scope))
+            ),
+          })
+        );
+        const result = (await tool.execute!(
+          {
+            code: 'const s = xum.agent_skill_read({name: "repo-conventions"}); return s.skill.body;',
+          },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+        expect(result.success).toBe(true);
+        expect(result.result).toBe("SKILL BODY");
+        expect(result.carriesProjectSkillContent).toBe(scope === "project" ? true : undefined);
+      }
+    });
+  });
+
   describe("static analysis", () => {
     it("rejects raw heredoc strings without side effects and accepts a correctly quoted retry", async () => {
       const executeBash = mock(() => mockResults.bash);

@@ -13,6 +13,7 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { PROJECT_SKILL_TURN_WITHHELD_MESSAGE } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { REFINE_SUMMARY_LABEL } from "@/constants/refine";
@@ -156,6 +157,8 @@ async function createFixture(options?: {
   applyLockTimeoutMs?: number;
   /** r40 turn-exclusion hook (busy-workspace refusal tests). */
   acquireTurnExclusion?: (workspaceId: string) => Result<Disposable, string>;
+  /** Rejected-row quarantine lookup (consent tests); Err = record unreadable. */
+  getQuarantinedRowIds?: (workspaceId: string) => Result<ReadonlySet<string>, string>;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -167,6 +170,9 @@ async function createFixture(options?: {
   await config.editConfig((cfg) => {
     cfg.projects.set("/projects/demo", {
       workspaces: [{ id: WORKSPACE_ID, name: WORKSPACE_ID, path: workspacePath }],
+      // Trusted: the distillation transcript carries project skill content
+      // only under Project Trust (withholding tests flip it).
+      trusted: true,
     });
     return cfg;
   });
@@ -218,6 +224,9 @@ async function createFixture(options?: {
         : {}),
       ...(options?.acquireTurnExclusion !== undefined
         ? { acquireTurnExclusion: options.acquireTurnExclusion }
+        : {}),
+      ...(options?.getQuarantinedRowIds !== undefined
+        ? { getQuarantinedRowIds: options.getQuarantinedRowIds }
         : {}),
       ...(options?.onStagedEditAttempted !== undefined
         ? { onStagedEditAttempted: options.onStagedEditAttempted }
@@ -508,9 +517,10 @@ describe("RefineService", () => {
 
     const stagedResult = await fixture.service.run(WORKSPACE_ID);
     expect(stagedResult.success).toBe(true);
-    // The run held the exclusion around its write section and released it.
-    expect(holds).toBe(1);
-    expect(disposals).toBe(1);
+    // The run held the exclusion twice — around the transcript snapshot and
+    // around its write section — releasing each before moving on.
+    expect(holds).toBe(2);
+    expect(disposals).toBe(2);
 
     busy = true;
     const applyResult = await fixture.applyShown();
@@ -535,8 +545,9 @@ describe("RefineService", () => {
     expect(retryResult.success).toBe(true);
     if (!retryResult.success) return;
     expect(retryResult.data.applied).toHaveLength(1);
-    expect(holds).toBe(2);
-    expect(disposals).toBe(2);
+    // Two holds from the run plus the retry apply's own.
+    expect(holds).toBe(3);
+    expect(disposals).toBe(3);
   });
 
   it("rejects a concurrent invocation while a pass is in flight", async () => {
@@ -2453,6 +2464,35 @@ describe("RefineService", () => {
     }
   });
 
+  it("caps timeline events at the snapshot instant", async () => {
+    // The exclusion is released after the snapshot; a turn admitted then can
+    // emit its `turn.user` digest before the timeline read, and if it is later
+    // refused, the prefix verification cannot see the event. Events stamped
+    // after the snapshot contribute nothing.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+      timelineEvents: [
+        { kind: "milestone", description: "shipped the fix", ts: 1_700_000_000_000 },
+        {
+          kind: "turn.user",
+          description: "LATE ROUTED PROMPT (digest)",
+          ts: Date.now() + 60_000,
+        },
+      ],
+      enabledExperiments: [
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        EXPERIMENT_IDS.TIMELINE,
+      ],
+    });
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("shipped the fix");
+    expect(prompt).not.toContain("LATE ROUTED PROMPT");
+  });
+
   it("confines the refine input to the active context segment (r37)", async () => {
     // SECURITY: after /clear --soft, pre-reset rows are discarded context —
     // a pre-reset prompt injection must not steer a staged proposal that is
@@ -2463,8 +2503,10 @@ describe("RefineService", () => {
     using fixture = await createFixture({
       modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
       timelineEvents: [
+        // Event timestamps predate the snapshot instant (the timeline is capped
+        // there); the post-reset one lies between the boundary and the snapshot.
         { kind: "milestone", description: "pre-reset timeline lore", ts: now - 60_000 },
-        { kind: "milestone", description: "post-reset timeline note", ts: now + 60_000 },
+        { kind: "milestone", description: "post-reset timeline note", ts: now - 500 },
       ],
       enabledExperiments: [
         EXPERIMENT_IDS.RLM,
@@ -2476,7 +2518,7 @@ describe("RefineService", () => {
     await fixture.historyService.appendToHistory(
       WORKSPACE_ID,
       createMuxMessage("reset-boundary-1", "assistant", "", {
-        timestamp: now,
+        timestamp: now - 1000,
         contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
       })
     );
@@ -2773,8 +2815,9 @@ describe("RefineService", () => {
     const prompts: string[] = [];
     const now = Date.now();
     const timelineEvents = [
-      { kind: "milestone", description: "same-millisecond pre-reset digest", ts: now },
-      { kind: "milestone", description: "recent post-reset digest", ts: now + 60_000 },
+      // Event timestamps predate the snapshot instant (the timeline is capped there).
+      { kind: "milestone", description: "same-millisecond pre-reset digest", ts: now - 1000 },
+      { kind: "milestone", description: "recent post-reset digest", ts: now - 500 },
     ];
     const experiments = [
       EXPERIMENT_IDS.RLM,
@@ -2821,7 +2864,7 @@ describe("RefineService", () => {
       await fixture.historyService.appendToHistory(
         WORKSPACE_ID,
         createMuxMessage("reset-same-ms", "assistant", "", {
-          timestamp: now,
+          timestamp: now - 1000,
           contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
         })
       );
@@ -2902,5 +2945,357 @@ describe("RefineService", () => {
     // Only the block's own terminator remains; the injected closers are gone.
     expect(prompt.split("</workspace_timeline>")).toHaveLength(2);
     expect(prompt).not.toMatch(/<\s*\/\s*workspace_timeline\s+>/);
+  });
+
+  it("keeps stamped rejected turns out of the distillation transcript", async () => {
+    // A late consent refusal stamps its turn transcript-only. Refine may run on
+    // another provider, so neither the refused prompt nor the project-skill
+    // snapshot persisted with it (stamp or no stamp on that row) may reach the
+    // model — the same rule the memory harvest applies.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("snap-project-skill", "user", "PROJECT SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-refused", "user", "REFUSED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        preStreamRejected: true,
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-later", "user", "Lesson learned: run bun install first.", {
+        timestamp: Date.now(),
+      })
+    );
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("Please run the tests for this repo.");
+    expect(prompt).toContain("Lesson learned: run bun install first.");
+    expect(prompt).not.toContain("REFUSED ROUTED PROMPT");
+    expect(prompt).not.toContain("PROJECT SKILL BODY");
+  });
+
+  it("keeps an unsettled routed turn out of the snapshot", async () => {
+    // An interrupted routed project-skill stream leaves the workspace idle
+    // with a retryable turn; a Retry after a trust revocation refuses and
+    // stamps it, and by then the transcript would already be streaming to the
+    // refinement provider. The whole turn stays out; a settled one is read.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    const routedRetry = {
+      model: "anthropic:claude-haiku-4-5",
+      agentId: "exec",
+      routedProjectConsent: true,
+    };
+    for (const row of [
+      createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("user-settled", "user", "SETTLED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        retrySendOptions: routedRetry,
+      }),
+      createMuxMessage("assistant-settled", "assistant", "Applied the settled skill", {
+        timestamp: Date.now(),
+      }),
+      createMuxMessage("snap-unsettled", "user", "UNSETTLED SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "u" },
+      }),
+      createMuxMessage("user-unsettled", "user", "UNSETTLED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        retrySendOptions: routedRetry,
+      }),
+      createMuxMessage("assistant-interrupted", "assistant", "INTERRUPTED PARTIAL OUTPUT", {
+        timestamp: Date.now(),
+        partial: true,
+      }),
+    ]) {
+      await fixture.historyService.appendToHistory(WORKSPACE_ID, row);
+    }
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("SETTLED ROUTED PROMPT");
+    expect(prompt).toContain("Applied the settled skill");
+    for (const withheld of [
+      "UNSETTLED SKILL BODY",
+      "UNSETTLED ROUTED PROMPT",
+      "INTERRUPTED PARTIAL OUTPUT",
+    ]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  it("withholds settled project skill content from the distillation transcript without Project Trust", async () => {
+    // A settled routed project-skill turn is past every consent gate, but the
+    // refinement model is configured apart from the workspace's model: without
+    // Project Trust its snapshot and reply stay out of the transcript copy.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await seedSettledProjectTurn(fixture);
+    await fixture.config.editConfig((cfg) => {
+      const project = cfg.projects.get("/projects/demo");
+      if (project) project.trusted = false;
+      return cfg;
+    });
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("Please run the tests for this repo.");
+    expect(prompt).toContain(PROJECT_SKILL_TURN_WITHHELD_MESSAGE);
+    for (const withheld of ["SETTLED SKILL BODY", "Applied the settled skill"]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  it("aborts the pass when Project Trust is revoked between the snapshot and dispatch", async () => {
+    // The snapshot kept project skill content under trust; the pre-dispatch
+    // re-verification must notice a revocation in the model-creation window.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await seedSettledProjectTurn(fixture);
+    const readHistory = fixture.historyService.getHistoryFromLatestBoundary.bind(
+      fixture.historyService
+    );
+    let reads = 0;
+    const readSpy = spyOn(
+      fixture.historyService,
+      "getHistoryFromLatestBoundary"
+    ).mockImplementation(async (workspaceId: string) => {
+      reads += 1;
+      // Second read = the pre-dispatch re-verification.
+      if (reads === 2) {
+        await fixture.config.editConfig((cfg) => {
+          const project = cfg.projects.get("/projects/demo");
+          if (project) project.trusted = false;
+          return cfg;
+        });
+      }
+      return readHistory(workspaceId);
+    });
+    try {
+      const result = await fixture.service.run(WORKSPACE_ID);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("Project Trust was revoked");
+      expect(prompts).toHaveLength(0);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  async function seedSettledProjectTurn(fixture: Fixture): Promise<void> {
+    for (const row of [
+      createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {
+        timestamp: Date.now(),
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("user-settled", "user", "SETTLED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      }),
+      createMuxMessage("assistant-settled", "assistant", "Applied the settled skill", {
+        timestamp: Date.now(),
+      }),
+    ]) {
+      await fixture.historyService.appendToHistory(WORKSPACE_ID, row);
+    }
+  }
+
+  it("stamps refine summary rows with the provenance of the distilled transcript", async () => {
+    // The proposal and audit rows are durable assistant rows a later routed
+    // request carries: they summarize the distilled transcript, so they take
+    // its provenance — through the staged set into the apply audit row — and
+    // a routed request after a trust revocation withholds them like any
+    // other summary. A clean trajectory stamps FALSE (distinguishable from a
+    // markerless legacy row, which counts as carrying).
+    const stagingModel = () =>
+      toolCallModel(
+        [
+          {
+            toolCallId: "refine-provenance-1",
+            toolName: "memory",
+            input: { command: "create", path: LESSON_PATH, file_text: "A lesson.\n" },
+          },
+        ],
+        `${LESSON_PATH}: a lesson.`
+      );
+    {
+      using fixture = await createFixture({ modelFactory: stagingModel });
+      await fixture.seedTrajectory(["Please run the tests for this repo."]);
+      await seedSettledProjectTurn(fixture);
+      expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+      expect(fixture.emittedMessages).toHaveLength(1);
+      expect(fixture.emittedMessages[0].metadata?.carriesProjectSkillContent).toBe(true);
+      expect((await loadStagedRefineSet(fixture.sessionDir))?.carriesProjectSkillContent).toBe(
+        true
+      );
+      expect((await fixture.applyShown()).success).toBe(true);
+      const chat = await fixture.readChat();
+      const auditRow = chat[chat.length - 1];
+      expect(auditRow.metadata?.muxMetadata?.type).toBe("refine-summary");
+      expect(auditRow.metadata?.carriesProjectSkillContent).toBe(true);
+    }
+    {
+      using fixture = await createFixture({ modelFactory: stagingModel });
+      await fixture.seedTrajectory(["Please run the tests for this repo."]);
+      expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+      expect(fixture.emittedMessages[0]?.metadata?.carriesProjectSkillContent).toBe(false);
+    }
+  });
+
+  it("omits the timeline while the segment holds a rejected turn", async () => {
+    // A `turn.user` timeline event carries the prompt's digest, recorded
+    // before the row was refused; the timeline is selected by time alone, so
+    // it is omitted entirely while a rejected turn is in the segment.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+      timelineEvents: [{ kind: "turn.user", description: "REFUSED ROUTED PROMPT (digest)" }],
+      enabledExperiments: [
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        EXPERIMENT_IDS.TIMELINE,
+      ],
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-refused", "user", "REFUSED ROUTED PROMPT", {
+        timestamp: Date.now(),
+        preStreamRejected: true,
+      })
+    );
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const prompt = prompts.at(-1) ?? "";
+    expect(prompt).toContain("Please run the tests for this repo.");
+    expect(prompt).not.toContain("REFUSED ROUTED PROMPT");
+  });
+
+  it("re-verifies the snapshot immediately before the provider call", async () => {
+    // The turn exclusion is released after the snapshot. A manual Retry of an
+    // idle, still-retryable routed turn can be refused and stamped before the
+    // model call; the pass must not ship the captured transcript then.
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["Please run the tests for this repo."]);
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("user-retryable", "user", "RETRYABLE ROUTED PROMPT", {
+        timestamp: Date.now(),
+      })
+    );
+    const readHistory = fixture.historyService.getHistoryFromLatestBoundary.bind(
+      fixture.historyService
+    );
+    let reads = 0;
+    const readSpy = spyOn(
+      fixture.historyService,
+      "getHistoryFromLatestBoundary"
+    ).mockImplementation(async (workspaceId: string) => {
+      reads += 1;
+      // Second read = the pre-dispatch re-verification: the turn was refused
+      // and stamped after the snapshot (first read), before the model call.
+      if (reads === 2) {
+        const stamped = await fixture.historyService.markMessagesPreStreamRejected(workspaceId, [
+          "user-retryable",
+        ]);
+        if (!stamped.success) throw new Error(stamped.error);
+      }
+      return readHistory(workspaceId);
+    });
+    try {
+      const result = await fixture.service.run(WORKSPACE_ID);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("run /refine again");
+      expect(prompts).toHaveLength(0);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("fails closed when the rejected-turn quarantine record cannot be read", async () => {
+    // Without the record's keys the pass cannot tell which unstamped rows a
+    // refusal still protects: no model call, an explicit error to retry.
+    using fixture = await createFixture({
+      getQuarantinedRowIds: () => Err("record unreadable"),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("rejected-turn record");
+    expect(fixture.modelCalls).toHaveLength(0);
+  });
+
+  it("snapshots the transcript under the turn exclusion and releases it before the model call", async () => {
+    // TOCTOU: a routed project-skill turn preparing during the read could
+    // contribute rows its late consent gate still refuses (and stamps); with
+    // the exclusion held across the read, no turn is preparing or streaming.
+    // The model call itself must not hold it — sends would be refused for the
+    // whole pass.
+    const events: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () =>
+        noOpModel(() => {
+          events.push("model");
+        }),
+      acquireTurnExclusion: () => {
+        events.push("acquire");
+        return Ok({
+          [Symbol.dispose]: () => {
+            events.push("release");
+          },
+        });
+      },
+    });
+    await fixture.seedTrajectory();
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    expect(events.slice(0, 3)).toEqual(["acquire", "release", "model"]);
+  });
+
+  it("refuses to snapshot the transcript while a turn is preparing or streaming", async () => {
+    using fixture = await createFixture({
+      acquireTurnExclusion: () => Err("a turn is preparing or streaming"),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cannot be distilled");
+    expect(fixture.modelCalls).toHaveLength(0);
   });
 });

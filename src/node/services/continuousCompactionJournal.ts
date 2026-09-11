@@ -16,6 +16,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import type { MuxMessage } from "@/common/types/message";
 import { log } from "./log";
 
 // JSON.stringify otherwise silently drops functions/symbols and coerces binary/URL options.
@@ -61,10 +62,14 @@ export function stripMessageCacheControl(messages: ModelMessage[]): ModelMessage
 
 export async function rebuildContinuousPrefix(
   journal: ContinuousCompactionJournal,
-  workspaceId: string
+  workspaceId: string,
+  // Provider-copy transform of the durable sources (rejected-row exclusion,
+  // untrusted project skill withholding for a routed turn); the journal itself
+  // keeps the unfiltered rows.
+  prefixRows: (rows: MuxMessage[]) => MuxMessage[] = (rows) => rows
 ): Promise<ModelMessage[]> {
   const prepared = prepareProviderRequestMessages(
-    journal.prefixSourceRows,
+    prefixRows(journal.prefixSourceRows),
     journal.preparation.providerForMessages,
     journal.preparation.effectiveThinkingLevel
   );
@@ -402,4 +407,12 @@ export interface ContinuousPrefixSwap {
   prefix: ModelMessage[];
   firstTailToolCallId: string;
   journal: ContinuousCompactionJournal;
+  /**
+   * The provider-facing prefix carries project skill content kept under
+   * Project Trust (rows or loaded-skill attachments). Rebuilt into
+   * ModelMessages the rows lose their provenance and the per-step scan sees
+   * only tool results, so the swap carries its own verdict for the routed
+   * turn's consent gate (PreDispatchConsentGateContext).
+   */
+  carriesProjectSkillContent?: boolean;
 }

@@ -49,6 +49,13 @@ export interface GenerateWorkspaceStatusFailure {
    * change first.
    */
   reachedProvider: boolean;
+  /**
+   * The caller's `beforeDispatch` re-verification failed after a candidate
+   * model was created: the transcript went stale during construction and
+   * nothing was sent. Not a property of the transcript or the config — the
+   * caller must neither settle nor count it as a provider failure.
+   */
+  staleTranscript?: true;
 }
 
 export interface BuildWorkspaceStatusPromptOptions {
@@ -145,6 +152,15 @@ export interface GenerateWorkspaceStatusOptions extends BuildWorkspaceStatusProm
       metadataModel: string;
     }
   ) => Promise<void>;
+  /**
+   * Re-verification run after a candidate model is created, immediately
+   * before the provider request. Model construction is an await the caller
+   * cannot see past: a row of the captured transcript can be refused and
+   * stamped provider-ineligible during it. `false` aborts the generation
+   * with `staleTranscript` instead of trying another candidate with the same
+   * stale text.
+   */
+  beforeDispatch?: () => Promise<boolean>;
 }
 
 /**
@@ -216,6 +232,26 @@ function generateWorkspaceStatusEffect(
         continue;
       }
       reachedProvider = true;
+
+      // The caller's transcript can go stale during the construction await
+      // above (a captured row refused and stamped). Re-verify right before the
+      // request; a stale transcript aborts outright — the next candidate would
+      // dispatch the same text — and releases the model like an attempt would.
+      const beforeDispatch = options.beforeDispatch;
+      if (beforeDispatch !== undefined) {
+        const stillCurrent = yield* Effect.promise(() => beforeDispatch());
+        if (!stillCurrent) {
+          runLanguageModelCleanup(modelResult.data.model);
+          return Err({
+            error: {
+              type: "unknown",
+              raw: "The transcript changed before the status request was sent",
+            },
+            reachedProvider: false,
+            staleTranscript: true,
+          });
+        }
+      }
 
       const attempt = yield* attemptCandidate(transcript, modelString, modelResult.data, options);
       if (attempt.success) return Ok(attempt.data);

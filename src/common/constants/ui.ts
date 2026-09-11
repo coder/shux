@@ -70,6 +70,18 @@ Write in a factual, dense style. Every sentence should convey essential context.
 export const FORCE_COMPACTION_BUFFER_PERCENT = 5;
 
 /**
+ * Headroom (percentage points of the routed model's context window) reserved
+ * for the pending turn when deciding whether a skill-routed send must compact
+ * first. Routed sends deliberately ignore the user's compaction threshold —
+ * a cheap skill invocation must not force an unrequested workspace-wide
+ * compaction of a history far under the workspace model's limit — but the
+ * recorded usage excludes the new message, attachments, and skill snapshot,
+ * so requiring a full 100% would let a near-limit history overrun the routed
+ * model at request startup instead of compacting.
+ */
+export const ROUTED_SEND_COMPACTION_HEADROOM_PERCENT = 10;
+
+/**
  * Duration (ms) to show "copied" feedback after copying to clipboard
  */
 export const COPY_FEEDBACK_DURATION_MS = 2000;

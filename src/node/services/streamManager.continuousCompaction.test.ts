@@ -502,6 +502,27 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(tracker.latestMessages).toEqual(result.messages);
   });
 
+  for (const carries of [true, false]) {
+    it(`hands the consumed swap's project provenance to the consent gate: ${carries}`, async () => {
+      // The swapped prefix is ModelMessages without row provenance; the routed
+      // turn's per-step gate learns about project skill content kept under
+      // trust from the swap itself, so a trust revocation before the prefix
+      // ships still refuses the step.
+      const { manager, tracker, swap } = await setup();
+      swap.carriesProjectSkillContent = carries;
+      const gate = mock((_context?: unknown) => Promise.resolve(null));
+      const { run } = prepareHarness(manager, tracker, { preDispatchConsentGate: gate });
+      const result = await run();
+      assert(result?.messages, "Expected swapped messages");
+      expect(tracker.consumedPrefixSwap).toBe(swap);
+      expect(gate).toHaveBeenCalledTimes(1);
+      expect(gate.mock.calls[0][0]).toMatchObject({
+        midStream: true,
+        swappedPrefixCarriesProjectSkillContent: carries,
+      });
+    });
+  }
+
   for (const tail of [[], originalMessages.slice(4)]) {
     it("drops a missing/non-assistant locator without slicing or writing", async () => {
       const { run, tracker, store } = await setup();

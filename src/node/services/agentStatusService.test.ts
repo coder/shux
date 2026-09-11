@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
-import { Ok, Err } from "@/common/types/result";
+import { Ok, Err, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import {
   AGENT_STATUS_PROVIDER_FAILURE_IDLE_COOLDOWN_MS,
@@ -70,6 +70,9 @@ describe("AgentStatusService", () => {
     typeof mock<(workspaceId: string, snapshot: unknown) => void>
   >;
   let getCandidatesMock: ReturnType<typeof mock<(workspaceId: string) => Promise<string[]>>>;
+  let getQuarantineMock: ReturnType<
+    typeof mock<(workspaceId: string) => Promise<Result<ReadonlySet<string>, string>>>
+  >;
   let generateSpy: ReturnType<
     typeof spyOn<typeof workspaceStatusGenerator, "generateWorkspaceStatus">
   >;
@@ -86,7 +89,9 @@ describe("AgentStatusService", () => {
   function makeProjectsConfig(workspaces: Workspace[]): ProjectsConfig {
     return {
       projects: new Map<string, ProjectConfig>([
-        [projectPath, { workspaces } as unknown as ProjectConfig],
+        // Trusted: project skill content reaches the status model only under
+        // Project Trust (withholding tests flip it).
+        [projectPath, { workspaces, trusted: true } as unknown as ProjectConfig],
       ]),
     };
   }
@@ -123,9 +128,13 @@ describe("AgentStatusService", () => {
 
     emitWorkspaceActivityMock = mock(() => undefined);
     getCandidatesMock = mock((_id: string) => Promise.resolve(["anthropic:claude-haiku-4-5"]));
+    getQuarantineMock = mock((_workspaceId: string) =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set<string>()))
+    );
     mockWorkspaceService = {
       getWorkspaceTitleModelCandidates: getCandidatesMock,
       emitWorkspaceActivity: emitWorkspaceActivityMock,
+      getQuarantinedRejectedRowIds: getQuarantineMock,
     } as unknown as WorkspaceService;
 
     // Stateful fake for the shared status slot: mirrors the real service,
@@ -249,6 +258,414 @@ describe("AgentStatusService", () => {
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(generateSpy.mock.calls[1][0]).toContain("Assistant (in progress): Reading config files");
+  });
+
+  test("withholds rejected turns, their snapshots and surviving output from the transcript", async () => {
+    // SECURITY: the status model may live on another provider. A
+    // consent-refused turn's prompt, its project-skill snapshot and any
+    // output whose deletion failed were withheld from the routed dispatch
+    // itself; a stamped row and a row quarantined while its stamp is
+    // outstanding must both stay out of the status prompt.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-stamped", "user", "STAMPED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        preStreamRejected: true,
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-stamped", "user", "STAMPED REFUSED PROMPT", { preStreamRejected: true })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-quarantined", "user", "QUARANTINED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "y" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-quarantined", "user", "QUARANTINED REFUSED PROMPT")
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "SURVIVING REFUSED OUTPUT")
+    );
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set(["u-quarantined"])))
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    expect(prompt).toContain("Assistant: Running tests now");
+    for (const withheld of [
+      "STAMPED SKILL BODY",
+      "STAMPED REFUSED PROMPT",
+      "QUARANTINED SKILL BODY",
+      "QUARANTINED REFUSED PROMPT",
+      "SURVIVING REFUSED OUTPUT",
+    ]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  test("skips status generation while the rejected-turn quarantine is unreadable", async () => {
+    // Unknown quarantine: no prompt is built from an unfiltered transcript,
+    // and the tick is not settled, so a later readable state generates.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Err("record unreadable"))
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    getQuarantineMock.mockImplementation(() =>
+      Promise.resolve<Result<ReadonlySet<string>, string>>(Ok(new Set<string>()))
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("withholds a routed turn's rows and partial until it has a committed reply", async () => {
+    // A routed turn (the retry options the resume path gates on) can still be
+    // refused and stamped — by its pre-dispatch or per-step gate, or by a
+    // Retry after a failed stream — until a reply is committed; the status
+    // prompt must not carry what that refusal would withhold.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-routed", "user", "ROUTED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "z" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "ROUTED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      })
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "ROUTED PARTIAL OUTPUT")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const inFlight = generateSpy.mock.calls[0][0];
+    expect(inFlight).toContain("User: Please run the test suite");
+    for (const withheld of ["ROUTED SKILL BODY", "ROUTED PROMPT", "ROUTED PARTIAL OUTPUT"]) {
+      expect(inFlight).not.toContain(withheld);
+    }
+
+    // The empty assistant placeholder a starting stream appends (finalized in
+    // place at stream end) is not a reply: the turn is still in flight.
+    await history.appendToHistory(workspaceId, createMuxMessage("a-placeholder", "assistant", ""));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // An interrupted stream's committed partial (content, flagged partial) is
+    // not a reply either: the whole turn stays out, that row included.
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a-interrupted", "assistant", "INTERRUPTED ROUTED OUTPUT", {
+        partial: true,
+      })
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).not.toContain("INTERRUPTED ROUTED OUTPUT");
+
+    // Settled: with the reply committed the turn can no longer be refused.
+    await history.deletePartial(workspaceId);
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a-routed", "assistant", "Applied the routed skill")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const settled = generateSpy.mock.calls[1][0];
+    expect(settled).toContain("ROUTED PROMPT");
+    expect(settled).toContain("ROUTED SKILL BODY");
+    expect(settled).toContain("Assistant: Applied the routed skill");
+  });
+
+  test("withholds settled project skill content without Project Trust and rechecks trust before dispatch", async () => {
+    // A settled routed project-skill turn can no longer be refused, but the
+    // status model is configured apart from the workspace's model: without
+    // Project Trust its snapshot and reply stay out of the prompt, and trust
+    // granted at build time is re-verified right before the provider request.
+    const history = historyHandle.historyService;
+    for (const row of [
+      createMuxMessage("u1", "user", "Please run the test suite"),
+      createMuxMessage("a1", "assistant", "Running tests now"),
+      createMuxMessage("snap-settled", "user", "SETTLED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "s" },
+      }),
+      createMuxMessage("u-settled", "user", "SETTLED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      }),
+      createMuxMessage("a-settled", "assistant", "Applied the settled skill"),
+    ]) {
+      await history.appendToHistory(workspaceId, row);
+    }
+    const project = projectsConfig.projects.get(projectPath) as { trusted?: boolean };
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).toContain("SETTLED SKILL BODY");
+
+    project.trusted = false;
+    await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "What changed?"));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const untrusted = generateSpy.mock.calls[1][0];
+    expect(untrusted).toContain("User: Please run the test suite");
+    expect(untrusted).toContain("What changed?");
+    for (const withheld of ["SETTLED SKILL BODY", "Applied the settled skill"]) {
+      expect(untrusted).not.toContain(withheld);
+    }
+
+    // Trust granted at build time, revoked during the generator's model
+    // construction: the dispatch recheck refuses.
+    project.trusted = true;
+    await history.appendToHistory(workspaceId, createMuxMessage("u3", "user", "And now?"));
+    let recheck: boolean | undefined;
+    generateSpy.mockImplementationOnce(async (_transcript, _candidates, _aiService, options) => {
+      project.trusted = false;
+      recheck = await options?.beforeDispatch?.();
+      return Ok({
+        status: { emoji: "🛠️", message: "Editing source" },
+        modelUsed: "anthropic:claude-haiku-4-5",
+      });
+    });
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(3);
+    expect(generateSpy.mock.calls[2][0]).toContain("SETTLED SKILL BODY");
+    expect(recheck).toBe(false);
+  });
+
+  test("correlates the partial with the history read instead of an older snapshot", async () => {
+    // A routed turn can persist its rows and start streaming between the
+    // history read and the partial read. Its in-flight text then belongs to
+    // a turn the transcript never verified; the partial is read first and
+    // attached only to the latest user row of the history read that follows.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    const readPartial = history.readPartial.bind(history);
+    const partialSpy = spyOn(history, "readPartial").mockImplementation(async (id: string) => {
+      // The new routed turn lands (rows, then its partial) around this read.
+      await history.appendToHistory(
+        id,
+        createMuxMessage("snap-late", "user", "LATE ROUTED SKILL BODY", {
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "l" },
+        })
+      );
+      await history.appendToHistory(
+        id,
+        createMuxMessage("u-late", "user", "LATE ROUTED PROMPT", {
+          retrySendOptions: {
+            model: "anthropic:claude-haiku-4-5",
+            agentId: "exec",
+            routedProjectConsent: true,
+          },
+        })
+      );
+      await history.writePartial(id, createMuxMessage("a-late", "assistant", "LATE ROUTED OUTPUT"));
+      partialSpy.mockRestore();
+      return readPartial(id);
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    for (const withheld of ["LATE ROUTED SKILL BODY", "LATE ROUTED PROMPT", "LATE ROUTED OUTPUT"]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  test("passes the row re-verification into the generator and drops a stale result unsettled", async () => {
+    // The generator awaits model construction before its request; a Retry can
+    // refuse and stamp a captured row during that await. The service hands the
+    // generator the same re-verification, and a stale outcome is neither
+    // persisted nor settled, so the next tick regenerates from current rows.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    generateSpy.mockImplementationOnce(async (_transcript, _candidates, _aiService, options) => {
+      // Model construction window: the captured row is refused and stamped.
+      const stamped = await history.markMessagesPreStreamRejected(workspaceId, ["u1"]);
+      if (!stamped.success) throw new Error(stamped.error);
+      expect(await options?.beforeDispatch?.()).toBe(false);
+      return Err({
+        error: { type: "unknown", raw: "stale" },
+        reachedProvider: false,
+        staleTranscript: true,
+      });
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    // Not settled: a later tick regenerates, now without the stamped row.
+    await history.appendToHistory(workspaceId, createMuxMessage("u2", "user", "Try again"));
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(generateSpy.mock.calls[1][0]).not.toContain("Please run the test suite");
+    expect(generateSpy.mock.calls[1][0]).toContain("User: Try again");
+  });
+
+  test("keeps withholding a routed turn past a synthetic file-update notification", async () => {
+    // A stream appends a <system-file-update> notification (synthetic user
+    // row) after the routed user row; it must not read as a newer, unrouted
+    // turn that settles the routed one.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Running tests now")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-routed", "user", "ROUTED SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "z" },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u-routed", "user", "ROUTED PROMPT", {
+        retrySendOptions: {
+          model: "anthropic:claude-haiku-4-5",
+          agentId: "exec",
+          routedProjectConsent: true,
+        },
+      })
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage(
+        "sys-file-update",
+        "user",
+        "<system-file-update>x.ts changed</system-file-update>",
+        {
+          synthetic: true,
+        }
+      )
+    );
+    await history.writePartial(
+      workspaceId,
+      createMuxMessage("a-partial", "assistant", "ROUTED PARTIAL OUTPUT")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const prompt = generateSpy.mock.calls[0][0];
+    expect(prompt).toContain("User: Please run the test suite");
+    for (const withheld of ["ROUTED SKILL BODY", "ROUTED PROMPT", "ROUTED PARTIAL OUTPUT"]) {
+      expect(prompt).not.toContain(withheld);
+    }
+  });
+
+  test("drops a trailing snapshot prefix whose user row has not landed yet", async () => {
+    // PREPARING persists the snapshot prefix before the user row; a tick in
+    // between must not read the prefix as settled history.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("snap-pending", "user", "PENDING SKILL BODY", {
+        synthetic: true,
+        agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "p" },
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(generateSpy.mock.calls[0][0]).toContain("User: Please run the test suite");
+    expect(generateSpy.mock.calls[0][0]).not.toContain("PENDING SKILL BODY");
+  });
+
+  test("re-verifies the snapshotted rows right before dispatch", async () => {
+    // A settled row can still be refused and stamped by a later Retry between
+    // the snapshot and the provider call; the stale snapshot is dropped
+    // without settling the tick.
+    const history = historyHandle.historyService;
+    await history.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please run the test suite")
+    );
+    getCandidatesMock.mockImplementation(async () => {
+      const stamped = await history.markMessagesPreStreamRejected(workspaceId, ["u1"]);
+      if (!stamped.success) throw new Error(stamped.error);
+      return ["anthropic:claude-haiku-4-5"];
+    });
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {

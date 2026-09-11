@@ -30,7 +30,9 @@ test("an admitted marker clear commits after its generation retires while queued
   const release = Promise.withResolvers<void>();
   const writeFile = fsPromises.writeFile;
   const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (...args) => {
-    if (args[0] === preferencePath) {
+    // The preference file is replaced through a sibling temp path (prefixed
+    // by the preference path) and renamed over it; hold that write.
+    if (typeof args[0] === "string" && args[0].startsWith(preferencePath)) {
       entered.resolve();
       await release.promise;
     }
@@ -362,7 +364,9 @@ test("a retry's issued marker unlink cannot delete a later durable opt-out", asy
       : mkdir(...args)) as typeof fsPromises.mkdir);
   const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation((...args) => {
     const write = writeFile(...args);
-    if (args[0] === preferencePath) concurrentWrite = write;
+    // The preference payload is written to a sibling temp path (prefixed by
+    // the preference path) before being renamed over the file.
+    if (typeof args[0] === "string" && args[0].startsWith(preferencePath)) concurrentWrite = write;
     return write;
   });
   const persist = marker.persistAutoRetryState.bind(h.session);

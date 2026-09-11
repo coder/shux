@@ -202,6 +202,10 @@ async function deleteInboxIfPresent(args: {
   }
 }
 
+/** Retryable harvest failure: trust or quarantine changed under the built input. */
+export const HARVEST_INPUT_STALE_MESSAGE =
+  "harvest input changed before dispatch (trust or rejected-turn quarantine); retry";
+
 export async function runMemoryHarvest(args: {
   model: LanguageModel;
   agentBody: string;
@@ -211,6 +215,14 @@ export async function runMemoryHarvest(args: {
   messages: MuxMessage[];
   summary: MuxMessage;
   abortSignal?: AbortSignal;
+  /**
+   * Re-verification run immediately before EACH chunk's provider request
+   * (model construction and earlier chunks are awaits the caller cannot see
+   * past): the harvest input was filtered by trust and quarantine when it was
+   * built, and either can change meanwhile. `false` ends the harvest with a
+   * retryable stream error instead of sending the stale input.
+   */
+  beforeDispatch?: () => Promise<boolean>;
   /**
    * Best-effort cost telemetry: headless harvest bypasses the chat cost
    * pipeline, so the caller records each clean chunk stream's full usage
@@ -265,6 +277,10 @@ export async function runMemoryHarvest(args: {
   const streamErrors: string[] = [];
   let usage: MemoryHarvestResult["usage"];
   for (const [index, chunk] of chunks.entries()) {
+    if (args.beforeDispatch !== undefined && !(await args.beforeDispatch())) {
+      streamErrors.push(HARVEST_INPUT_STALE_MESSAGE);
+      break;
+    }
     activeEvidenceIds = chunk.evidenceIds;
     const stream = streamText({
       model: args.model,

@@ -10,6 +10,7 @@ import type { EventEmitter } from "events";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { TelemetryService } from "./telemetryService";
@@ -279,6 +280,43 @@ describe("CompactionHandler", () => {
       expect(metadata?.previousBoundaryHistorySequence).toBe(1);
     });
 
+    it("stamps the summary with the provenance of project skill content it summarizes", async () => {
+      // The summary is ordinary assistant text that may quote a project skill
+      // a summarized turn loaded, and the routed-request consent scan
+      // recognizes only tagged rows: the summary inherits the rows' obligation.
+      // Plain chat first: no stamp.
+      await seedHistory(
+        createMuxMessage("u0", "user", "Ordinary chat"),
+        createCompactionRequest("compact-request-plain")
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent("Plain summary"))).toBe(true);
+      const afterPlain = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!afterPlain.success) throw new Error(afterPlain.error);
+      const plainSummary = afterPlain.data.filter((m) => m.metadata?.compactionBoundary).at(-1);
+      // Verified clean: stamped FALSE, so a routed request after a trust
+      // revocation can tell it from a legacy summary of unknown provenance.
+      expect(plainSummary?.metadata?.carriesProjectSkillContent).toBe(false);
+
+      // A project skill snapshot in the summarized range: stamped.
+      for (const row of [
+        createMuxMessage("snap", "user", "PROJECT SKILL BODY", {
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+        }),
+        createMuxMessage("u1", "user", "Use skill done"),
+        createCompactionRequest("compact-request-project"),
+      ]) {
+        const appended = await historyService.appendToHistory(workspaceId, row);
+        if (!appended.success) throw new Error(appended.error);
+      }
+      expect(await handler.handleCompletion(createStreamEndEvent("Project summary"))).toBe(true);
+      const afterProject = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!afterProject.success) throw new Error(afterProject.error);
+      const projectSummary = afterProject.data.filter((m) => m.metadata?.compactionBoundary).at(-1);
+      expect(projectSummary?.id).not.toBe(plainSummary?.id);
+      expect(projectSummary?.metadata?.carriesProjectSkillContent).toBe(true);
+    });
+
     describe("onIdleCompactionOutcome", () => {
       const createIdleCompactionRequest = (id = "idle-req"): MuxMessage =>
         createMuxMessage(id, "user", "Please summarize the conversation", {
@@ -376,6 +414,65 @@ describe("CompactionHandler", () => {
         output_tokens_b2: 512,
         compaction_source: "manual",
       });
+    });
+
+    it("never carries a rejected turn's loaded skills or diffs into the pending state", async () => {
+      // A pre-stream rejected turn (durably stamped) or a quarantined row (the
+      // stamp failed; only the session's in-memory set knows) never reached
+      // the provider — compaction must not re-inject what it loaded or edited
+      // through post-compaction.json on the next turn.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        getQuarantinedRowIds: () =>
+          new Set(["assistant-quarantined", "assistant-quarantined-edit"]),
+      });
+      await seedHistory(
+        createSuccessfulFileEditMessage(
+          "assistant-edit-kept",
+          "/tmp/kept.ts",
+          "@@ -1 +1 @@\n-a\n+b\n"
+        ),
+        createSuccessfulAgentSkillReadMessage("assistant-kept", "kept-skill", "Keep me."),
+        // Stamped: the refused turn's synthetic skill snapshot row and prompt.
+        createMuxMessage(
+          "snapshot-stamped",
+          "user",
+          renderAgentSkillSnapshotText({
+            name: "stamped-skill",
+            scope: "project",
+            body: "Drop me.",
+          }),
+          {
+            synthetic: true,
+            preStreamRejected: true,
+            agentSkillSnapshot: { skillName: "stamped-skill", scope: "project", sha256: "stamped" },
+          }
+        ),
+        createMuxMessage("u-stamped", "user", "refused prompt", { preStreamRejected: true }),
+        // Quarantined: the refused turn's in-flight assistant, committed after
+        // its partial delete failed — tool output the row stamp never covers.
+        createSuccessfulAgentSkillReadMessage(
+          "assistant-quarantined",
+          "quarantined-skill",
+          "Drop me."
+        ),
+        createSuccessfulFileEditMessage(
+          "assistant-quarantined-edit",
+          "/tmp/rejected.ts",
+          "@@ -1 +1 @@\n-a\n+b\n"
+        ),
+        createCompactionRequest()
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const pendingState = await handler.peekPendingState();
+      expect(pendingState?.loadedSkills.map((skill) => skill.name)).toEqual(["kept-skill"]);
+      expect(pendingState?.diffs.map((diff) => diff.path)).toEqual(["/tmp/kept.ts"]);
     });
 
     it("persists pending post-compaction state to disk and reloads it on restart", async () => {
@@ -1827,6 +1924,46 @@ describe("CompactionHandler", () => {
           keepRecentTail: { startHistorySequence },
         },
       });
+
+    it("excludes rejected rows (stamped or quarantined) from the preserved tail", async () => {
+      // The boundary hides the originals, so a copy is the only thing that
+      // could put a refused prompt back in front of the provider: a stamped
+      // row's copy would only ever be filtered out again, and a quarantined
+      // row's copy gets a fresh ID the in-memory set cannot match.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+        getQuarantinedRowIds: () => new Set(["u3"]),
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createMuxMessage("u2", "user", "refused prompt", { preStreamRejected: true }),
+        createMuxMessage("u3", "user", "quarantined prompt"),
+        // seedHistory assigns sequences 0..6; the tail starts at u1 (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const [boundary, ...copies] = epochResult.data;
+      expect(boundary.metadata?.compactionBoundary).toBe(true);
+      expect(copies.map((copy) => copy.parts)).toMatchObject([
+        [{ type: "text", text: "tail question" }],
+        [{ type: "text", text: "tail answer" }],
+      ]);
+      for (const copy of copies) {
+        expect(copy.metadata?.rlmPreservedTailCopy).toBe(true);
+        expect(copy.metadata?.preStreamRejected).toBeUndefined();
+      }
+    });
 
     it("re-appends sanitized tail copies after the boundary for stamped requests", async () => {
       const onCompactionComplete = mock((_metadata: CompactionCompletionMetadata) => undefined);

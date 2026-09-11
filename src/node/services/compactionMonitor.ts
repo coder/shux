@@ -40,6 +40,13 @@ interface CheckMidStreamParams {
   providersConfig: ProvidersConfigMap | null;
   /** Request-level OpenAI wire format; decides whether the Codex OAuth cap applies. */
   openaiWireFormat?: OpenAIWireFormat | null;
+  /**
+   * Replaces the workspace threshold+buffer force bar for this check. Skill
+   * class routing passes the routed-send policy (compact only near the routed
+   * window's limit) so a mid-stream usage update can't force the workspace-wide
+   * compaction the routed pre-send band deliberately avoided.
+   */
+  forceThresholdPercentOverride?: number;
 }
 
 /**
@@ -126,7 +133,9 @@ export class CompactionMonitor {
     );
 
     const usagePercent = (usageTokens / contextLimit) * 100;
-    const forceThresholdPercent = this.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    const forceThresholdPercent =
+      params.forceThresholdPercentOverride ??
+      this.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
 
     if (usagePercent < forceThresholdPercent) {
       return false;

@@ -68,6 +68,26 @@ describe("prepareMessagePayload", () => {
     );
   });
 
+  it("forwards the raw numeric index for an explicit-model composed skill send", () => {
+    // "/opus+2 /done": the explicit model bypasses class routing, but its
+    // ladder can depend on provider mappings only the backend resolves
+    // authoritatively, so the raw index rides along instead of being dropped.
+    const result = prepare({
+      messageText: "/opus+2 /done args",
+      modelOneShot: { ...oneShot, thinkingLevel: 2, message: "/done args" },
+      hasSkillInvocation: true,
+    });
+    expect(result.options.skipSkillModelRouting).toBe(true);
+    expect(result.options.oneShotThinkingIndex).toBe(2);
+    // A named level is final client-side: nothing to re-resolve.
+    const named = prepare({
+      messageText: "/opus+high /done args",
+      modelOneShot: { ...oneShot, message: "/done args" },
+      hasSkillInvocation: true,
+    });
+    expect(named.options.oneShotThinkingIndex).toBeUndefined();
+  });
+
   it("applies compaction, context, and dispatch overrides", () => {
     const result = prepare({
       compactionMessageText: "compact request",

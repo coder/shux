@@ -150,16 +150,23 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           }
         );
 
+        // The consent scan of routed requests identifies a project skill's
+        // referenced files from the persisted result, so it carries the scope.
+        const tagScope = (result: AgentSkillReadFileToolResult): AgentSkillReadFileToolResult =>
+          result.success ? { ...result, skillScope: resolvedSkill.package.scope } : result;
+
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
           const builtIn = readBuiltInSkillFile(parsedName.data, filePath);
-          return readContentWithFileReadLimits({
-            fullContent: builtIn.content,
-            fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
-            modifiedTime: new Date(0).toISOString(),
-            offset,
-            limit,
-          });
+          return tagScope(
+            readContentWithFileReadLimits({
+              fullContent: builtIn.content,
+              fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
+              modifiedTime: new Date(0).toISOString(),
+              offset,
+              limit,
+            })
+          );
         }
 
         const skillRuntime = resolvedSkill.sourceRuntime;
@@ -278,13 +285,15 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return readContentWithFileReadLimits({
-          fullContent,
-          fileSize: resultFileSize,
-          modifiedTime: resultModifiedTime,
-          offset,
-          limit,
-        });
+        return tagScope(
+          readContentWithFileReadLimits({
+            fullContent,
+            fileSize: resultFileSize,
+            modifiedTime: resultModifiedTime,
+            offset,
+            limit,
+          })
+        );
       } catch (error) {
         return {
           success: false,

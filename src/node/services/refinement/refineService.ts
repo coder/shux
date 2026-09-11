@@ -27,7 +27,13 @@ import type { LanguageModel, Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  collectRejectedTurnRowIds,
+  createMuxMessage,
+  excludeRejectedTurnRows,
+  findUnansweredRoutedTurnRow,
+  type MuxMessage,
+} from "@/common/types/message";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -35,6 +41,11 @@ import {
 } from "@/common/types/refinement";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
+import {
+  messagesCarryProjectSkillContent,
+  withholdProjectSkillContentFromRequest,
+} from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
@@ -129,6 +140,14 @@ interface RefineServiceOptions {
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
   /**
+   * Session-local quarantine of rejected rows whose durable preStreamRejected
+   * stamp failed: refine's side-channel model call must exclude them exactly
+   * like provider request assembly does.
+   */
+  getQuarantinedRowIds?: (
+    workspaceId: string
+  ) => Result<ReadonlySet<string>, string> | Promise<Result<ReadonlySet<string>, string>>;
+  /**
    * Serialize refine row publication (and apply mutations) with the
    * workspace's turn lifecycle (r40): returns a disposable holding the
    * session's turn-admission block, or Err when a turn is already
@@ -218,7 +237,13 @@ export function createRefineSummaryMessage(
         edits: StagedRefineEdit[];
         /** Canonical hash binding /refine apply to the rendered bytes. */
         stagedSetHash: string;
-      }
+      },
+  /**
+   * Provenance of the distilled transcript: a routed request after a trust
+   * revocation withholds this row like any summary (see
+   * MuxMessageMetadata.carriesProjectSkillContent).
+   */
+  carriesProjectSkillContent: boolean
 ): MuxMessage {
   const lines = [REFINE_SUMMARY_LABEL, ""];
   if (mode.mode === "staged") {
@@ -302,6 +327,7 @@ export function createRefineSummaryMessage(
     // request-time injection), uiVisible so users see what was self-applied.
     synthetic: true,
     uiVisible: true,
+    carriesProjectSkillContent,
     muxMetadata: {
       type: "refine-summary",
       ...(mode.mode === "staged" ? { stagedSetHash: mode.stagedSetHash } : {}),
@@ -840,9 +866,14 @@ export class RefineService {
     // even when removal is racing. Removal awaits this promise before
     // deleting the session directory, so the append still precedes teardown.
     if (!record.noOp) {
-      const auditDurable = await this.appendSummaryMessage(workspaceId, record, {
-        mode: "applied",
-      });
+      const auditDurable = await this.appendSummaryMessage(
+        workspaceId,
+        record,
+        { mode: "applied" },
+        // The audit row describes edits derived from the staged transcript;
+        // a set staged before provenance was recorded is unknown → carrying.
+        staged.carriesProjectSkillContent ?? true
+      );
       // The staged set is the only state that can regenerate the audit row
       // (persisted baseline + attempted IDs reproduce it with zero
       // re-mutation). A swallowed append failure here would consume that
@@ -921,34 +952,37 @@ export class RefineService {
     const workspace = this.config.findWorkspace(workspaceId);
     if (!workspace) return Err(`workspace not found: ${workspaceId}`);
 
-    // SECURITY: confine the distillation input to the ACTIVE context
-    // segment. getLastMessages crosses reset boundaries (and pages into the
-    // sealed archive), so after /clear --soft a pre-reset prompt injection
-    // could steer the staged proposal — which is durably appended AFTER the
-    // boundary, re-entering model-visible context, and on approval persists
-    // to memory/skills. Durable sandbox/carryover invalidation does not
-    // filter chat history, so the read itself must stop at the boundary.
-    // Compaction epochs stay represented inside the active segment (summary
-    // row + preserved tail copies), so nothing legitimate is lost.
-    const messagesResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-    if (!messagesResult.success) {
-      return Err(`could not read workspace history: ${messagesResult.error}`);
+    // SECURITY (TOCTOU): the transcript is snapshotted under the turn-admission
+    // block, released before the model call. Without it, a routed project-skill
+    // turn PREPARING during the read contributes rows its late consent gate may
+    // still refuse (and stamp) — the refinement model would receive them before
+    // the pre-publication recheck could notice, and that recheck only blocks
+    // publication. With no turn preparing or streaming, every persisted routed
+    // turn has already passed its gates.
+    const snapshotExclusion = this.acquireTurnExclusionIfWired(workspaceId);
+    if (!snapshotExclusion.success) {
+      return Err(
+        `a turn is active in this workspace (${snapshotExclusion.error}); the transcript cannot ` +
+          `be distilled while a turn is preparing or streaming — run /refine again once the ` +
+          `workspace is idle`
+      );
     }
-    const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
-    // r47: fingerprint the snapshot rows for the pre-publication recheck.
-    // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
-    // a streaming assistant row through updateHistory() PRESERVING its ID
-    // and historySequence, so a pass distilled from the in-flight
-    // placeholder would pass an ID-only prefix test after the stream
-    // settles. Hash the serialized row instead — any in-place rewrite
-    // changes the bytes. Captured before any consumer touches the rows so
-    // the fingerprints reflect the disk state the transcript was built from.
-    const snapshotRowFingerprints = activeSegment.map(fingerprintHistoryRow);
+    const snapshot = await this.snapshotActiveSegment(workspaceId, snapshotExclusion.data);
+    if (!snapshot.success) return snapshot;
+    const {
+      messages,
+      activeSegment,
+      transcriptRows,
+      trustedProjectContent,
+      takenAt,
+      rejectedRowsPresent,
+      snapshotRowFingerprints,
+    } = snapshot.data;
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
     // transcript size.
-    const transcript = buildAbandonedBranchTranscript(activeSegment.slice(-REFINE_MAX_MESSAGES));
+    const transcript = buildAbandonedBranchTranscript(transcriptRows.slice(-REFINE_MAX_MESSAGES));
     if (transcript.length === 0) {
       // Empty trajectory: a clean first-class no-op without spending a model call.
       return Ok({ applied: [], summary: "Nothing worth distilling.", noOp: true });
@@ -960,8 +994,8 @@ export class RefineService {
     // CLOSED when the boundary cannot be correlated: a boundary row without
     // a usable timestamp must omit the timeline entirely rather than let
     // pre-reset user-controlled digests through unbounded.
-    const boundaryIndex = findLatestContextBoundaryIndex(messagesResult.data);
-    const boundaryRow = boundaryIndex >= 0 ? messagesResult.data[boundaryIndex] : undefined;
+    const boundaryIndex = findLatestContextBoundaryIndex(messages);
+    const boundaryRow = boundaryIndex >= 0 ? messages[boundaryIndex] : undefined;
     const timelineSinceTs = boundaryRow?.metadata?.timestamp;
     // Persisted rows are JSON-cast without metadata validation, so a
     // corrupted boundary timestamp can be any number: -1 would admit every
@@ -971,10 +1005,17 @@ export class RefineService {
       typeof timelineSinceTs === "number" &&
       Number.isFinite(timelineSinceTs) &&
       timelineSinceTs >= 0;
+    // Timeline events are selected by timestamp alone, and a `turn.user` event
+    // carries the prompt's digest recorded before its row was refused. While
+    // the segment holds a rejected (stamped or quarantined) turn, the timeline
+    // is omitted entirely (fail closed) rather than correlated event by event;
+    // and it is capped at the snapshot instant, so a turn that starts after
+    // the exclusion is released (and may still be refused) contributes nothing
+    // even though the prefix verification cannot see its event.
     const timelineText =
-      boundaryRow !== undefined && !boundaryTsUsable
+      rejectedRowsPresent || (boundaryRow !== undefined && !boundaryTsUsable)
         ? undefined
-        : await this.buildTimelineText(workspaceId, timelineSinceTs);
+        : await this.buildTimelineText(workspaceId, timelineSinceTs, takenAt);
 
     // Model: reuse the dream-agent inherit cascade — refine is the same class
     // of background self-maintenance agent, so a per-workspace dream override
@@ -1037,6 +1078,21 @@ export class RefineService {
       const skillWriteAvailable =
         (await this.buildSkillWriteTool(workspaceId, sessionDir)) !== undefined;
 
+      // The turn exclusion was released after the snapshot. A manual Retry of
+      // an idle, still-retryable routed turn can be refused and stamped in
+      // the meantime, so the snapshot is re-verified against current history
+      // and quarantine immediately before the provider call: the transcript
+      // must not ship rows that are provider-ineligible by then. (Holding the
+      // exclusion through the model call would refuse every send for the
+      // whole pass.)
+      const preDispatch = await this.verifySnapshotUnchanged(
+        workspaceId,
+        boundaryRow,
+        activeSegment,
+        snapshotRowFingerprints,
+        trustedProjectContent
+      );
+      if (!preDispatch.success) return preDispatch;
       const result = await runRefinePass({
         model: modelResult.data.model,
         memoryService: this.memoryService,
@@ -1163,26 +1219,14 @@ export class RefineService {
       // edit-resend or partial truncation that keeps the first row but
       // rewrites the tail breaks the prefix; and a same-ID finalization
       // changes the row's fingerprint.
-      const recheckResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-      if (!recheckResult.success) {
-        return Err(`could not re-verify workspace history before staging: ${recheckResult.error}`);
-      }
-      const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
-      const recheckBoundaryId =
-        recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
-      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
-      const snapshotIsUnchangedPrefix =
-        activeSegment.length <= recheckSegment.length &&
-        snapshotRowFingerprints.every(
-          (fingerprint, index) => fingerprintHistoryRow(recheckSegment[index]) === fingerprint
-        );
-      if (recheckBoundaryId !== (boundaryRow?.id ?? null) || !snapshotIsUnchangedPrefix) {
-        return Err(
-          "the workspace context was reset, cleared, compacted, or rewritten while the refine " +
-            "pass was running; the distilled proposal no longer describes the active context — " +
-            "run /refine again"
-        );
-      }
+      const staging = await this.verifySnapshotUnchanged(
+        workspaceId,
+        boundaryRow,
+        activeSegment,
+        snapshotRowFingerprints,
+        trustedProjectContent
+      );
+      if (!staging.success) return staging;
 
       // r49: fingerprint each staged skill write's CURRENT target before the
       // set is saved and hash-bound to the proposal row, so apply can refuse
@@ -1216,6 +1260,7 @@ export class RefineService {
           createdAt: Date.now(),
           summary,
           edits: stagedEdits,
+          carriesProjectSkillContent: trustedProjectContent,
         });
       } else {
         await clearStagedRefineSet(sessionDir);
@@ -1226,11 +1271,18 @@ export class RefineService {
       // The row renders the exact staged payloads and carries their hash so
       // apply can bind approval to these bytes.
       if (!record.noOp) {
-        const proposalDurable = await this.appendSummaryMessage(workspaceId, record, {
-          mode: "staged",
-          edits: stagedEdits,
-          stagedSetHash: hashStagedRefineSet(stagedEdits),
-        });
+        const proposalDurable = await this.appendSummaryMessage(
+          workspaceId,
+          record,
+          {
+            mode: "staged",
+            edits: stagedEdits,
+            stagedSetHash: hashStagedRefineSet(stagedEdits),
+          },
+          // The pass distilled transcriptRows: project content reached the
+          // model only under trust (a withheld copy carries none).
+          trustedProjectContent
+        );
         // Approval is hash-bound to this rendered row; without it apply fails
         // closed ("no staged refine proposal found"). Reporting staged
         // success here would leave the user a dead end.
@@ -1501,7 +1553,8 @@ export class RefineService {
   /** Timeline digest when the Timeline experiment is on; undefined otherwise. */
   private async buildTimelineText(
     workspaceId: string,
-    sinceTs?: number
+    sinceTs: number | undefined,
+    untilTs: number
   ): Promise<string | undefined> {
     if (!this.experiments.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) return undefined;
     if (this.options.timelineService === undefined) return undefined;
@@ -1514,8 +1567,12 @@ export class RefineService {
       // after: timestamps are millisecond-resolution, so a pre-reset event
       // sharing the boundary's millisecond must be dropped (excluding a
       // legitimate same-millisecond post-reset event is the safe direction).
-      const events =
-        sinceTs === undefined ? page.events : page.events.filter((event) => event.ts > sinceTs);
+      // The upper bound is the snapshot instant, STRICTLY before for the same
+      // reason: a turn admitted right after the exclusion was released can
+      // emit within the snapshot's millisecond.
+      const events = page.events.filter(
+        (event) => (sinceTs === undefined || event.ts > sinceTs) && event.ts < untilTs
+      );
       if (events.length === 0) return undefined;
       // list() returns newest-first; present oldest-first for the model.
       return [...events]
@@ -1541,6 +1598,180 @@ export class RefineService {
    * wired; Ok(null) otherwise (lightweight test fakes). `using` accepts the
    * null, so call sites stay uniform.
    */
+  /**
+   * The distillation input, read while `exclusion` (the turn-admission block,
+   * or null when unwired) is held and released on return so the model call
+   * that follows never blocks sends.
+   *
+   * SECURITY: confine the input to the ACTIVE context segment.
+   * getLastMessages crosses reset boundaries (and pages into the sealed
+   * archive), so after /clear --soft a pre-reset prompt injection could steer
+   * the staged proposal — which is durably appended AFTER the boundary,
+   * re-entering model-visible context, and on approval persists to
+   * memory/skills. Durable sandbox/carryover invalidation does not filter chat
+   * history, so the read itself must stop at the boundary. Compaction epochs
+   * stay represented inside the active segment (summary row + preserved tail
+   * copies), so nothing legitimate is lost.
+   *
+   * Rejected turns are transcript-only: the refinement model (possibly on
+   * another provider) must not read their prompt or repository snapshots.
+   * Stamped rows are filtered by their own metadata; the quarantine — the
+   * session's in-memory set, or the durable repair record when no session is
+   * live — names rows whose stamp failed, and a record key names only the user
+   * row, so keys expand to the whole turn (snapshot prefix included). Fail
+   * CLOSED when the quarantine state is unknown (unreadable record): the pass
+   * cannot tell which rows an unstamped rejection still protects.
+   *
+   * r47: the snapshot rows are fingerprinted for the pre-publication recheck.
+   * Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes a
+   * streaming assistant row through updateHistory() PRESERVING its ID and
+   * historySequence, so a pass distilled from the in-flight placeholder would
+   * pass an ID-only prefix test after the stream settles. Hash the serialized
+   * row instead — any in-place rewrite changes the bytes. Captured before any
+   * consumer touches the rows so the fingerprints reflect the disk state the
+   * transcript was built from.
+   */
+  private async snapshotActiveSegment(
+    workspaceId: string,
+    exclusion: Disposable | null
+  ): Promise<
+    Result<
+      {
+        messages: MuxMessage[];
+        /** Eligible history rows (fingerprinted for the prefix verification). */
+        activeSegment: MuxMessage[];
+        /** Provider-facing copy of activeSegment (project content withheld without trust). */
+        transcriptRows: MuxMessage[];
+        trustedProjectContent: boolean;
+        takenAt: number;
+        rejectedRowsPresent: boolean;
+        snapshotRowFingerprints: string[];
+      },
+      string
+    >
+  > {
+    using _exclusion = exclusion;
+    const messagesResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!messagesResult.success) {
+      return Err(`could not read workspace history: ${messagesResult.error}`);
+    }
+    const quarantine =
+      (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
+    if (!quarantine.success) {
+      return Err(
+        `could not read the workspace's rejected-turn record (${quarantine.error}); ` +
+          "run /refine again once the workspace has been opened"
+      );
+    }
+    // Captured under the exclusion: no turn is preparing or streaming, so
+    // every timeline event a later turn emits is stamped after this instant.
+    const takenAt = Date.now();
+    const segment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    let activeSegment = excludeRejectedTurnRows(segment, quarantine.data);
+    // A routed turn without a terminal reply (interrupted stream, failed
+    // stream) is idle yet still retryable, and a Retry after a trust
+    // revocation refuses and stamps it. The pre-dispatch re-verification
+    // cannot undo a transcript already streaming to the refinement provider,
+    // so the whole unsettled turn — snapshot prefix, user row, and every row
+    // after it — stays out of the snapshot, as the status transcript does.
+    const unsettledRouted = findUnansweredRoutedTurnRow(activeSegment);
+    if (unsettledRouted !== undefined) {
+      const turnRowIds = collectRejectedTurnRowIds(activeSegment, [unsettledRouted.id]);
+      const turnStart = activeSegment.findIndex((row) => turnRowIds.has(row.id));
+      activeSegment = activeSegment.slice(0, turnStart);
+    }
+    // SETTLED project skill content: the refinement (Dream) model is configured
+    // apart from the workspace's model, so without Project Trust the transcript
+    // COPY withholds it the way a routed request does; the fingerprints stay on
+    // the history rows (the withheld copy is provider-facing only). Content
+    // kept under trust is re-verified with the snapshot, before dispatch and at
+    // staging. Fails closed for an unknown workspace.
+    const trusted = this.isProjectTrustedNow(workspaceId);
+    return Ok({
+      messages: messagesResult.data,
+      activeSegment,
+      transcriptRows: trusted
+        ? activeSegment
+        : withholdProjectSkillContentFromRequest(activeSegment),
+      trustedProjectContent: trusted && messagesCarryProjectSkillContent(activeSegment),
+      takenAt,
+      // The timeline input is selected by time alone, so the caller omits it
+      // while the segment holds a withheld turn — rejected, quarantined or
+      // unsettled routed (see runLocked).
+      rejectedRowsPresent: activeSegment.length !== segment.length,
+      snapshotRowFingerprints: activeSegment.map(fingerprintHistoryRow),
+    });
+  }
+
+  /**
+   * Re-read the workspace and confirm the snapshot is still an unchanged
+   * PREFIX of the active segment under the same context boundary, compared by
+   * per-row content fingerprint, not row ID (r43/r47): a stream that was
+   * mid-flight at snapshot time settles by finalizing its placeholder row IN
+   * PLACE (same ID, new parts), which an ID-only prefix test cannot see. The
+   * rejected-turn filter is re-applied from a FRESH quarantine read, so a row
+   * stamped or quarantined since the snapshot drops out and fails the prefix
+   * check — the pass would ship (or has distilled) content that is now
+   * provider-ineligible. Ordinary appends extend the tail and keep the
+   * prefix; a boundary-less full /clear empties it; an edit-resend or partial
+   * truncation that keeps the first row but rewrites the tail breaks it.
+   */
+  private async verifySnapshotUnchanged(
+    workspaceId: string,
+    boundaryRow: MuxMessage | undefined,
+    activeSegment: MuxMessage[],
+    snapshotRowFingerprints: string[],
+    trustedProjectContent: boolean
+  ): Promise<Result<void, string>> {
+    const recheckResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!recheckResult.success) {
+      return Err(`could not re-verify workspace history: ${recheckResult.error}`);
+    }
+    // Project skill content kept under trust at snapshot time: trust must
+    // still hold now, or the pass would ship (or has distilled) content the
+    // routed path no longer sends to another provider.
+    if (trustedProjectContent && !this.isProjectTrustedNow(workspaceId)) {
+      return Err(
+        "Project Trust was revoked while the refine pass was running and the transcript " +
+          "carried project skill content under it — run /refine again"
+      );
+    }
+    const quarantine =
+      (await this.options.getQuarantinedRowIds?.(workspaceId)) ?? Ok(new Set<string>());
+    if (!quarantine.success) {
+      return Err(
+        `could not re-verify the workspace's rejected-turn record (${quarantine.error}); ` +
+          "run /refine again"
+      );
+    }
+    const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
+    const recheckBoundaryId =
+      recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
+    const recheckSegment = excludeRejectedTurnRows(
+      sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data),
+      quarantine.data
+    );
+    const snapshotIsUnchangedPrefix =
+      activeSegment.length <= recheckSegment.length &&
+      snapshotRowFingerprints.every(
+        (fingerprint, index) => fingerprintHistoryRow(recheckSegment[index]) === fingerprint
+      );
+    if (recheckBoundaryId !== (boundaryRow?.id ?? null) || !snapshotIsUnchangedPrefix) {
+      return Err(
+        "the workspace context was reset, cleared, compacted, rewritten, or a turn in it was " +
+          "refused while the refine pass was running; the distilled proposal no longer " +
+          "describes the active context — run /refine again"
+      );
+    }
+    return Ok(undefined);
+  }
+
+  /** Provider-selection trust for the workspace's project (fail closed for an unknown workspace). */
+  private isProjectTrustedNow(workspaceId: string): boolean {
+    const workspace = this.config.findWorkspace(workspaceId);
+    return workspace != null && isProjectTrusted(this.config, workspace.projectPath);
+  }
+
   private acquireTurnExclusionIfWired(workspaceId: string): Result<Disposable | null, string> {
     if (!this.options.acquireTurnExclusion) {
       return Ok(null);
@@ -1559,10 +1790,11 @@ export class RefineService {
   private async appendSummaryMessage(
     workspaceId: string,
     record: RefineRecord,
-    mode: Parameters<typeof createRefineSummaryMessage>[1]
+    mode: Parameters<typeof createRefineSummaryMessage>[1],
+    carriesProjectSkillContent: boolean
   ): Promise<boolean> {
     try {
-      const message = createRefineSummaryMessage(record, mode);
+      const message = createRefineSummaryMessage(record, mode, carriesProjectSkillContent);
       const appendResult = await this.historyService.appendToHistory(workspaceId, message);
       if (!appendResult.success) {
         log.warn("[Refine] failed to append summary row", {

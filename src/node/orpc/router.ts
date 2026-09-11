@@ -344,6 +344,12 @@ export const router = (authToken?: string) => {
           })
         ),
 
+      updateModelClass: t
+        .input(schemas.config.updateModelClass.input)
+        .output(schemas.config.updateModelClass.output)
+        .handler(({ context, input }) =>
+          context.config.updateModelClass(input.className, input.model)
+        ),
       updateModelPreferences: t
         .input(schemas.config.updateModelPreferences.input)
         .output(schemas.config.updateModelPreferences.output)

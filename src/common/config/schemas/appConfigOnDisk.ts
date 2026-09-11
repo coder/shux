@@ -179,6 +179,20 @@ export const AppConfigOnDiskSchema = z
      * runtime sanitization rules (drop self, de-dupe, cap length).
      */
     modelFallbacks: ModelFallbacksSchema.optional(),
+    /**
+     * Named model classes (e.g. large/medium/small → a model alias or
+     * "provider:model" id with an optional "+thinking" suffix, one-shot
+     * syntax). Indirection layer so bindings survive model churn; consumed by
+     * per-skill model routing (see skillModelClasses and the skill frontmatter
+     * metadata "model-class" key).
+     */
+    modelClasses: z.record(z.string(), z.string()).optional(),
+    /**
+     * Per-skill routing table (skill name → class name in modelClasses).
+     * Wins over a skill's own frontmatter metadata "model-class" binding, so
+     * skills the user does not own can be routed without editing them.
+     */
+    skillModelClasses: z.record(z.string(), z.string()).optional(),
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),

@@ -37,6 +37,7 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { PreDispatchConsentGate } from "@/node/services/streamManager";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -269,6 +270,16 @@ export interface StreamMessageOptions {
   messages: MuxMessage[];
   workspaceId: string;
   modelString: string;
+  /**
+   * Routed project-skill turns: last consent check before the provider
+   * operation starts. Invoked by AIService immediately before
+   * streamManager.startStream — request building is the final revocation
+   * window. Performs its own rejection bookkeeping and returns the error to
+   * surface (null = proceed). Per-step re-verification passes
+   * `midStream: true` (the stream's error path then owns the visible
+   * emission). Never sourced from IPC schemas.
+   */
+  preDispatchConsentGate?: PreDispatchConsentGate;
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
   reasoningMode?: OpenAIReasoningMode;
@@ -308,6 +319,12 @@ export interface StreamMessageOptions {
     modelString: string,
     options?: { includeHotMemories?: boolean; onlyContextNotes?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
+  /**
+   * The request's rows or attachments carry project skill content: memory
+   * files the turn writes inherit that provenance (the model can copy the
+   * content into them), so later routed requests can withhold them.
+   */
+  memoryWritesCarryProjectSkillContent?: boolean;
   experiments?: SendMessageOptions["experiments"];
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
@@ -517,7 +534,9 @@ interface WorkflowResultContinuationSender {
       requireIdle?: boolean;
       startStreamInBackground?: boolean;
     }
-  ): Promise<Result<void, SendMessageError>>;
+    // The continuation sender ignores the accepted-send payload; unknown keeps
+    // this structural type compatible with WorkspaceService.sendMessage.
+  ): Promise<Result<unknown, SendMessageError>>;
 }
 
 interface TurnRequestBuildStartupState {
@@ -862,6 +881,7 @@ export class TurnRequestBuilder {
       recordFileState,
       postCompactionAttachments,
       resolveMemoryContext,
+      memoryWritesCarryProjectSkillContent,
       experiments: experimentsFromOptions,
       allowAgentSetGoal,
       workspaceGoalService,
@@ -2388,6 +2408,11 @@ export class TurnRequestBuilder {
       memoryService: this.dependencies.bindings.memoryService,
       memoryAccess,
       ...(contextBudgetFlushTurn ? { memoryWritePath: CONTEXT_NOTES_MEMORY_PATH } : {}),
+      // Write provenance: the request's own project content, or a preloaded /
+      // indexed memory that already carries it.
+      memoryWriteCarriesProjectSkillContent:
+        memoryWritesCarryProjectSkillContent === true ||
+        memoryContext?.carriesProjectSkillContent === true,
       contextBudgetRolloverAvailable,
       // Experiments for inheritance to subagents and workflow tool gating.
       experiments: {
@@ -3183,6 +3208,11 @@ export class TurnRequestBuilder {
       emitStartupBreadcrumb("starting_stream");
       const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
+        // Threaded to the stream-start critical section (see
+        // TurnExecutionOptions.preDispatchConsentGate).
+        ...(opts.preDispatchConsentGate != null
+          ? { preDispatchConsentGate: opts.preDispatchConsentGate }
+          : {}),
         messages: streamFinalMessages,
         model: modelResult.data.model,
         modelString,

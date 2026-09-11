@@ -42,6 +42,25 @@ export function appendStagedAttachmentNotice(text: string, attachments: ChatAtta
   return text.trim().length > 0 ? `${text}\n${notice}` : notice.trimStart();
 }
 
+/**
+ * The raw <attached-files> blocks in a message text, verbatim. For rebuilds
+ * that regenerate the surrounding model-facing text (compact-and-retry):
+ * staged attachments are deliberately absent from fileParts, so dropping the
+ * generated notice would silently lose the file and its workspace path.
+ */
+export function extractStagedAttachmentNotices(text: string): string[] {
+  return (
+    text
+      .match(ATTACHED_FILES_BLOCK_PATTERN)
+      ?.map((block) => block.replace(/^\n/, ""))
+      // Only GENERATED notices: a skill argument can itself contain an
+      // <attached-files> example (pasted XML, fenced block) that the rebuilt
+      // argument text already restores — re-appending it would duplicate
+      // user content and change the retried prompt.
+      .filter((block) => isGeneratedStagedAttachmentBlock(block)) ?? []
+  );
+}
+
 export function parseStagedAttachmentNotice(text: string): {
   text: string;
   attachments: DisplayStagedAttachment[];

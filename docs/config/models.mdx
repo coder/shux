@@ -71,12 +71,15 @@ Override the model or thinking level for a single message using slash commands. 
 
 ### Syntax
 
-| Command                     | Effect                                   |
-| --------------------------- | ---------------------------------------- |
-| `/sonnet explain this code` | Use Sonnet for one message               |
-| `/opus+high deep review`    | Use Opus with high thinking              |
-| `/haiku+0 quick answer`     | Use Haiku at its lowest thinking level   |
-| `/+2 analyze this`          | Keep current model, set thinking level 2 |
+| Command                     | Effect                                      |
+| --------------------------- | ------------------------------------------- |
+| `/sonnet explain this code` | Use Sonnet for one message                  |
+| `/opus+high deep review`    | Use Opus with high thinking                 |
+| `/haiku+0 quick answer`     | Use Haiku at its lowest thinking level      |
+| `/+2 analyze this`          | Keep current model, set thinking level 2    |
+| `/haiku+0 /done`            | Run the `done` skill on Haiku for this send |
+
+One-shot prefixes compose with [skill invocations](/agents/agent-skills): `/haiku+0 /done cleanup` invokes the skill normally (arguments, snapshots) while overriding the model for that send. An explicit one-shot also wins over the skill's own [model-class routing](/agents/agent-skills#per-skill-model-routing).
 
 ### Thinking levels
 

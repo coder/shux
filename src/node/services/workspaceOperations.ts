@@ -239,7 +239,24 @@ export async function sendWorkspaceMessage(
     input.options
   );
   return result.success
-    ? { success: true as const, data: {} }
+    ? {
+        success: true as const,
+        // Routed skill sends report the class model (and effective thinking)
+        // so the frontend can attribute send telemetry to what actually
+        // streams instead of the workspace's selected model. `queued` marks
+        // acknowledgements taken BEFORE routing resolved (busy session), so
+        // absence of routedModel there means "unknown", not "unrouted".
+        data: {
+          ...(result.data?.routedModel != null ? { routedModel: result.data.routedModel } : {}),
+          ...(result.data?.routedThinkingLevel != null
+            ? { routedThinkingLevel: result.data.routedThinkingLevel }
+            : {}),
+          ...(result.data?.queued === true ? { queued: true } : {}),
+          // Accepted (rows durable) but refused before any provider request:
+          // the renderer must not attribute send telemetry to it.
+          ...(result.data?.acceptedWithoutStream === true ? { acceptedWithoutStream: true } : {}),
+        },
+      }
     : { success: false as const, error: result.error };
 }
 

@@ -63,6 +63,16 @@ export interface MemoryMetaEntry {
   accessCount: number;
   lastAccessedAt: number | null;
   lastWriteAt: number | null;
+  /**
+   * Provenance: the file was written while repository-controlled PROJECT
+   * skill content was in the writer's context — a harvest inbox distilled
+   * from a trusted project-skill epoch, a consolidation sweep over such an
+   * inbox, a chat turn whose request carried it. Sticky for the file's life
+   * (pins and stats follow renames). Routed requests after a Project Trust
+   * revocation withhold such memories (MemoryScopeContext.writeProvenance,
+   * MemorySessionContext.carriesProjectSkillContent).
+   */
+  carriesProjectSkillContent: boolean;
 }
 
 const EMPTY_ENTRY: MemoryMetaEntry = {
@@ -70,6 +80,7 @@ const EMPTY_ENTRY: MemoryMetaEntry = {
   accessCount: 0,
   lastAccessedAt: null,
   lastWriteAt: null,
+  carriesProjectSkillContent: false,
 };
 
 function isEmptyEntry(entry: MemoryMetaEntry): boolean {
@@ -77,7 +88,8 @@ function isEmptyEntry(entry: MemoryMetaEntry): boolean {
     !entry.pinned &&
     entry.accessCount === 0 &&
     entry.lastAccessedAt === null &&
-    entry.lastWriteAt === null
+    entry.lastWriteAt === null &&
+    !entry.carriesProjectSkillContent
   );
 }
 
@@ -112,6 +124,7 @@ function sanitizeMetaFile(raw: unknown): MemoryMetaFile {
       accessCount: sanitizeCount(record.accessCount),
       lastAccessedAt: sanitizeTimestamp(record.lastAccessedAt),
       lastWriteAt: sanitizeTimestamp(record.lastWriteAt),
+      carriesProjectSkillContent: record.carriesProjectSkillContent === true,
     };
     if (isEmptyEntry(entry)) continue;
     entries[key] = entry;
@@ -195,7 +208,7 @@ export class MemoryMetaService {
     /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
     recordAccess: (
       logicalKey: string,
-      options: { write: boolean }
+      options: { write: boolean; carriesProjectSkillContent?: boolean }
     ): Effect.Effect<void, MemoryMetaWriteError> =>
       this.mutate((entries) => {
         const current = entries[logicalKey] ?? EMPTY_ENTRY;
@@ -205,6 +218,10 @@ export class MemoryMetaService {
           accessCount: current.accessCount + 1,
           lastAccessedAt: now,
           lastWriteAt: options.write ? now : current.lastWriteAt,
+          // A tainted write marks the file for good; reads never clear it.
+          carriesProjectSkillContent:
+            current.carriesProjectSkillContent ||
+            (options.write && options.carriesProjectSkillContent === true),
         };
       }),
 
@@ -332,7 +349,10 @@ export class MemoryMetaService {
   }
 
   /** Record a use (read or write) of a memory file at the MemoryService chokepoint. */
-  async recordAccess(logicalKey: string, options: { write: boolean }): Promise<void> {
+  async recordAccess(
+    logicalKey: string,
+    options: { write: boolean; carriesProjectSkillContent?: boolean }
+  ): Promise<void> {
     await Effect.runPromise(this.effects.recordAccess(logicalKey, options));
   }
 

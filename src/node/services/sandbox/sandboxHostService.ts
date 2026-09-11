@@ -253,6 +253,18 @@ export async function reclaimExcessResultHandleBlobs(
 export type SandboxMountLifetime = "ephemeral" | "persistent";
 
 /**
+ * Reserved guest `vars` key carrying a persistent mount's project-skill taint
+ * (see SandboxMount.projectSkillTainted) through the vars snapshot, so the
+ * taint survives restarts together with the vars that may hold the content.
+ * "1" = tainted, "0" = verified clean at persist time; the host re-asserts it
+ * before every snapshot (guest code can delete or rewrite the key). A snapshot
+ * WITHOUT the marker predates it or lost it: its retained vars may hold
+ * content nobody classified, so restore treats it as tainted unless the
+ * namespace is empty.
+ */
+export const PROJECT_SKILL_TAINT_VAR = "__xumProjectSkillTaint";
+
+/**
  * Cap on undrained host events per mount. Guests that never call
  * mux.events() must not grow the queue unboundedly across a long-lived
  * workspace; oldest events are dropped first (the queue is best-effort —
@@ -401,6 +413,14 @@ const GUEST_NEXT_HANDLE_SEQ_SOURCE = `
 export class SandboxMount {
   private readonly hostEventQueue: unknown[] = [];
   private disposed = false;
+  /**
+   * A nested agent_skill_read(_file) on this mount returned PROJECT-scope
+   * skill content: vars can hold it for later calls, so every later
+   * code_execution result on the mount is stamped as project content (see
+   * CodeExecutionResult.carriesProjectSkillContent). Restored from the vars
+   * snapshot (PROJECT_SKILL_TAINT_VAR) and re-asserted before each persist.
+   */
+  projectSkillTainted = false;
 
   constructor(
     public readonly runtime: IJSRuntime,
@@ -495,7 +515,18 @@ export class SandboxMount {
     assert(this.grants.vars, "restoreVars requires the vars grant");
     // Parse host-side first: crash-fast on corrupted snapshots instead of
     // injecting garbage into the guest.
-    JSON.parse(varsJson);
+    const restored: unknown = JSON.parse(varsJson);
+    // Markerless snapshots (pre-marker builds, or a guest that deleted the
+    // key before a persist that never re-asserted it) are unknown: retained
+    // vars may hold project skill content, so they restore TAINTED. An empty
+    // namespace retains nothing — reset tombstones and never-used scopes stay
+    // clean.
+    const vars =
+      typeof restored === "object" && restored !== null
+        ? (restored as Record<string, unknown>)
+        : {};
+    const marker = vars[PROJECT_SKILL_TAINT_VAR];
+    this.projectSkillTainted = marker === "1" || (marker !== "0" && Object.keys(vars).length > 0);
     const literal = JSON.stringify(varsJson);
     const result = await this.runtime.eval(
       `globalThis.vars = JSON.parse(${literal}); return true;`
@@ -510,6 +541,9 @@ export class SandboxMount {
       this.persistSnapshot,
       "persistVars is only available on persistent mounts with a session dir"
     );
+    // Always explicit: "0" marks a snapshot verified clean at persist time,
+    // so restore can tell it from a legacy markerless one (which is unknown).
+    this.runtime.setVarsProperty(PROJECT_SKILL_TAINT_VAR, this.projectSkillTainted ? "1" : "0");
     const varsJson = await this.snapshotVars();
     // Hard per-snapshot budget over ALL vars: retention only manages handle
     // and load keys, but every key is guest-writable — without this bound a

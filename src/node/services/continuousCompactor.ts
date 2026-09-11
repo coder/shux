@@ -64,6 +64,10 @@ interface Dependencies {
     requestProviderOptions?: Record<string, unknown>;
     attachments: PostCompactionAttachment[];
     cacheEnabled: boolean;
+    /** Provider-copy filter for the rebuilt prefix's source rows (see rebuildContinuousPrefix). */
+    prefixRows?: (rows: MuxMessage[]) => MuxMessage[];
+    /** Consent verdict of the (filtered) prefix rows for the routed turn's per-step gate. */
+    prefixCarriesProjectSkillContent?: (prefixRows: MuxMessage[]) => boolean;
   } | null>;
   // Includes usage recording: the generation fence must be AFTER the last await.
   summarize(
@@ -555,9 +559,22 @@ export class ContinuousCompactor {
         stepNumber: 0,
         firstTailToolCallId: tool.toolCallId,
       };
-      const prefix = await rebuildContinuousPrefix(journal, this.deps.workspaceId);
+      const prefix = await rebuildContinuousPrefix(
+        journal,
+        this.deps.workspaceId,
+        prepared.prefixRows
+      );
       if (!this.isValid(staged, rows)) return false;
-      const swap: ContinuousPrefixSwap = { prefix, firstTailToolCallId: tool.toolCallId, journal };
+      // Provenance of the provider copy — judged on the same filtered rows.
+      const providerPrefixRows =
+        prepared.prefixRows?.(journal.prefixSourceRows) ?? journal.prefixSourceRows;
+      const swap: ContinuousPrefixSwap = {
+        prefix,
+        firstTailToolCallId: tool.toolCallId,
+        journal,
+        carriesProjectSkillContent:
+          prepared.prefixCarriesProjectSkillContent?.(providerPrefixRows) === true,
+      };
       if (!this.deps.streamManager.setPrefixSwap(this.deps.workspaceId, swap)) return false;
       this.activeSwap = swap;
       return true;

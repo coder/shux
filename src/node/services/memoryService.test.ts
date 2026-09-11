@@ -881,12 +881,14 @@ describe("MemoryService", () => {
           scope: "global",
           relPath: "described.md",
           description: "a useful note",
+          carriesProjectSkillContent: false,
         },
         {
           path: "/memories/project/plain.md",
           scope: "project",
           relPath: "plain.md",
           description: "",
+          carriesProjectSkillContent: false,
         },
       ]);
     });
@@ -1165,6 +1167,51 @@ describe("MemoryService", () => {
       for (const key of entries.keys()) {
         expect(key).not.toContain(fixture.checkout);
       }
+    });
+
+    it("records project skill provenance for tainted writes and exposes it to the index and hot set", async () => {
+      // Provenance rides the scope context of the writer (harvest of a trusted
+      // project-skill epoch, sweep over such an inbox, tainted chat turn): the
+      // sidecar marks the file, the index and hot set report it, and a routed
+      // request without trust can leave such files out.
+      using fixture = await createFixture("ws-provenance");
+      const tainted = {
+        ...fixture.ctx,
+        writeProvenance: { carriesProjectSkillContent: true as const },
+      };
+      await fixture.service.create(tainted, "/memories/global/from-skill.md", "quotes it", "agent");
+      await fixture.service.create(fixture.ctx, "/memories/global/clean.md", "clean", "agent");
+      // A later clean read or write does not launder the provenance.
+      await fixture.service.view(fixture.ctx, "/memories/global/from-skill.md");
+      await fixture.service.strReplace(
+        fixture.ctx,
+        "/memories/global/from-skill.md",
+        "quotes",
+        "still quotes",
+        "agent"
+      );
+      const meta = await fixture.metaService.getEntries();
+      expect(meta.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(meta.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
+
+      const entries = await fixture.service.listIndexEntries(fixture.ctx);
+      const byPath = (virtualPath: string) => entries.find((entry) => entry.path === virtualPath);
+      expect(byPath("/memories/global/from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(byPath("/memories/global/clean.md")?.carriesProjectSkillContent).toBe(false);
+      expect(await fixture.service.scopeCarriesProjectSkillContent(fixture.ctx)).toBe(true);
+
+      await fixture.metaService.setPinned("global:from-skill.md", true);
+      const countTokens = (text: string) => Promise.resolve(Math.ceil(text.length / 4));
+      const hot = await fixture.service.listHotMemories(fixture.ctx, { countTokens });
+      expect(
+        hot.find((item) => item.path === "/memories/global/from-skill.md")
+          ?.carriesProjectSkillContent
+      ).toBe(true);
+      const withheld = await fixture.service.listHotMemories(fixture.ctx, {
+        countTokens,
+        excludeProjectSkillContent: true,
+      });
+      expect(withheld.some((item) => item.path === "/memories/global/from-skill.md")).toBe(false);
     });
 
     it("records edits (str_replace, insert) as writes", async () => {

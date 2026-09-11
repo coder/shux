@@ -147,6 +147,40 @@ describe("CompactionMonitor", () => {
     ).toBe(false);
   });
 
+  test("checkMidStream honors the routed-send force threshold override", () => {
+    const { monitor, statusEvents } = createMonitor();
+
+    // 75% would force-compact under the workspace threshold+buffer, but a
+    // routed turn's override defers until the routed window is nearly full.
+    expect(
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        usage: createMidStreamUsage(150_000),
+        use1MContext: false,
+        providersConfig: null,
+        forceThresholdPercentOverride: 90,
+      })
+    ).toBe(false);
+    expect(statusEvents).toHaveLength(0);
+
+    expect(
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        usage: createMidStreamUsage(184_000),
+        use1MContext: false,
+        providersConfig: null,
+        forceThresholdPercentOverride: 90,
+      })
+    ).toBe(true);
+    expect(statusEvents).toEqual([
+      {
+        type: "auto-compaction-triggered",
+        reason: "mid-stream",
+        usagePercent: 92,
+      },
+    ]);
+  });
+
   test("checkMidStream stays disabled when threshold is set to 1.0", () => {
     const { monitor, statusEvents } = createMonitor();
     monitor.setThreshold(1);

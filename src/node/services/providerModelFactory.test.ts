@@ -1801,6 +1801,37 @@ describe("ProviderModelFactory Codex authentication", () => {
   });
 });
 describe("ProviderModelFactory routing", () => {
+  it("routes a Chat Completions request past OAuth-only direct OpenAI to the next gateway", async () => {
+    // Codex OAuth speaks only the Responses endpoint. With no stored wire
+    // format, createModel honors the REQUEST's providerOptions.openai.wireFormat
+    // and would reject an OAuth-only direct route with api_key_not_found; the
+    // class-availability preflight already skips direct for such a request,
+    // and runtime route selection must agree and take the next gateway.
+    await withTempConfig(async (config, factory) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          codexOauth: {
+            type: "oauth",
+            access: "test-access-token",
+            refresh: "test-refresh-token",
+            expires: Date.now() + 60_000,
+            accountId: "test-account-id",
+          },
+        },
+        openrouter: { apiKey: "or-test" },
+      });
+      await saveRoutePriority(config, ["direct", "openrouter"]);
+
+      const responses = await factory.resolveAndCreateModel("openai:gpt-5.5", "off");
+      expect(responses.success && responses.data.effectiveModelString).toBe("openai:gpt-5.5");
+
+      const chat = await factory.resolveAndCreateModel("openai:gpt-5.5", "off", {
+        openai: { wireFormat: "chatCompletions" },
+      });
+      expect(chat.success && chat.data.effectiveModelString).toBe("openrouter:openai/gpt-5.5");
+    });
+  });
+
   it("honors non-mux gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({

@@ -541,6 +541,10 @@ export const WorkersLive: Layer.Layer<
         sessionUsageService,
         emitChatMessage: (workspaceId, message) =>
           workspaceService.emitChatEvent(workspaceId, { ...message, type: "message" }),
+        // Rows quarantined after a failed pre-stream-rejection stamp are
+        // transcript-only: the side-channel distillation must not read them.
+        getQuarantinedRowIds: (workspaceId) =>
+          workspaceService.getQuarantinedRejectedRowIds(workspaceId),
         // r40: refine row publication and apply mutations must not interleave
         // with a concurrent turn's PREPARING snapshot or split its
         // user/assistant pair — hold the session's turn-admission block while

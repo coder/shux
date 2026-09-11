@@ -185,7 +185,7 @@ import {
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
@@ -2509,7 +2509,8 @@ export class TaskService implements AgentTaskIntegration {
         experiments: task.taskExperiments,
       };
       if (pendingGuidance.length > 0) {
-        let sendResult: Result<void, SendMessageError> = Ok(undefined);
+        // sendMessage reports the accepted-send payload (routing, queued); only success matters here.
+        let sendResult: Result<SendMessageAccepted | undefined, SendMessageError> = Ok(undefined);
         for (const guidance of pendingGuidance) {
           sendResult = await this.workspaceService.sendMessage(
             task.id,

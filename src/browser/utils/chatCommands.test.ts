@@ -1242,6 +1242,59 @@ describe("prepareCompactionMessage", () => {
     expect(metadata.parsed.followUpContent?.agentId).toBe("code");
   });
 
+  test("carried one-shot overrides win over ambient preserved send options", () => {
+    // A compact-and-retry rebuild of "/haiku+0 /skill" carries the one-shot's
+    // model, thinking, and persistence semantics in followUpContent; the
+    // ambient stored options (different thinking, no skip flags) must not
+    // clobber them.
+    const sendMessageOptions = createBaseOptions();
+
+    const { metadata } = prepareCompactionMessage({
+      workspaceId: "ws-1",
+      followUpContent: {
+        text: "/haiku+0 /done finish up",
+        model: "anthropic:claude-3-5-haiku",
+        skipSkillModelRouting: true,
+        thinkingLevel: "off",
+        skipAiSettingsPersistence: true,
+      },
+      sendMessageOptions,
+    });
+
+    expectCompactionMetadata(metadata);
+
+    const followUp = metadata.parsed.followUpContent;
+    expect(followUp?.model).toBe("anthropic:claude-3-5-haiku");
+    expect(followUp?.skipSkillModelRouting).toBe(true);
+    expect(followUp?.thinkingLevel).toBe("off");
+    expect(followUp?.skipAiSettingsPersistence).toBe(true);
+  });
+
+  test("a thinking-only carried one-shot keeps its raw index for routed re-resolution", () => {
+    const sendMessageOptions = createBaseOptions();
+
+    const { metadata } = prepareCompactionMessage({
+      workspaceId: "ws-1",
+      followUpContent: {
+        text: "/+0 /done finish up",
+        thinkingLevel: "medium",
+        oneShotThinkingIndex: 0,
+        skipAiSettingsPersistence: true,
+      },
+      sendMessageOptions,
+    });
+
+    expectCompactionMetadata(metadata);
+
+    const followUp = metadata.parsed.followUpContent;
+    // No model override: the re-dispatch stays routable...
+    expect(followUp?.model).toBe("anthropic:claude-sonnet-4-6");
+    expect(followUp?.skipSkillModelRouting).toBeUndefined();
+    // ...and the raw index survives so the backend can re-ladder it.
+    expect(followUp?.oneShotThinkingIndex).toBe(0);
+    expect(followUp?.thinkingLevel).toBe("medium");
+  });
+
   test("does not create followUpContent when no text or images provided", () => {
     const sendMessageOptions = createBaseOptions();
     const { metadata } = prepareCompactionMessage({

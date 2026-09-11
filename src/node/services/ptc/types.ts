@@ -135,6 +135,13 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
       ? { error: record.error.slice(0, KERNEL_COMPACT_ARGS_CAP_BYTES) }
       : {};
 
+  if (toolName === "agent_skill_read_file") {
+    // Only the status and scope tag are consumed (consent scan); the file
+    // content is guest-visible in the record summary and never mined.
+    const skillScope = (result as { skillScope?: unknown }).skillScope;
+    return { ...success, ...error, ...(skillScope !== undefined ? { skillScope } : {}) };
+  }
+
   if (toolName === "agent_skill_read") {
     const skill = (result as { skill?: unknown }).skill;
     const reduced = { ...success, ...error, ...(skill !== undefined ? { skill } : {}) };
@@ -702,6 +709,9 @@ export function retainWorkflowResultIdentityFields(
 export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
   return (
     toolName === "agent_skill_read" ||
+    // The routed-request consent scan reads the result's scope tag; a bounded
+    // marker would erase it (see boundPersistenceCriticalResult).
+    toolName === "agent_skill_read_file" ||
     FILE_EDIT_TOOL_NAMES.includes(toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])
   );
 }

@@ -17,6 +17,7 @@ import {
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
+import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
@@ -174,7 +175,7 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError, StreamErrorType } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import { formatSendMessageError as classifySendMessageError } from "@/node/services/utils/sendMessageError";
 import type { IdleCompactionOutcome } from "@/node/services/idleCompactionService";
@@ -195,8 +196,11 @@ import {
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
+  collectRejectedTurnRowIds,
+  excludeRejectedTurnRows,
   getCompactionFollowUpContent,
   isSameWorkspaceTurnTaskCorrelation,
+  findUnansweredRoutedTurnRow,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
@@ -204,6 +208,10 @@ import {
   type MuxMessage,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
+import {
+  AUTO_RETRY_PREFERENCE_FILE,
+  readDurableRejectedTurnKeys,
+} from "@/node/services/rejectedTurnRepairRecord";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -3240,6 +3248,73 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return Ok(hold);
   }
 
+  /**
+   * Fork-time guard against the source's in-flight turn. The copied rows
+   * inherit only the quarantine known at copy time, and a SUCCESSFUL late
+   * stamp in the source is never reported by getQuarantinedRejectedRowIds, so
+   * a turn refused after the copy would leave the fork holding its rows and
+   * finalized partial unprotected. The source's turn admission is held across
+   * the copy (a queued turn cannot start preparing under it); a turn being
+   * prepared or admitted refuses the fork (retryable); a streaming turn's rows
+   * are persisted and final, and only a ROUTED turn's per-step gate can still
+   * refuse them, so the fork is refused while such a turn streams. Never
+   * creates a session — a workspace without one has no turn to overlap.
+   */
+  /**
+   * Whether every abandoned-tail row a fork's background summary was built
+   * from is still present and provider-eligible in the SOURCE — re-read from
+   * the FULL history (a fork from an archived message abandons the rest of
+   * that archive too, which a latest-boundary read never returns) with a
+   * fresh quarantine. False (also on an unreadable history or quarantine)
+   * means a row was stamped, quarantined or truncated since the copy: the
+   * summary is abandoned rather than sent from stale rows.
+   */
+  private async abandonedRowsStillEligible(
+    sourceWorkspaceId: string,
+    rowIds: readonly string[]
+  ): Promise<boolean> {
+    const rows: MuxMessage[] = [];
+    const read = await this.historyService.iterateFullHistory(
+      sourceWorkspaceId,
+      "forward",
+      (chunk) => {
+        rows.push(...chunk);
+      }
+    );
+    if (!read.success) return false;
+    const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
+    if (!quarantine.success) return false;
+    const eligible = new Set(excludeRejectedTurnRows(rows, quarantine.data).map((row) => row.id));
+    return rowIds.every((id) => eligible.has(id));
+  }
+
+  private async guardForkAgainstSourceTurn(
+    sourceWorkspaceId: string
+  ): Promise<Result<Disposable | null>> {
+    const session = this.sessions.get(sourceWorkspaceId);
+    const hold = session?.holdTurnAdmission() ?? null;
+    const streaming = this.aiService.isStreaming(sourceWorkspaceId);
+    if (
+      (this.preflightSendCounts.get(sourceWorkspaceId) ?? 0) > 0 ||
+      ((session?.hasActiveOrPendingTurnWork() ?? false) && !streaming)
+    ) {
+      hold?.[Symbol.dispose]();
+      return Err("Cannot fork while a message is being sent. Try again in a moment.");
+    }
+    if (streaming) {
+      const tail = await this.historyService.getHistoryFromLatestBoundary(sourceWorkspaceId);
+      if (!tail.success) {
+        hold?.[Symbol.dispose]();
+        return Err(`Cannot fork: the source history could not be read (${tail.error})`);
+      }
+      if (findUnansweredRoutedTurnRow(tail.data) !== undefined) {
+        hold?.[Symbol.dispose]();
+        return Err("Cannot fork while a routed skill turn is streaming. Wait for it to finish.");
+      }
+    }
+    return Ok(hold);
+  }
+
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
     return (
       this.config.loadConfigOrDefault().worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
@@ -4313,6 +4388,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
+      onDeferredSendDelivered: (text) => {
+        this.runAutoTitleForDeliveredSend(workspaceId, text);
+      },
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield
@@ -4412,6 +4490,91 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "emitChatEvent requires workspaceId");
     this.sessions.get(trimmed)?.emitChatEvent(message);
+  }
+
+  /** Session-local quarantine of rejected rows for refine's side-channel exclusion. */
+  /**
+   * Rows the side channels (refine, memory harvest) must treat as
+   * provider-ineligible: a live session's in-memory quarantine of rows whose
+   * durable stamp failed, plus the durable repair record's turn keys — the
+   * post-restart launch sweep harvests before any session exists, and a fresh
+   * session has not run its startup repair yet.
+   */
+  async getQuarantinedRejectedRowIds(
+    workspaceId: string
+  ): Promise<Result<ReadonlySet<string>, string>> {
+    const durable = await readDurableRejectedTurnKeys(
+      path.join(this.config.sessionsDir, workspaceId, AUTO_RETRY_PREFERENCE_FILE)
+    );
+    // Err = the durable record is unreadable, so the quarantine state is
+    // UNKNOWN even with a live session (its own read of the file failed the
+    // same way): side channels skip their provider request rather than treat
+    // the state as empty.
+    if (!durable.success) return durable;
+    const live = this.sessions.get(workspaceId)?.getQuarantinedRejectedRowIds();
+    return Ok(live == null ? durable.data : new Set([...live, ...durable.data]));
+  }
+
+  /**
+   * Carries the source workspace's rejected-turn quarantine into a fork's
+   * copied history: every quarantined row (or turn, for record keys) still
+   * present in the fork is stamped provider-ineligible there; if the stamp
+   * fails, the fork gets its own durable repair record naming those rows, so
+   * its session repairs them at startup and side channels fail closed until
+   * then. An unreadable source record refuses the fork — copying history whose
+   * quarantine state is unknown would launder the refused content.
+   */
+  private async propagateRejectedTurnQuarantineToFork(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    targetSessionDir: string
+  ): Promise<Result<ReadonlySet<string>>> {
+    const quarantine = await this.getQuarantinedRejectedRowIds(sourceWorkspaceId);
+    if (!quarantine.success) {
+      return Err(
+        `the source workspace's rejected-turn record is unreadable (${quarantine.error}); ` +
+          "refusing to fork its history"
+      );
+    }
+    if (quarantine.data.size === 0) return Ok(quarantine.data);
+    const rows: MuxMessage[] = [];
+    const read = await this.historyService.iterateFullHistory(
+      targetWorkspaceId,
+      "forward",
+      (chunk) => {
+        rows.push(...chunk);
+      }
+    );
+    if (!read.success) return Err(read.error);
+    const present = new Set(rows.map((row) => row.id));
+    // Rows behind the branch point were truncated away; only what the fork kept matters.
+    const rowIds = [...collectRejectedTurnRowIds(rows, quarantine.data)].filter((id) =>
+      present.has(id)
+    );
+    if (rowIds.length === 0) return Ok(quarantine.data);
+    const stamped = await this.historyService.markMessagesPreStreamRejected(
+      targetWorkspaceId,
+      rowIds
+    );
+    if (stamped.success) return Ok(quarantine.data);
+    log.warn(
+      "Failed to stamp quarantined rows in forked history; seeding the fork's repair record",
+      {
+        sourceWorkspaceId,
+        targetWorkspaceId,
+        error: stamped.error,
+      }
+    );
+    try {
+      await fsPromises.mkdir(targetSessionDir, { recursive: true });
+      await writeFileAtomic(
+        path.join(targetSessionDir, AUTO_RETRY_PREFERENCE_FILE),
+        JSON.stringify({ pendingRejectedTurnRepair: { userMessageIds: rowIds } }) + "\n"
+      );
+    } catch (error) {
+      return Err(`could not record the fork's rejected-turn quarantine: ${getErrorMessage(error)}`);
+    }
+    return Ok(quarantine.data);
   }
 
   /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
@@ -7603,6 +7766,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return candidates;
   }
 
+  /**
+   * Fork auto-title for a send whose delivery was deferred behind an on-send
+   * compaction: sendMessage released its claim at the `{ queued: true }`
+   * answer (the follow-up could still be refused), and the session reports
+   * the actual delivery here.
+   */
+  private runAutoTitleForDeliveredSend(workspaceId: string, text: string): void {
+    if (!this.hasPendingAutoTitle(workspaceId) || this.autoTitlingWorkspaces.has(workspaceId)) {
+      return;
+    }
+    this.autoTitlingWorkspaces.add(workspaceId);
+    this.maybeRunPendingAutoTitleFromMessage(workspaceId, text)
+      .catch((error: unknown) => {
+        log.error("Unexpected rejection while running deferred fork auto-title", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.autoTitlingWorkspaces.delete(workspaceId);
+      });
+  }
+
   private async maybeRunPendingAutoTitleFromMessage(
     workspaceId: string,
     message: string
@@ -10068,8 +10254,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (sourceMetadata.kind === "scratch") {
         return Err("Forking scratch chats is not supported yet");
       }
-      const partialSnapshot =
-        sourceMessageId == null ? await this.historyService.readPartial(sourceWorkspaceId) : null;
+      // Consent guard against the source's in-flight turn: checked early for a
+      // cheap refusal before any runtime work, then held around the history
+      // copy below (the partial is read there, under the hold).
+      const sourceTurnCheck = await this.guardForkAgainstSourceTurn(sourceWorkspaceId);
+      if (!sourceTurnCheck.success) {
+        return Err(sourceTurnCheck.error);
+      }
+      sourceTurnCheck.data?.[Symbol.dispose]();
       const foundProjectPath = sourceMetadata.projectPath;
       const projectName = sourceMetadata.projectName;
       const sourceRuntimeConfig = sourceMetadata.runtimeConfig;
@@ -10290,7 +10482,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
       let abandonedBranchMessages: MuxMessage[] | null = null;
+      // The source's rejected-turn quarantine (live set ∪ durable record),
+      // applied to the copied rows below and to the abandoned tail's summary.
+      let sourceRejectedQuarantine: ReadonlySet<string> = new Set();
+      // Held from the partial read through the quarantine propagation, so no
+      // turn starts preparing (and no routed turn is refused) between them.
+      let sourceTurnHold: Disposable | null = null;
       try {
+        const sourceTurnGuard = await this.guardForkAgainstSourceTurn(sourceWorkspaceId);
+        if (!sourceTurnGuard.success) {
+          throw new Error(sourceTurnGuard.error);
+        }
+        sourceTurnHold = sourceTurnGuard.data;
+        const partialSnapshot =
+          sourceMessageId == null ? await this.historyService.readPartial(sourceWorkspaceId) : null;
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
           newWorkspaceId
@@ -10352,6 +10557,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           targetWorkspaceId: newWorkspaceId,
         });
 
+        // A late consent refusal whose row stamp failed leaves its rows
+        // unstamped in the source, protected by that workspace's in-memory
+        // quarantine and durable repair record — neither of which the copied
+        // chat inherits. Stamp those rows in the fork (after the partial
+        // snapshot above, which may be the refused turn's own) before it can
+        // build a request or run a side channel; when even that fails, seed the
+        // fork's repair record so its session and side channels fail closed.
+        const quarantinePropagated = await this.propagateRejectedTurnQuarantineToFork(
+          sourceWorkspaceId,
+          newWorkspaceId,
+          newSessionDir
+        );
+        if (!quarantinePropagated.success) {
+          throw new Error(quarantinePropagated.error);
+        }
+        sourceRejectedQuarantine = quarantinePropagated.data;
+        sourceTurnHold?.[Symbol.dispose]();
+        sourceTurnHold = null;
+
         const referencedStagedAttachmentPaths =
           await collectReferencedStagedAttachmentPaths(newSessionDir);
         if (referencedStagedAttachmentPaths.length > 0) {
@@ -10386,6 +10610,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
       } catch (copyError) {
+        sourceTurnHold?.[Symbol.dispose]();
+        sourceTurnHold = null;
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
           foundProjectPath,
@@ -10555,6 +10781,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // stat-visible before the fork IPC returns (r55): an immediate first
         // send handled by another backend must find it; generation itself
         // still runs in the background.
+        // The removed tail can hold the source's refused turn (rows still
+        // unstamped there): the summarizer, possibly on another provider,
+        // must not read it any more than the fork's request may.
+        const abandonedForSummary = excludeRejectedTurnRows(
+          abandonedBranchMessages,
+          sourceRejectedQuarantine
+        );
+        const abandonedRowIds = abandonedForSummary.map((row) => row.id);
         await startAbandonedBranchSummaryInBackground({
           historyService: this.historyService,
           aiService: this.aiService,
@@ -10562,7 +10796,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
           sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
-          abandonedMessages: abandonedBranchMessages,
+          abandonedMessages: abandonedForSummary,
+          // The source hold is released by now and the tail was read under
+          // it: re-verify the rows against the source's CURRENT history and
+          // quarantine right before the summarizer's request (a Retry can
+          // refuse and stamp a source turn meanwhile).
+          beforeDispatch: () => this.abandonedRowsStillEligible(sourceWorkspaceId, abandonedRowIds),
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
           // The fork target's metadata carries no model settings yet (its
@@ -11003,7 +11242,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       fileParts?: FilePart[];
     },
     internal?: SendMessageInternalOptions
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<SendMessageAccepted | undefined, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
       workspaceId,
       messagePreview: message.substring(0, 50),
@@ -11123,7 +11362,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         internal?.requireIdle === true || internal?.yieldToQueuedMessages === true;
       // A queue-mode heartbeat superseded by input that arrived during its preparation is a
       // quiet success: its next slot fires anyway.
-      const yieldToPreflightSend = (): Result<void, SendMessageError> => {
+      const yieldToPreflightSend = (): Result<
+        SendMessageAccepted | undefined,
+        SendMessageError
+      > => {
         log.info("sendMessage: yielded to a send in preflight during send preparation", {
           workspaceId,
         });
@@ -11242,10 +11484,74 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // that bypass the client-side guard. Manual sends still delegate into
       // AgentSession on rejection so it can preserve the user's interruption
       // message and apply goal auto-pause safety.
-      const pricingGate = await this.assertPricedModelForBudgetedGoal(
-        workspaceId,
-        normalizedOptions
-      );
+      //
+      // Skill sends defer this preflight: class routing resolves inside
+      // AgentSession (it needs the workspace's skill definitions), and the
+      // dispatch-time gate there re-asserts pricing against the model that
+      // will actually stream — the routed class model when routing applies.
+      // Gating here on the ambient model would reject a skill bound to a
+      // priced class just because the workspace model is unpriced. Deferral
+      // cannot corrupt stored settings: a composer skill send re-persists the
+      // already-selected workspace model, and one-shot prefixed sends skip
+      // persistence entirely.
+      const mayRouteViaSkill = normalizedMuxMetadata?.type === "agent-skill";
+      if (mayRouteViaSkill) {
+        // AI-settings persistence is deferred with the gate (see below): a
+        // skill send whose routing does NOT apply at dispatch (unbound skill,
+        // skipSkillModelRouting) still carries the ambient model into
+        // AgentSession's own pricing gate, and persisting before that gate
+        // could store an unpriced model for a budgeted goal — the exact
+        // corruption assertPricedModelForBudgetedGoal exists to prevent.
+        // Acceptance fires only after every dispatch-time gate passed, and
+        // MessageQueue carries the callback through queued dispatch.
+        const callerOnAccepted = internal?.onAccepted;
+        // MessageQueue carries the acceptance callback until dispatch — an
+        // unbounded window in which the user may store a newer selection.
+        // Snapshot the persisted settings NOW and persist at acceptance only
+        // when they are unchanged, or the enqueue-time options would
+        // overwrite the newer choice.
+        const snapshotPersistedAiSettings = (): string => {
+          try {
+            for (const project of this.config.loadConfigOrDefault().projects.values()) {
+              const entry = project.workspaces.find((candidate) => candidate.id === workspaceId);
+              if (entry) {
+                return JSON.stringify({
+                  agentId: entry.agentId,
+                  aiSettingsByAgent: entry.aiSettingsByAgent,
+                });
+              }
+            }
+          } catch {
+            // Unreadable either time compares equal below → old behavior.
+          }
+          return "unavailable";
+        };
+        const settingsAtEnqueue = snapshotPersistedAiSettings();
+        internal = {
+          ...internal,
+          onAccepted: async () => {
+            try {
+              if (snapshotPersistedAiSettings() === settingsAtEnqueue) {
+                await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
+              }
+            } catch (error) {
+              // Best-effort by contract: the send is already accepted (its
+              // user row is durable), so a persistence failure must not
+              // propagate through onAccepted and turn the accepted send into
+              // a partial failure (draft restored over a visible row; queued
+              // entry dropped without streaming).
+              log.debug("Failed to persist AI settings from accepted skill send", {
+                workspaceId,
+                error: getErrorMessage(error),
+              });
+            }
+            await callerOnAccepted?.();
+          },
+        };
+      }
+      const pricingGate = mayRouteViaSkill
+        ? Ok(undefined)
+        : await this.assertPricedModelForBudgetedGoal(workspaceId, normalizedOptions);
       if (!pricingGate.success) {
         if (internal?.synthetic !== true) {
           // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): unlike the accepted handoffs
@@ -11280,7 +11586,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       // Synthetic turns must not replace the user's remembered model and mode.
-      if (internal?.synthetic !== true) {
+      // Skill sends persist on session acceptance instead (see mayRouteViaSkill
+      // above), after the routing-aware gates validated the send.
+      if (internal?.synthetic !== true && !mayRouteViaSkill) {
         await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
       }
 
@@ -11474,7 +11782,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
-        return Ok(undefined);
+        // Queued: class routing has not resolved yet — the acknowledgement
+        // must say so, or the frontend would attribute the ambient model to a
+        // send that may dispatch on a routed class model.
+        return Ok({ queued: true });
       }
 
       if (!internal?.skipAutoResumeReset) {
@@ -11613,6 +11924,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         return result;
+      }
+
+      if (
+        claimedAutoTitle &&
+        (result.data?.acceptedWithoutStream === true || result.data?.queued === true)
+      ) {
+        // Nothing streamed yet: a late consent refusal recorded as a
+        // transcript row, or a send deferred behind an on-send compaction
+        // whose follow-up can still be refused. The text must not reach the
+        // title model before the primary request was allowed to leave.
+        // Release the claim; the pending auto-title stays armed — a deferred
+        // send titles on its delivery (onDeferredSendDelivered), a refused
+        // one on the next turn that streams.
+        this.autoTitlingWorkspaces.delete(workspaceId);
+        claimedAutoTitle = false;
       }
 
       if (claimedAutoTitle) {

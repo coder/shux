@@ -6,7 +6,7 @@ import type { ExperimentId } from "@/common/constants/experiments";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError } from "@/common/types/errors";
 import type {
   MuxMessage,
   MuxMessageMetadata,
@@ -323,6 +323,14 @@ export interface WorkspaceLiveActivity {
 }
 
 export interface SendMessageInternalOptions {
+  /**
+   * True when this send is a QUEUE-DISPATCHED entry (sendQueuedMessages):
+   * pre-stream gate rejections preserve the user row only then — the
+   * composer already cleared on queue accept, so the row is the only
+   * record. A direct renderer send gets its Err back and restores the
+   * draft; preserving would double-record the prompt.
+   */
+  dequeued?: boolean;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
   synthetic?: boolean;
@@ -393,7 +401,7 @@ export interface WorkspaceTurnHost {
     message: string,
     options: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: SendMessageInternalOptions
-  ): Promise<Result<void, SendMessageError>>;
+  ): Promise<Result<SendMessageAccepted | undefined, SendMessageError>>;
   resumeStream(
     workspaceId: string,
     options: SendMessageOptions,

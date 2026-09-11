@@ -78,6 +78,17 @@ async function createFixture(options?: {
 }
 
 describe("memory tool sub-project workspaces", () => {
+  it("carries the tool configuration's write provenance into the scope context", async () => {
+    // A turn whose request carries project skill content marks every memory
+    // file it writes (MemoryService records it from ctx.writeProvenance).
+    using fixture = await createFixture();
+    expect(memoryScopeContextFromToolConfig(fixture.config).writeProvenance).toBeUndefined();
+    fixture.config.memoryWriteCarriesProjectSkillContent = true;
+    expect(memoryScopeContextFromToolConfig(fixture.config).writeProvenance).toEqual({
+      carriesProjectSkillContent: true,
+    });
+  });
+
   it("resolves project memory from the project identity, not the execution cwd", async () => {
     using fixture = await createFixture();
     // Simulate a sub-project workspace: tools execute in <checkout>/packages/app.

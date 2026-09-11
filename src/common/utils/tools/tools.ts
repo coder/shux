@@ -213,6 +213,12 @@ export interface ToolConfiguration {
    * (context-budget flush turns may only write the workspace context notes).
    */
   memoryWritePath?: string;
+  /**
+   * Memory writes of this turn are made with project skill content in the
+   * model's context; MemoryService records the provenance in its sidecar so
+   * routed requests after a Project Trust revocation can withhold the files.
+   */
+  memoryWriteCarriesProjectSkillContent?: boolean;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
   /** Callback to notify that provider/config was written (triggers hot-reload). */

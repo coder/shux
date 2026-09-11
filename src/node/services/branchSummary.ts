@@ -16,11 +16,16 @@
  */
 
 import { streamText } from "ai";
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  filterPreStreamRejectedRows,
+  createMuxMessage,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -146,7 +151,13 @@ function formatMessageForBranchTranscript(message: MuxMessage): string {
  */
 export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   assert(Array.isArray(messages), "buildAbandonedBranchTranscript requires a message array");
-  const formatted = messages.map(formatMessageForBranchTranscript).filter((s) => s.length > 0);
+  // Same exclusion as main request assembly: rows preserved by pre-stream
+  // gate rejections are transcript-only — every model call (refine, RLM
+  // branch summaries) must skip them or the rejected prompt gets distilled
+  // into durable context anyway.
+  const formatted = filterPreStreamRejectedRows(messages)
+    .map(formatMessageForBranchTranscript)
+    .filter((s) => s.length > 0);
 
   let totalChars = formatted.reduce((sum, s) => sum + s.length, 0);
   let drop = 0;
@@ -339,6 +350,8 @@ async function generateAbandonedBranchSummaryText(input: {
   prompt: string;
   timeoutMs: number;
   cancellationSignal?: AbortSignal;
+  /** See AbandonedBranchSummaryInput.beforeDispatch. */
+  beforeDispatch?: () => Promise<boolean>;
   /**
    * Cost telemetry for the side-channel call (mirrors the status generator's
    * hook): invoked after a cleanly finished stream so this spend reaches
@@ -409,6 +422,15 @@ async function generateAbandonedBranchSummaryText(input: {
       continue;
     }
     try {
+      // The rows behind `prompt` were read before this background call; a
+      // stale verdict abandons the summary outright (there is nothing else to
+      // send) and lets the finally release the model.
+      if (input.beforeDispatch !== undefined && !(await input.beforeDispatch())) {
+        log.debug("Branch summary: abandoned rows changed before dispatch; skipping", {
+          workspaceId: input.workspaceId,
+        });
+        return null;
+      }
       // streamText (not generateText): Codex OAuth endpoints require
       // stream:true in the request body (same rationale as workspaceTitleGenerator).
       // No thinking provider options are passed, so the call itself stays
@@ -599,8 +621,17 @@ async function generateAbandonedBranchSummaryText(input: {
   return null;
 }
 
-/** Build the durable labeled summary row appended to the new branch. */
-export function createBranchSummaryMessage(summaryText: string): MuxMessage {
+/**
+ * Build the durable labeled summary row appended to the new branch.
+ * `carriesProjectSkillContent` is the provenance of the abandoned rows the
+ * text distills (see MuxMessageMetadata.carriesProjectSkillContent): a
+ * summary of a trusted project-skill turn may quote the skill, and a routed
+ * request after trust revocation must be able to withhold it.
+ */
+export function createBranchSummaryMessage(
+  summaryText: string,
+  carriesProjectSkillContent: boolean
+): MuxMessage {
   assert(summaryText.trim().length > 0, "branch summary text must be non-empty");
   return createMuxMessage(
     createBranchSummaryMessageId(),
@@ -619,6 +650,7 @@ export function createBranchSummaryMessage(summaryText: string): MuxMessage {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
+      carriesProjectSkillContent,
       muxMetadata: { type: "branch-summary" },
     }
   );
@@ -632,6 +664,14 @@ export interface AbandonedBranchSummaryInput {
   workspaceId: string;
   /** The removed tail, as returned by HistoryService.truncateAfterMessage. */
   abandonedMessages: MuxMessage[];
+  /**
+   * Re-verification run after a candidate model is created, immediately
+   * before the summarizer's request. The tail was read under the fork's
+   * source hold, which is released long before this background call: a
+   * Retry can refuse and stamp a source turn in between, and the stale
+   * rows/quarantine set would not show it. `false` abandons the summary.
+   */
+  beforeDispatch?: () => Promise<boolean>;
   /** Send-option experiments when available (edit path); omit for IPC ops without send options (fork). */
   experiments?: RlmExperimentFlags;
   /**
@@ -737,6 +777,7 @@ export async function maybeAppendAbandonedBranchSummary(
 
     const sessionUsageService = input.sessionUsageService;
     const summaryText = await generateAbandonedBranchSummaryText({
+      beforeDispatch: input.beforeDispatch,
       aiService: input.aiService,
       workspaceId: input.workspaceId,
       candidates,
@@ -786,7 +827,14 @@ export async function maybeAppendAbandonedBranchSummary(
       return null;
     }
 
-    const summaryMessage = createBranchSummaryMessage(summaryText);
+    // Provenance rides with the summary: routed requests after a trust
+    // revocation withhold a summary distilled from project skill content. The
+    // row-set detector also counts a project skill invocation whose repeated
+    // snapshot deduplicated (no snapshot row, a reply that can quote it).
+    const summaryMessage = createBranchSummaryMessage(
+      summaryText,
+      messagesCarryProjectSkillContent(input.abandonedMessages)
+    );
     if (input.guardTailMessageId !== undefined) {
       const guardedResult = await input.historyService.appendToHistoryIfTailMatches(
         input.workspaceId,

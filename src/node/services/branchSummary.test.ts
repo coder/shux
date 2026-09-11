@@ -425,6 +425,65 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("stamps the summary with the provenance of project skill content in the abandoned rows", async () => {
+    // The summary distills the abandoned rows; a trusted project-skill turn
+    // among them can be quoted, so the row carries the rows' provenance for
+    // routed requests after a trust revocation to withhold it. Clean rows
+    // stamp FALSE so the summary is distinguishable from a legacy one.
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const clean = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Clean summary of the exchange.")),
+        workspaceId: "ws-provenance-clean",
+        abandonedMessages: meatyExchange("clean"),
+        experiments: RLM_ON,
+      });
+      expect(clean?.metadata?.carriesProjectSkillContent).toBe(false);
+
+      const tainted = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-tainted",
+        abandonedMessages: [
+          createMuxMessage("snap-project", "user", "PROJECT SKILL BODY", {
+            timestamp: 1,
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "done", scope: "project", sha256: "x" },
+          }),
+          ...meatyExchange("tainted"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(tainted?.metadata?.carriesProjectSkillContent).toBe(true);
+
+      // A repeated project skill invocation whose snapshot deduplicated
+      // leaves no snapshot row in the abandoned branch; its reply can still
+      // quote the skill, so the invocation itself carries the provenance.
+      const deduplicated = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(summaryModel("Summary quoting the skill.")),
+        workspaceId: "ws-provenance-dedup",
+        abandonedMessages: [
+          createMuxMessage("u-dedup", "user", "Using skill done", {
+            timestamp: 1,
+            muxMetadata: {
+              type: "agent-skill",
+              rawCommand: "/done",
+              skillName: "done",
+              scope: "project",
+            },
+          }),
+          ...meatyExchange("dedup"),
+        ],
+        experiments: RLM_ON,
+      });
+      expect(deduplicated?.metadata?.carriesProjectSkillContent).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("meaty segment appends exactly one labeled durable row", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {

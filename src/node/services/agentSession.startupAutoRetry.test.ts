@@ -22,6 +22,7 @@ import {
   createMuxMessage,
   pickStartupRetrySendOptions,
   type MuxMessage,
+  type StartupRetrySendOptions,
 } from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -34,6 +35,12 @@ interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: typeof GOAL_CONTINUATION_KIND;
+  /** Routed-turn compaction context; must stay absent for malformed rows. */
+  compactionBaseOptions?: SendMessageOptions;
+  /** Routed project-skill turn: the resume re-verifies Project Trust. */
+  routedProjectConsent?: boolean;
+  /** The row a refused resume stamps. */
+  userMessageId?: string;
 }
 
 interface RetryableSessionForTests {
@@ -1037,6 +1044,173 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test("malformed persisted compactionBaseOptions neither marks the row routed nor is forwarded", async () => {
+    const workspaceId = "startup-retry-malformed-routed-context";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // chat.jsonl is unchecked JSON: a corrupted non-null compactionBaseOptions
+    // (boolean here) must not count as routed compaction context and must not
+    // ride into the resume request as a compaction base.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: true,
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    // The persisted model still resumes; the corrupted context is dropped.
+    expect(retryOptions.options.model).toBe("anthropic:claude-opus-5");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
+
+    await session.dispose();
+  });
+
+  test("routed-retry context with an invalid model id is rejected like the startup model path", async () => {
+    const workspaceId = "startup-retry-garbage-routed-model";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // An object shape with a model that fails provider:model validation must
+    // not count as routed either — same bar as normalizeStartupModel.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: { model: "garbage" },
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    expect(retryOptions.options.model).toBe("anthropic:claude-opus-5");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
+
+    await session.dispose();
+  });
+
+  test("restores routed consent on a resumed compaction request", async () => {
+    // A routed project-skill send that compacted on-send persisted its consent
+    // obligation on the compaction request row. Startup recovery derives the
+    // compaction retry through an early-returning branch; it must still carry
+    // the flag — the resumed compaction reads that turn's project snapshot,
+    // possibly on the class model, and re-verifies trust only from it.
+    const workspaceId = "startup-retry-routed-compaction-request";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-request-1", "user", "Please compact", {
+        timestamp: Date.now(),
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "compact",
+          agentInitiated: true,
+          routedProjectConsent: true,
+        },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+    expect(retryOptions.options.agentId).toBe("compact");
+    expect(retryOptions.routedProjectConsent).toBe(true);
+    expect(retryOptions.userMessageId).toBe("compaction-request-1");
+
+    await session.dispose();
+  });
+
   test("replays pending auto-retry schedule during reconnect catch-up", async () => {
     const workspaceId = "startup-retry-replay-snapshot";
     const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
@@ -1315,7 +1489,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const releaseUnlink = Promise.withResolvers<void>();
     const releaseWrite = Promise.withResolvers<void>();
     const macrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
-    const { unlink, mkdir, writeFile } = fsPromises;
+    const { unlink, mkdir, rename, writeFile } = fsPromises;
+    // The preference file is replaced atomically: the payload is written to a
+    // sibling temp path (prefixed by the preference path) and renamed over it.
+    const isPreferenceWrite = (target: unknown): boolean =>
+      typeof target === "string" && target.startsWith(preferencePath);
     const spies = [
       spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
         if (target !== preferencePath) return unlink(target);
@@ -1326,8 +1504,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       spyOn(fsPromises, "mkdir").mockImplementation(async (target, options) => {
         if (target !== path.dirname(preferencePath)) await mkdir(target, options);
       }),
+      spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+        if (to !== preferencePath) return rename(from, to);
+      }),
       spyOn(fsPromises, "writeFile").mockImplementation(async (target, data, options) => {
-        if (target !== preferencePath || typeof data !== "string") {
+        if (!isPreferenceWrite(target) || typeof data !== "string") {
           return writeFile(target, data, options);
         }
         if (holdMarkerWrites) {
@@ -1605,7 +1786,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { writeFile } = fsPromises;
     const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(
       async (target, data, options) => {
-        if (target === preferencePath && failWrites) throw new Error("EIO");
+        // The preference file is replaced through a sibling temp path
+        // (prefixed by the preference path), so fail that write.
+        if (typeof target === "string" && target.startsWith(preferencePath) && failWrites) {
+          throw new Error("EIO");
+        }
         return writeFile(target, data, options);
       }
     );
@@ -1645,6 +1830,58 @@ describe("AgentSession startup auto-retry recovery", () => {
     };
     expect(persisted.enabled).toBe(false);
     expect(persisted.startupAutoRetryAbandon).toBeUndefined();
+  });
+
+  test("provider config sweep cannot erase a repair record persisted after its scan began", async () => {
+    // The sweep's skip set is a snapshot: a workspace can open — and refuse a
+    // routed turn whose stamp failed — after the sweep read its fixable
+    // marker. Both writers are serialized per preference file, so the sweep's
+    // read-decide-write sees the session's state instead of clobbering it.
+    const workspaceId = "startup-retry-sweep-serialized";
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    const privateSession = session as unknown as {
+      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
+      persistAutoRetryState: () => Promise<void>;
+      getAutoRetryPreferencePath: () => string;
+      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
+      pendingRejectedTurnRepair: { userMessageIds: string[] } | null;
+    };
+    await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
+    const preferencePath = privateSession.getAutoRetryPreferencePath();
+
+    // Hold the sweep at its write: by then it has read the fixable marker.
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const { unlink } = fsPromises;
+    const unlinkSpy = spyOn(fsPromises, "unlink").mockImplementation(async (target) => {
+      if (target === preferencePath) {
+        entered.resolve();
+        await release.promise;
+      }
+      return unlink(target);
+    });
+    try {
+      const sweep = clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
+      await entered.promise;
+      // The workspace opened meanwhile and refused a routed turn whose row
+      // stamp failed: rejection marker + repair key.
+      privateSession.startupAutoRetryAbandon = {
+        reason: "pre_stream_rejected",
+        userMessageId: "u-refused",
+      };
+      privateSession.pendingRejectedTurnRepair = { userMessageIds: ["u-refused"] };
+      const persisted = privateSession.persistAutoRetryState();
+      release.resolve();
+      await Promise.all([sweep, persisted]);
+      expect(JSON.parse(await Bun.file(preferencePath).text())).toEqual({
+        startupAutoRetryAbandon: { reason: "pre_stream_rejected", userMessageId: "u-refused" },
+        pendingRejectedTurnRepair: { userMessageIds: ["u-refused"] },
+      });
+    } finally {
+      release.resolve();
+      unlinkSpy.mockRestore();
+    }
   });
 
   test("reschedules retry when resumeStream defers without starting a stream", async () => {

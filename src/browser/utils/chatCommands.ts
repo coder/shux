@@ -1513,6 +1513,24 @@ export function prepareCompactionMessage(options: CompactionOptions): {
       model: existingModel ?? options.sendMessageOptions.model,
       agentId: existingAgentId ?? options.sendMessageOptions.agentId ?? WORKSPACE_DEFAULTS.agentId,
       ...pickPreservedSendOptions(options.sendMessageOptions),
+      // One-shot overrides reconstructed from the original send (model /
+      // thinking carried by the follow-up content) must win over the ambient
+      // stored options that pickPreservedSendOptions just spread — otherwise a
+      // compact-and-retry of "/haiku+0 /skill" re-dispatches with the
+      // workspace's thinking and persistence semantics instead of the
+      // one-shot's.
+      ...(options.followUpContent.thinkingLevel != null
+        ? { thinkingLevel: options.followUpContent.thinkingLevel }
+        : {}),
+      ...(options.followUpContent.oneShotThinkingIndex != null
+        ? { oneShotThinkingIndex: options.followUpContent.oneShotThinkingIndex }
+        : {}),
+      ...(options.followUpContent.skipSkillModelRouting != null
+        ? { skipSkillModelRouting: options.followUpContent.skipSkillModelRouting }
+        : {}),
+      ...(options.followUpContent.skipAiSettingsPersistence != null
+        ? { skipAiSettingsPersistence: options.followUpContent.skipAiSettingsPersistence }
+        : {}),
     };
   }
 

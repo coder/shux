@@ -85,6 +85,9 @@ export function memoryScopeContextFromToolConfig(config: ToolConfiguration): Mem
     // so "" disables project-keyed memory (same resolution as
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
+    ...(config.memoryWriteCarriesProjectSkillContent === true
+      ? { writeProvenance: { carriesProjectSkillContent: true as const } }
+      : {}),
   };
 }
 

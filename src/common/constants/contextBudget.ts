@@ -36,6 +36,9 @@ export const FLUSH_MAX_OUTPUT_TOKENS = Math.min(
 // reserve three WARNING_RESERVE_TOKENS: one notes flush plus roughly two working steps.
 export const WARNING_ADVANCE_MIN_TOKENS = 3 * WARNING_RESERVE_TOKENS;
 export const IMAGE_TOKEN_ESTIMATE = 1_024;
+// Conservative per-page cost of a PDF attachment (extracted text plus the page image the
+// provider also bills): the upper end of Anthropic's published 1,500-3,000 tokens/page.
+export const PDF_TOKENS_PER_PAGE_ESTIMATE = 3_000;
 export const SYSTEM_FLOOR_TOKENS_ESTIMATE = 8_192;
 export const SESSION_HISTORY_MAX_RESULT_BYTES = 16 * 1024;
 export const SESSION_HISTORY_MAX_SCAN_BYTES = 2 * 1024 * 1024;

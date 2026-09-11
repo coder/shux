@@ -1,3 +1,5 @@
+import * as os from "node:os";
+import * as fs from "node:fs";
 import { describe, it, expect } from "bun:test";
 import { Effect } from "effect";
 
@@ -7,6 +9,35 @@ import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
 
 describe("memoryLogicalKey", () => {
+  it("records project skill provenance on tainted writes and keeps it across clean uses", async () => {
+    // A write made with project skill content in the writer's context marks
+    // the file; later reads and clean writes never launder it, and the flag
+    // survives a reload of the sidecar.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "memory-meta-provenance-"));
+    try {
+      const service = new MemoryMetaService(home);
+      await service.recordAccess("global:from-skill.md", {
+        write: true,
+        carriesProjectSkillContent: true,
+      });
+      await service.recordAccess("global:from-skill.md", { write: false });
+      await service.recordAccess("global:from-skill.md", { write: true });
+      await service.recordAccess("global:clean.md", { write: true });
+      // A read with the flag is not a write: it must not taint.
+      await service.recordAccess("global:read-only.md", {
+        write: false,
+        carriesProjectSkillContent: true,
+      });
+      const reloaded = new MemoryMetaService(home);
+      const entries = await reloaded.getEntries();
+      expect(entries.get("global:from-skill.md")?.carriesProjectSkillContent).toBe(true);
+      expect(entries.get("global:clean.md")?.carriesProjectSkillContent).toBe(false);
+      expect(entries.get("global:read-only.md")?.carriesProjectSkillContent).toBe(false);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("keys each scope by its stable identity, never the physical path", () => {
     const ids = { projectPath: "/home/user/proj", workspaceId: "ws-1" };
     expect(memoryLogicalKey("global", "prefs.md", ids)).toBe("global:prefs.md");
@@ -207,6 +238,7 @@ describe("MemoryMetaService", () => {
         accessCount: 3,
         lastAccessedAt: 1000,
         lastWriteAt: null,
+        carriesProjectSkillContent: false,
       });
       // Invalid fields heal to defaults; the pin itself survives.
       expect(entries.get("global:bad-count.md")).toEqual({
@@ -214,6 +246,7 @@ describe("MemoryMetaService", () => {
         accessCount: 0,
         lastAccessedAt: null,
         lastWriteAt: null,
+        carriesProjectSkillContent: false,
       });
       // Entirely-default entries are dropped.
       expect(entries.has("global:all-defaults.md")).toBe(false);

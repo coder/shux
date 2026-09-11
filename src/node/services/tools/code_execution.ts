@@ -21,6 +21,7 @@ import {
   VarsSnapshotBudgetError,
 } from "@/node/services/sandbox/sandboxHostService";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { toolOutputCarriesProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
 import { CODE_EXECUTION_STRING_GUIDANCE } from "@/constants/codeExecution";
@@ -688,6 +689,24 @@ ${xumTypes}
             result = await runtime.eval(code);
           } finally {
             abortSignal?.removeEventListener("abort", onAbort);
+          }
+
+          // Project-skill provenance for the routed-request consent scan
+          // (CodeExecutionResult.carriesProjectSkillContent): a nested
+          // agent_skill_read(_file) that returned project-scope content
+          // taints this whole output — the guest can copy the content into
+          // the return value or console — and, on a persistent mount, the
+          // mount itself for the rest of its life (vars can hold the content
+          // for later calls). Computed BEFORE kernel-mode compaction, which
+          // may drop the nested records the scan would otherwise rely on.
+          const readProjectSkill = result.toolCalls.some((record) =>
+            toolOutputCarriesProjectSkillContent(record.toolName, record.result)
+          );
+          if (readProjectSkill && mount?.lifetime === "persistent") {
+            mount.projectSkillTainted = true;
+          }
+          if (readProjectSkill || mount?.projectSkillTainted === true) {
+            result.carriesProjectSkillContent = true;
           }
 
           // Kernel-mode context isolation (r12): nested records become compact

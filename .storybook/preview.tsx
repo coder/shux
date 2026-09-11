@@ -197,6 +197,14 @@ const preview: Preview = {
           styles: { width: "375px", height: "667px" },
           type: "mobile",
         },
+        // Mirrors the Pixel snapshot matrix's named "phone" width (390px):
+        // breakpoint-pinned stories must render locally at the exact width CI
+        // captures, or wrap-point regressions hide between the two.
+        pixelPhone: {
+          name: "Pixel phone (390px)",
+          styles: { width: "390px", height: "844px" },
+          type: "mobile",
+        },
         mobile2: {
           name: "iPhone XR",
           styles: { width: "414px", height: "896px" },

@@ -74,6 +74,10 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   useRouting: () => ({
     routePriority: ["direct"],
     routeOverrides: {},
+    // Consumed by ModelClassesEditor's warning gate; bun mock.module leaks
+    // across test files, so this stub must stay shape-complete for suites
+    // that run after this file in the same process.
+    loaded: true,
     resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
     resolveEffectiveRoute: () => "direct",
     availableRoutes: () => [],

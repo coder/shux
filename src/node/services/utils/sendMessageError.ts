@@ -28,6 +28,53 @@ export const stripNoisyErrorPrefix = (message: string): string => {
  * Helper to wrap arbitrary errors into SendMessageError structures.
  * Enforces that the raw string is non-empty for defensive debugging.
  */
+/**
+ * Rejection surfaced when Project Trust is revoked between the routing
+ * gate's consent check and one of the turn's irreversible steps (edit
+ * truncation, snapshot persistence, provider dispatch). Lives here — not in
+ * agentSession — so StreamManager's per-step consent gate can reference it
+ * without an import cycle. Shared by every recheck site so the user sees one
+ * consistent, actionable message.
+ */
+export const ROUTED_SKILL_TRUST_REVOKED_MESSAGE =
+  "Project trust was revoked while this send was being prepared; the skill " +
+  "was not dispatched to its routed model. Re-send to run it on the current " +
+  "model without routing.";
+
+/**
+ * Request build refused because an earlier consent-refused turn could not be
+ * made durably provider-ineligible (its row stamp or the deletion of its
+ * in-flight output failed again). The request never leaves: committing the
+ * surviving output as an ordinary history row would strand it protected only
+ * by process memory. Retrying the send re-runs the repair.
+ */
+export const REJECTED_TURN_REPAIR_PENDING_MESSAGE =
+  "A previously refused turn could not be secured (its rows or in-flight output " +
+  "could not be marked provider-ineligible); this message was not sent. Retry it.";
+
+/**
+ * A consent refusal whose row stamp AND repair-record write both failed: the
+ * refused content is quarantined for this process only. Sends stay refused
+ * until one of the two durable records lands.
+ */
+export const REJECTED_TURN_RECORD_UNRECORDED_MESSAGE =
+  "The refused turn could not be recorded on disk; its content is withheld for this " +
+  "session only, and new messages are refused until the record can be written.";
+
+/**
+ * The durable rejected-turn record (or the preference document carrying it)
+ * exists but cannot be parsed, and the session's conservative reconstruction
+ * (AgentSession.recoverFromCorruptRejectedTurnRecord) could not be made
+ * durable either, so WHICH earlier turns a refusal still protects is unknown.
+ * The path is in the message because removing the file by hand is the
+ * remaining remedy.
+ */
+export const rejectedTurnRecordCorruptMessage = (recordPath: string): string =>
+  `The record of refused turns (${recordPath}) is unreadable and could not be ` +
+  "repaired automatically, so this message was not sent: which earlier turns must " +
+  "stay withheld from providers is unknown. Retry; if this persists, remove that " +
+  "file and reopen the workspace.";
+
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");
   const trimmed = stripNoisyErrorPrefix(raw.trim());

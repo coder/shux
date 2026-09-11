@@ -11,6 +11,7 @@ import {
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { isRouteProviderConfigured } from "@/common/utils/ai/modelAvailability";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
@@ -37,6 +38,13 @@ export interface RoutingState {
   routePriority: string[];
   /** Per-model route overrides */
   routeOverrides: Record<string, string>;
+  /**
+   * True once the routing config fetch has landed. Until then routePriority
+   * is the built-in default — availability verdicts computed against it can
+   * be wrong for gateway-routed setups, so consumers gating UI on route
+   * reachability must wait for this.
+   */
+  loaded: boolean;
 
   /** What route will be used for a given canonical model? */
   resolveRoute(canonicalModel: string): {
@@ -81,11 +89,17 @@ export function useRouting(): RoutingState {
   const appConfig = useSyncExternalStore(store.subscribe, store.getSnapshot);
   const routePriority = appConfig?.routePriority ?? DEFAULT_ROUTE_PRIORITY;
   const routeOverrides = appConfig?.routeOverrides ?? EMPTY_ROUTE_OVERRIDES;
+  // Until the store's first snapshot lands, routePriority is the built-in
+  // default — availability verdicts computed against it can be wrong for
+  // gateway-routed setups, so consumers gating UI on route reachability wait.
+  const loaded = appConfig != null;
 
+  // Shared predicates: the send-path availability check
+  // (isModelServableWithProvidersConfig) uses these same definitions, so the
+  // Settings picker and skill-routing verdicts cannot drift apart.
   const isConfigured = useCallback(
     (provider: string) =>
-      providersConfig?.[provider]?.isConfigured === true &&
-      providersConfig?.[provider]?.isEnabled !== false,
+      providersConfig != null && isRouteProviderConfigured(providersConfig, provider),
     [providersConfig]
   );
 
@@ -241,5 +255,6 @@ export function useRouting(): RoutingState {
     setRoutePreferences,
     setRoutePriority,
     setRouteOverride,
+    loaded,
   };
 }

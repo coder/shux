@@ -21,6 +21,7 @@ import {
   reclaimSupersededSnapshotBlobs,
   SandboxHostService,
   VarsSnapshotBudgetError,
+  PROJECT_SKILL_TAINT_VAR,
 } from "./sandboxHostService";
 import { RESULT_HANDLE_BLOB_QUOTA_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 
@@ -175,6 +176,36 @@ describe("SandboxHostService", () => {
     expect(await journal.blobs.has(refs[2] as never)).toBe(true);
     expect(await journal.blobs.has(refs[1] as never)).toBe(false);
     expect(await journal.blobs.has(refs[0] as never)).toBe(true);
+  });
+
+  test("markerless vars snapshots with retained content restore tainted; persists write an explicit marker", async () => {
+    // A snapshot written before the taint marker existed may hold project
+    // skill content nobody classified: retained vars restore TAINTED (fail
+    // closed) while an empty namespace retains nothing. Every persist writes
+    // "1"/"0" so a verified-clean snapshot is distinguishable from a legacy one.
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-taint",
+      sessionDir: tmp.path,
+    });
+    await mount.restoreVars(JSON.stringify({ retained: "value" }));
+    expect(mount.projectSkillTainted).toBe(true);
+    await mount.restoreVars("{}");
+    expect(mount.projectSkillTainted).toBe(false);
+    await mount.restoreVars(JSON.stringify({ [PROJECT_SKILL_TAINT_VAR]: "0", retained: "value" }));
+    expect(mount.projectSkillTainted).toBe(false);
+    await mount.restoreVars(JSON.stringify({ [PROJECT_SKILL_TAINT_VAR]: "1" }));
+    expect(mount.projectSkillTainted).toBe(true);
+
+    mount.projectSkillTainted = false;
+    await mount.runtime.eval('vars.state = "clean"; return true;');
+    await mount.persistVars();
+    const persisted = JSON.parse(await mount.snapshotVars()) as Record<string, unknown>;
+    expect(persisted[PROJECT_SKILL_TAINT_VAR]).toBe("0");
+    await host.disposeScope("ws-taint");
   });
 
   test("superseded snapshot blobs are reclaimed; referenced blobs survive", async () => {

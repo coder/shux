@@ -42,6 +42,7 @@ import { z } from "zod";
 import {
   AgentIdSchema,
   AgentSkillPackageSchema,
+  AgentSkillScopeSchema,
   BestOfGroupSchema,
   SkillNameSchema,
   WorkflowRunRecordSchema,
@@ -2188,9 +2189,17 @@ export const AgentSkillReadToolResultSchema = z.union([
 
 /**
  * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read.
+ * Uses the same shape/limits as file_read, plus the scope of the skill the
+ * file belongs to: a referenced file of a PROJECT skill is repository-
+ * controlled content, and the routed-request consent scan identifies it from
+ * the persisted result alone (older rows without the tag count as project).
  */
-export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
+export const AgentSkillReadFileToolResultSchema = z.union([
+  FileReadToolResultSchema.options[0].extend({
+    skillScope: AgentSkillScopeSchema.optional(),
+  }),
+  FileReadToolResultSchema.options[1],
+]);
 
 /**
  * MCP prompt get tool result - flattened prompt text or error.

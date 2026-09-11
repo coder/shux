@@ -70,6 +70,18 @@ export const ModelsConfigured: Story = {
         );
 
         return setupSettingsStory({
+          modelClasses: {
+            large: "anthropic:claude-opus-4-8+max",
+            // xai is deliberately unconfigured in this story: exercises the
+            // "no configured route" warning on the medium row.
+            medium: "xai:grok-beta",
+            small: "anthropic:claude-sonnet-4-20250514+0",
+            // Hand-edited custom class with a long unbroken model id: pins
+            // the custom-classes line's wrap treatment at phone width (the
+            // pinned ModelsConfiguredPhone variant snapshots this).
+            "batch-experiments":
+              "someproxy:organization-research/experimental-preview-20260815-extended-context",
+          },
           providersConfig: {
             anthropic: {
               apiKeySet: true,
@@ -119,5 +131,24 @@ export const ModelsConfigured: Story = {
       },
       { timeout: 5000 }
     );
+  },
+};
+
+/**
+ * Pinned phone-width snapshot of the configured state: the Model Classes rows
+ * wrap their label/select layout at narrow widths, and without an explicit
+ * Pixel phone variant CI would only ever snapshot the desktop layout the
+ * wrapping is meant to protect against. globals.viewport mirrors the Pixel
+ * matrix so local Storybook shows the same width.
+ */
+export const ModelsConfiguredPhone: Story = {
+  ...ModelsConfigured,
+  globals: {
+    viewport: { value: "pixelPhone", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
   },
 };

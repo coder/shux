@@ -634,6 +634,7 @@ describe("ContinuousCompactor", () => {
     live.parts[liveToolIndex] = toolPart;
     answer.parts[liveToolIndex] = toolPart;
     let swap: ContinuousPrefixSwap | undefined;
+    let prefixRowsSeen: MuxMessage[] | undefined;
     let state: "none" | "pending" | "consumed" = "none";
     const dependencies: Dependencies = {
       workspaceId,
@@ -667,6 +668,11 @@ describe("ContinuousCompactor", () => {
           attachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
           systemPrefix: [],
           cacheEnabled: true,
+          // The verdict is judged on the provider copy of the prefix sources.
+          prefixCarriesProjectSkillContent: (rows) => {
+            prefixRowsSeen = rows;
+            return true;
+          },
         }),
     };
     compactor = new ContinuousCompactor(dependencies);
@@ -692,7 +698,7 @@ describe("ContinuousCompactor", () => {
     assert(journal, "Expected reproducible journal");
     state = consumed ? "consumed" : "pending";
     swap.consumed = consumed;
-    return { answer, journal, journalStore, dependencies, swap };
+    return { answer, journal, journalStore, dependencies, swap, prefixRowsSeen };
   }
 
   for (const reason of ["disabled", "threshold-changed", "context-changed"]) {
@@ -931,7 +937,14 @@ describe("ContinuousCompactor", () => {
   });
 
   it("seamlessly rebuilds an internal committed cut as static prefix context and anchors the live step", async () => {
-    const { answer, journal, journalStore } = await activateJournaledSwap(true, true, true);
+    const { answer, journal, journalStore, swap, prefixRowsSeen } = await activateJournaledSwap(
+      true,
+      true,
+      true
+    );
+    // The swap's consent verdict is judged on exactly the prefix sources.
+    expect(prefixRowsSeen).toEqual([journal.boundary, ...journal.staticCopies]);
+    expect(swap.carriesProjectSkillContent).toBe(true);
     expect(journal.headEnd.id).toBe("committed-tail");
     expect(journal.headPartIndex).toBe(2);
     expect(journal.liveTailCopySpec.partIndex).toBe(0);

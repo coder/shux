@@ -268,6 +268,12 @@ export class AIService extends EventEmitter {
       tokenBudgetActive?: boolean;
       /** Context-budget flush turns: expose only the workspace context notes. */
       onlyContextNotes?: boolean;
+      /**
+       * Routed turn without Project Trust: memories carrying project skill
+       * provenance stay out of the index and the preload (least privilege,
+       * mirroring the request's own withholding).
+       */
+      excludeProjectSkillContent?: boolean;
     }
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
@@ -288,8 +294,11 @@ export class AIService extends EventEmitter {
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
       const onlyNotes = (entry: { path: string }) => entry.path === CONTEXT_NOTES_MEMORY_PATH;
-      const allIndexEntries =
-        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
+      const allIndexEntries = (
+        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx)
+      ).filter(
+        (entry) => options?.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+      );
       const indexEntries =
         options?.onlyContextNotes === true ? allIndexEntries.filter(onlyNotes) : allIndexEntries;
       // Hot preloading is a sub-experiment: without it, memories stay
@@ -311,6 +320,7 @@ export class AIService extends EventEmitter {
             countTokens: (text) => tokenizer.countTokens(text),
             tokenBudgetActive: options?.tokenBudgetActive === true,
             onlyContextNotes: options?.onlyContextNotes === true,
+            excludeProjectSkillContent: options?.excludeProjectSkillContent === true,
           });
           assert(
             options?.onlyContextNotes !== true || items.every(onlyNotes),
@@ -331,7 +341,13 @@ export class AIService extends EventEmitter {
           });
         }
       }
-      return { indexEntries, hotMemoriesBlock };
+      return {
+        indexEntries,
+        hotMemoriesBlock,
+        // Preloaded files are a subset of the index, so the index provenance
+        // covers both channels.
+        carriesProjectSkillContent: indexEntries.some((entry) => entry.carriesProjectSkillContent),
+      };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });
@@ -999,6 +1015,12 @@ export class AIService extends EventEmitter {
         return buildOutcome.result;
       }
 
+      // Routed project-skill turns: the consent gate rides
+      // turnExecutionOptions into StreamManager.startStream, which invokes
+      // it inside its critical section (mutex held, safety and temp-dir
+      // setup done) immediately before the provider stream is constructed —
+      // checking here would leave that section as a revocation window. Its
+      // rejection surfaces below as a failed stream start.
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);

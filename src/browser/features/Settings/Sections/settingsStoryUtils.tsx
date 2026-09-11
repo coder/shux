@@ -132,6 +132,8 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 
 interface SetupSettingsStoryOptions {
   layoutPresets?: LayoutPresetsConfig;
+  /** Initial model classes for Settings → Models → Model Classes. */
+  modelClasses?: Record<string, string>;
   providersConfig?: Record<
     string,
     {
@@ -186,6 +188,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
     layoutPresets: options.layoutPresets,
+    modelClasses: options.modelClasses,
   });
 }
 

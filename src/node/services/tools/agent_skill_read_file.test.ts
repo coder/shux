@@ -220,6 +220,8 @@ describe("agent_skill_read_file", () => {
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.content).toMatch(/name:\s*foo/i);
+        // Provenance tag: a global skill's file is not repository-controlled.
+        expect(result.skillScope).toBe("global");
       }
     } finally {
       restoreMuxRoot(previousMuxRoot);
@@ -281,6 +283,8 @@ describe("agent_skill_read_file", () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.content).toMatch(/name:\s*project-skill/i);
+      // Provenance tag: the routed-request consent scan reads it from the row.
+      expect(result.skillScope).toBe("project");
     }
   });
 

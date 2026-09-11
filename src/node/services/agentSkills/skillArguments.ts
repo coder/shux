@@ -10,7 +10,17 @@ import assert from "@/common/utils/assert";
  * - A positional placeholder consumes exactly one digit (bash-style), so `$10` is
  *   interpreted as `$1` followed by a literal `0`.
  */
-const SKILL_ARGUMENT_PLACEHOLDER_RE = /\$(ARGUMENTS\b|[1-9])/g;
+const SKILL_ARGUMENT_PLACEHOLDER_SOURCE = String.raw`\$(ARGUMENTS\b|[1-9])`;
+const SKILL_ARGUMENT_PLACEHOLDER_RE = new RegExp(SKILL_ARGUMENT_PLACEHOLDER_SOURCE, "g");
+
+/**
+ * Whether substitution can change the body's size: a body that repeats
+ * `$ARGUMENTS` (or a positional) expands with the argument text, up to the
+ * snapshot cap, so size estimates made from the raw body must price the cap.
+ */
+export function skillBodyHasArgumentPlaceholders(body: string): boolean {
+  return new RegExp(SKILL_ARGUMENT_PLACEHOLDER_SOURCE).test(body);
+}
 
 /**
  * Substitute slash-command argument placeholders in an agent skill body.

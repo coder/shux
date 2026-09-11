@@ -1767,6 +1767,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         api,
         discovery: skillDiscovery,
         signal: resolutionSignal,
+        // One-shot × skill composition ("/haiku+0 /done") ships for workspace
+        // sends; the creation composer has no one-shot support to compose with.
+        composeOneShot: variant === "workspace",
       });
       if (!isSendScopeCurrent()) return;
       parsed = resolution.parsed;
@@ -1917,6 +1920,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     try {
       const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
+      // Model/thinking override from either a bare one-shot ("/haiku+0 msg")
+      // or one composed with a skill invocation ("/haiku+0 /done args").
+      const oneShotOverride = modelOneShot ?? skillInvocation?.oneShot ?? null;
       // Mirror the creation-composer /goal bypass: with attachments present,
       // send the raw text as a normal message instead of processing the
       // command, which would drop the files. Transferred staging-failure
@@ -1939,7 +1945,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // the composer, it must not restore stale command text over the newer turn.
       asyncCommandTokenRef.current++;
 
-      const modelOverride = modelOneShot?.modelString;
+      const modelOverride = oneShotOverride?.modelString;
 
       // Regular message (or /<model-alias> one-shot override) - send directly via API
       const messageTextForSend =
@@ -1978,11 +1984,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
       }
 
+      // Composed one-shot sends highlight the full "/haiku+0 /done" prefix:
+      // the transcript badge check requires rawCommand.startsWith(commandPrefix),
+      // and the combined prefix also keeps the explicit override visible.
+      const composedPrefixMatch = skillInvocation?.oneShot
+        ? new RegExp(`^\\S+\\s+/${skillInvocation.descriptor.name}(?=\\s|$)`).exec(
+            messageText.trim()
+          )
+        : null;
       const skillMuxMetadata = skillInvocation
         ? buildSkillInvocationMetadata(
-            appendStagedAttachmentNotice(messageText, sendAttachments),
+            // Trimmed like the view parseCommand accepted: the transcript
+            // badge requires rawCommand.startsWith(commandPrefix), so leading
+            // whitespace ("  /haiku+0 /done") would silently drop the badge
+            // (and the composed prefix highlight) while the skill turn still
+            // sends.
+            appendStagedAttachmentNotice(messageText.trim(), sendAttachments),
             skillInvocation.descriptor,
-            skillInvocation.argumentText
+            skillInvocation.argumentText,
+            composedPrefixMatch?.[0]
           )
         : undefined;
       const promptMuxMetadata: MuxMessageMetadata | undefined = mcpPromptInvocation
@@ -1998,8 +2018,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const policyModel = modelOverride ?? baseModel;
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
+      // Routable skill invocations (no explicit model override) may stream on a
+      // class model with different PDF capabilities than the workspace model, so
+      // this local check would judge the wrong model both ways — defer to the
+      // backend gate, which validates against the routed model and rejects with
+      // a persisted, visible error.
+      const pdfPreflightModelIsAuthoritative = !(skillInvocation && !modelOverride);
       const pdfAttachments = attachments.filter(isPdfAttachment);
-      if (pdfAttachments.length > 0) {
+      if (pdfAttachments.length > 0 && pdfPreflightModelIsAuthoritative) {
         const caps = getModelCapabilitiesResolved(policyModel, providersConfig);
         if (caps && !caps.supportsPdfInput) {
           const pdfCapableKnownModels = Object.values(KNOWN_MODELS)
@@ -2123,7 +2149,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           compactionMessageText: actualMessageText,
           appendStagedNotice: appendStagedNoticeToUserMessage,
           modelOneShot,
+          // One-shot composed with a skill invocation ("/haiku+0 /done"):
+          // option overrides ride the invocation, not a bare model-oneshot.
+          skillOneShot: skillInvocation?.oneShot ?? null,
+          hasSkillInvocation: skillInvocation != null,
           policyModel,
+          providersConfig,
           transferredDraftProjectDiscovery,
           additionalSystemContextHydrated,
           additionalSystemContext,
@@ -2169,17 +2200,33 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           setDraft(preSendDraft);
           setDraftReviews(preSendReviews);
         } else {
-          // Track telemetry for successful message send
-          telemetry.messageSent(
-            props.workspaceId,
-            effectiveModel,
-            sendMessageOptions.agentId ?? agentId ?? WORKSPACE_DEFAULTS.agentId,
-            finalMessageText.length,
-            runtimeType,
-            sendMessageOptions.thinkingLevel ?? "off"
-          );
+          // Track telemetry for successful message send. Skill class routing
+          // can swap the model and thinking backend-side; the send result
+          // reports both so usage is attributed to what actually streams. A
+          // QUEUED skill send acknowledges before it dispatches — routed or
+          // not, the backend's dequeue-dispatch capture owns its attribution
+          // (recording here would double-count, and a later cancellation or
+          // rejection would make the event wholly false).
+          const queuedSkillSend = result.data?.queued === true && skillInvocation != null;
+          // Accepted but never dispatched (a late consent refusal, a canceled
+          // startup): the visible stream error is the record, and no provider
+          // request happened to attribute.
+          const acceptedWithoutStream = result.data?.acceptedWithoutStream === true;
+          if (!queuedSkillSend && !acceptedWithoutStream) {
+            telemetry.messageSent(
+              props.workspaceId,
+              result.data?.routedModel ?? effectiveModel,
+              sendMessageOptions.agentId ?? agentId ?? WORKSPACE_DEFAULTS.agentId,
+              finalMessageText.length,
+              runtimeType,
+              // Fall back to what this send actually carried (sendOptions
+              // includes a composed one-shot's thinking), not the ambient
+              // workspace setting.
+              result.data?.routedThinkingLevel ?? sendOptions.thinkingLevel ?? "off"
+            );
+          }
 
-          if (modelOneShot) {
+          if (oneShotOverride) {
             trackCommandUsed("model");
           }
 

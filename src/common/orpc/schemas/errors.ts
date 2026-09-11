@@ -1,4 +1,33 @@
 import { z } from "zod";
+import { ThinkingLevelSchema } from "../../types/thinking";
+
+/**
+ * Success payload of an accepted (non-queued) send — the single source for
+ * both the oRPC output schema (workspace.sendMessage) and the backend's
+ * SendMessageAccepted type, so the wire shape and the compile-time shape can
+ * never drift.
+ */
+export const SendMessageAcceptedSchema = z.object({
+  // Class model applied by skill routing — lets the frontend attribute send
+  // telemetry to the model that actually streams. Absent when no routing
+  // occurred or the send was queued for later dispatch.
+  routedModel: z.string().optional(),
+  // Thinking level routing replaced (class suffix or re-resolved numeric
+  // one-shot); absent when the ambient thinking level applies.
+  routedThinkingLevel: ThinkingLevelSchema.optional(),
+  // True when the send was QUEUED behind a busy turn (class routing has not
+  // resolved yet, so the absence of routedModel means "unknown", not
+  // "unrouted"), or when its dispatch is otherwise settled after this
+  // response (compaction-deferred and background-started skill sends). The
+  // backend attributes such a send when it actually streams — telemetry here
+  // must not attribute the ambient model to it.
+  queued: z.boolean().optional(),
+  // True when the turn was ACCEPTED (its rows are durable) but never reached
+  // a provider — a late consent refusal or a canceled startup surfaced as a
+  // visible stream error instead. No request occurred, so send telemetry must
+  // not attribute the ambient model to it.
+  acceptedWithoutStream: z.boolean().optional(),
+});
 
 /**
  * Discriminated union for all possible sendMessage errors.

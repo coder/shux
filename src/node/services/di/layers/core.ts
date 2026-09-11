@@ -573,6 +573,12 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    // Rejected-row quarantine reaches the dream-harvest boundary (r-consent):
+    // WorkspaceService owns the per-session sets. Wired in the shared core so
+    // headless `xum run` harvests honor it like the desktop does.
+    memoryConsolidationService.setQuarantinedRowIdsLookup((workspaceId) =>
+      workspaceService.getQuarantinedRejectedRowIds(workspaceId)
+    );
     if (opts.devToolsService) {
       // DevTools debug-log cleanup when workspaces are archived/removed.
       workspaceService.setDevToolsService(opts.devToolsService);

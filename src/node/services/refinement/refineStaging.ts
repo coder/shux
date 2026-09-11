@@ -92,6 +92,13 @@ export const StagedRefineSetSchema = z.object({
    * and consume the staged set with the failure silently lost.
    */
   failedToolCalls: z.array(z.object({ toolCallId: z.string(), reason: z.string() })).optional(),
+  /**
+   * Provenance of the distilled transcript (MuxMessageMetadata
+   * .carriesProjectSkillContent): the staged edits and the apply audit row
+   * derive from it. Absent on sets staged before the field existed — unknown,
+   * so the audit row is stamped as carrying. Outside the approval hash.
+   */
+  carriesProjectSkillContent: z.boolean().optional(),
 });
 export type StagedRefineSet = z.infer<typeof StagedRefineSetSchema>;
 

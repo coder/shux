@@ -1700,6 +1700,12 @@ export class Config {
 
         const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
 
+        // Lenient on read: malformed entries never break config load. Values
+        // are judged at send time by resolveSkillModelClassBinding — a bound
+        // class with a bad value fails that send with an actionable error.
+        const modelClasses = parseOptionalStringRecord(parsed.modelClasses);
+        const skillModelClasses = parseOptionalStringRecord(parsed.skillModelClasses);
+
         const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
         const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
         const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
@@ -1850,6 +1856,8 @@ export class Config {
           routeOverrides,
           minThinkingLevelByModel,
           modelFallbacks,
+          modelClasses,
+          skillModelClasses,
           defaultModel,
           advisorModelString,
           advisorThinkingLevel,
@@ -2065,6 +2073,16 @@ export class Config {
       const modelFallbacks = normalizeModelFallbacks(config.modelFallbacks);
       if (modelFallbacks !== undefined) {
         data.modelFallbacks = modelFallbacks;
+      }
+
+      const modelClasses = parseOptionalStringRecord(config.modelClasses);
+      if (modelClasses !== undefined) {
+        data.modelClasses = modelClasses;
+      }
+
+      const skillModelClasses = parseOptionalStringRecord(config.skillModelClasses);
+      if (skillModelClasses !== undefined) {
+        data.skillModelClasses = skillModelClasses;
       }
 
       const apiServerBindHost = parseOptionalNonEmptyString(config.apiServerBindHost);
@@ -2366,6 +2384,8 @@ export class Config {
       routeOverrides: config.routeOverrides,
       minThinkingLevelByModel: config.minThinkingLevelByModel,
       modelFallbacks: config.modelFallbacks,
+      modelClasses: config.modelClasses,
+      skillModelClasses: config.skillModelClasses,
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,
@@ -2508,6 +2528,50 @@ export class Config {
       ...config,
       modelFallbacks: Object.keys(sanitized).length > 0 ? sanitized : undefined,
     }));
+  }
+
+  async updateModelClass(className: string, model: string | null): Promise<void> {
+    // One entry per call, merged inside the editConfig transaction (which
+    // serializes read-modify-write under the config queue): a full-map
+    // replacement composed by a client would race a concurrent Settings
+    // consumer's edit of a DIFFERENT class and silently delete it. Values
+    // are stored verbatim — entries this build cannot parse (hand-edited
+    // custom models, future syntax) must survive edits of other classes.
+    // Broken values already fail loudly at send time and are flagged inline
+    // by the editor.
+    await this.editConfig((config) => {
+      const merged = { ...config.modelClasses };
+      if (model == null) {
+        delete merged[className];
+      } else {
+        merged[className] = model;
+      }
+      return {
+        ...config,
+        modelClasses: Object.keys(merged).length > 0 ? merged : undefined,
+      };
+    });
+    // saveConfig swallows write errors (read-only or full filesystem), and
+    // the editor publishes this RPC's resolution as the freshest backend
+    // truth — routing would then keep reading the OLD class while Settings
+    // displays the new one, with no notification to repair the split. Read
+    // back STRICTLY and fail loudly instead. Only THIS entry is verified: a
+    // concurrent peer edit of another class between the save and this read
+    // is legitimate, not a persistence failure.
+    let persisted: Record<string, string> | undefined;
+    try {
+      persisted = this.loadConfigOrDefault({ throwOnError: true }).modelClasses;
+    } catch {
+      throw new Error(
+        "Could not verify the model class was persisted to config.json; the change was not applied."
+      );
+    }
+    const persistedValue = persisted?.[className];
+    if (model == null ? persistedValue !== undefined : persistedValue !== model) {
+      throw new Error(
+        "Failed to persist the model class to config.json; the change was not applied."
+      );
+    }
   }
 
   async updateModelPreferences(input: {

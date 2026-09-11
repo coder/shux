@@ -49,6 +49,29 @@ export interface UserMessageContent {
 export interface CompactionFollowUpInput extends UserMessageContent {
   /** Message metadata to apply to the queued follow-up user message (e.g., preserve /skill display) */
   muxMetadata?: MuxMessageMetadata;
+  /**
+   * Explicit model override reconstructed from the original send (a composed
+   * "/model /skill" one-shot). Without it, a compact-and-retry rebuild would
+   * re-dispatch the skill through class routing even though the user
+   * explicitly overrode the model for that invocation.
+   */
+  model?: string;
+  /** Rides with `model`: an explicit one-shot must keep bypassing class routing on re-dispatch. */
+  skipSkillModelRouting?: boolean;
+  /**
+   * Explicit one-shot thinking reconstructed from the original send
+   * ("/haiku+0 /skill", "/+high /skill"). Resolved against `model` when
+   * present, else against the workspace model at rebuild time.
+   */
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * Raw numeric one-shot thinking index ("/+2 /skill"). Model-relative: the
+   * re-dispatched send re-resolves it against the routed class model when
+   * skill routing applies (see SendMessageOptions.oneShotThinkingIndex).
+   */
+  oneShotThinkingIndex?: number;
+  /** One-shot overrides carried through compaction must not persist as new workspace defaults. */
+  skipAiSettingsPersistence?: boolean;
 }
 
 /**
@@ -68,6 +91,8 @@ type PreservedSendOptions = Pick<
   | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
+  | "skipSkillModelRouting"
+  | "oneShotThinkingIndex"
 >;
 
 /**
@@ -108,6 +133,16 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     ...(options.skipAiSettingsPersistence !== undefined
       ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
       : {}),
+    // A one-shot's routing bypass and raw thinking index must survive into a
+    // compaction follow-up, or the re-dispatch re-routes/re-ladders the send.
+    // Same omit-if-unset rule as above: an explicit undefined would clobber
+    // the original preserved value when spread over a persisted follow-up.
+    ...(options.skipSkillModelRouting !== undefined
+      ? { skipSkillModelRouting: options.skipSkillModelRouting }
+      : {}),
+    ...(options.oneShotThinkingIndex !== undefined
+      ? { oneShotThinkingIndex: options.oneShotThinkingIndex }
+      : {}),
   };
 }
 
@@ -147,7 +182,46 @@ export type StartupRetrySendOptions = Pick<
    * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
    */
   goalId?: string;
+  /**
+   * Pre-skill-routing compaction context for routed turns (durable subset),
+   * restored on startup retry so the routed compaction policy survives a
+   * relaunch. One level deep by construction — the nested pick never
+   * receives a compactionBaseOptions of its own.
+   */
+  compactionBaseOptions?: Omit<StartupRetrySendOptions, "compactionBaseOptions">;
+  /**
+   * True when the routed turn carried project-scope skill content at
+   * acceptance: every resumed dispatch (same-session auto-retry, startup
+   * recovery) must re-verify Project Trust before replaying the persisted
+   * routed options — the resume path bypasses the send gates.
+   */
+  routedProjectConsent?: boolean;
 };
+
+/**
+ * The SendMessageOptions keys pickStartupRetrySendOptions persists (its
+ * muxMetadata narrowing and retry-state extras aside). Restore paths that
+ * re-admit persisted JSON parse AGAINST this whitelist — the general send
+ * schema is broader, and a corrupted row smuggling a non-durable field like
+ * editMessageId into a restored send would flip behavioral switches (the
+ * edit/truncation path) instead of replaying configuration. Keep in sync with
+ * the function below.
+ */
+export const STARTUP_RETRY_DURABLE_SEND_OPTION_KEYS = [
+  "model",
+  "agentId",
+  "thinkingLevel",
+  "reasoningMode",
+  "toolPolicy",
+  "additionalSystemInstructions",
+  "maxOutputTokens",
+  "providerOptions",
+  "experiments",
+  "disableWorkspaceAgents",
+  "strictAgentResolution",
+  "allowAgentSetGoal",
+  "muxMetadata",
+] as const satisfies ReadonlyArray<keyof SendMessageOptions>;
 
 /**
  * Snapshot retry-relevant send options so startup recovery can resume interrupted
@@ -156,7 +230,9 @@ export type StartupRetrySendOptions = Pick<
 export function pickStartupRetrySendOptions(
   options: SendMessageOptions,
   agentInitiated?: boolean,
-  goalKind?: GoalSyntheticMessageKind
+  goalKind?: GoalSyntheticMessageKind,
+  compactionBaseOptions?: SendMessageOptions,
+  routedProjectConsent?: boolean
 ): StartupRetrySendOptions {
   const typedMuxMetadata = options.muxMetadata as MuxMessageMetadata | undefined;
   const workspaceTurnMuxMetadata =
@@ -180,6 +256,17 @@ export function pickStartupRetrySendOptions(
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),
+    // Routed turns persist their pre-routing compaction context (durable
+    // fields only) so a post-relaunch retry keeps the routed compaction
+    // policy instead of force-compacting at the workspace threshold against
+    // the routed window. Absent on non-routed turns and rows written by
+    // older versions — both fall back to today's behavior.
+    ...(compactionBaseOptions != null
+      ? {
+          compactionBaseOptions: pickStartupRetrySendOptions(compactionBaseOptions),
+        }
+      : {}),
+    ...(routedProjectConsent === true ? { routedProjectConsent: true } : {}),
   };
 }
 
@@ -230,6 +317,16 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * AgentSession.inheritOpenWorkspaceTurnMetadata).
    */
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * The interrupted stream ran with a routed consent gate (skill class routing
+   * or an inherited obligation). Its continuation streams on the same routed
+   * options and can still carry repository-controlled content — preserved tail
+   * copies of the project snapshot, post-compaction project-skill attachments —
+   * so the dispatch re-verifies Project Trust like a resumed routed turn.
+   * Persisted with the follow-up: a restart between the boundary commit and
+   * the dispatch must not drop the obligation.
+   */
+  routedProjectConsent?: boolean;
 }
 
 /**
@@ -375,6 +472,17 @@ export function buildMcpPromptUserText(
   return argumentText ? `${base}: ${argumentText}` : base;
 }
 
+/**
+ * Model-facing text for a skill invocation. The transcript displays the raw
+ * command ("/done finish") from metadata, but the payload the model streams
+ * on is this rewritten form — every dispatcher that rebuilds a skill turn
+ * (send, compact-and-retry follow-up) must produce the same text, or the
+ * retried turn is semantically different from the invocation that failed.
+ */
+export function buildSkillInvocationUserText(skillName: string, argumentText: string): string {
+  return argumentText ? `Using skill ${skillName}: ${argumentText}` : `Use skill ${skillName}`;
+}
+
 export function isMcpPromptReference(value: unknown): value is MCPPromptReference {
   if (value === null || typeof value !== "object") return false;
   const ref = value as Partial<MCPPromptReference>;
@@ -437,6 +545,136 @@ function isMcpPromptSnapshotBaseShape(
  * and the user-row append: a snapshot survives only when its invoking user row
  * exists and still references the same prompt.
  */
+/**
+ * Drop rows stamped by pre-stream gate rejections from provider requests. The
+ * transcript keeps showing them (they document what was rejected and why),
+ * but the send never streamed: replaying the text would duplicate the prompt
+ * once the user retries, and a PDF rejected for model incompatibility would
+ * re-fail every later request it rides along in. EVERY stamped row goes, not
+ * only user rows: a refused turn's surviving partial can be committed as an
+ * assistant row (a fork commits the source's partial, a repair stamps a
+ * promoted one) and its tool output can hold the refused project content.
+ */
+export function filterPreStreamRejectedRows(messages: MuxMessage[]): MuxMessage[] {
+  return messages.filter((message) => message.metadata?.preStreamRejected !== true);
+}
+
+/**
+ * Every row a rejected turn persisted: the keyed user row plus the contiguous
+ * synthetic snapshot prefix (skill / MCP prompt / @file) written immediately
+ * before it — the repository content a consent refusal exists to keep away
+ * from another provider. Keys that are not user rows in `messages` (in-memory
+ * quarantine ids, rows already truncated) pass through unchanged, so callers
+ * can feed a mix of durable turn keys and quarantined row ids.
+ */
+export function collectRejectedTurnRowIds(
+  messages: MuxMessage[],
+  keys: Iterable<string>
+): Set<string> {
+  const ids = new Set<string>();
+  for (const key of keys) {
+    ids.add(key);
+    const index = messages.findIndex((message) => message.id === key);
+    if (index === -1 || messages[index].role !== "user") {
+      continue;
+    }
+    for (let i = index - 1; i >= 0 && isTurnSnapshotPrefixRow(messages[i]); i--) {
+      ids.add(messages[i].id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * A synthetic row a turn persists immediately before its user row: a skill,
+ * MCP prompt or @file-mention snapshot. Such rows carry repository content and
+ * belong to the user row that follows them.
+ */
+export function isTurnSnapshotPrefixRow(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  return (
+    metadata?.synthetic === true &&
+    (metadata.agentSkillSnapshot != null ||
+      metadata.mcpPromptSnapshot != null ||
+      metadata.fileAtMentionSnapshot != null)
+  );
+}
+
+/**
+ * A user row that STARTS a turn. A stream appends synthetic user rows around a
+ * turn's own — a <system-file-update> notification after it, a snapshot prefix
+ * before the next — which are part of the turn they sit in, not turns of their
+ * own. Synthetic rows that do start a turn (compaction requests) carry retry
+ * options like any resumable turn.
+ */
+export function isTurnStartingUserRow(message: MuxMessage): boolean {
+  return (
+    message.role === "user" &&
+    (message.metadata?.synthetic !== true || message.metadata.retrySendOptions != null)
+  );
+}
+
+/**
+ * The latest user row of `messages` when it starts a ROUTED turn — retry
+ * options carrying the consent obligation or the routed compaction context,
+ * the same predicate resumeStream gates on — that has no committed assistant
+ * reply yet. Such a turn can still be refused and stamped by its late consent
+ * gates (pre-dispatch, per-step) or by a Retry of the unanswered row, so side
+ * channels and forks treat its rows (and its partial) as not yet settled.
+ */
+export function findUnansweredRoutedTurnRow(
+  messages: readonly MuxMessage[]
+): MuxMessage | undefined {
+  const index = messages.findLastIndex(isTurnStartingUserRow);
+  if (index === -1) {
+    return undefined;
+  }
+  const retry = messages[index].metadata?.retrySendOptions;
+  const routed = retry?.routedProjectConsent === true || retry?.compactionBaseOptions != null;
+  if (!routed || messages.slice(index + 1).some(isCommittedAssistantReply)) {
+    return undefined;
+  }
+  return messages[index];
+}
+
+/**
+ * An assistant row that carries a TERMINAL reply — the turn ran to completion.
+ * TurnRequestBuilder appends an EMPTY assistant placeholder when a stream
+ * starts and finalizes it in place at stream end, so while the turn streams
+ * the row exists with no parts; an interrupted stream commits its partial
+ * output as a row flagged `partial`, and a failed one carries `error`. Neither
+ * settles the turn: a Retry replays it, and a routed turn's consent gate can
+ * still refuse it then. Only content (text, reasoning, a tool call, a file) on
+ * a row without those marks counts.
+ */
+export function isCommittedAssistantReply(message: MuxMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    message.metadata?.partial !== true &&
+    message.metadata?.error == null &&
+    message.parts.some((part) => part.type !== "text" || part.text.trim().length > 0)
+  );
+}
+
+/**
+ * Rows a side-channel model call (refine, memory harvest — possibly on another
+ * provider) must never read: every stamped pre-stream rejection, plus the
+ * whole turn — user row and contiguous snapshot prefix — of each quarantined
+ * key AND of each stamped user row. The stamp normally covers a turn's
+ * snapshot rows too; expanding from the stamped user row as well covers a
+ * turn whose prefix stamp is missing (rows written before whole-turn stamping).
+ */
+export function excludeRejectedTurnRows(
+  messages: MuxMessage[],
+  quarantinedKeys: Iterable<string>
+): MuxMessage[] {
+  const stampedUserRowIds = messages
+    .filter((message) => message.role === "user" && message.metadata?.preStreamRejected === true)
+    .map((message) => message.id);
+  const excluded = collectRejectedTurnRowIds(messages, [...quarantinedKeys, ...stampedUserRowIds]);
+  return filterPreStreamRejectedRows(messages).filter((message) => !excluded.has(message.id));
+}
+
 export function filterOrphanedMcpPromptSnapshots(messages: MuxMessage[]): MuxMessage[] {
   // Drop only genuine expansion rows: the reserved ID prefix marks one even
   // when corruption removed its metadata, and synthetic rows with a valid
@@ -1035,6 +1273,20 @@ export interface MuxMetadata {
   // Readers should use helper: isCompacted = compacted !== undefined && compacted !== false
   compacted?: "user" | "idle" | "heartbeat" | boolean;
   /**
+   * Provenance stamp on a summary row — a compaction summary of any form
+   * (user/idle summary, continuous boundary, heartbeat reset boundary) or an
+   * abandoned-branch summary. TRUE: the summarized rows carried
+   * repository-controlled PROJECT skill content, and the summary is ordinary
+   * assistant text that may quote it, so it inherits the rows' consent
+   * obligation (the routed-request scan treats it like a project snapshot
+   * row; an untrusted workspace's request copy withholds its text). FALSE:
+   * verified clean at summarization. UNDEFINED on a summary row: written by a
+   * build that did not track provenance — unknown, treated as TRUE across the
+   * trust boundary until a newer summary replaces it. Sticky across chained
+   * summaries.
+   */
+  carriesProjectSkillContent?: boolean;
+  /**
    * Monotonic compaction epoch identifier.
    *
    * Legacy histories may omit this; compaction code backfills by counting historical compacted summaries.
@@ -1052,6 +1304,14 @@ export interface MuxMetadata {
   disableWorkspaceAgents?: boolean; // Whether workspace-local agent files were disabled for this user turn
   /** Snapshot of send options used for this user turn (for startup retry recovery). */
   retrySendOptions?: StartupRetrySendOptions;
+  /**
+   * Stamped on user rows persisted by pre-stream gate rejections
+   * (preserveRejectedManualSend): the send never streamed and must never be
+   * replayed by startup recovery — atomic with the row, unlike the
+   * preference-file abandon marker which can be lost to a crash between the
+   * two writes.
+   */
+  preStreamRejected?: boolean;
   agentId?: string; // Agent id active when this message was sent (assistant messages only)
   cmuxMetadata?: MuxMessageMetadata; // Command metadata persisted for legacy message formats
   muxMetadata?: MuxMessageMetadata; // Command metadata used by both frontend and backend message flows

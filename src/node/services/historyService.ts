@@ -3894,6 +3894,44 @@ export class HistoryService {
    * edit-resend) can summarize the abandoned segment; computed under the
    * history lock so it exactly matches what was cut.
    */
+  /**
+   * Stamp preStreamRejected onto already-persisted rows (the accepted user
+   * row and its snapshot rows) when a late consent gate rejects the turn
+   * post-acceptance: request construction filters on the ROW metadata, so a
+   * sidecar marker alone would leave the rejected turn provider-eligible.
+   * Missing ids are skipped (a concurrent truncation is not an error).
+   */
+  async markMessagesPreStreamRejected(
+    workspaceId: string,
+    messageIds: string[]
+  ): Promise<Result<void>> {
+    if (messageIds.length === 0) {
+      return Ok(undefined);
+    }
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to mark rejected messages",
+      async () => {
+        const ids = new Set(messageIds);
+        const messages = await this.readChatHistory(workspaceId);
+        let changed = false;
+        const updated = messages.map((msg) => {
+          if (!ids.has(msg.id) || msg.metadata?.preStreamRejected === true) {
+            return msg;
+          }
+          changed = true;
+          return { ...msg, metadata: { ...msg.metadata, preStreamRejected: true as const } };
+        });
+        if (!changed) {
+          return Ok(undefined);
+        }
+        const historyPath = this.getChatHistoryPath(workspaceId);
+        await writeFileAtomic(historyPath, this.serializeHistoryEntries(updated, workspaceId));
+        return Ok(undefined);
+      }
+    );
+  }
+
   async truncateAfterMessage(
     workspaceId: string,
     messageId: string,

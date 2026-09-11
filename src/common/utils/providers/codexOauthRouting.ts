@@ -10,6 +10,7 @@
  */
 
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 
@@ -77,6 +78,47 @@ export function hasOpenAIApiKey(config: unknown): boolean {
  * route OAuth; otherwise OAuth wins when no API key is configured or when
  * `codexOauthDefaultAuth` prefers OAuth over a present key.
  */
+/**
+ * Can a DIRECT OpenAI route serve this model with the credentials on hand?
+ *
+ * `isConfigured` alone over-reports: a Codex-OAuth-only config serves only the
+ * OAuth-allowed model set. Mirrors providerModelFactory's credential outcome —
+ * an API key always attempts (OAuth-required models fall back to the key and
+ * let the API decide), while stored tokens without a key serve only allowed
+ * models — so availability checks can't claim a direct route the factory
+ * would reject with api_key_not_found.
+ */
+export function canDirectOpenAIServeModel(
+  model: string,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  options?: CodexOauthRoutingOptions
+): boolean {
+  const openAIConfig = providersConfig?.openai;
+  // A custom provider (any wire type) shadowing the built-in "openai" id is
+  // direct-only and authenticates against its own endpoint (key optional):
+  // built-in OpenAI credential rules don't apply to it.
+  if (isCustomProviderConfig(openAIConfig)) {
+    return true;
+  }
+  if (hasOpenAIApiKey(openAIConfig)) {
+    return true;
+  }
+  // Codex OAuth speaks only the Responses endpoint: a provider pinned to the
+  // Chat Completions wire format cannot be served by OAuth-only credentials —
+  // createModel rejects that combination with api_key_not_found — so direct
+  // routing must not win over a configured gateway for it. The REQUEST's own
+  // wire format counts the same way: with no stored format the factory honors
+  // providerOptions.openai.wireFormat, so a chatCompletions send is judged as
+  // the factory will judge it.
+  const wireFormat = asRecord(openAIConfig)?.wireFormat ?? options?.openaiWireFormat;
+  if (wireFormat === "chatCompletions") {
+    return false;
+  }
+  return (
+    hasCodexOauthTokens(openAIConfig) && isCodexOauthAllowedModel(model, providersConfig ?? null)
+  );
+}
+
 export function wouldRouteOpenAIThroughCodexOauth(
   model: string,
   providersConfig: ProvidersConfigMap | null | undefined,

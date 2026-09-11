@@ -79,6 +79,14 @@ export interface MemoryScopeContext {
    * and sidecar logical keys; empty when no project identity is available.
    */
   projectPath: string;
+  /**
+   * Provenance of the WRITES made through this context: set when the writer's
+   * own context carried repository-controlled project skill content (a
+   * harvest of a trusted project-skill epoch, a sweep over such an inbox, a
+   * chat turn whose request carried it), so the sidecar marks every file
+   * written as carrying it (MemoryMetaEntry.carriesProjectSkillContent).
+   */
+  writeProvenance?: { carriesProjectSkillContent: true };
 }
 
 export type MemoryActor = "agent" | "user";
@@ -109,6 +117,8 @@ export interface MemoryIndexEntry {
   relPath: string;
   /** Sanitized single-line description from frontmatter (may be empty). */
   description: string;
+  /** Sidecar provenance (MemoryMetaEntry.carriesProjectSkillContent); absent on test doubles. */
+  carriesProjectSkillContent?: boolean;
 }
 
 export type MemoryReadFileResult =
@@ -626,7 +636,13 @@ export class MemoryService extends EventEmitter {
     try {
       const key = this.logicalKeyFor(ctx, scope, relPath);
       if (key === null) return;
-      await this.metaService.recordAccess(key, options);
+      await this.metaService.recordAccess(key, {
+        write: options.write,
+        // Provenance rides the context: a write made with project skill
+        // content in the writer's context marks the file (sticky).
+        carriesProjectSkillContent:
+          options.write && ctx.writeProvenance?.carriesProjectSkillContent === true,
+      });
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
     }
@@ -1641,6 +1657,9 @@ export class MemoryService extends EventEmitter {
    */
   async listIndexEntries(ctx: MemoryScopeContext): Promise<MemoryIndexEntry[]> {
     const entries: MemoryIndexEntry[] = [];
+    // Sidecar provenance rides the index so prompt injection and hot-set
+    // selection can withhold tainted files without a second enumeration.
+    const meta = await this.metaService.getEntries();
     for (const scope of MEMORY_SCOPES) {
       try {
         const store = this.getStore(ctx, scope);
@@ -1691,13 +1710,30 @@ export class MemoryService extends EventEmitter {
           } catch {
             // Unreadable file: list it without a description.
           }
-          entries.push({ path: toVirtualPath(scope, relPath), scope, relPath, description });
+          const key = this.logicalKeyFor(ctx, scope, relPath);
+          entries.push({
+            path: toVirtualPath(scope, relPath),
+            scope,
+            relPath,
+            description,
+            carriesProjectSkillContent:
+              key !== null && meta.get(key)?.carriesProjectSkillContent === true,
+          });
         }
       } catch (error) {
         log.debug("[MemoryService] skipping scope in memory index", { scope, error });
       }
     }
     return entries;
+  }
+
+  /**
+   * Whether any memory file of the scope carries project skill provenance —
+   * a consolidation sweep reads freely across the scope, so its writes
+   * inherit the provenance of everything it could have read.
+   */
+  async scopeCarriesProjectSkillContent(ctx: MemoryScopeContext): Promise<boolean> {
+    return (await this.listIndexEntries(ctx)).some((entry) => entry.carriesProjectSkillContent);
   }
 
   /**
@@ -1712,9 +1748,13 @@ export class MemoryService extends EventEmitter {
       countTokens: (text: string) => Promise<number>;
       tokenBudgetActive?: boolean;
       onlyContextNotes?: boolean;
+      /** Leave files carrying project skill provenance out of the selection. */
+      excludeProjectSkillContent?: boolean;
     }
   ): Promise<MemoryHotSetItem[]> {
-    const entries = await this.listIndexEntries(ctx);
+    const entries = (await this.listIndexEntries(ctx)).filter(
+      (entry) => options.excludeProjectSkillContent !== true || !entry.carriesProjectSkillContent
+    );
     const meta = await this.metaService.getEntries();
     const candidates = entries.map((entry) => {
       const key = this.logicalKeyFor(ctx, entry.scope, entry.relPath);
@@ -1724,6 +1764,7 @@ export class MemoryService extends EventEmitter {
         pinned: stats?.pinned ?? false,
         accessCount: stats?.accessCount ?? 0,
         lastAccessedAt: stats?.lastAccessedAt ?? null,
+        carriesProjectSkillContent: entry.carriesProjectSkillContent,
       };
     });
     return selectHotMemories({
@@ -1762,6 +1803,13 @@ export interface MemorySessionContext {
    * sub-experiment is off or nothing qualifies.
    */
   hotMemoriesBlock: string | null;
+  /**
+   * An included memory (index entry or preloaded file) carries project skill
+   * provenance: a routed turn arms its consent gate on it, and writes made
+   * with this context in the prompt inherit the provenance. Absent on
+   * contexts built by test doubles (treated as clean).
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 /**

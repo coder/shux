@@ -49,6 +49,11 @@ export async function summarizeContinuousCompaction(args: {
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
   compactOptions: SendMessageOptions;
+  /**
+   * Re-verification run immediately before the provider call (model creation
+   * above is a trust-revocation / quarantine window); false → no summary.
+   */
+  beforeDispatch?: () => Promise<boolean>;
 }): Promise<{ text: string; model: string } | null> {
   args.signal.throwIfAborted();
   const providersConfig = args.aiService.getProvidersConfig();
@@ -160,6 +165,7 @@ export async function summarizeContinuousCompaction(args: {
       await eventSpine.run("request.assemble", assembleContext);
     }
     args.signal.throwIfAborted();
+    if (args.beforeDispatch != null && !(await args.beforeDispatch())) return null;
     assert(
       typeof created.data.model !== "string",
       "Pinned model creation must return a model instance"

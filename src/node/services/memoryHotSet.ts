@@ -30,6 +30,8 @@ export interface MemoryHotSetCandidate {
   pinned: boolean;
   accessCount: number;
   lastAccessedAt: number | null;
+  /** Sidecar provenance (MemoryMetaEntry.carriesProjectSkillContent). */
+  carriesProjectSkillContent?: boolean;
 }
 
 export interface MemoryHotSetItem {
@@ -39,6 +41,8 @@ export interface MemoryHotSetItem {
   /** True when content was cut to the per-item byte budget. */
   truncated: boolean;
   content: string;
+  /** Sidecar provenance carried through selection (see MemoryMetaEntry). */
+  carriesProjectSkillContent?: boolean;
 }
 
 /**
@@ -177,7 +181,13 @@ export async function selectHotMemories(args: {
     const bytes = Buffer.byteLength(text, "utf-8");
     if (bytes > remainingBytes) continue;
 
-    const item = { path: candidate.path, pinned: candidate.pinned, truncated, content: text };
+    const item = {
+      path: candidate.path,
+      pinned: candidate.pinned,
+      truncated,
+      content: text,
+      carriesProjectSkillContent: candidate.carriesProjectSkillContent === true,
+    };
     let tokens: number;
     try {
       // The configured cap applies to the exact injected <hot_memories> block,
@@ -209,7 +219,13 @@ export async function selectHotMemories(args: {
         if (!content.includes("\u0000")) {
           const { text, truncated } = truncateToBytes(content, CONTEXT_NOTES_RESERVED_BYTES);
           const fitted = await fitContextNotes(
-            { path: notes.path, pinned: notes.pinned, content: text, truncated },
+            {
+              path: notes.path,
+              pinned: notes.pinned,
+              content: text,
+              truncated,
+              carriesProjectSkillContent: notes.carriesProjectSkillContent === true,
+            },
             items,
             selectedTokens,
             args.countTokens,

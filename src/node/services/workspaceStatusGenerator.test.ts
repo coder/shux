@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { LanguageModel } from "ai";
+import { Ok } from "@/common/types/result";
 import { buildWorkspaceStatusPrompt, generateWorkspaceStatus } from "./workspaceStatusGenerator";
 
 describe("buildWorkspaceStatusPrompt", () => {
@@ -76,5 +78,43 @@ describe("generateWorkspaceStatus error paths", () => {
       // retrying so a future config change recovers without a new message.
       expect(result.error.reachedProvider).toBe(false);
     }
+  });
+
+  test("aborts before the provider request when the transcript went stale during model creation", async () => {
+    // The caller re-verifies its transcript before calling, but model
+    // construction is an await of its own: the re-verification passed in as
+    // beforeDispatch runs after it, and a stale verdict must stop the whole
+    // generation — no request, no further candidate with the same text.
+    let created = 0;
+    const fakeAiService = {
+      createModelWithPinnedMetadata: () => {
+        created += 1;
+        return Promise.resolve(
+          Ok({
+            model: {
+              doStream: () => {
+                throw new Error("the stale transcript must not be sent");
+              },
+            } as unknown as LanguageModel,
+            metadataModel: "test:model",
+          })
+        );
+      },
+    } as unknown as Parameters<typeof generateWorkspaceStatus>[2];
+
+    const result = await generateWorkspaceStatus(
+      "hello",
+      ["test:model", "test:other"],
+      fakeAiService,
+      {
+        beforeDispatch: () => Promise.resolve(false),
+      }
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.staleTranscript).toBe(true);
+      expect(result.error.reachedProvider).toBe(false);
+    }
+    expect(created).toBe(1);
   });
 });
