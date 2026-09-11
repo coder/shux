@@ -47,7 +47,10 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
-import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  resolveWorkspaceMemoryOwnerId,
+  workspaceMemoryOwnerResolver,
+} from "@/node/services/memoryWorkspaceOwner";
 import {
   REFINEMENT_CAPTURE_MAX_FILES,
   REFINEMENT_CAPTURE_MAX_TOTAL_BYTES,
@@ -337,7 +340,7 @@ export function projectMemoryDirName(projectPath: string): string {
   return `${base}-${hash}`;
 }
 
-function toVirtualPath(scope: MemoryScope, relPath: string): string {
+export function toVirtualPath(scope: MemoryScope, relPath: string): string {
   return relPath === ""
     ? `${MEMORY_VIRTUAL_ROOT}/${scope}`
     : `${MEMORY_VIRTUAL_ROOT}/${scope}/${relPath}`;
@@ -605,6 +608,22 @@ export class MemoryService extends EventEmitter {
     private readonly metaService: MemoryMetaService
   ) {
     super();
+    // Parent links are immutable, but an OWNER can be removed while a
+    // shared-checkout descendant keeps running; its deregistration lands as a
+    // config change, after which the child must re-resolve (and fall back to
+    // its own store) instead of writing into the tombstoned owner forever.
+    // Local edits notify here; edits by ANOTHER backend (multi-instance) are
+    // caught by the config-file stamp check in resolveWorkspaceMemoryOwnerId.
+    // The notification fires after the file write, so adopting the new stamp
+    // here keeps the next resolve from repeating the invalidation — but only
+    // once the memo was actually rebuilt from the file: an unreadable file at
+    // notification time (a swallowed late write failure, an EACCES interval)
+    // keeps the old stamp so the next resolve retries, exactly like the
+    // stamp check in resolveWorkspaceMemoryOwnerId.
+    this.config.onConfigChanged(() => {
+      const stamp = this.config.configFileStamp();
+      if (this.invalidateWorkspaceMemoryOwnerMemo()) this.workspaceMemoryOwnerConfigStamp = stamp;
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -615,68 +634,127 @@ export class MemoryService extends EventEmitter {
   // -------------------------------------------------------------------------
 
   /**
-   * Positive-only memo for resolveWorkspaceMemoryOwnerId: a workspace's
-   * parentWorkspaceId is fixed at creation and IDs are never reused, so a
-   * resolved chain stays valid for the process lifetime. Unknown IDs are not
-   * cached — the workspace may simply not be registered yet.
+   * Memo of every owner this process resolved (self-resolutions included),
+   * valid for one config-file stamp: a workspace's parentWorkspaceId is fixed
+   * at creation and IDs are never reused, so a mapping can only change through
+   * a config rewrite, which the stamp check / onConfigChanged catch. Fallback
+   * observations (unregistered ID, config missing or malformed → self) are
+   * memoized too, so their recovery to a shared owner is a visible transition
+   * (see invalidateWorkspaceMemoryOwnerMemo).
    */
   private readonly workspaceMemoryOwnerById = new Map<string, string>();
+  /** Config-file stamp (Config.configFileStamp) the memo was built against. */
+  private workspaceMemoryOwnerConfigStamp: string | null = null;
 
   /**
-   * The workspace whose <sessionDir>/memory backs `/memories/workspace` for
-   * `workspaceId`: the root of its parentWorkspaceId chain. Sub-agents (and
-   * nested sub-agents) thereby share ONE notebook with the workspace that
-   * spawned the task tree, while their transcripts/session artifacts stay
-   * separate. Full `kind: "workspace"` tasks and forks carry no
-   * parentWorkspaceId and own their notes. Unknown IDs, cycles, and depth
-   * overflow resolve to the ID itself so a misconfigured tree degrades to
-   * today's per-workspace behavior instead of failing every memory command.
+   * Memoized resolveWorkspaceMemoryOwnerId (see memoryWorkspaceOwner.ts). The
+   * config is only loaded on a memo miss. Callers resolving many workspaces
+   * in one synchronous pass (launch sweep, recovery, config-change diffing)
+   * supply a shared `snapshot`, which bypasses the memo entirely: neither the
+   * per-call config stat (O(n) synchronous statSync on the main process for
+   * n workspaces) nor memoization apply — the snapshot can predate the current
+   * file stamp (another backend rewriting config.json mid-pass) and would
+   * otherwise be cached under the newer stamp.
    */
-  resolveWorkspaceMemoryOwnerId(workspaceId: string): string {
-    assert(workspaceId.length > 0, "resolveWorkspaceMemoryOwnerId requires a workspaceId");
+  resolveWorkspaceMemoryOwnerId(
+    workspaceId: string,
+    snapshot?: () => ReturnType<Config["loadConfigOrDefault"]>
+  ): string {
+    if (snapshot !== undefined) return resolveWorkspaceMemoryOwnerId(snapshot(), workspaceId);
+    const stamp = this.config.configFileStamp();
+    if (stamp !== this.workspaceMemoryOwnerConfigStamp) {
+      // Adopt the new stamp only once its contents were actually read: a
+      // changed-but-unreadable file (see below) must be retried on the next
+      // call, not remembered as "seen".
+      if (this.invalidateWorkspaceMemoryOwnerMemo()) this.workspaceMemoryOwnerConfigStamp = stamp;
+    }
     const cached = this.workspaceMemoryOwnerById.get(workspaceId);
     if (cached !== undefined) return cached;
-    const cfg = this.config.loadConfigOrDefault();
-    let current = workspaceId;
-    const visited = new Set<string>();
-    for (let depth = 0; depth < 32; depth++) {
-      if (visited.has(current)) {
-        log.warn(
-          "[MemoryService] parentWorkspaceId cycle; using acting workspace as memory owner",
-          {
-            workspaceId,
-          }
-        );
-        return workspaceId;
-      }
-      visited.add(current);
-      const entry = findWorkspaceEntry(cfg, current);
-      if (entry === null) {
-        // Only the chain root may be unknown without invalidating the walk:
-        // an unregistered starting workspace resolves to itself (not cached).
-        if (current === workspaceId) return workspaceId;
-        log.warn("[MemoryService] parentWorkspaceId points at an unknown workspace", {
-          workspaceId,
-          parentWorkspaceId: current,
-        });
-        return workspaceId;
-      }
-      const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-      if (parentWorkspaceId === undefined || parentWorkspaceId === "") {
-        this.workspaceMemoryOwnerById.set(workspaceId, current);
-        return current;
-      }
-      current = parentWorkspaceId;
+    // Only a successful load is memoized. A config.json that stats fine but
+    // cannot be read or parsed right now (EACCES interval, half-written by a
+    // non-atomic writer) yields the fresh-install default — the self
+    // fallback — and the stamp will not move when readability returns, so a
+    // memo taken now would pin the child to its private notebook until an
+    // unrelated config rewrite. The fallback is still returned (callers
+    // degrade to the private store), just re-resolved on the next call.
+    let cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    try {
+      cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error) {
+      log.debug("[MemoryService] config unreadable; workspace memory owner not memoized", {
+        workspaceId,
+        error,
+      });
+      return resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
     }
-    log.warn("[MemoryService] parentWorkspaceId chain too deep; using acting workspace", {
-      workspaceId,
-    });
-    return workspaceId;
+    const owner = resolveWorkspaceMemoryOwnerId(cfg, workspaceId);
+    this.workspaceMemoryOwnerById.set(workspaceId, owner);
+    return owner;
   }
 
-  /** Owner of the workspace scope for this context ("" when there is no workspace). */
-  private ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
-    return ctx.workspaceId === "" ? "" : this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+  /**
+   * Re-resolve every memoized workspace against the current config and tell
+   * listeners which ones now map to a DIFFERENT owner: their live sessions
+   * hold a memory context built from the previous store (an owner that was
+   * just removed — or the private fallback store used while config.json was
+   * missing/malformed and the tree could not be resolved), so core.ts
+   * invalidates those caches and the memory subscription refreshes. There is
+   * no memory-change event for either transition to ride on.
+   *
+   * Most config edits (titles, models, task status) leave the topology alone;
+   * emitting for those would make every live child rebuild its index and hot
+   * set from disk on ordinary churn, so only real owner changes are reported.
+   * One parse, only when something was memoized. Returns false when the
+   * config could not be read (readable stat, unreadable/unparseable content):
+   * the memoized mappings are RETAINED rather than replaced by the empty
+   * default's self fallbacks — those would be pinned until the stamp moved,
+   * which a restored permission bit never does — and the caller keeps the old
+   * stamp so the pass is retried on the next resolution.
+   */
+  private invalidateWorkspaceMemoryOwnerMemo(): boolean {
+    if (this.workspaceMemoryOwnerById.size === 0) return true;
+    // One parse and one ID index for the whole pass (O(n), not O(n²)).
+    let cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    try {
+      cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error) {
+      log.debug("[MemoryService] config unreadable; keeping memoized workspace memory owners", {
+        error,
+      });
+      return false;
+    }
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    const changed: string[] = [];
+    for (const [workspaceId, previousOwner] of this.workspaceMemoryOwnerById) {
+      const owner = resolve(workspaceId);
+      this.workspaceMemoryOwnerById.set(workspaceId, owner);
+      if (owner !== previousOwner) changed.push(workspaceId);
+    }
+    if (changed.length > 0) this.emit("ownersInvalidated", changed);
+    return true;
+  }
+
+  /**
+   * Per-context owner cache: a context object is created per command / per
+   * index+hot-set build and reused for every entry within it, so the stamp
+   * stat behind resolveWorkspaceMemoryOwnerId runs once per operation instead
+   * of once per candidate file. Staleness is bounded to that one operation;
+   * writes are still gated by the commit check (assertMutationCommittable).
+   */
+  private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
+
+  /**
+   * Owner of the workspace scope for this context ("" when there is no
+   * workspace). Public so callers that key sidecar metadata for the same
+   * context (memoryOperations) bind to the exact owner the store resolved to.
+   */
+  ownerWorkspaceIdFor(ctx: MemoryScopeContext): string {
+    if (ctx.workspaceId === "") return "";
+    const cached = this.ownerByContext.get(ctx);
+    if (cached !== undefined) return cached;
+    const owner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+    this.ownerByContext.set(ctx, owner);
+    return owner;
   }
 
   /** Logical sidecar key, or null when the scope has no stable identity. */
@@ -685,9 +763,40 @@ export class MemoryService extends EventEmitter {
     return memoryLogicalKey(scope, relPath, {
       projectPath: ctx.projectPath,
       // Pins/usage stats follow the physical file, so a shared notebook has
-      // one ranking regardless of which tree member touched it.
-      workspaceId: this.ownerWorkspaceIdFor(ctx),
+      // one ranking regardless of which tree member touched it. Only the
+      // workspace key embeds the id; skip the lookup for the other scopes.
+      workspaceId: scope === "workspace" ? this.ownerWorkspaceIdFor(ctx) : ctx.workspaceId,
     });
+  }
+
+  /**
+   * Consolidation's pin protection (pinned files are editable but never
+   * deleted/renamed; a directory counts when anything under it is pinned),
+   * evaluated INSIDE the mutation lock against the owner the command's store
+   * is bound to: logicalKeyFor and getStore share this command's owner
+   * resolution (ownerWorkspaceIdFor), so the key checked is the key of the
+   * file about to be removed. A guard run before the command against a
+   * separately resolved owner (the private-store fallback while config.json
+   * was unreadable) would check the wrong sidecar entries and let an
+   * owner-pinned note go.
+   */
+  private async assertNotPinnedForRemoval(
+    ctx: MemoryScopeContext,
+    scope: MemoryScope,
+    relPath: string,
+    virtualPath: string
+  ): Promise<void> {
+    const key = this.logicalKeyFor(ctx, scope, relPath);
+    if (key === null) return;
+    const subtreePrefix = `${key}/`;
+    for (const [entryKey, entry] of await this.metaService.getEntries()) {
+      if (entry.pinned !== true) continue;
+      if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
+        throw new MemoryCommandError(
+          `${virtualPath} is pinned by the user (directly or via a pinned file inside it); pinned files may be edited but never deleted or renamed.`
+        );
+      }
+    }
   }
 
   private async recordUsage(
@@ -797,8 +906,15 @@ export class MemoryService extends EventEmitter {
   }
 
   private async runCommand(
+    ctx: MemoryScopeContext,
     operation: () => Promise<MemoryCommandResult>
   ): Promise<MemoryCommandResult> {
+    // The per-context owner cache is scoped to ONE command: createMemoryTool
+    // reuses a context for a whole stream, and a cached owner would otherwise
+    // let a child keep reading its parent's notebook after the tree changed
+    // (owner removed by another backend — no local event) for as long as the
+    // stream lives. Re-resolving costs one memoized, stamp-validated lookup.
+    this.ownerByContext.delete(ctx);
     try {
       return await operation();
     } catch (error) {
@@ -842,19 +958,15 @@ export class MemoryService extends EventEmitter {
    * Append the invertible `refinement` row for one memory mutation (RLM r2).
    *
    * Rows land in the ACTING workspace's session journal even though memory
-   * files can be global/project-scoped: the journal is per-session, so
+   * files can be global/project-scoped — or, for a sub-agent's workspace
+   * scope, live in the OWNER's session dir: the journal is per-session, so
    * cross-workspace edits to a shared file are attributed to (and invertible
-   * from) whichever workspace made them — the intended v1 scope. The one
-   * exception is workspace scope written by a sub-agent: the file lives in
-   * the OWNER's <sessionDir>/memory and rollback confinement only admits a
-   * journal's own session memory root, so those rows go to the owner's
-   * journal (where they are actually invertible). When the context has no
-   * workspace, there is no session journal; skip (log-only).
+   * from) whichever workspace made them — the intended v1 scope. When the
+   * context has no workspace, there is no session journal; skip (log-only).
    * Never throws: journaling failures must not fail the memory command.
    */
   private async journalRefinement(
     ctx: MemoryScopeContext,
-    scope: MemoryScope,
     action: MemoryRefinementAction,
     inverse: RefinementInverseDraft,
     actor: MemoryActor,
@@ -867,11 +979,9 @@ export class MemoryService extends EventEmitter {
       });
       return;
     }
-    const journalWorkspaceId =
-      scope === "workspace" ? this.ownerWorkspaceIdFor(ctx) : ctx.workspaceId;
     await appendRefinementEvent({
-      sessionDir: path.join(this.config.sessionsDir, journalWorkspaceId),
-      workspaceId: journalWorkspaceId,
+      sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
+      workspaceId: ctx.workspaceId,
       kind: "memory",
       action,
       inverse,
@@ -904,10 +1014,12 @@ export class MemoryService extends EventEmitter {
    *   removal here at commit time and refuses instead of recreating the
    *   deleted session directory via its write or journal append.
    *
-   * Both the acting workspace and the workspace-memory owner are checked: a
-   * removed sub-agent must not keep writing into its parent's notebook, and
-   * a removed owner must not have its session directory recreated by a
-   * lingering child's write.
+   * The owner the command's store was bound to is then compared with a fresh
+   * resolution: the per-context cache (ownerWorkspaceIdFor) may hold a
+   * self-fallback taken while config.json was missing or malformed, and if
+   * the file recovers before this command commits, the write would land in
+   * the child's private store although the tree is shared again. Refused as
+   * a recoverable error; the retried command resolves the owner anew.
    */
   private async assertMutationCommittable(
     ctx: MemoryScopeContext,
@@ -920,12 +1032,19 @@ export class MemoryService extends EventEmitter {
       );
     }
     if (ctx.workspaceId === "") return;
-    for (const workspaceId of new Set([ctx.workspaceId, this.ownerWorkspaceIdFor(ctx)])) {
-      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+    const boundOwner = this.ownerByContext.get(ctx);
+    if (boundOwner !== undefined) {
+      const currentOwner = this.resolveWorkspaceMemoryOwnerId(ctx.workspaceId);
+      if (currentOwner !== boundOwner) {
         throw new MemoryCommandError(
-          `Workspace ${workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
+          `Ownership of the workspace notebook changed while mutating ${virtualPath} (now ${currentOwner}); retry the command`
         );
       }
+    }
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, ctx.workspaceId)) {
+      throw new MemoryCommandError(
+        `Workspace ${ctx.workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
+      );
     }
   }
 
@@ -1056,6 +1175,39 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
+   * Toggle a pin (Memory tab). Pins live in the sidecar, not the store, so
+   * nothing else emits a change: for the workspace scope the sidecar write
+   * happens under the store's mutation lock, so a lock timeout fails BEFORE
+   * anything is committed (no durable pin with a failed route), and the other
+   * tree members' tabs are told afterwards. Sidecar write failures surface as
+   * MemoryMetaWriteError.
+   */
+  async setPinned(ctx: MemoryScopeContext, virtualPath: string, pinned: boolean): Promise<void> {
+    const parsed = parseMemoryPath(virtualPath);
+    const scope = this.requireFilePath(parsed, virtualPath);
+    const key = this.logicalKeyFor(ctx, scope, parsed.relPath);
+    if (key === null) {
+      throw new MemoryCommandError(
+        "Project memory is unavailable: no project is associated with this session"
+      );
+    }
+    if (scope === "workspace") {
+      const store = this.getStore(ctx, scope);
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        // Same commit guard as file mutations: `key` and `store` were bound to
+        // the owner the context resolved BEFORE the lock. If ownership moved
+        // meanwhile, the pin would land under a dead logical key and the
+        // route would still report success. Refuse instead.
+        await this.assertMutationCommittable(ctx, undefined, virtualPath);
+        await this.metaService.setPinned(key, pinned);
+      });
+    } else {
+      await this.metaService.setPinned(key, pinned);
+    }
+    this.emitChange(ctx, scope, parsed.relPath, "user");
+  }
+
+  /**
    * Announces that a project's memory was mutated outside this service. The settings-backup
    * restore writes memory files directly (under the shared memory mutation lock), and
    * subscribers only refresh from disk on change events, so without this an open memory
@@ -1085,7 +1237,7 @@ export class MemoryService extends EventEmitter {
     virtualPath: string,
     options?: { offset?: number; limit?: number }
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       if (parsed.scope === null) {
         // Virtual root: list every scope.
@@ -1142,7 +1294,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       assertWithinFileSizeCap(fileText);
@@ -1171,7 +1323,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "create", path: toVirtualPath(scope, parsed.relPath) },
           { op: "delete-files", paths: [store.physicalPath(parsed.relPath)] },
           actor,
@@ -1197,7 +1348,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       if (oldStr.length === 0) {
@@ -1213,7 +1364,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "str_replace", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1240,7 +1390,7 @@ export class MemoryService extends EventEmitter {
     expectedFingerprint?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
@@ -1267,7 +1417,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: "insert", path: toVirtualPath(scope, parsed.relPath) },
           {
             op: "restore-files",
@@ -1315,7 +1464,7 @@ export class MemoryService extends EventEmitter {
     toolCallId?: string,
     abortSignal?: AbortSignal
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       if (mutation.command === "str_replace" && mutation.oldStr.length === 0) {
@@ -1364,7 +1513,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the write is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           { op: mutation.command, path: toVirtualPath(scope, parsed.relPath) },
           previous === null
             ? { op: "delete-files", paths: [physicalPath] }
@@ -1392,7 +1540,7 @@ export class MemoryService extends EventEmitter {
       | { command: "delete"; path: string }
       | { command: "rename"; path: string; new_path: string }
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    const result = await this.runCommand(async () => {
+    const result = await this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(command.path);
       const scope = this.requireFilePath(parsed, command.path);
       switch (command.command) {
@@ -1505,9 +1653,10 @@ export class MemoryService extends EventEmitter {
     actor: MemoryActor,
     toolCallId?: string,
     expectedFingerprint?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: { rejectPinned?: boolean }
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
@@ -1515,6 +1664,9 @@ export class MemoryService extends EventEmitter {
         const kind = await store.kind(parsed.relPath);
         if (kind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
+        }
+        if (options?.rejectPinned === true) {
+          await this.assertNotPinnedForRemoval(ctx, scope, parsed.relPath, virtualPath);
         }
         // r55: staged refine deletes were approved against the target's
         // staging-time state — a target edited between staging and apply
@@ -1537,7 +1689,6 @@ export class MemoryService extends EventEmitter {
         if (inverse !== null) {
           await this.journalRefinement(
             ctx,
-            scope,
             { op: "delete", path: toVirtualPath(scope, parsed.relPath) },
             inverse,
             actor,
@@ -1560,9 +1711,10 @@ export class MemoryService extends EventEmitter {
     newVirtualPath: string,
     actor: MemoryActor,
     toolCallId?: string,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    options?: { rejectPinned?: boolean }
   ): Promise<MemoryCommandResult> {
-    return this.runCommand(async () => {
+    return this.runCommand(ctx, async () => {
       const oldParsed = parseMemoryPath(oldVirtualPath);
       const newParsed = parseMemoryPath(newVirtualPath);
       const scope = this.requireFilePath(oldParsed, oldVirtualPath);
@@ -1579,6 +1731,9 @@ export class MemoryService extends EventEmitter {
         const oldKind = await store.kind(oldParsed.relPath);
         if (oldKind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${oldVirtualPath}`);
+        }
+        if (options?.rejectPinned === true) {
+          await this.assertNotPinnedForRemoval(ctx, scope, oldParsed.relPath, oldVirtualPath);
         }
         // Pre-flight (mirrored in validateMutation): store.rename would mkdir
         // the destination parent INSIDE the source before the filesystem
@@ -1600,7 +1755,6 @@ export class MemoryService extends EventEmitter {
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
           ctx,
-          scope,
           {
             op: "rename",
             path: toVirtualPath(scope, oldParsed.relPath),
