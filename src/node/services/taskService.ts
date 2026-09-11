@@ -2762,7 +2762,10 @@ export class TaskService implements AgentTaskIntegration {
 
     this.initStateManager.startInit(workspaceId, projectPath);
     return {
-      logStep: (message: string) => this.initStateManager.appendOutput(workspaceId, message, false),
+      logStep: (message: string) =>
+        this.initStateManager.appendOutput(workspaceId, message, false, true),
+      logProgress: (label: string, percent: number) =>
+        this.initStateManager.reportProgress(workspaceId, label, percent),
       logStdout: (line: string) => this.initStateManager.appendOutput(workspaceId, line, false),
       logStderr: (line: string) => this.initStateManager.appendOutput(workspaceId, line, true),
       logComplete: (exitCode: number) => void this.initStateManager.endInit(workspaceId, exitCode),

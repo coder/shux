@@ -165,6 +165,7 @@ export interface FileStat {
 export interface InitLogger {
   /** Log a creation step (e.g., "Creating worktree", "Syncing files") */
   logStep(message: string): void;
+  logProgress?(label: string, percent: number): void;
   /** Log stdout line from init hook */
   logStdout(line: string): void;
   /** Log stderr line from init hook */

@@ -222,6 +222,7 @@ export class StreamTranslator {
       case "runtime-status":
       case "init-start":
       case "init-output":
+      case "init-progress":
       case "init-end":
         return [];
 

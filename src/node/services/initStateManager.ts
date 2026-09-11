@@ -12,6 +12,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 export interface TimedLine {
   line: string;
   isError: boolean; // true if from stderr
+  step?: true;
   timestamp: number;
 }
 
@@ -140,6 +141,7 @@ export class InitStateManager extends EventEmitter {
         workspaceId,
         line: timedLine.line,
         isError: timedLine.isError,
+        ...(timedLine.step ? { step: true } : {}),
         timestamp: timedLine.timestamp, // Use original timestamp for replay
         lineNumber: truncatedLines + index,
         replay: true,
@@ -244,7 +246,7 @@ export class InitStateManager extends EventEmitter {
    * Truncation strategy: Keep only the most recent INIT_HOOK_MAX_LINES lines (tail).
    * Older lines are dropped to prevent OOM with large rsync/build output.
    */
-  appendOutput(workspaceId: string, line: string, isError: boolean): void {
+  appendOutput(workspaceId: string, line: string, isError: boolean, step = false): void {
     const state = this.store.getState(workspaceId);
 
     if (!state) {
@@ -254,7 +256,7 @@ export class InitStateManager extends EventEmitter {
 
     const timestamp = Date.now();
     const lineNumber = (state.truncatedLines ?? 0) + state.lines.length;
-    const timedLine: TimedLine = { line, isError, timestamp };
+    const timedLine: TimedLine = { line, isError, timestamp, ...(step ? { step: true } : {}) };
 
     // Truncation: keep only the most recent MAX_LINES
     if (state.lines.length >= INIT_HOOK_MAX_LINES) {
@@ -269,8 +271,24 @@ export class InitStateManager extends EventEmitter {
       workspaceId,
       line,
       isError,
+      ...(step ? { step: true } : {}),
       timestamp,
       lineNumber,
+    } satisfies WorkspaceInitEvent & { workspaceId: string });
+  }
+
+  reportProgress(workspaceId: string, label: string, percent: number): void {
+    if (this.store.getState(workspaceId)?.status !== "running" || !Number.isFinite(percent)) {
+      return;
+    }
+
+    // Transient progress must not fill the durable init log or reappear on replay.
+    this.emit("init-progress", {
+      type: "init-progress",
+      workspaceId,
+      label,
+      percent: Math.max(0, Math.min(100, Math.round(percent))),
+      timestamp: Date.now(),
     } satisfies WorkspaceInitEvent & { workspaceId: string });
   }
 

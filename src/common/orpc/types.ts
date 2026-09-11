@@ -172,6 +172,12 @@ export function isInitOutput(
   return (msg as { type?: string }).type === "init-output";
 }
 
+export function isInitProgress(
+  msg: WorkspaceChatMessage
+): msg is Extract<WorkspaceInitEvent, { type: "init-progress" }> {
+  return msg.type === "init-progress";
+}
+
 export function isInitEnd(
   msg: WorkspaceChatMessage
 ): msg is Extract<WorkspaceInitEvent, { type: "init-end" }> {

@@ -1627,6 +1627,7 @@ export class MuxAgent implements Agent {
         event.type === "advisor-reasoning-output" ||
         event.type === "bash-output" ||
         event.type === "init-output" ||
+        event.type === "init-progress" ||
         // Drop replay history messages under saturation, but keep live message
         // events so ACP clients do not miss real-time conversation updates.
         isReplayMessageEvent
