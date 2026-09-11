@@ -1520,20 +1520,14 @@ describe("MemoryService", () => {
       await fsPromises.writeFile(path.join(legacyRoot, "sub", "same.md"), "identical");
       await fsPromises.writeFile(path.join(legacyRoot, "clash.md"), "child version");
       await fixture.metaService.setPinned("workspace:ws-child:only-child.md", true);
-      // The owner already holds one identical and one conflicting file.
+      // The owner already holds one identical and one conflicting file
+      // (written before the upgrade: an owner access would adopt the child's
+      // notes first, see "owner access adopts ..." below).
       const ownerCtx = { ...fixture.ctx, workspaceId: "ws-owner" };
-      await fixture.service.create(
-        ownerCtx,
-        "/memories/workspace/sub/same.md",
-        "identical",
-        "agent"
-      );
-      await fixture.service.create(
-        ownerCtx,
-        "/memories/workspace/clash.md",
-        "owner version",
-        "agent"
-      );
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      await fsPromises.mkdir(path.join(ownerRoot, "sub"), { recursive: true });
+      await fsPromises.writeFile(path.join(ownerRoot, "sub", "same.md"), "identical");
+      await fsPromises.writeFile(path.join(ownerRoot, "clash.md"), "owner version");
       const events: unknown[] = [];
       fixture.service.on("change", (event) => events.push(event));
 
@@ -1544,7 +1538,6 @@ describe("MemoryService", () => {
         "only-child.md",
         "sub/same.md",
       ]);
-      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
       expect(await fsPromises.readFile(path.join(ownerRoot, "only-child.md"), "utf-8")).toBe(
         "child notes"
       );
@@ -1711,16 +1704,33 @@ describe("MemoryService", () => {
         "agent"
       );
       expect(full.success).toBe(false);
-      // Freed capacity lets a later pass of the SAME process fold in the rest:
-      // an incomplete pass is not memoized, since its retry depends on owner
-      // state the legacy check key does not observe.
+      // Bounded: the incomplete pass is memoized against the legacy store's
+      // stamp like a complete one, so an over-cap notebook is not re-walked
+      // (manifest, sidecar, owner listing) on every access — freed capacity
+      // alone does not re-run it.
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0000.md", "agent");
       await fixture.service.deletePath({ ...fixture.ctx }, "/memories/workspace/o0001.md", "agent");
       const relisted = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
         .filter((e) => e.scope === "workspace")
         .map((e) => e.relPath);
-      expect(relisted).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(passes).not.toHaveBeenCalled();
+      expect(relisted).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE - 2);
       expect(relisted.filter((f) => ["a.md", "b.md", "c.md", "d.md"].includes(f))).toEqual([
+        "a.md",
+      ]);
+      // A changed legacy store (a note written on the downgraded build)
+      // re-runs the pass, which then uses the freed capacity.
+      await fsPromises.writeFile(path.join(legacyRoot, "e.md"), "child e.md");
+      const rewalked = (await fixture.service.listIndexEntries({ ...fixture.ctx }))
+        .filter((e) => e.scope === "workspace")
+        .map((e) => e.relPath);
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(rewalked).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+      expect(rewalked.filter((f) => ["a.md", "b.md", "c.md", "d.md", "e.md"].includes(f))).toEqual([
         "a.md",
         "b.md",
         "c.md",
@@ -1838,25 +1848,88 @@ describe("MemoryService", () => {
         await fsPromises.writeFile(manifestPath, savedManifest);
       }
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
-      // Malformed (not missing) aborts too: a bad record whose source is
-      // gone could not be reconciled, and an empty substitute would drop the
-      // provenance for its owner copy while removal deletes the child.
-      for (const [label, body] of [
-        ["not JSON", "{nope"],
-        ["not an object", "[]"],
-        ["record 'note.md'", JSON.stringify({ "note.md": { content: 1 } })],
-      ] as const) {
+      // A MALFORMED (not merely unreadable) manifest self-heals: it is
+      // quarantined beside itself and the pass re-adopts from scratch
+      // (idempotent: identical files are skipped), so neither access-time
+      // adoption nor a non-forced removal is blocked forever by it.
+      const quarantined = async () =>
+        (await fsPromises.readdir(path.dirname(legacyRoot))).filter((name) =>
+          name.startsWith(`${path.basename(manifestPath)}.malformed-`)
+        );
+      for (const body of ["{nope", "[]", JSON.stringify({ "note.md": { content: 1 } })]) {
         await fsPromises.writeFile(manifestPath, body);
+        await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      }
+      expect((await quarantined()).length).toBe(3);
+      expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(true);
+      expect(await pathExists(path.join(ownerRoot, "only-child.md"))).toBe(true);
+      // The rewritten manifest records the re-adopted notes.
+      expect(
+        Object.keys(JSON.parse(await fsPromises.readFile(manifestPath, "utf-8")) as object).sort()
+      ).toEqual(["late.md", "only-child.md"]);
+      // When the quarantine rename itself fails, the pass fails closed like before.
+      await fsPromises.writeFile(manifestPath, "{nope");
+      const rename = spyOn(fsPromises, "rename").mockImplementationOnce(() =>
+        Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+      );
+      try {
         expect(
           await fixture.service
             .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
             .then(() => null, getErrorMessage)
-        ).toContain(`malformed (${label})`);
-        expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(false);
+        ).toContain("malformed (not JSON)");
+      } finally {
+        rename.mockRestore();
       }
+      expect(await fsPromises.readFile(manifestPath, "utf-8")).toBe("{nope");
+      expect((await quarantined()).length).toBe(3);
       await fsPromises.writeFile(manifestPath, savedManifest);
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
       expect(await pathExists(path.join(ownerRoot, "late.md"))).toBe(true);
+    });
+
+    it("owner access adopts an inactive pre-sharing child's notebook without the child touching memory", async () => {
+      using fixture = await createFixture("ws-owner");
+      await registerTaskTree(fixture);
+      // A sub-agent that finished before the upgrade: its private notebook
+      // exists, but no memory command will ever run in its context again.
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-grandchild", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "finished.md"), "found before the upgrade");
+      await fixture.metaService.setPinned("workspace:ws-grandchild:finished.md", true);
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+
+      // The OWNER's own access folds the descendant's notes in (one pass for
+      // the one child with a legacy root; ws-child and ws-solo have none).
+      const listed = await fixture.service.listIndexEntries(fixture.ctx);
+      expect(listed.filter((e) => e.scope === "workspace").map((e) => e.relPath)).toEqual([
+        "finished.md",
+      ]);
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(
+        await fsPromises.readFile(
+          path.join(fixture.config.sessionsDir, "ws-owner", "memory", "finished.md"),
+          "utf-8"
+        )
+      ).toBe("found before the upgrade");
+      expect(await fixture.metaService.getPinnedKeys()).toContain("workspace:ws-owner:finished.md");
+      expect(events).toHaveLength(1);
+      // The legacy copy stays for a downgraded build.
+      expect(await pathExists(path.join(legacyRoot, "finished.md"))).toBe(true);
+
+      // A second owner access is a no-op: the memo answers for the unchanged
+      // legacy store (one lstat), no pass runs and nothing is announced.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(events).toHaveLength(1);
+      // An unrelated root (ws-solo) never enumerates the tree's children.
+      await fixture.service.listIndexEntries({ ...fixture.ctx, workspaceId: "ws-solo" });
+      expect(passes).toHaveBeenCalledTimes(1);
     });
 
     it("keeps adopting a legacy note named __proto__ exactly once", async () => {

@@ -51,6 +51,7 @@ import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memory
 import {
   adoptionTargetStamp,
   legacyAdoptionManifestPath,
+  LegacyAdoptionManifestMalformedError,
   readLegacyAdoptionManifest,
   type LegacyAdoptionRecord,
 } from "@/node/services/memoryLegacyAdoption";
@@ -1142,6 +1143,11 @@ export class MemoryService extends EventEmitter {
       // Not redirected: the private store IS the store. Recorded so a later
       // redirect (config recovered) is seen as a change of the key below.
       this.legacyStoreCheckedAgainst.set(childId, owner);
+      // The OWNER's access adopts its descendants' legacy notebooks too: a
+      // sub-agent that finished before the upgrade never touches memory
+      // again, and without this its notes would stay invisible to the owner
+      // until the child's removal hands them over.
+      await this.adoptDescendantLegacyStores(ctx, store, owner);
       return;
     }
     try {
@@ -1155,6 +1161,45 @@ export class MemoryService extends EventEmitter {
           error,
         }
       );
+    }
+  }
+
+  /**
+   * Access-time adoption on behalf of every registered workspace resolving
+   * to `owner` (one config snapshot per pass). Each child costs one lstat of
+   * its legacy root when there is nothing to adopt — an absent root is
+   * skipped outright, an unchanged one is answered by the per-child memo —
+   * and a failing child never fails the owner's access (logged, retried on
+   * the next access like the child's own pass).
+   */
+  private async adoptDescendantLegacyStores(
+    ctx: MemoryScopeContext,
+    store: MemoryStore,
+    owner: string
+  ): Promise<void> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    for (const project of cfg.projects.values()) {
+      for (const workspace of project.workspaces) {
+        const childId = workspace.id;
+        if (childId === undefined || childId === owner || resolve(childId) !== owner) continue;
+        const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
+        if ((await lstatKind(legacyRoot)) === "missing") continue;
+        const childCtx: MemoryScopeContext = {
+          runtime: null,
+          checkoutCwd: "",
+          workspaceId: childId,
+          projectPath: ctx.projectPath,
+        };
+        try {
+          await this.adoptLegacyPrivateStoreOrThrow(childCtx, store, owner);
+        } catch (error) {
+          log.warn(
+            "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook on the owner's behalf; retrying on next access",
+            { childId, owner, error }
+          );
+        }
+      }
     }
   }
 
@@ -1325,7 +1370,7 @@ export class MemoryService extends EventEmitter {
       // basis), so a transiently unreadable manifest, sidecar or owner
       // listing must fail the pass rather than stand in as "empty".
       const manifestPath = legacyAdoptionManifestPath(childSessionDir);
-      const adopted = await readLegacyAdoptionManifest(manifestPath, { strict: true });
+      const adopted = await this.readOrQuarantineAdoptionManifest(manifestPath, childId);
       const sidecarEntries = await this.metaService.getEntriesOrThrow();
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
@@ -1617,17 +1662,53 @@ export class MemoryService extends EventEmitter {
     }
     // Recorded against the state observed BEFORE the pass: a foreign write
     // landing during it changes the stamp and re-runs the (idempotent) pass.
-    // Only a complete pass is memoized: a note left unrepresented (owner
-    // store full, both destinations taken, unreadable, sidecar fold failed)
-    // is retried on the next access, and that retry depends on OWNER-side
-    // state the check key does not observe.
-    if (skipped === 0) {
-      this.legacyStoreCheckedAgainst.set(childId, checkKey);
-    } else {
-      this.legacyStoreCheckedAgainst.delete(childId);
-    }
+    // Memoized even when notes were left unrepresented (owner store full,
+    // both destinations taken, unreadable, sidecar fold failed): an
+    // unchanged legacy store cannot adopt more on a retry, and re-walking it
+    // on every access would make a stuck note a per-access tax. Owner-side
+    // state the key does not observe (freed capacity) is picked up by the
+    // next legacy-store change, a process restart, or removal's forced pass.
+    this.legacyStoreCheckedAgainst.set(childId, checkKey);
     if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
     return { skipped };
+  }
+
+  /**
+   * Strict manifest read that self-heals a MALFORMED file: its bytes are the
+   * file's state, and refusing forever would block every access-time pass
+   * and non-forced removal of the child. The file is quarantined beside
+   * itself (`<name>.malformed-<ts>`) and the pass continues from an empty
+   * record map — safe because adoption is idempotent: identical files are
+   * skipped and differing ones land under imported/<child>/. Only the
+   * provenance of copies this adoption created is lost (they read as the
+   * owner's own from now on). An UNREADABLE manifest (EACCES, EIO) still
+   * fails the pass, as does a quarantine rename that fails.
+   */
+  private async readOrQuarantineAdoptionManifest(
+    manifestPath: string,
+    childId: string
+  ): Promise<Map<string, LegacyAdoptionRecord>> {
+    try {
+      return await readLegacyAdoptionManifest(manifestPath, { strict: true });
+    } catch (error) {
+      if (!(error instanceof LegacyAdoptionManifestMalformedError)) throw error;
+      const quarantined = `${manifestPath}.malformed-${Date.now()}`;
+      try {
+        await fsPromises.rename(manifestPath, quarantined);
+      } catch (renameError) {
+        log.warn("[MemoryService] cannot quarantine a malformed legacy adoption manifest", {
+          childId,
+          manifestPath,
+          error: renameError,
+        });
+        throw error;
+      }
+      log.warn(
+        "[MemoryService] quarantined a malformed legacy adoption manifest; re-adopting from scratch",
+        { childId, manifestPath, quarantined, error: getErrorMessage(error) }
+      );
+      return new Map();
+    }
   }
 
   /**

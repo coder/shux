@@ -84,6 +84,19 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
 }
 
 /**
+ * A manifest that exists and could be read but does not parse as a record
+ * map. Distinguished from an UNREADABLE file (EACCES, EIO — the plain fs
+ * error) so strict callers can quarantine the former (its bytes are the
+ * file's state) while still refusing on the latter.
+ */
+export class LegacyAdoptionManifestMalformedError extends Error {
+  constructor(manifestPath: string, detail: string) {
+    super(`the legacy adoption manifest at ${manifestPath} is malformed (${detail})`);
+    this.name = "LegacyAdoptionManifestMalformedError";
+  }
+}
+
+/**
  * Read of the adoption manifest. A MISSING file reads as "nothing adopted"
  * for every caller. Tolerant callers also read an unreadable (EACCES, EIO)
  * or malformed file — bad JSON, a non-object, a record missing its string
@@ -111,7 +124,7 @@ export async function readLegacyAdoptionManifest(
   }
   const malformed = (detail: string): Map<string, LegacyAdoptionRecord> => {
     if (options?.strict === true) {
-      throw new Error(`the legacy adoption manifest at ${manifestPath} is malformed (${detail})`);
+      throw new LegacyAdoptionManifestMalformedError(manifestPath, detail);
     }
     return new Map();
   };
