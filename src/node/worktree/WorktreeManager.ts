@@ -319,6 +319,8 @@ export class WorktreeManager {
           // git delays progress output by 2s, which hides it for most checkouts.
           env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
           onStderrData: (chunk) => progress.push(chunk),
+          // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
+          killTreeOnTermination: true,
         }
       );
       const { stdout } = await checkoutProc.result;
@@ -328,16 +330,25 @@ export class WorktreeManager {
       }
     } catch (error) {
       progress.flush();
-      // A retained (deferred) workspace must not be left on the placeholder ref: later git
-      // operations would commit to it instead of the workspace branch. Runs without the
-      // caller's signal because an aborted checkout (archive) needs the restore most.
+      // A retained (deferred) workspace must not be left on the placeholder ref with the empty
+      // pre-checkout index: a later commit would land on the placeholder or record every
+      // tracked file as deleted. Put HEAD back on the branch and rebuild the index from it,
+      // leaving the working tree alone. Runs without the caller's signal because an aborted
+      // checkout needs the restore most.
+      const restoreOptions = noHooksEnv?.env ? { env: noHooksEnv.env } : undefined;
       try {
         using restoreProc = execFileAsync(
           "git",
           ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/${branchName}`],
-          noHooksEnv?.env ? { env: noHooksEnv.env } : undefined
+          restoreOptions
         );
         await restoreProc.result;
+        using resetProc = execFileAsync(
+          "git",
+          ["-C", workspacePath, "reset", "--quiet"],
+          restoreOptions
+        );
+        await resetProc.result;
       } catch {
         // The checkout error below is the one worth reporting.
       }

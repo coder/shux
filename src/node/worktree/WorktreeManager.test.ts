@@ -592,12 +592,90 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toContain("README.md");
       expect(await fsPromises.readFile(strayFile, "utf8")).toBe("user data\n");
-      // The retained workspace stays on its branch rather than the checkout placeholder.
+      // The retained workspace stays on its branch rather than the checkout placeholder, with
+      // an index that matches it: the stray file reads as a modification, not as every tracked
+      // file staged for deletion.
       expect(
         execFileSync("git", ["symbolic-ref", "HEAD"], { cwd: result.workspacePath })
           .toString()
           .trim()
       ).toBe(`refs/heads/${branchName}`);
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath })
+          .toString()
+          .trimEnd()
+      ).toBe(" M README.md");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("cancelling a deferred checkout also stops the helpers it spawned", async () => {
+    const branchName = "feature-stalled-smudge";
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const pidFile = path.join(fixture.rootDir, "smudge-pids");
+      const shim = path.join(fixture.rootDir, "stalled-smudge.sh");
+      await fsPromises.writeFile(
+        shim,
+        `#!/bin/sh\nsleep 600 &\nprintf '%s\\n%s\\n' "$$" "$!" > "${pidFile}"\nwait\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(shim, 0o755);
+      await fsPromises.writeFile(
+        path.join(fixture.projectPath, ".gitattributes"),
+        "README.md filter=stall\n"
+      );
+      execFileSync("git", ["add", ".gitattributes"], { cwd: fixture.projectPath, stdio: "ignore" });
+      execFileSync("git", ["commit", "-qm", "stall the checkout"], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "filter.stall.smudge", shim], { cwd: fixture.projectPath });
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const controller = new AbortController();
+      const materialize = fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+            abortSignal: controller.signal,
+          },
+          result.pendingMaterialization!
+        )
+        .then(
+          () => "resolved",
+          () => "rejected"
+        );
+      const deadline = Date.now() + 5_000;
+      let pids: number[] = [];
+      while (Date.now() < deadline && pids.length !== 2) {
+        pids = await fsPromises.readFile(pidFile, "utf-8").then(
+          (content) => content.trim().split("\n").map(Number),
+          () => []
+        );
+        if (pids.length !== 2) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(pids).toHaveLength(2);
+      controller.abort();
+      expect(await materialize).toBe("rejected");
+      expect(await waitForProcessesToExit(pids)).toBe(true);
     } finally {
       await fixture.cleanup();
     }

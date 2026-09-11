@@ -493,11 +493,11 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
-    "sanitizes a deferred checkout that archiving interrupted",
+    "archiving during a deferred checkout parks a complete, sanitized checkout",
     async () => {
       // Archive aborts a running init but keeps the checkout registered (default behaviour),
-      // and unarchiving does not rerun init, so the interrupted materialization must still
-      // prune committed plugin enables before the workspace is parked.
+      // and unarchiving does not rerun init, so the checkout must finish and prune committed
+      // plugin enables before the workspace is parked.
       const env = await createTestEnvironment();
       const execAsync = promisify(exec);
       const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
@@ -540,6 +540,7 @@ describeIntegration("Workspace init hook", () => {
           enabledServers: string[];
         };
         expect(pruned.enabledServers).toEqual(["shots"]);
+        expect(await fs.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe("test\n");
         const { stdout } = await execAsync("git symbolic-ref HEAD", { cwd: workspacePath });
         expect(stdout.trim()).toBe(`refs/heads/${branchName}`);
       } finally {
