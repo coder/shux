@@ -205,7 +205,12 @@ export class WorktreeManager {
         using checkoutProc = execFileAsync(
           "git",
           ["-C", workspacePath, "checkout", "--progress", "--force", branchName],
-          { ...noHooksEnv, onStderrData: (chunk) => progress.push(chunk) }
+          {
+            ...noHooksEnv,
+            // git delays progress output by 2s, which hides it for most checkouts.
+            env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
+            onStderrData: (chunk) => progress.push(chunk),
+          }
         );
         const { stdout } = await checkoutProc.result;
         for (const line of stdout.split(/[\r\n]/)) {

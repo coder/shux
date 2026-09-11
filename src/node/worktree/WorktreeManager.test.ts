@@ -187,8 +187,6 @@ describe("WorktreeManager.createWorkspace", () => {
           if (file === "git" && args[2] === "checkout") {
             checkoutStarted = true;
             expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
-            options?.onStderrData?.("Updating files: 25% (1/4)\rUpdating fi");
-            options?.onStderrData?.("les: 100% (4/4), done.\n");
           }
           const proc = realExecFile(file, args, options);
           if (file === "git" && args[2] === "worktree" && args[3] === "add") {
@@ -245,12 +243,13 @@ describe("WorktreeManager.createWorkspace", () => {
         expect(existsSync(hookMarker)).toBe(false);
         expect(stdout).toContain("worktree metadata ready");
         expect(stderr.some((line) => line.includes("Preparing worktree"))).toBe(true);
-        expect(stderr).toContain("Updating files: 100% (4/4), done.");
+        // Real git progress: a one-file checkout only reports progress because the
+        // checkout disables git's 2s progress delay.
+        expect(stderr.some((line) => /^Updating files: 100% \(1\/1\), done\.$/.test(line))).toBe(
+          true
+        );
         expect(stderr.some((line) => line.includes(branchName))).toBe(true);
-        expect(progress).toEqual([
-          ["Updating files", 25],
-          ["Updating files", 100],
-        ]);
+        expect(progress).toEqual([["Updating files", 100]]);
       } finally {
         execSpy.mockRestore();
         await fixture.cleanup();
