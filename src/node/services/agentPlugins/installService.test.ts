@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,8 +7,11 @@ import * as path from "node:path";
 import { Config } from "@/node/config";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as mcpSdk from "@/node/services/mcpClient";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { readMutationEpochToken } from "./journals";
+import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken } from "./journals";
 import * as treeHash from "./treeHash";
 import { readPluginMcpPolicy } from "./registry";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -282,6 +285,8 @@ describe("AgentPluginInstallService", () => {
         keyPrefix: "plugin:",
         readToken: () => readMutationEpochToken(stagingDir()),
         readComponentPolicy: () => readPluginMcpPolicy(registryFile()),
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options }),
         readWorkspaceOverrides: async () =>
           JSON.parse(await fsPromises.readFile(overridesFile, "utf8")) as WorkspaceMCPOverrides,
       },
@@ -649,6 +654,152 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
   });
+
+  test.each(["stdio", "http"] as const)(
+    "named %s admission pins an open policy inode against the real component setter",
+    async (transport) => {
+      if (transport === "http") {
+        await fsPromises.writeFile(
+          path.join(remoteDir, "mcp.json"),
+          JSON.stringify({
+            $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+            mcpServers: { echo: { type: "streamable-http", url: "https://mcp.example.test/echo" } },
+          })
+        );
+        await commitAll(remoteDir, "HTTP fixture");
+      }
+      const preview = await service.preview({ input: remoteDir });
+      const all = { skills: [], mcpServers: ["echo"] };
+      await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+        importedComponents: all,
+      });
+      const inventory = await service.getComponents({ name: "demo-plugin" });
+      const configService = new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+          xumHome: muxRoot,
+          isEnabled: () => true,
+        }),
+      });
+      let finalRead = false;
+      let lockHeld = false;
+      const manager = new MCPServerManager(configService, {
+        pluginInvalidation: {
+          keyPrefix: "plugin:",
+          readToken: () => Promise.resolve(undefined),
+          readComponentPolicy: () => {
+            finalRead = true;
+            return readPluginMcpPolicy(registryFile()).finally(() => {
+              finalRead = false;
+            });
+          },
+          tryAcquireComponentPolicyLock: async (options) => {
+            const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options });
+            lockHeld = true;
+            return async () => {
+              await release();
+              lockHeld = false;
+            };
+          },
+        },
+      });
+      const opened = Promise.withResolvers<void>();
+      const resumeRead = Promise.withResolvers<void>();
+      const launched = Promise.withResolvers<void>();
+      const finishLaunch = Promise.withResolvers<never>();
+      finishLaunch.promise.catch(() => undefined);
+      const writerAttempted = Promise.withResolvers<boolean>();
+      const readFile = fsPromises.readFile;
+      let interceptRead = true;
+      const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.readFile>
+      ) => {
+        if (interceptRead && finalRead && args[0] === registryFile()) {
+          interceptRead = false;
+          const handle = await fsPromises.open(registryFile(), "r");
+          try {
+            opened.resolve();
+            await resumeRead.promise;
+            return await handle.readFile("utf8");
+          } finally {
+            await handle.close();
+          }
+        }
+        return readFile(...args);
+      }) as typeof fsPromises.readFile);
+      let observeWriter = false;
+      const link = fsPromises.link;
+      const linkSpy = spyOn(fsPromises, "link").mockImplementation(async (from, to) => {
+        try {
+          await link(from, to);
+          if (observeWriter && to === path.join(stagingDir(), MUTATION_LOCK_FILE))
+            writerAttempted.resolve(false);
+        } catch (error) {
+          if (observeWriter && to === path.join(stagingDir(), MUTATION_LOCK_FILE))
+            writerAttempted.resolve(true);
+          throw error;
+        }
+      });
+      let setterFinished = false;
+      const initiate = mock(() => {
+        expect(lockHeld).toBe(true);
+        expect(setterFinished).toBe(false);
+        launched.resolve();
+        return finishLaunch.promise;
+      });
+      const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        exec: initiate,
+      } as unknown as Runtime);
+      const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(initiate);
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "echo"
+      );
+      let setter: Promise<unknown> | undefined;
+      const pending = manager.test({ projectPath: muxRoot, name: key });
+      try {
+        await opened.promise;
+        observeWriter = true;
+        setter = service
+          .setComponents({
+            name: "demo-plugin",
+            expectedLockedSha: inventory.lockedSha,
+            expectedContentHash: inventory.contentHash,
+            expectedImportedComponents: all,
+            importedComponents: { skills: [], mcpServers: [] },
+          })
+          .then((result) => {
+            setterFinished = true;
+            return result;
+          });
+        expect(await writerAttempted.promise).toBe(true);
+        expect(initiate).not.toHaveBeenCalled();
+        expect(setterFinished).toBe(false);
+        resumeRead.resolve();
+        await launched.promise;
+        // The setter can finish while the connection is still pending: admission
+        // owns the lock only through the real synchronous exec/client initiation.
+        await setter;
+        expect(lockHeld).toBe(false);
+        expect((await service.getComponents({ name: "demo-plugin" })).importedComponents).toEqual({
+          skills: [],
+          mcpServers: [],
+        });
+        expect(initiate).toHaveBeenCalledTimes(1);
+      } finally {
+        resumeRead.resolve();
+        finishLaunch.reject(new Error("connection probe complete"));
+        await pending;
+        await setter;
+        runtime.mockRestore();
+        client.mockRestore();
+        readSpy.mockRestore();
+        linkSpy.mockRestore();
+        manager.dispose();
+      }
+    }
+  );
 
   test("replacement selections remove, mix, empty, and reject stale baselines without rewriting identity", async () => {
     const preview = await service.preview({ input: remoteDir });

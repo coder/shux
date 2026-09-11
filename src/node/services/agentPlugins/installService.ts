@@ -50,7 +50,6 @@ import {
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -62,7 +61,9 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import {
+  acquirePluginMutationLock,
   bumpContainerMutationEpoch,
+  MUTATION_LOCK_FILE,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
@@ -148,20 +149,8 @@ const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 
-/**
- * Cross-process mutation lock file in the staging root. The in-process
- * mutationQueue serializes one service instance, but two processes sharing
- * the same rootDir (ALLOW_MULTIPLE_INSTANCES, a desktop app alongside `mux
- * server`) each have their own queue: two concurrent mutations could both
- * read the same plugins.json snapshot and the later atomic write would
- * silently drop the earlier one's entry. Every mutation transaction
- * (registry read → directory moves → registry write) holds this lock.
- */
-const MUTATION_LOCK_FILE = "mutation.lock";
 /** How long an acquire waits on a live holder before failing (covers a full clone). */
 const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
-/** Pid-reuse guard: no plugin mutation legitimately runs this long. */
-const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
 
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
@@ -713,12 +702,8 @@ export class AgentPluginInstallService {
     // process sharing rootDir must not interleave its read-modify-write of
     // plugins.json (or its directory moves) with ours.
     const locked = async (): Promise<T> => {
-      const release = await acquireCrossProcessLock({
-        lockPath: path.join(this.stagingRoot, MUTATION_LOCK_FILE),
-        acquireTimeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
-        staleMs: MUTATION_LOCK_STALE_MS,
-        timeoutMessage:
-          "Another Mux process is currently modifying plugins. Wait for it to finish and try again.",
+      const release = await acquirePluginMutationLock(this.config.rootDir, {
+        timeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
       });
       try {
         return await fn();

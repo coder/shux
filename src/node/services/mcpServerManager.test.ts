@@ -9,7 +9,10 @@ import {
   MCP_PROMPT_MAX_TEXT_BYTES,
   MCP_PROMPT_TRUNCATION_MARKER,
 } from "@/common/constants/toolLimits";
-import { MUTATION_EPOCH_UNREADABLE_TOKEN } from "@/node/services/agentPlugins/journals";
+import {
+  acquirePluginMutationLock,
+  MUTATION_EPOCH_UNREADABLE_TOKEN,
+} from "@/node/services/agentPlugins/journals";
 import { readPluginMcpPolicy } from "./agentPlugins/registry";
 import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -22,9 +25,11 @@ import {
   runMCPToolWithDeadline,
   wrapMCPTools,
   type MCPWorkspaceRequestOptions,
+  type MCPServerManagerOptions,
 } from "./mcpServerManager";
 import { MCPConfigService } from "./mcpConfigService";
 import { Config } from "@/node/config";
+import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import type { TelemetryService } from "./telemetryService";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -239,19 +244,25 @@ describe("MCPServerManager", () => {
     await fs.mkdir(path.join(home, "plugins"), { recursive: true });
     const registryPath = path.join(home, "plugins.json");
     const write = async (names: string[]) => {
-      await fs.writeFile(
-        `${registryPath}.tmp`,
-        JSON.stringify({
-          plugins: [createTestPluginInstallEntry("demo", { skills: [], mcpServers: names })],
-        })
-      );
-      await fs.rename(`${registryPath}.tmp`, registryPath);
+      const release = await acquirePluginMutationLock(home, { timeoutMs: 5000 });
+      try {
+        await fs.writeFile(
+          `${registryPath}.tmp`,
+          JSON.stringify({
+            plugins: [createTestPluginInstallEntry("demo", { skills: [], mcpServers: names })],
+          })
+        );
+        await fs.rename(`${registryPath}.tmp`, registryPath);
+      } finally {
+        await release();
+      }
     };
     await write(["remove", "keep"]);
     const configs: Record<string, MCPServerInfo> = { ordinary: stdioConfig("ordinary") };
     for (const name of ["remove", "keep", "added"]) {
       configs[`plugin:instance:${name}`] = {
         ...stdioConfig(name),
+        env: { PLUGIN_DATA: path.join(home, "data", name) },
         plugin: {
           pluginName: "demo",
           serverName: name,
@@ -264,12 +275,15 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() => Promise.resolve({ ...configs }));
     const read = mock(() => readPluginMcpPolicy(registryPath));
     const makeManager = () => {
+      const invalidation: NonNullable<MCPServerManagerOptions["pluginInvalidation"]> = {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve(undefined),
+        readComponentPolicy: read,
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(home, { timeoutMs: 0, ...options }),
+      };
       const instance = new MCPServerManager(configService as unknown as MCPConfigService, {
-        pluginInvalidation: {
-          keyPrefix: "plugin:",
-          readToken: () => Promise.resolve(undefined),
-          readComponentPolicy: read,
-        },
+        pluginInvalidation: invalidation,
       });
       const internals = instance as unknown as MCPServerManagerTestAccess;
       const started: Array<ReturnType<typeof testInstance>> = [];
@@ -286,7 +300,7 @@ describe("MCPServerManager", () => {
         started.push(client);
         return Promise.resolve(client);
       });
-      return { instance, internals, started };
+      return { instance, internals, started, invalidation };
     };
     manager.dispose();
     const local = makeManager();
@@ -698,6 +712,317 @@ describe("MCPServerManager", () => {
       f.started.find((i) => i.name.endsWith(":remove"))!.tools.echo.execute
     ).not.toHaveBeenCalled();
   });
+
+  test.each(["tool", "prompt", "test"] as const)(
+    "managed %s admission fails closed without its writer fence",
+    async (operation) => {
+      using tmp = new DisposableTempDir("mcp-components-missing-fence");
+      const f = await componentFixture(tmp.path);
+      const request = workspaceRequest("missing-fence");
+      const served = await manager.getToolsForWorkspace(request);
+      delete f.invalidation.tryAcquireComponentPolicyLock;
+      const key = "plugin:instance:remove";
+      const toolName = Object.keys(served.toolServerNames).find(
+        (name) => served.toolServerNames[name] === key
+      )!;
+      const exec = mock(() => Promise.reject(new Error("launch reached")));
+      const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        exec,
+      } as unknown as Runtime);
+      try {
+        if (operation === "test") {
+          const result = await manager.test({ projectPath: tmp.path, name: key });
+          expect(result.success).toBe(false);
+          if (result.success) throw new Error("Expected missing fence to deny the test");
+          expect(result.error).toMatch(/unavailable/);
+          expect(exec).not.toHaveBeenCalled();
+        } else {
+          const pending: unknown =
+            operation === "tool"
+              ? served.tools[toolName].execute!(
+                  {},
+                  { toolCallId: "missing-fence", messages: [], context: {} }
+                )
+              : manager.getPrompt(request.workspaceId, key, "review", {});
+          expect(Promise.resolve(pending)).rejects.toThrow(/unavailable/);
+          const client = f.started.find((instance) => instance.name === key)!;
+          expect(client.tools.echo.execute).not.toHaveBeenCalled();
+          expect(client.getPrompt).not.toHaveBeenCalled();
+        }
+        const ordinary = Object.keys(served.toolServerNames).find(
+          (name) => served.toolServerNames[name] === "ordinary"
+        )!;
+        await served.tools[ordinary].execute!(
+          {},
+          { toolCallId: "ordinary", messages: [], context: {} }
+        );
+        expect(
+          f.started.find((instance) => instance.name === "ordinary")!.tools.echo.execute
+        ).toHaveBeenCalledTimes(1);
+      } finally {
+        runtime.mockRestore();
+      }
+    }
+  );
+
+  test.each(["tool", "prompt"] as const)(
+    "%s admission holds the writer lock before opening the final policy inode",
+    async (operation) => {
+      using tmp = new DisposableTempDir("mcp-components-inode");
+      const f = await componentFixture(tmp.path);
+      const overrides = new WorkspaceMcpOverridesService(new Config(tmp.path));
+      let overrideHeld = false;
+      let pluginHeld = false;
+      f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
+      f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+      f.invalidation.acquireOverridesLock = async (options) => {
+        const release = await overrides.acquireExclusiveLock(options);
+        overrideHeld = true;
+        return async () => {
+          await release();
+          overrideHeld = false;
+        };
+      };
+      f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
+        const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0, ...options });
+        pluginHeld = true;
+        return async () => {
+          await release();
+          pluginHeld = false;
+        };
+      };
+      const dispatched = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      const original = access.startSingleServer;
+      access.startSingleServer = async (...args) => {
+        const instance = (await original(...args)) as ReturnType<typeof testInstance>;
+        if (args[0] === "plugin:instance:remove") {
+          const dispatch = () => {
+            expect(pluginHeld).toBe(true);
+            expect(overrideHeld).toBe(true);
+            dispatched.resolve();
+            return finish.promise;
+          };
+          instance.tools.echo = { ...testTool(), execute: () => dispatch().then(() => "ok") };
+          instance.getPrompt = mock(() =>
+            dispatch().then(() => ({
+              messages: [{ role: "user", content: { type: "text", text: "ok" } }],
+            }))
+          );
+        }
+        return instance;
+      };
+      const request = workspaceRequest("inode");
+      const served = await manager.getToolsForWorkspace(request);
+      const toolName = Object.keys(served.toolServerNames).find(
+        (name) => served.toolServerNames[name] === "plugin:instance:remove"
+      )!;
+      const opened = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const readFile = fs.readFile;
+      let intercept = true;
+      const readSpy = spyOn(fs, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fs.readFile>
+      ) => {
+        if (intercept && overrideHeld && args[0] === f.registryPath) {
+          intercept = false;
+          const handle = await fs.open(f.registryPath, "r");
+          try {
+            opened.resolve();
+            await resume.promise;
+            return await handle.readFile("utf8");
+          } finally {
+            await handle.close();
+          }
+        }
+        return readFile(...args);
+      }) as typeof fs.readFile);
+      const pending = Promise.resolve(
+        operation === "tool"
+          ? served.tools[toolName].execute!({}, { toolCallId: "inode", messages: [], context: {} })
+          : manager.getPrompt(request.workspaceId, "plugin:instance:remove", "review", {})
+      );
+      const settled = pending.catch((error: unknown) => error);
+      let writer: Promise<void> | undefined;
+      try {
+        await opened.promise;
+        expect(pluginHeld).toBe(true);
+        expect(acquirePluginMutationLock(tmp.path, { timeoutMs: 0 })).rejects.toThrow();
+        writer = f.write(["keep"]);
+        resume.resolve();
+        await dispatched.promise;
+        await writer;
+        const releaseOverride = await overrides.acquireExclusiveLock({ timeoutMs: 1000 });
+        await releaseOverride();
+        expect(pluginHeld).toBe(false);
+        expect(overrideHeld).toBe(false);
+        finish.resolve();
+        if (operation === "tool") expect(await settled).toBe("ok");
+        else expect(await settled).toBeInstanceOf(Error);
+      } finally {
+        resume.resolve();
+        finish.resolve();
+        await settled;
+        await writer;
+        readSpy.mockRestore();
+      }
+    }
+  );
+
+  test.each(["tool", "prompt"] as const)(
+    "%s contention releases overrides so a plugin writer can prune",
+    async (operation) => {
+      using tmp = new DisposableTempDir("mcp-components-writer-wins");
+      const f = await componentFixture(tmp.path);
+      const key = "plugin:0123456789abcdef:remove";
+      f.configs[key] = f.configs["plugin:instance:remove"];
+      delete f.configs["plugin:instance:remove"];
+      const config = new Config(tmp.path);
+      const workspacePath = path.join(tmp.path, "checkout");
+      const workspaceId = "writer-wins";
+      await fs.mkdir(workspacePath);
+      await config.editConfig((current) => {
+        current.projects.set(workspacePath, {
+          workspaces: [
+            {
+              path: workspacePath,
+              id: workspaceId,
+              name: workspaceId,
+              runtimeConfig: { type: "local" },
+            },
+          ],
+        });
+        return current;
+      });
+      const overrides = new WorkspaceMcpOverridesService(config);
+      await overrides.setOverridesForWorkspace(workspaceId, {
+        enabledServers: [key, "ordinary"],
+      });
+      let releaseWriter: (() => Promise<void>) | undefined;
+      let prune: ReturnType<typeof overrides.prunePluginOverrideKeysForWorkspaces> | undefined;
+      let overrideReleases = 0;
+      f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
+      f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+      f.invalidation.acquireOverridesLock = async (options) => {
+        const release = await overrides.acquireExclusiveLock(options);
+        // The installer wins the plugin lock after preflight; pruning then waits
+        // for the invocation's override fence, the former O -> P -> O cycle.
+        releaseWriter = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
+        prune = overrides.prunePluginOverrideKeysForWorkspaces(
+          [workspaceId],
+          "plugin:0123456789abcdef:"
+        );
+        return async () => {
+          overrideReleases++;
+          await release();
+        };
+      };
+      const request = workspaceRequest(workspaceId);
+      const served = await manager.getToolsForWorkspace(request);
+      const toolName = Object.keys(served.toolServerNames).find(
+        (name) => served.toolServerNames[name] === key
+      )!;
+      try {
+        const pending: unknown =
+          operation === "tool"
+            ? served.tools[toolName].execute!(
+                {},
+                { toolCallId: "writer", messages: [], context: {} }
+              )
+            : manager.getPrompt(workspaceId, key, "review", {});
+        expect(Promise.resolve(pending)).rejects.toThrow(/unavailable.*retry/);
+        expect(overrideReleases).toBe(1);
+        expect(await prune).toEqual([]);
+        expect(
+          (await overrides.getOverridesForWorkspace(workspaceId)).overrides.enabledServers
+        ).toEqual(["ordinary"]);
+        const client = f.started.find((instance) => instance.name === key)!;
+        expect(client.tools.echo.execute).not.toHaveBeenCalled();
+        expect(client.getPrompt).not.toHaveBeenCalled();
+      } finally {
+        await releaseWriter?.();
+        await prune;
+      }
+    }
+  );
+
+  test.each(
+    (["tool", "prompt"] as const).flatMap((operation) =>
+      (["read-error", "read-abort", "read-timeout", "late-acquisition"] as const).map(
+        (failure) => ({ operation, failure })
+      )
+    )
+  )(
+    "$operation component fence releases exactly once on $failure without late dispatch",
+    async ({ operation, failure }) => {
+      using tmp = new DisposableTempDir("mcp-components-release");
+      const f = await componentFixture(tmp.path);
+      const request = workspaceRequest("release");
+      const served = await manager.getToolsForWorkspace(request);
+      const key = "plugin:instance:remove";
+      const toolName = Object.keys(served.toolServerNames).find(
+        (name) => served.toolServerNames[name] === key
+      )!;
+      const controller = new AbortController();
+      const entered = Promise.withResolvers<void>();
+      const resumeAcquisition = Promise.withResolvers<void>();
+      const resumeRead = Promise.withResolvers<void>();
+      const released = Promise.withResolvers<void>();
+      let inFence = false;
+      let releaseCount = 0;
+      const now = spyOn(Date, "now");
+      f.invalidation.tryAcquireComponentPolicyLock = async () => {
+        const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
+        inFence = true;
+        if (failure === "late-acquisition") {
+          entered.resolve();
+          await resumeAcquisition.promise;
+        }
+        return async () => {
+          releaseCount++;
+          await release();
+          released.resolve();
+        };
+      };
+      f.read.mockImplementation(async () => {
+        if (inFence) {
+          entered.resolve();
+          if (failure === "read-error") throw new Error("final policy read failed");
+          if (failure === "read-timeout") now.mockReturnValue(Date.now() + 60_000);
+          if (failure === "read-abort" || failure === "read-timeout") await resumeRead.promise;
+        }
+        return readPluginMcpPolicy(f.registryPath);
+      });
+      const pending = Promise.resolve(
+        operation === "tool"
+          ? served.tools[toolName].execute!(
+              {},
+              { toolCallId: "release", messages: [], context: {}, abortSignal: controller.signal }
+            )
+          : manager.getPrompt(request.workspaceId, key, "review", {}, { signal: controller.signal })
+      );
+      const rejected = pending.catch((error: unknown) => error);
+      try {
+        await entered.promise;
+        if (failure === "read-abort" || failure === "late-acquisition") controller.abort();
+        expect(await rejected).toBeInstanceOf(Error);
+        resumeAcquisition.resolve();
+        await released.promise;
+        resumeRead.resolve();
+        expect(releaseCount).toBe(1);
+        const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
+        await release();
+        const client = f.started.find((instance) => instance.name === key)!;
+        expect(client.tools.echo.execute).not.toHaveBeenCalled();
+        expect(client.getPrompt).not.toHaveBeenCalled();
+      } finally {
+        now.mockRestore();
+        resumeAcquisition.resolve();
+        resumeRead.resolve();
+        await rejected;
+      }
+    }
+  );
 
   test("unavailable component reader fails closed only for managed clients", async () => {
     using tmp = new DisposableTempDir("mcp-components-reader");

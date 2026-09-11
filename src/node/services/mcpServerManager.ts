@@ -1198,6 +1198,11 @@ export interface MCPServerManagerOptions {
     readToken: () => Promise<string | undefined>;
     /** Atomic plugins.json content, independent of tree replacement and override epochs. */
     readComponentPolicy?: () => Promise<PluginMcpPolicy>;
+    /** Same writer lock as plugins.json mutations. Must try once, never queue/wait. */
+    tryAcquireComponentPolicyLock?: (options: {
+      signal?: AbortSignal;
+    }) => Promise<() => Promise<void>>;
+
     /**
      * Disk-authoritative workspace override read. A sibling's uninstall also
      * pruned plugin keys from workspace override FILES; the sweep uses this
@@ -1387,6 +1392,70 @@ export class MCPServerManager {
       log.debug("MCP component policy unavailable", { error });
     }
     return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+  }
+
+  private async withComponentPolicyFence<T>(
+    name: string,
+    info: MCPServerInfo | undefined,
+    dispatch: () => T,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<{ pending: T }> {
+    // Ownership comes from the served provenance, never an unfenced policy read:
+    // a missing registry row must not turn a managed client into a legacy one.
+    const plugin = this.managedPluginServers.get(name) ?? info?.plugin;
+    if (plugin?.componentPolicy === undefined) return { pending: dispatch() };
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    const acquire = this.pluginInvalidation?.tryAcquireComponentPolicyLock;
+    const unavailable = () =>
+      new Error(
+        `MCP server '${name}' is unavailable while plugin components are being updated; retry`
+      );
+    if (read === undefined || acquire === undefined) throw unavailable();
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const checkActive = () => {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt) throw unavailable();
+    };
+    const bounded = async <V>(work: Promise<V>): Promise<V> => {
+      // A pre-aborted race does not subscribe to work; still observe late rejection.
+      work.catch(() => undefined);
+      const result = await raceWithAbortAndTimeout(work, {
+        timeoutMs: Math.max(0, deadlineAt - Date.now()),
+        signal: options.signal,
+      });
+      checkActive();
+      if (result.kind !== "ok") throw unavailable();
+      return result.value;
+    };
+    checkActive();
+    // Overrides are locked first. Uninstall takes the plugin lock and then prunes
+    // overrides, so waiting here would deadlock. A contended try-lock fails closed
+    // and lets the outer finally release overrides; no admission retry loop.
+    const acquisition = acquire({ signal: options.signal });
+    let release: () => Promise<void>;
+    try {
+      release = await bounded(acquisition);
+    } catch {
+      acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+      checkActive();
+      throw unavailable();
+    }
+    try {
+      // Atomic rename alone is insufficient: readFile may still own the old inode.
+      // Hold the writer lock BEFORE opening policy, through synchronous dispatch.
+      checkActive();
+      const policy = await bounded(read());
+      checkActive();
+      if (!this.componentAllowed(name, info, policy))
+        throw new Error(`MCP server '${name}' is disabled by component policy`);
+      const pending = dispatch();
+      // Dispatch may reject before the filesystem releases finish. Observe it now,
+      // but return the original result only after both admission locks are released.
+      Promise.resolve(pending).catch(() => undefined);
+      return { pending };
+    } finally {
+      await release();
+    }
   }
 
   private async refreshComponentPolicy(): Promise<Error | undefined> {
@@ -3954,13 +4023,12 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            const policy =
-              this.pluginInvalidation?.readComponentPolicy !== undefined
-                ? await this.readComponentPolicy()
-                : undefined;
-            if (!this.componentAllowed(serverName, undefined, policy))
-              throw new Error(`MCP server '${serverName}' is disabled`);
-            pending = dispatch();
+            ({ pending } = await this.withComponentPolicyFence(
+              serverName,
+              undefined,
+              dispatch,
+              options
+            ));
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
             // abort race cannot stop this callback, so a stalled home filesystem
@@ -3990,13 +4058,10 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
-              const policy =
-                this.pluginInvalidation?.readComponentPolicy !== undefined
-                  ? await this.readComponentPolicy()
-                  : undefined;
-              if (!this.componentAllowed(serverName, undefined, policy))
-                throw new Error(`MCP server '${serverName}' is disabled`);
-              pending = dispatch();
+              ({ pending } = await this.withComponentPolicyFence(serverName, undefined, dispatch, {
+                signal: options?.signal,
+                timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+              }));
             } finally {
               await release();
             }
@@ -4401,17 +4466,14 @@ export class MCPServerManager {
       ): Promise<MCPTestResult> => {
         // Admit the named test after disk/OAuth preparation, before its connection
         // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
-        const plugin = this.managedPluginServers.get(trimmedName) ?? server.plugin;
-        if (
-          plugin?.componentPolicy !== undefined &&
-          !this.componentAllowed(trimmedName, server, await this.readComponentPolicy())
-        ) {
-          return {
-            success: false,
-            error: `MCP server '${trimmedName}' is disabled by component policy`,
-          };
+        try {
+          const { pending } = await this.withComponentPolicyFence(trimmedName, server, () =>
+            runServerTest(launch, projectPath, `server "${trimmedName}"`)
+          );
+          return await pending;
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
         }
-        return runServerTest(launch, projectPath, `server "${trimmedName}"`);
       };
       if (server.transport === "stdio") {
         const launch = await prepareStdioLaunch(server);
@@ -4889,22 +4951,23 @@ export class MCPServerManager {
             }
             return "dispatch";
           };
-          const componentPolicy =
-            this.pluginInvalidation?.readComponentPolicy !== undefined
-              ? await bounded(this.readComponentPolicy())
-              : undefined;
-          if (!this.componentAllowed(serverName, servedInfo, componentPolicy))
-            throw revoked(`server '${serverName}'`);
           if (decide() === "retry") {
             continue;
           }
+          // Recheck live authorization synchronously after the fenced read.
+          const dispatch = (): Promise<unknown> | "retry" =>
+            decide() === "retry" ? "retry" : Promise.resolve(originalExecute(args, context));
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            // No cross-process writers to fence: the checks above ran in the
-            // same synchronous block as this invocation start.
-            const result: unknown = await Promise.resolve(originalExecute(args, context));
-            return result;
+            const { pending } = await this.withComponentPolicyFence(
+              serverName,
+              servedInfo,
+              dispatch,
+              { signal: abortSignal, timeoutMs: remainingMs() }
+            );
+            if (pending === "retry") continue;
+            return await pending;
           }
           // Cross-process fence. The bracket's postflight epoch read and this
           // invocation are separated by promise continuations, and a sibling
@@ -4934,7 +4997,7 @@ export class MCPServerManager {
             acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
             throw error;
           }
-          let pending: Promise<unknown> | undefined;
+          let pending: Promise<unknown> | "retry";
           try {
             const epochNow = await bounded(readOverridesEpoch());
             if (
@@ -4946,21 +5009,14 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
-            const componentPolicy =
-              this.pluginInvalidation?.readComponentPolicy !== undefined
-                ? await bounded(this.readComponentPolicy())
-                : undefined;
-            if (!this.componentAllowed(serverName, servedInfo, componentPolicy))
-              throw revoked(`server '${serverName}'`);
-            // Process-local state may have moved during the two awaits above.
-            if (decide() === "retry") {
-              continue;
-            }
-            // Synchronous from the last check to the invocation start, under the lock.
-            pending = Promise.resolve(originalExecute(args, context));
+            ({ pending } = await this.withComponentPolicyFence(serverName, servedInfo, dispatch, {
+              signal: abortSignal,
+              timeoutMs: remainingMs(),
+            }));
           } finally {
             await release();
           }
+          if (pending === "retry") continue;
           return await pending;
         }
         throw new Error(
