@@ -263,13 +263,18 @@ describe("WorktreeManager.createWorkspace", () => {
       const fixture = await createWorktreeManagerFixture({
         existingBranchName: existing ? branchName : undefined,
       });
+      const stdout: string[] = [];
       const stderr: string[] = [];
       try {
+        // Several files so git reports checkout progress before the filter fails.
+        for (const name of ["a", "b", "c", "d"]) {
+          await fsPromises.writeFile(path.join(fixture.projectPath, `${name}.txt`), name);
+        }
         await fsPromises.writeFile(
           path.join(fixture.projectPath, ".gitattributes"),
           "README.md filter=fail\n"
         );
-        execFileSync("git", ["add", ".gitattributes"], {
+        execFileSync("git", ["add", "-A"], {
           cwd: fixture.projectPath,
           stdio: "ignore",
         });
@@ -295,12 +300,23 @@ describe("WorktreeManager.createWorkspace", () => {
           trunkBranch: "main",
           skipRemoteSync: true,
           trusted: true,
-          initLogger: { ...fixture.initLogger, logStderr: (line) => stderr.push(line) },
+          initLogger: {
+            ...fixture.initLogger,
+            logStdout: (line) => stdout.push(line),
+            logStderr: (line) => stderr.push(line),
+          },
         });
         expect(result.success).toBe(false);
         if (result.success) throw new Error("Expected checkout to fail");
         expect(result.error).toContain("smudge filter fail failed");
-        expect(stderr.some((line) => line.includes("smudge filter fail failed"))).toBe(true);
+        // Git's diagnostics are classified once by the exit status: as error output, not
+        // streamed as output first and repeated as error afterwards.
+        const diagnostic = (line: string) => line.includes("external filter");
+        expect(stderr.filter(diagnostic)).toHaveLength(2);
+        expect(stdout.filter(diagnostic)).toEqual([]);
+        expect(stderr.filter((line) => line.includes("smudge filter fail failed"))).toHaveLength(1);
+        // Progress separators never leak into a logged line.
+        expect([...stdout, ...stderr].some((line) => line.includes("\r"))).toBe(false);
         const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
         expect(existsSync(workspacePath)).toBe(false);
         expect(

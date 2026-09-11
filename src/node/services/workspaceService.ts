@@ -3120,7 +3120,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await runtime.materializeWorkspace(initParams, args.pending);
     } catch (error) {
       log.error(`Workspace checkout failed for ${workspaceId}:`, { error });
-      initParams.initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+      const [summary, ...details] = getErrorMessage(error).split(/\r?\n/);
+      initParams.initLogger.logStderr(`Initialization failed: ${summary}`);
+      for (const line of details) {
+        if (line) initParams.initLogger.logStderr(line);
+      }
       initParams.initLogger.logComplete(-1);
       return;
     }

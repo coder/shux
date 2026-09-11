@@ -402,6 +402,49 @@ describeIntegration("Workspace init hook", () => {
   );
 
   test.concurrent(
+    "reports a failed deferred checkout on the card and keeps the workspace",
+    async () => {
+      const env = await createTestEnvironment();
+      const execAsync = promisify(exec);
+      const tempGitRepo = await createTempGitRepoWithInitHook({ exitCode: 0 });
+      await fs.writeFile(path.join(tempGitRepo, ".gitattributes"), "README.md filter=fail\n");
+      await execAsync(
+        "git add -A && git commit -m 'require checkout filter' && git config filter.fail.smudge 'exit 1' && git config filter.fail.required true",
+        { cwd: tempGitRepo }
+      );
+
+      try {
+        const branchName = generateBranchName("deferred-checkout-failure");
+        const createResult = await createWorkspace(env, tempGitRepo, branchName);
+        expect(createResult.success).toBe(true);
+        if (!createResult.success) return;
+
+        const initEvents = await waitForInitEnd(env, createResult.metadata.id, 10000);
+        const endEvent = initEvents.find(isInitEnd);
+        expect(endEvent?.exitCode).toBe(-1);
+        const errorLines = initEvents
+          .filter((e): e is Extract<WorkspaceInitEvent, { type: "init-output" }> => isInitOutput(e))
+          .filter((e) => e.isError === true)
+          .map((e) => e.line);
+        expect(
+          errorLines.filter((line) => line.includes("smudge filter fail failed"))
+        ).toHaveLength(1);
+        expect(initEvents.filter(isInitOutput).some((e) => /Running init hook/.test(e.line))).toBe(
+          false
+        );
+        // Like a remote sync failure, the workspace stays so the user can inspect and remove it.
+        const client = resolveOrpcClient(env);
+        const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
+        expect(info?.id).toBe(createResult.metadata.id);
+      } finally {
+        await cleanupTestEnvironment(env);
+        await cleanupTempGitRepo(tempGitRepo);
+      }
+    },
+    15000
+  );
+
+  test.concurrent(
     "should persist init state to disk for replay across page reloads",
     async () => {
       const env = await createTestEnvironment();

@@ -28,7 +28,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
-import { GitProgressParser } from "./gitProgress";
+import { GitProgressParser, isGitProgressLine } from "./gitProgress";
 
 type GitExecOptions = Pick<ExecFileAsyncOptions, "env" | "signal" | "timeoutMs"> | undefined;
 
@@ -298,9 +298,13 @@ export class WorktreeManager {
     );
 
     initLogger.logStep("Checking out files...");
+    // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
+    // held until the exit status is known so a failure is reported as error output once,
+    // rather than streamed as output and then repeated as the error.
+    const output: string[] = [];
     const progress = new GitProgressParser(
       (stage, percent) => initLogger.logProgress?.(stage, percent),
-      (line) => initLogger.logStdout(line)
+      (line) => output.push(line)
     );
     try {
       // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
@@ -324,11 +328,14 @@ export class WorktreeManager {
         }
       );
       const { stdout } = await checkoutProc.result;
-      for (const line of stdout.split(/[\r\n]/)) {
+      progress.flush();
+      for (const line of [...output, ...stdout.split(/[\r\n]/)]) {
         if (line) initLogger.logStdout(line);
       }
-    } finally {
+    } catch (error) {
       progress.flush();
+      const diagnostics = output.filter((line) => !isGitProgressLine(line));
+      throw new Error(diagnostics.length > 0 ? diagnostics.join("\n") : getErrorMessage(error));
     }
 
     initLogger.logStep("Worktree created successfully");

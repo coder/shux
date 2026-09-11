@@ -1,3 +1,9 @@
+const PROGRESS_LINE = /^(.+?):\s+(\d{1,3})%/;
+
+export function isGitProgressLine(line: string): boolean {
+  return PROGRESS_LINE.test(line);
+}
+
 export class GitProgressParser {
   private buffer = "";
   private lastStage: string | undefined;
@@ -15,7 +21,7 @@ export class GitProgressParser {
     for (let index = 0; index < lines.length; index += 2) {
       const line = lines[index];
       if (!line) continue;
-      const match = /^(.+?):\s+(\d{1,3})%/.exec(line);
+      const match = PROGRESS_LINE.exec(line);
       if (!match) {
         this.onOutput(line);
         continue;
