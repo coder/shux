@@ -308,6 +308,7 @@ export class WorktreeManager {
       // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
       killTreeOnTermination: true,
     };
+    let headMoved = false;
     try {
       // Populate the files while HEAD still holds the branch, so no other worktree can claim it
       // for as long as the checkout streams. Hooks stay off here: the switch below reruns the
@@ -347,6 +348,7 @@ export class WorktreeManager {
         noHooksEnv
       );
       await unbornProc.result;
+      headMoved = true;
       using switchProc = execFileAsync(
         "git",
         ["-C", workspacePath, "checkout", "--no-recurse-submodules", branchName],
@@ -366,12 +368,28 @@ export class WorktreeManager {
       // checkout needs the restore most.
       const restoreOptions = noHooksEnv?.env ? { env: noHooksEnv.env } : undefined;
       try {
-        using restoreProc = execFileAsync(
-          "git",
-          ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/${branchName}`],
-          restoreOptions
-        );
-        await restoreProc.result;
+        if (headMoved) {
+          // If another worktree claimed the branch during that instant, re-attaching would
+          // leave two worktrees on it; detach at the tip instead and let the error report it.
+          const claimedElsewhere = (await this.listWorktreeBlocks(projectPath, restoreOptions))
+            .filter((block) => this.findWorktreeBlockByPath([block], workspacePath) === undefined)
+            .some((block) => this.getWorktreeBranchName(block) === branchName);
+          using restoreProc = execFileAsync(
+            "git",
+            claimedElsewhere
+              ? [
+                  "-C",
+                  workspacePath,
+                  "update-ref",
+                  "--no-deref",
+                  "HEAD",
+                  `refs/heads/${branchName}`,
+                ]
+              : ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/${branchName}`],
+            restoreOptions
+          );
+          await restoreProc.result;
+        }
         using resetProc = execFileAsync(
           "git",
           ["-C", workspacePath, "reset", "--quiet"],
@@ -390,7 +408,7 @@ export class WorktreeManager {
     // Sync gitignored files declared in .xumignore (e.g. .env)
     // before init hooks run so they have access to secrets/config
     initLogger.logStep("Syncing .xumignore files...");
-    await syncXumignoreFiles(projectPath, workspacePath);
+    await syncXumignoreFiles(projectPath, workspacePath, params.abortSignal);
 
     if (pending.fastForwardFromOrigin) {
       await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);

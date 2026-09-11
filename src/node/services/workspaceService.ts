@@ -8933,6 +8933,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         this.initStateManager.clearInMemoryState(workspaceId);
+        // The running record startInit persisted would otherwise read as an app exit on replay.
+        await this.initStateManager.deleteInitStatus(workspaceId);
 
         // Clearing init state prevents init-end from firing (createInitLogger.logComplete() bails when
         // state is missing). If archiving fails before we persist archivedAt (e.g., beforeArchive hook

@@ -74,6 +74,25 @@ describe("syncXumignoreFiles", () => {
     expect(copied).toBe("SECRET=abc\n");
   });
 
+  it("stops on cancellation instead of copying the rest", async () => {
+    await fsPromises.writeFile(path.join(projectPath, ".xumignore"), "!.env\n");
+    const controller = new AbortController();
+    controller.abort();
+
+    const failure = await syncXumignoreFiles(projectPath, worktreePath, controller.signal).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(
+      await fsPromises.access(path.join(worktreePath, ".env")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
   it("falls back to .muxignore when the canonical file is absent", async () => {
     await fsPromises.writeFile(path.join(projectPath, ".muxignore"), "!.env\n");
 

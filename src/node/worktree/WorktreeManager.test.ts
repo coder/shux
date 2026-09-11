@@ -635,6 +635,93 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   }, 20_000);
 
+  it("detaches instead of re-attaching when the branch is claimed during the hook switch", async () => {
+    const branchName = "feature-claimed-in-gap";
+    const fixture = await createWorktreeManagerFixture();
+    const rival = path.join(fixture.rootDir, "rival");
+    const realExecFile = disposableExec.execFileAsync;
+    // Claim the branch from another worktree in the instant HEAD sits on the placeholder.
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExecFile(file, args, options);
+        if (
+          file === "git" &&
+          args.includes("symbolic-ref") &&
+          args.some((arg) => arg.startsWith("refs/heads/xum-unborn-"))
+        ) {
+          const result = proc.result;
+          Object.defineProperty(proc, "result", {
+            value: result.then((output) => {
+              execFileSync("git", ["worktree", "add", "--no-checkout", rival, branchName], {
+                cwd: fixture.projectPath,
+                stdio: "ignore",
+              });
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName,
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger: fixture.initLogger,
+        deferMaterialization: true,
+      });
+      expect(result.success).toBe(true);
+      if (!result.success || !result.workspacePath) throw new Error("Expected reservation");
+
+      const failure = await fixture.manager
+        .materializeWorkspace(
+          {
+            projectPath: fixture.projectPath,
+            workspacePath: result.workspacePath,
+            branchName,
+            trunkBranch: "main",
+            trusted: true,
+            initLogger: fixture.initLogger,
+          },
+          result.pendingMaterialization!
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/already (checked out|used by worktree)/);
+      // The rival keeps the branch alone; this worktree stays usable, detached at the tip.
+      const holders = execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: fixture.projectPath,
+      })
+        .toString()
+        .split("\n\n")
+        .filter((block) => block.includes(`branch refs/heads/${branchName}`))
+        .map((block) => block.split("\n")[0]);
+      expect(holders).toEqual([`worktree ${rival}`]);
+      expect(
+        execFileSync("git", ["rev-parse", "HEAD"], { cwd: result.workspacePath }).toString().trim()
+      ).toBe(
+        execFileSync("git", ["rev-parse", branchName], { cwd: fixture.projectPath })
+          .toString()
+          .trim()
+      );
+      expect(
+        execFileSync("git", ["status", "--porcelain"], { cwd: result.workspacePath }).toString()
+      ).toBe("");
+      expect(await fsPromises.readFile(path.join(result.workspacePath, "README.md"), "utf8")).toBe(
+        "hello\n"
+      );
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("refuses to overwrite files written into the reserved worktree and returns to the branch", async () => {
     const branchName = "feature-stray-file";
     const fixture = await createWorktreeManagerFixture();

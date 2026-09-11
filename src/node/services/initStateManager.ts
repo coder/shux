@@ -42,6 +42,10 @@ export interface InitStatus {
  */
 type InitHookState = InitStatus;
 
+/** Appended when replay finds a creation record that no live init owns (the app exited mid-way). */
+const INTERRUPTED_INIT_LINE =
+  "Workspace creation was interrupted: Xum exited before it finished. Delete and recreate this workspace.";
+
 /**
  * InitStateManager - Manages init hook lifecycle with persistence and replay.
  *
@@ -183,6 +187,13 @@ export class InitStateManager extends EventEmitter {
     };
 
     this.store.setState(workspaceId, state);
+    // Persisted while running so an app exit mid-creation leaves a record for replayInit to
+    // finalize; per-workspace writes are serialized, so endInit's later write lands after it.
+    void this.store.persist(
+      workspaceId,
+      { ...state, lines: [] },
+      { shouldWrite: () => this.store.hasState(workspaceId) }
+    );
 
     // Create completion promise for this init
     // This allows multiple tools to await the same init without event listeners
@@ -379,6 +390,25 @@ export class InitStateManager extends EventEmitter {
    * init state is visible after page reloads.
    */
   async replayInit(workspaceId: string): Promise<void> {
+    if (!this.store.hasState(workspaceId)) {
+      const persisted = await this.store.readPersisted(workspaceId);
+      if (persisted?.status === "running") {
+        // Written by startInit and never finalized, with no live init here: the process that ran
+        // it is gone and the checkout may be empty or partial. Record the failure once so this
+        // and every later replay show the creation as failed.
+        const endTime = Date.now();
+        await this.store.persist(workspaceId, {
+          ...persisted,
+          status: "error",
+          exitCode: -1,
+          endTime,
+          lines: [
+            ...(persisted.lines ?? []),
+            { line: INTERRUPTED_INIT_LINE, isError: true, timestamp: endTime },
+          ],
+        });
+      }
+    }
     // Pass workspaceId as context for serialization
     await this.store.replay(workspaceId, { workspaceId });
   }

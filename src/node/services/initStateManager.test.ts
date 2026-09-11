@@ -192,6 +192,44 @@ describe("InitStateManager", () => {
       expect((events[3] as { exitCode: number }).exitCode).toBe(1);
     });
 
+    it("finalizes an init left running by an earlier process as a failed creation on replay", async () => {
+      const workspaceId = "test-workspace";
+      const events: Array<WorkspaceInitEvent & { workspaceId: string }> = [];
+
+      manager.startInit(workspaceId, "/path/to/hook");
+      manager.appendOutput(workspaceId, "Checking out files...", false, true);
+      // The running record lands asynchronously; a new process would then find it with no
+      // in-memory state.
+      let persisted = await manager.readInitStatus(workspaceId);
+      for (let attempt = 0; persisted === null && attempt < 100; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        persisted = await manager.readInitStatus(workspaceId);
+      }
+      expect(persisted?.status).toBe("running");
+      manager.clearInMemoryState(workspaceId);
+
+      manager.on("init-start", (event: WorkspaceInitEvent & { workspaceId: string }) =>
+        events.push(event)
+      );
+      manager.on("init-output", (event: WorkspaceInitEvent & { workspaceId: string }) =>
+        events.push(event)
+      );
+      manager.on("init-end", (event: WorkspaceInitEvent & { workspaceId: string }) =>
+        events.push(event)
+      );
+
+      await manager.replayInit(workspaceId);
+
+      expect(events.map((event) => event.type)).toEqual(["init-start", "init-output", "init-end"]);
+      expect((events[1] as { isError?: boolean }).isError).toBe(true);
+      expect((events[2] as { exitCode: number }).exitCode).toBe(-1);
+      // Finalized on disk, so the next replay sees the same failed creation.
+      expect((await manager.readInitStatus(workspaceId))?.status).toBe("error");
+      events.length = 0;
+      await manager.replayInit(workspaceId);
+      expect(events.map((event) => event.type)).toEqual(["init-start", "init-output", "init-end"]);
+    });
+
     it("should not replay if no state exists", async () => {
       const workspaceId = "nonexistent-workspace";
       const events: Array<WorkspaceInitEvent & { workspaceId: string }> = [];
@@ -377,14 +415,19 @@ describe("InitStateManager", () => {
       await fs.mkdir(sessionDir, { recursive: true });
 
       let releaseLock: (() => void) | undefined;
+      let lockAcquired: () => void;
+      const lockAcquiredPromise = new Promise<void>((resolve) => {
+        lockAcquired = resolve;
+      });
       const lockHeld = workspaceFileLocks.withLock(workspaceId, async () => {
+        lockAcquired();
         await new Promise<void>((resolve) => {
           releaseLock = resolve;
         });
       });
 
-      // Let the lock callback run so releaseLock is set.
-      await Promise.resolve();
+      // startInit's running-record write is queued ahead of this lock; wait until it is ours.
+      await lockAcquiredPromise;
       if (!releaseLock) {
         throw new Error("Expected workspace file lock to be held");
       }
