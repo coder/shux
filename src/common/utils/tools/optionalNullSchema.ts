@@ -1,5 +1,6 @@
 import { OPTIONAL_PLACEHOLDER_MAX_JUDGED } from "@/common/constants/toolLimits";
 import {
+  JSON_SCHEMA_SUBSET_MAX_DEPTH,
   compileJsonSchemaSubset,
   validateJsonSchemaSubset,
   validateJsonSchemaSubsetSchema,
@@ -7,19 +8,6 @@ import {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
-}
-
-function containsReferenceKeyword(value: unknown): boolean {
-  if (Array.isArray(value)) {
-    return value.some(containsReferenceKeyword);
-  }
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (["$ref", "$dynamicRef", "$recursiveRef"].some((key) => Object.hasOwn(value, key))) {
-    return true;
-  }
-  return Object.values(value).some(containsReferenceKeyword);
 }
 
 function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
@@ -44,8 +32,8 @@ function getRequiredProperties(schema: Record<string, unknown>): Set<string> {
 /**
  * Whether the schema provably rejects `null`. The validator evaluates every
  * keyword it supports (type, enum, const, composition, not, if/then/else), so
- * this is exact for resolvable schemas. A schema with an unresolved reference
- * or outside the supported subset proves nothing, so it does not reject.
+ * this is exact for schemas in its subset. A schema outside it (a reference,
+ * an unknown dialect, too deep) proves nothing, so it does not reject.
  */
 function rejectsNull(schema: unknown): boolean {
   if (schema === true) {
@@ -54,10 +42,10 @@ function rejectsNull(schema: unknown): boolean {
   if (schema === false) {
     return true;
   }
-  if (containsReferenceKeyword(schema) || !validateJsonSchemaSubsetSchema(schema).success) {
-    return false;
-  }
-  return !validateJsonSchemaSubset(schema, null).success;
+  return (
+    validateJsonSchemaSubsetSchema(schema).success &&
+    !validateJsonSchemaSubset(schema, null).success
+  );
 }
 
 function makeNullableSchema(schema: unknown): Record<string, unknown> {
@@ -131,11 +119,14 @@ export function createOptionalNullSchemaContract(
   options: OmissionPlaceholderOptions
 ): OptionalNullSchemaContract {
   const restore = (value: unknown) => stripOmissionPlaceholders(schema, value, options);
-  if (containsReferenceKeyword(schema)) {
-    // Reference resolution is incomplete here, so leave the model schema alone
-    // and let the provider decode without strict mode. `restore` stays: it only
-    // removes placeholders the source schema provably rejects.
-    return { modelSchema: structuredClone(schema), strict: false, restore };
+  if (!validateJsonSchemaSubsetSchema(schema).success) {
+    // The validator cannot judge this schema (a reference, an unknown dialect,
+    // too deep, invalid), so nothing here can either: the model sees the
+    // source schema as is, and the provider decodes without strict mode.
+    // `restore` stays: it only removes placeholders the source schema
+    // provably rejects. The check is bounded, so no walk below runs on a
+    // schema that could overflow it.
+    return { modelSchema: schema, strict: false, restore };
   }
   return { modelSchema: widenOptionalPropertiesToNullable(schema), strict: undefined, restore };
 }
@@ -163,33 +154,12 @@ export function widenOptionalPropertiesToNullable(schema: unknown): unknown {
  * meaning ("clear this field"). Callers never treat required properties as
  * placeholders for the same reason.
  */
-function isOmissionPlaceholder(
-  propertySchema: unknown,
-  value: unknown,
-  options: OmissionPlaceholderOptions
-): boolean {
-  if (value === "") {
-    return options.emptyStringIsOmission;
-  }
-  return value === null && rejectsNull(propertySchema);
-}
-
-/**
- * Compile `schema` into a verdict on instances, so a loop of verdicts pays for
- * the schema once. A schema the validator cannot judge accepts nothing.
- */
-function compileAcceptance(schema: unknown): (value: unknown) => boolean {
-  if (schema === true) {
-    return () => true;
-  }
-  if (schema === false) {
-    return () => false;
-  }
-  return compileJsonSchemaSubset(schema) ?? (() => false);
-}
-
-function schemaAcceptsValue(schema: unknown, value: unknown): boolean {
-  return compileAcceptance(schema)(value);
+interface PlaceholderSite {
+  parent: Record<string, unknown>;
+  name: string;
+  value: null | "";
+  /** Every schema that declares this property; union branches may disagree on null. */
+  declarations: unknown[];
 }
 
 function getUnionBranches(schema: Record<string, unknown>): unknown[] {
@@ -206,168 +176,192 @@ function getAllOfBranches(schema: Record<string, unknown>): unknown[] {
   return Array.isArray(schema.allOf) ? (schema.allOf as unknown[]) : [];
 }
 
-/**
- * Delete the placeholders among this level's declared properties that
- * `context` does not need for this instance. A rejected `null` is deleted
- * outright: the property schema rejects it, so the instance is rejected while
- * it stays. For `""`, the plain reading comes first: every placeholder is an
- * omission, and when the context accepts that, it is the answer. Otherwise the
- * context needs some of them, and which ones depends on the instance (if/then,
- * dependencies, minProperties, a union inside then), so the validator judges
- * one deletion at a time: a deletion that would turn an instance the context
- * accepts into one it rejects is undone. Statically required properties are
- * never placeholders; when the context is outside the validator's subset
- * nothing is accepted, so that list is the only evidence. Cost: the context is
- * compiled once, then at most one verdict per `""` plus two, each linear in
- * the instance; past OPTIONAL_PLACEHOLDER_MAX_JUDGED the `""`s are kept, which
- * never invalidates a valid instance.
- */
-function deleteOmissionPlaceholders(
-  properties: Record<string, unknown>,
-  restored: Record<string, unknown>,
-  context: unknown,
-  options: OmissionPlaceholderOptions
-): void {
-  const alwaysRequired = isRecord(context) ? getRequiredProperties(context) : new Set<string>();
-  const placeholders = Object.entries(properties)
-    .filter(
-      ([propertyName, propertySchema]) =>
-        propertyName in restored &&
-        !alwaysRequired.has(propertyName) &&
-        isOmissionPlaceholder(propertySchema, restored[propertyName], options)
-    )
-    .map(([propertyName]) => propertyName);
-  const emptyStrings: string[] = [];
-  for (const propertyName of placeholders) {
-    if (restored[propertyName] === null) {
-      delete restored[propertyName];
-    } else {
-      emptyStrings.push(propertyName);
-    }
-  }
-  if (emptyStrings.length === 0) {
-    return;
-  }
-  const accepts = compileAcceptance(context);
-  for (const propertyName of emptyStrings) {
-    delete restored[propertyName];
-  }
-  if (accepts(restored)) {
-    return;
-  }
-  for (const propertyName of emptyStrings) {
-    restored[propertyName] = "";
-  }
-  if (emptyStrings.length > OPTIONAL_PLACEHOLDER_MAX_JUDGED) {
-    return;
-  }
-  let accepted = accepts(restored);
-  for (const propertyName of emptyStrings) {
-    delete restored[propertyName];
-    const stillAccepted = accepts(restored);
-    if (accepted && !stillAccepted) {
-      restored[propertyName] = "";
-    } else {
-      accepted = stillAccepted;
-    }
-  }
+/** Sub-schemas that apply to the same instance as `schema`, conditionally or not. */
+function getSameInstanceSubSchemas(schema: Record<string, unknown>): unknown[] {
+  const dependents = [schema.dependentSchemas, schema.dependencies].flatMap((keyword) =>
+    isRecord(keyword) ? Object.values(keyword).filter(isRecord) : []
+  );
+  return [
+    ...getAllOfBranches(schema),
+    ...getUnionBranches(schema),
+    schema.then,
+    schema.else,
+    ...dependents,
+  ];
+}
+
+function getStaticRequired(schema: unknown): Set<string> {
+  return isRecord(schema) ? getRequiredProperties(schema) : new Set<string>();
 }
 
 /**
- * Restore the properties and items this schema node declares directly
- * (including through allOf), then delete the placeholders that `context` does
- * not need for this instance. `context` is the schema in force at this
- * instance level: the node itself, conjoined with the union branches chosen on
- * the way in (see restoreNode). Union branches are the caller's concern.
+ * Walk the schema and payload together and record every declared property
+ * whose value is `null` or `""`, with each schema that declares it: allOf,
+ * anyOf/oneOf branches, then/else, and dependent schemas all apply to the same
+ * instance, so one property can have several declarations. `required` is what
+ * this level requires unconditionally (the node's own list and its allOf's);
+ * those properties are never placeholders. A branch's own `required` is
+ * conditional, so the root verdict judges it instead. The walk is bounded like
+ * the validator's, so a schema too deep to judge is also too deep to restore.
  */
-function restoreStructure(
-  schema: Record<string, unknown>,
+function collectPlaceholderSites(
+  schema: unknown,
   value: unknown,
-  context: unknown,
-  options: OmissionPlaceholderOptions
-): unknown {
+  required: ReadonlySet<string>,
+  path: string,
+  depth: number,
+  sites: Map<string, PlaceholderSite>
+): void {
+  if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH || !isRecord(schema)) {
+    return;
+  }
   if (Array.isArray(value)) {
-    const itemSchema = schema.items;
-    let restored: unknown = Array.isArray(itemSchema)
-      ? value.map((item, index) => restoreNode(itemSchema[index], item, itemSchema[index], options))
-      : value.map((item) => restoreNode(itemSchema, item, itemSchema, options));
-    for (const subSchema of getAllOfBranches(schema)) {
-      restored = restoreNode(subSchema, restored, context, options);
-    }
-    return restored;
-  }
-  if (!isRecord(value)) {
-    return value;
-  }
-  const restored: Record<string, unknown> = { ...value };
-  const properties = isRecord(schema.properties) ? schema.properties : {};
-  for (const [propertyName, propertySchema] of Object.entries(properties)) {
-    // Children first, so this level is judged on restored values.
-    if (propertyName in restored) {
-      restored[propertyName] = restoreNode(
+    value.forEach((item, index) => {
+      const itemSchemas = [
+        Array.isArray(schema.items) ? schema.items[index] : schema.items,
+        Array.isArray(schema.prefixItems) ? schema.prefixItems[index] : undefined,
+      ];
+      for (const itemSchema of itemSchemas) {
+        const itemPath = `${path}/${index}`;
+        collectPlaceholderSites(
+          itemSchema,
+          item,
+          getStaticRequired(itemSchema),
+          itemPath,
+          depth + 1,
+          sites
+        );
+      }
+    });
+  } else if (isRecord(value) && isRecord(schema.properties)) {
+    for (const [name, propertySchema] of Object.entries(schema.properties)) {
+      if (!(name in value)) {
+        continue;
+      }
+      const propertyPath = `${path}/${name}`;
+      const propertyValue = value[name];
+      if (!required.has(name) && (propertyValue === null || propertyValue === "")) {
+        const site = sites.get(propertyPath) ?? {
+          parent: value,
+          name,
+          value: propertyValue,
+          declarations: [],
+        };
+        site.declarations.push(propertySchema);
+        sites.set(propertyPath, site);
+      }
+      collectPlaceholderSites(
         propertySchema,
-        restored[propertyName],
-        propertySchema,
-        options
+        propertyValue,
+        getStaticRequired(propertySchema),
+        propertyPath,
+        depth + 1,
+        sites
       );
     }
   }
-  deleteOmissionPlaceholders(properties, restored, context, options);
-  let result: unknown = restored;
-  for (const subSchema of getAllOfBranches(schema)) {
-    result = restoreNode(subSchema, result, context, options);
+  for (const subSchema of getSameInstanceSubSchemas(schema)) {
+    collectPlaceholderSites(subSchema, value, required, path, depth + 1, sites);
   }
-  return result;
 }
 
-function restoreNode(
-  schema: unknown,
-  value: unknown,
-  context: unknown,
-  options: OmissionPlaceholderOptions
-): unknown {
-  if (!isRecord(schema)) {
-    return value;
+/**
+ * Compile `schema` into a verdict on instances, so a loop of verdicts pays for
+ * the schema once. A schema the validator cannot judge accepts nothing.
+ */
+function compileAcceptance(schema: unknown): (value: unknown) => boolean {
+  if (schema === true) {
+    return () => true;
   }
-  const branches = getUnionBranches(schema);
-  if (branches.length === 0) {
-    return restoreStructure(schema, value, context, options);
+  if (schema === false) {
+    return () => false;
   }
-
-  // A union requires nothing until a branch is chosen, and a branch that
-  // accepts the raw value gives that value meaning (an explicit null a nullable
-  // branch allows, a "" a branch requires). So try the raw-accepting branches
-  // first; for each candidate branch, conjoin it with the context so its
-  // constraints apply while restoring this level and the branch's own
-  // structure. The first branch that accepts its candidate wins.
-  const rawAccepting = branches.filter((branch) => schemaAcceptsValue(branch, value));
-  const ordered = [...rawAccepting, ...branches.filter((branch) => !rawAccepting.includes(branch))];
-  for (const branch of ordered) {
-    const branchContext = { allOf: [context, branch] };
-    const candidate = restoreNode(
-      branch,
-      restoreStructure(schema, value, branchContext, options),
-      branchContext,
-      options
-    );
-    if (schemaAcceptsValue(branch, candidate)) {
-      return candidate;
-    }
-  }
-  // No candidate satisfies its branch. Never turn a valid payload into an
-  // invalid one: keep a raw value some branch accepted, else strip best-effort.
-  return rawAccepting.length > 0 ? value : restoreStructure(schema, value, context, options);
+  return compileJsonSchemaSubset(schema) ?? (() => false);
 }
 
 /**
  * Restore a third-party executor contract from a model payload by removing the
  * placeholder values the model used for omitted optional properties (see
- * isOmissionPlaceholder). Required properties and source-nullable values stay.
+ * PlaceholderSite). Required properties and source-nullable values stay.
+ *
+ * Whether a placeholder may go is a question about the whole payload, because
+ * a constraint can come from any ancestor (a root `then` that requires a
+ * nested property, `dependencies`, `minProperties`, a union inside `then`, a
+ * union branch whose sibling declares the property nullable), so the root
+ * schema judges. A `null` every declaration rejects is deleted outright: the
+ * payload is rejected while it stays. Then the plain reading comes first:
+ * every `""` is an omission, and when the root accepts that, it is the answer,
+ * with any remaining `null` standing where the schema accepts it. Otherwise
+ * the remaining `null`s go too, and if that is not accepted either, each
+ * placeholder is judged alone: a `null` stays while the payload is accepted, a
+ * deletion that would turn an accepted payload into a rejected one is undone.
+ * Cost: the root is compiled once, then at most one verdict per judged
+ * placeholder plus three, each linear in the payload; past
+ * OPTIONAL_PLACEHOLDER_MAX_JUDGED they are kept, which never invalidates a
+ * valid payload. A root the validator cannot judge accepts nothing, so only
+ * the static `required` lists protect a `""` there.
  */
 export function stripOmissionPlaceholders(
   schema: unknown,
   value: unknown,
   options: OmissionPlaceholderOptions
 ): unknown {
-  return restoreNode(schema, value, schema, options);
+  const restored: unknown = structuredClone(value);
+  const sites = new Map<string, PlaceholderSite>();
+  collectPlaceholderSites(schema, restored, getStaticRequired(schema), "", 0, sites);
+  const emptyStrings: PlaceholderSite[] = [];
+  const nulls: PlaceholderSite[] = [];
+  for (const site of sites.values()) {
+    if (site.value === "") {
+      if (options.emptyStringIsOmission) {
+        emptyStrings.push(site);
+      }
+      continue;
+    }
+    const rejecting = site.declarations.filter(rejectsNull).length;
+    if (rejecting === site.declarations.length) {
+      delete site.parent[site.name];
+    } else if (rejecting > 0) {
+      nulls.push(site);
+    }
+  }
+  const judged = [...nulls, ...emptyStrings];
+  if (judged.length === 0) {
+    return restored;
+  }
+  const accepts = compileAcceptance(schema);
+  for (const site of emptyStrings) {
+    delete site.parent[site.name];
+  }
+  if (accepts(restored)) {
+    return restored;
+  }
+  if (nulls.length > 0) {
+    for (const site of nulls) {
+      delete site.parent[site.name];
+    }
+    if (accepts(restored)) {
+      return restored;
+    }
+  }
+  for (const site of judged) {
+    site.parent[site.name] = site.value;
+  }
+  if (judged.length > OPTIONAL_PLACEHOLDER_MAX_JUDGED) {
+    return restored;
+  }
+  let accepted = accepts(restored);
+  for (const site of judged) {
+    if (site.value === null && accepted) {
+      continue;
+    }
+    delete site.parent[site.name];
+    const stillAccepted = accepts(restored);
+    if (accepted && !stillAccepted) {
+      site.parent[site.name] = site.value;
+    } else {
+      accepted = stillAccepted;
+    }
+  }
+  return restored;
 }

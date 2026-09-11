@@ -48,7 +48,7 @@ export const MCP_MEDIA_TYPE_MAX_BYTES = 255;
 
 // Restoring a third-party tool payload judges each optional "" the schema may
 // still need with one validator verdict, each linear in the payload. Beyond
-// this many such placeholders in one object, they are all kept instead: a
+// this many such placeholders in one payload, they are all kept instead: a
 // valid payload stays valid, and a server-authored schema cannot make one tool
 // call block the main process for seconds.
 export const OPTIONAL_PLACEHOLDER_MAX_JUDGED = 256;

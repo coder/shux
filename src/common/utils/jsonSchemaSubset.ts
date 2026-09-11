@@ -1,4 +1,7 @@
 import Ajv, { type AnySchema, type ErrorObject, type ValidateFunction } from "ajv";
+import Ajv2019 from "ajv/dist/2019";
+import Ajv2020 from "ajv/dist/2020";
+import type AjvCore from "ajv/dist/core";
 
 export interface JsonSchemaValidationError {
   path: string;
@@ -18,10 +21,74 @@ export function formatJsonSchemaValidationErrors(
   return visibleErrors.map((error) => `${error.path}: ${error.message}`).join("; ");
 }
 
+/**
+ * Deepest schema nesting the validator walks. Every traversal of a schema in
+ * this module and its callers is bounded by this, so a third-party schema
+ * cannot overflow the stack before it is judged.
+ */
+export const JSON_SCHEMA_SUBSET_MAX_DEPTH = 64;
+
+/**
+ * The dialects this validator speaks. A schema is judged in the dialect its
+ * `$schema` declares: draft-07 Ajv would silently ignore 2020-12 keywords such
+ * as `dependentRequired` and `prefixItems`, and a verdict in the wrong dialect
+ * is worse than none. Draft-06 is judged as draft-07, which only adds
+ * keywords. An undeclared dialect is draft-07, the default of the JSON Schema
+ * emitters this app meets (zod v3, OpenAPI tooling).
+ */
+type Dialect = "draft-07" | "2019-09" | "2020-12";
+
+const DIALECT_BY_SCHEMA_URI = new Map<string, Dialect>([
+  ["json-schema.org/draft-06/schema", "draft-07"],
+  ["json-schema.org/draft-07/schema", "draft-07"],
+  ["json-schema.org/draft/2019-09/schema", "2019-09"],
+  ["json-schema.org/draft/2020-12/schema", "2020-12"],
+]);
+
 // Ajv compiles schemas for this module; it is not their registry
 // (`addUsedSchema: false`). Compiled validators are looked up by schema text
 // below, never by `$id`.
-const ajv = new Ajv({ allErrors: true, strict: false, validateSchema: true, addUsedSchema: false });
+const AJV_OPTIONS = { allErrors: true, strict: false, validateSchema: true, addUsedSchema: false };
+const validators: Record<Dialect, AjvCore> = {
+  "draft-07": new Ajv(AJV_OPTIONS),
+  "2019-09": new Ajv2019(AJV_OPTIONS),
+  "2020-12": new Ajv2020(AJV_OPTIONS),
+};
+
+function getDialect(schema: Record<string, unknown>): Dialect | null {
+  if (schema.$schema === undefined) {
+    return "draft-07";
+  }
+  if (typeof schema.$schema !== "string") {
+    return null;
+  }
+  const uri = schema.$schema.replace(/^https?:\/\//u, "").replace(/#$/u, "");
+  return DIALECT_BY_SCHEMA_URI.get(uri) ?? null;
+}
+
+/** A schema as its dialect's Ajv sees it (see toValidatorTarget). */
+interface ValidatorTarget {
+  dialect: Dialect;
+  ajv: AjvCore;
+  schema: Record<string, unknown>;
+}
+
+/**
+ * `$schema` and `$id` describe the schema document, not the instance:
+ * `$schema` selects the dialect, and `$id` is an identity in Ajv's shared
+ * registry, where a third-party value can collide with a meta-schema or delete
+ * it when the compiled schema is released. `$ref` is rejected, so neither
+ * keyword affects validation once the dialect is chosen. Null when the dialect
+ * is one this validator does not speak.
+ */
+function toValidatorTarget(schema: Record<string, unknown>): ValidatorTarget | null {
+  const dialect = getDialect(schema);
+  if (dialect == null) {
+    return null;
+  }
+  const { $schema, $id, ...structure } = schema;
+  return { dialect, ajv: validators[dialect], schema: structure };
+}
 
 // Compiled validators are reused by schema text so repeated validation of one
 // schema skips Ajv code generation. Schemas can come from third parties (an MCP
@@ -31,23 +98,14 @@ const ajv = new Ajv({ allErrors: true, strict: false, validateSchema: true, addU
 const VALIDATOR_CACHE_MAX_ENTRIES = 512;
 const validatorCache = new Map<string, ValidateFunction>();
 
-/**
- * The schema as Ajv sees it. `$schema` and `$id` describe the schema document,
- * not the instance: `$schema` names a dialect this Ajv instance may not know
- * (zod v4 emits 2020-12, which would throw), and `$id` is an identity in Ajv's
- * shared registry, where a third-party value can collide with a meta-schema or
- * delete it when the compiled schema is released. `$ref` is rejected, so
- * neither keyword affects validation.
- */
-function toValidatorSchema(schema: Record<string, unknown>): Record<string, unknown> {
-  const { $schema, $id, ...validatorSchema } = schema;
-  return validatorSchema;
-}
+type CompiledJsonSchema =
+  | { success: true; validate: ValidateFunction }
+  | { success: false; errors: JsonSchemaValidationError[] };
 
-export function validateJsonSchemaSubsetSchema(
+function compileJsonSchema(
   schema: unknown,
   options?: { requireObjectSchema?: boolean }
-): JsonSchemaSubsetValidationResult {
+): CompiledJsonSchema {
   if (!isPlainRecord(schema)) {
     return { success: false, errors: [{ path: "$", message: "Schema must be an object" }] };
   }
@@ -67,22 +125,38 @@ export function validateJsonSchemaSubsetSchema(
   if (refError != null) {
     return { success: false, errors: [refError] };
   }
+  const target = toValidatorTarget(schema);
+  if (target == null) {
+    return {
+      success: false,
+      errors: [{ path: "$.$schema", message: "Unsupported JSON Schema dialect" }],
+    };
+  }
 
   try {
-    if (!ajv.validateSchema(toValidatorSchema(schema))) {
+    if (!target.ajv.validateSchema(target.schema)) {
       return {
         success: false,
-        errors: normalizeAjvErrors(ajv.errors ?? [], undefined, schema, { schemaErrors: true }),
+        errors: normalizeAjvErrors(target.ajv.errors ?? [], undefined, schema, {
+          schemaErrors: true,
+        }),
       };
     }
-    compileSchema(schema);
-    return { success: true };
+    return { success: true, validate: compileSchema(target) };
   } catch (error) {
     return {
       success: false,
       errors: [{ path: "$", message: error instanceof Error ? error.message : "Invalid schema" }],
     };
   }
+}
+
+export function validateJsonSchemaSubsetSchema(
+  schema: unknown,
+  options?: { requireObjectSchema?: boolean }
+): JsonSchemaSubsetValidationResult {
+  const compiled = compileJsonSchema(schema, options);
+  return compiled.success ? { success: true } : compiled;
 }
 
 /**
@@ -92,10 +166,11 @@ export function validateJsonSchemaSubsetSchema(
  * validateJsonSchemaSubsetSchema).
  */
 export function compileJsonSchemaSubset(schema: unknown): ((value: unknown) => boolean) | null {
-  if (!validateJsonSchemaSubsetSchema(schema).success) {
+  const compiled = compileJsonSchema(schema);
+  if (!compiled.success) {
     return null;
   }
-  const validate = compileSchema(schema);
+  const validate = compiled.validate;
   return (value) => validate(value);
 }
 
@@ -103,22 +178,21 @@ export function validateJsonSchemaSubset(
   schema: unknown,
   value: unknown
 ): JsonSchemaSubsetValidationResult {
-  const schemaValidation = validateJsonSchemaSubsetSchema(schema);
-  if (!schemaValidation.success) {
-    return schemaValidation;
+  const compiled = compileJsonSchema(schema);
+  if (!compiled.success) {
+    return compiled;
   }
-
-  const validate = compileSchema(schema);
-  if (validate(value)) {
+  if (compiled.validate(value)) {
     return { success: true };
   }
-
-  return { success: false, errors: normalizeAjvErrors(validate.errors ?? [], value, schema) };
+  return {
+    success: false,
+    errors: normalizeAjvErrors(compiled.validate.errors ?? [], value, schema),
+  };
 }
 
-function compileSchema(schema: unknown): ValidateFunction {
-  const validatorSchema = isPlainRecord(schema) ? toValidatorSchema(schema) : schema;
-  const key = JSON.stringify(validatorSchema);
+function compileSchema(target: ValidatorTarget): ValidateFunction {
+  const key = `${target.dialect}\n${JSON.stringify(target.schema)}`;
   const cached = validatorCache.get(key);
   if (cached != null) {
     // Re-insert so Map iteration order doubles as recency order.
@@ -128,11 +202,11 @@ function compileSchema(schema: unknown): ValidateFunction {
   }
   let validate: ValidateFunction;
   try {
-    validate = ajv.compile(validatorSchema as AnySchema);
+    validate = target.ajv.compile(target.schema as AnySchema);
   } finally {
     // Ajv caches every schema object it compiles; `$ref` is rejected above, so
     // the compiled closure stands alone and only this module's map retains it.
-    ajv.removeSchema(validatorSchema as AnySchema);
+    target.ajv.removeSchema(target.schema as AnySchema);
   }
   validatorCache.set(key, validate);
   if (validatorCache.size > VALIDATOR_CACHE_MAX_ENTRIES) {
@@ -248,12 +322,16 @@ function unescapePointer(part: string): string {
   return part.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
+// Reference resolution is not implemented, so a schema that uses any reference
+// keyword is outside the subset.
+const REFERENCE_KEYWORDS = ["$ref", "$dynamicRef", "$recursiveRef"] as const;
+
 function findRefKeyword(
   schema: unknown,
   path: string,
   depth: number
 ): JsonSchemaValidationError | null {
-  if (depth > 64) {
+  if (depth > JSON_SCHEMA_SUBSET_MAX_DEPTH) {
     return { path, message: "Schema is too deeply nested" };
   }
   if (Array.isArray(schema)) {
@@ -266,8 +344,10 @@ function findRefKeyword(
   if (!isPlainRecord(schema)) {
     return null;
   }
-  if (Object.hasOwn(schema, "$ref")) {
-    return { path, message: "$ref is not supported in workflow schemas" };
+  for (const keyword of REFERENCE_KEYWORDS) {
+    if (Object.hasOwn(schema, keyword)) {
+      return { path, message: `${keyword} is not supported` };
+    }
   }
   for (const [key, value] of Object.entries(schema)) {
     const error = findRefKeyword(value, `${path}.${key}`, depth + 1);

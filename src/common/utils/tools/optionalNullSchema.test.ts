@@ -194,6 +194,31 @@ describe("optional null JSON Schema contract", () => {
     expect(restoreMcp(source, { value: null })).toEqual({ value: null });
   });
 
+  test("judges a null by the union branch in force when branches disagree on nullability", () => {
+    const source = {
+      oneOf: [
+        {
+          type: "object",
+          required: ["kind", "value"],
+          properties: { kind: { const: "nullable" }, value: { type: ["string", "null"] } },
+          additionalProperties: false,
+        },
+        {
+          type: "object",
+          required: ["kind"],
+          properties: { kind: { const: "optional" }, value: { type: "string" } },
+          additionalProperties: false,
+        },
+      ],
+    };
+
+    expect(restoreMcp(source, { kind: "nullable", value: null })).toEqual({
+      kind: "nullable",
+      value: null,
+    });
+    expect(restoreMcp(source, { kind: "optional", value: null })).toEqual({ kind: "optional" });
+  });
+
   test("restores optional placeholders inside the union branch that accepts the raw value", () => {
     const source = {
       anyOf: [
@@ -365,7 +390,7 @@ describe("optional null JSON Schema contract", () => {
     });
   });
 
-  test("keeps the raw shape when stripping would only switch to a sibling branch", () => {
+  test("prefers the plain reading when the schema accepts both readings", () => {
     const source = {
       type: "object",
       required: ["kind"],
@@ -377,8 +402,13 @@ describe("optional null JSON Schema contract", () => {
     };
 
     // The raw value satisfies the first branch, which requires `message`; the
-    // stripped value would satisfy the second. The raw match wins.
-    expect(restoreMcp(source, { kind: "a", message: "" })).toEqual({ kind: "a", message: "" });
+    // stripped value satisfies the second. An optional "" is an omission
+    // whenever the schema accepts the omission.
+    expect(restoreMcp(source, { kind: "a", message: "" })).toEqual({ kind: "a" });
+    // Without the second branch, the "" is what keeps the payload valid.
+    expect(restoreMcp({ ...source, oneOf: [source.oneOf[0]] }, { kind: "a", message: "" })).toEqual(
+      { kind: "a", message: "" }
+    );
   });
 
   test.each(["allOf", "anyOf"] as const)(
@@ -494,15 +524,66 @@ describe("optional null JSON Schema contract", () => {
     expect(Object.keys(restoreMcp(source, judged) as object)).toHaveLength(2);
   });
 
-  test("restores payloads for a schema that declares a dialect the validator does not load", () => {
+  test("keeps a placeholder that an ancestor condition requires", () => {
+    const source = {
+      type: "object",
+      properties: {
+        mode: { type: "string" },
+        config: { type: "object", properties: { query: { type: "string" } } },
+      },
+      if: { properties: { mode: { const: "search" } }, required: ["mode"] },
+      then: { properties: { config: { required: ["query"] } } },
+    };
+
+    expect(restoreMcp(source, { mode: "search", config: { query: "" } })).toEqual({
+      mode: "search",
+      config: { query: "" },
+    });
+    expect(restoreMcp(source, { mode: "recent", config: { query: "" } })).toEqual({
+      mode: "recent",
+      config: {},
+    });
+  });
+
+  test("judges the payload in the dialect the schema declares", () => {
     const source = {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
       properties: { a: { type: "string" }, b: { type: "string" } },
-      required: ["a"],
+      dependentRequired: { a: ["b"] },
     };
 
-    expect(restoreMcp(source, { a: "", b: "" })).toEqual({ a: "" });
+    expect(restoreMcp(source, { a: "x", b: "" })).toEqual({ a: "x", b: "" });
+    // Without the declaration the schema is draft-07, where `dependentRequired`
+    // does not exist, so `b` is a plain omission.
+    const { $schema: _dialect, ...draft07 } = source;
+    expect(restoreMcp(draft07, { a: "x", b: "" })).toEqual({ a: "x" });
+  });
+
+  test("leaves a schema in a dialect the validator does not speak alone", () => {
+    const source = {
+      $schema: "http://json-schema.org/draft-04/schema#",
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" } },
+      required: ["a"],
+    };
+    const contract = createOptionalNullSchemaContract(source, MCP);
+
+    expect(contract.strict).toBe(false);
+    expect(contract.modelSchema).toEqual(source);
+    expect(contract.restore({ a: "", b: "" })).toEqual({ a: "" });
+  });
+
+  test("leaves a schema too deep to judge alone without walking it", () => {
+    let source: Record<string, unknown> = { type: "string" };
+    for (let depth = 0; depth < 100_000; depth++) {
+      source = { type: "object", properties: { a: source } };
+    }
+    const contract = createOptionalNullSchemaContract(source, MCP);
+
+    expect(contract.strict).toBe(false);
+    expect(contract.modelSchema).toBe(source);
+    expect(contract.restore({ a: { a: "" } })).toEqual({ a: {} });
   });
 
   test("falls back to the required list when the schema is outside the validator subset", () => {

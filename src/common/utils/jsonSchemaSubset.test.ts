@@ -193,7 +193,7 @@ describe("validateJsonSchemaSubset", () => {
   test("rejects $ref and overly deep schemas", () => {
     expect(validateJsonSchemaSubsetSchema({ $ref: "#/defs/value" })).toEqual({
       success: false,
-      errors: [{ path: "$", message: "$ref is not supported in workflow schemas" }],
+      errors: [{ path: "$", message: "$ref is not supported" }],
     });
 
     let schema: Record<string, unknown> = { type: "string" };
@@ -256,12 +256,42 @@ describe("validateJsonSchemaSubset", () => {
     );
   });
 
-  test("validates a schema that declares a dialect this validator does not load", () => {
-    // zod v4 emits a 2020-12 `$schema`; the dialect declaration describes the
-    // document, so it must neither throw nor change the verdict.
-    const schema = { $schema: "https://json-schema.org/draft/2020-12/schema", type: "string" };
-    expect(validateJsonSchemaSubset(schema, "text")).toEqual({ success: true });
-    expect(validateJsonSchemaSubset(schema, 1).success).toBe(false);
+  test("judges a schema in the dialect it declares", () => {
+    // zod v4 emits a 2020-12 `$schema`. Draft-07 Ajv ignores 2020-12 keywords,
+    // so the verdict must come from a 2020-12 validator.
+    const schema = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { a: { type: "string" }, b: { type: "string" } },
+      dependentRequired: { a: ["b"] },
+    };
+    expect(validateJsonSchemaSubset(schema, { a: "x" }).success).toBe(false);
+    expect(validateJsonSchemaSubset(schema, { a: "x", b: "y" })).toEqual({ success: true });
+    // Undeclared means draft-07, where the keyword does not exist.
+    const { $schema: _dialect, ...draft07 } = schema;
+    expect(validateJsonSchemaSubset(draft07, { a: "x" })).toEqual({ success: true });
+  });
+
+  test("rejects a schema in a dialect it does not speak", () => {
+    const result = validateJsonSchemaSubsetSchema({
+      $schema: "http://json-schema.org/draft-04/schema#",
+      type: "string",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.errors[0]?.path).toBe("$.$schema");
+    }
+  });
+
+  test("keeps schemas of different dialects apart in the validator cache", () => {
+    const structure = { type: "array", prefixItems: [{ type: "string" }] };
+    expect(validateJsonSchemaSubset(structure, [1])).toEqual({ success: true });
+    expect(
+      validateJsonSchemaSubset(
+        { $schema: "https://json-schema.org/draft/2020-12/schema", ...structure },
+        [1]
+      ).success
+    ).toBe(false);
   });
 
   test("keeps validating correctly once the compiled-validator cache has evicted entries", () => {
