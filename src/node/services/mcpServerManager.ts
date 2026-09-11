@@ -24,6 +24,7 @@ import type {
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
 import { shellQuote } from "@/common/utils/shell";
+import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -203,46 +204,70 @@ function shouldRecycleClientAfterToolError(error: unknown): boolean {
 }
 
 /**
- * Top-level parameter names the tool's input schema marks as required.
+ * Drop arguments the model emitted to mean "not provided" for optional
+ * parameters, walking nested objects and arrays alongside the server's schema.
  *
- * MCP tools built by mcpClient carry their server-declared JSON schema via
- * the AI SDK's jsonSchema() wrapper ({ jsonSchema: <raw schema> }); anything
- * else (or a malformed schema) yields an empty set.
+ * - "": LLMs often fill optional parameters with "" instead of omitting them,
+ *   and strict REST-backed MCP servers (e.g. GitLab) treat present-but-empty
+ *   as invalid and reject the call with 400 (#2887).
+ * - null the schema does not accept: schemaSanitizer widens optional
+ *   properties to nullable so OpenAI strict mode can omit them, so this null
+ *   is our own artifact, never a value the server can take. A null the schema
+ *   does accept passes through: servers may mean "clear this field".
+ *
+ * A required parameter keeps its value so a genuinely intended empty value is
+ * never silently dropped. Empty arrays pass through ("no filter").
  */
-function requiredParamsFromSchema(inputSchema: unknown): ReadonlySet<string> {
-  if (inputSchema !== null && typeof inputSchema === "object" && "jsonSchema" in inputSchema) {
-    const raw = (inputSchema as { jsonSchema: unknown }).jsonSchema;
-    if (raw !== null && typeof raw === "object" && "required" in raw) {
-      const required = (raw as { required: unknown }).required;
-      if (Array.isArray(required)) {
-        return new Set(required.filter((entry): entry is string => typeof entry === "string"));
+function sanitizeMCPToolArgs(args: unknown, schema: unknown): unknown {
+  if (!isPlainObject(args)) {
+    return args;
+  }
+  const required = requiredPropertyNames(schema);
+  const properties =
+    isPlainObject(schema) && isPlainObject(schema.properties) ? schema.properties : undefined;
+  const entries: Array<[string, unknown]> = [];
+  for (const [key, value] of Object.entries(args)) {
+    const propertySchema =
+      properties !== undefined && Object.hasOwn(properties, key) ? properties[key] : undefined;
+    if (!required.has(key)) {
+      if (value === "") {
+        continue;
+      }
+      if (value === null && propertySchema !== undefined && !schemaAcceptsNull(propertySchema)) {
+        continue;
       }
     }
+    entries.push([key, sanitizeNestedMCPToolArgs(value, propertySchema)]);
   }
-  return new Set();
+  return Object.fromEntries(entries);
 }
 
 /**
- * Drop top-level empty-string arguments the model emitted for optional
- * parameters.
- *
- * LLMs often fill optional parameters with "" instead of omitting them, and
- * strict REST-backed MCP servers (e.g. GitLab) treat present-but-empty as
- * invalid and reject the call with 400 (#2887). A required parameter keeps
- * its "" so a genuinely intended empty value is never silently dropped.
- * Explicit null and empty arrays pass through untouched: servers may assign
- * them meaning ("clear this field" / "no filter").
+ * Descend into arrays via `items` and into objects only when the schema
+ * declares `properties`; a free-form object (env vars, labels) keeps every
+ * value the model chose.
  */
-function sanitizeMCPToolArgs(args: unknown, inputSchema: unknown): unknown {
-  if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    return args;
+function sanitizeNestedMCPToolArgs(value: unknown, schema: unknown): unknown {
+  if (!isPlainObject(schema)) {
+    return value;
   }
-  const entries = Object.entries(args as Record<string, unknown>);
-  if (!entries.some(([, value]) => value === "")) {
-    return args;
+  if (Array.isArray(value)) {
+    const items = schema.items;
+    return isPlainObject(items)
+      ? value.map((item) => sanitizeNestedMCPToolArgs(item, items))
+      : value;
   }
-  const required = requiredParamsFromSchema(inputSchema);
-  return Object.fromEntries(entries.filter(([key, value]) => value !== "" || required.has(key)));
+  return isPlainObject(schema.properties) ? sanitizeMCPToolArgs(value, schema) : value;
+}
+
+/**
+ * MCP tools built by mcpClient carry their server-declared JSON schema via
+ * the AI SDK's jsonSchema() wrapper ({ jsonSchema: <raw schema> }); anything
+ * else yields undefined, and sanitizeMCPToolArgs then only applies the
+ * schema-free "" rule.
+ */
+function rawInputSchema(inputSchema: unknown): unknown {
+  return isPlainObject(inputSchema) ? inputSchema.jsonSchema : undefined;
 }
 
 /**
@@ -276,7 +301,7 @@ export function wrapMCPTools(
               ? (context as { abortSignal?: AbortSignal }).abortSignal
               : undefined;
 
-          const sanitizedArgs = sanitizeMCPToolArgs(args, tool.inputSchema);
+          const sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
           const result: unknown = await runMCPToolWithDeadline(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
