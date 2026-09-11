@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
+import { createMuxMessage } from "@/common/types/message";
 
 interface InitDisplayedMessage {
   type: "workspace-init";
@@ -14,6 +15,109 @@ interface InitDisplayedMessage {
 const waitForInitThrottle = () => new Promise((r) => setTimeout(r, 120));
 
 describe("Init display after cleanup changes", () => {
+  it.each([false, true])(
+    "places init after the first user regardless of early completion (%s)",
+    (completed) => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 1 });
+      if (completed) aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 2 });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "workspace-init",
+      ]);
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user", "user", "Create this workspace", {
+          historySequence: 7,
+          timestamp: 3,
+        }),
+      });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "user",
+        "workspace-init",
+      ]);
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("assistant", "assistant", "Ready", {
+          historySequence: 8,
+          timestamp: 4,
+        }),
+      });
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("next-user", "user", "Continue", { historySequence: 9, timestamp: 5 }),
+      });
+      expect(aggregator.getDisplayedMessages().map((message) => message.type)).toEqual([
+        "user",
+        "workspace-init",
+        "assistant",
+        "user",
+      ]);
+    }
+  );
+
+  it("propagates steps and throttles progress until another step or completion clears it", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const progress = {
+      type: "init-progress" as const,
+      label: "Updating files",
+      percent: 87,
+      timestamp: 2,
+    };
+    aggregator.handleMessage(progress);
+    expect(aggregator.getDisplayedMessages()).toEqual([]);
+    aggregator.handleMessage({ type: "init-start", hookPath: "/project", timestamp: 1 });
+    const before = aggregator.getDisplayedMessages();
+    aggregator.handleMessage(progress);
+    expect(aggregator.getDisplayedMessages()).toBe(before);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: { label: "Updating files", percent: 87 },
+    });
+    const step = { type: "init-output" as const, line: "Running hook", step: true, timestamp: 3 };
+    aggregator.handleMessage(step);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: null,
+      lines: [{ line: step.line, isError: false, step: true }],
+    });
+    aggregator.handleMessage(progress);
+    aggregator.handleMessage({ type: "init-output", line: "Raw output", timestamp: 4 });
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      progress: { label: "Updating files", percent: 87 },
+    });
+    aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 5 });
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({ progress: null });
+    const finished = aggregator.getDisplayedMessages();
+    aggregator.handleMessage(progress);
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()).toEqual(finished);
+  });
+
+  it("keeps checklist lines and live progress unchanged during reconnect replay", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const start = { type: "init-start" as const, hookPath: "/project", timestamp: 1 };
+    const step = { type: "init-output" as const, line: "Checkout", step: true, timestamp: 2 };
+    aggregator.handleMessage(start);
+    aggregator.handleMessage(step);
+    aggregator.handleMessage({
+      type: "init-progress",
+      label: "Updating files",
+      percent: 87,
+      timestamp: 3,
+    });
+    aggregator.flushPendingInitOutput();
+    const before = aggregator.getDisplayedMessages();
+    aggregator.handleMessage({ ...start, replay: true });
+    aggregator.handleMessage({ ...step, replay: true });
+    aggregator.flushPendingInitOutput();
+    expect(aggregator.getDisplayedMessages()).toEqual(before);
+    expect(aggregator.getDisplayedMessages()[0]).toMatchObject({
+      lines: [{ line: step.line, isError: false, step: true }],
+      progress: { label: "Updating files", percent: 87 },
+    });
+  });
+
   it("should display init messages correctly", async () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 

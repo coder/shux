@@ -192,7 +192,7 @@ describe("WorktreeManager.createWorkspace", () => {
           }
           const proc = realExecFile(file, args, options);
           if (file === "git" && args[2] === "worktree" && args[3] === "add") {
-            // --no-checkout usually emits only stderr, so supply stdout to cover both streams.
+            // Inject stdout so forwarding coverage does not depend on Git's output.
             const result = proc.result;
             Object.defineProperty(proc, "result", {
               value: result.then((output) => ({

@@ -87,6 +87,7 @@ describe("getLastNonDecorativeMessage", () => {
         status: "running",
         hookPath: ".mux/init",
         lines: [],
+        progress: null,
         exitCode: null,
         timestamp: Date.now(),
         durationMs: null,

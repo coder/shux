@@ -5,6 +5,7 @@ import type { WorkspaceInitEvent } from "@/common/orpc/types";
 import { log } from "@/node/services/log";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
+import { clamp } from "@/common/utils/clamp";
 
 /**
  * Output line with timestamp for replay timing.
@@ -287,7 +288,7 @@ export class InitStateManager extends EventEmitter {
       type: "init-progress",
       workspaceId,
       label,
-      percent: Math.max(0, Math.min(100, Math.round(percent))),
+      percent: clamp(Math.round(percent), 0, 100),
       timestamp: Date.now(),
     } satisfies WorkspaceInitEvent & { workspaceId: string });
   }

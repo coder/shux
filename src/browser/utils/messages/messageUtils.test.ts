@@ -127,6 +127,7 @@ describe("shouldBypassDeferredMessages", () => {
     status: "running",
     hookPath: "/tmp/project/.mux/init",
     lines: [{ line: "Installing dependencies...", isError: false }],
+    progress: null,
     exitCode: null,
     timestamp: 1,
     durationMs: null,

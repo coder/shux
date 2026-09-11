@@ -360,15 +360,22 @@ describeIntegration("Workspace init hook", () => {
         // Should include workspace creation logs + hook output
         expect(status.lines).toEqual(
           expect.arrayContaining([
-            { line: "Creating git worktree...", isError: false, timestamp: expect.any(Number) },
+            {
+              line: "Creating git worktree...",
+              isError: false,
+              step: true,
+              timestamp: expect.any(Number),
+            },
             {
               line: "Worktree created successfully",
               isError: false,
+              step: true,
               timestamp: expect.any(Number),
             },
             expect.objectContaining({
               line: expect.stringMatching(/Running init hook:/),
               isError: false,
+              step: true,
             }),
             { line: "Installing dependencies", isError: false, timestamp: expect.any(Number) },
             { line: "Done!", isError: false, timestamp: expect.any(Number) },

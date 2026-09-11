@@ -22,7 +22,7 @@ describe("GitProgressParser", () => {
       { stage: "Updating files", percent: 12 },
       { stage: "Updating files", percent: 34 },
     ]);
-    expect(output).toEqual([]);
+    expect(output).toEqual(["Updating files: 34% (34/100)"]);
   });
 
   it("deduplicates percentages while allowing a new stage at the same percentage", () => {

@@ -3036,6 +3036,7 @@ describe("WorkspaceStore", () => {
             isError: false,
             timestamp: 1_001,
           };
+          yield { type: "init-progress", label: "Checkout", percent: 87, timestamp: 1_002 };
           return;
         }
 
@@ -3075,7 +3076,8 @@ describe("WorkspaceStore", () => {
         return (
           state.loading === false &&
           initMessage?.status === "running" &&
-          initMessage.lines[0]?.line === firstLine
+          initMessage.lines[0]?.line === firstLine &&
+          initMessage.progress?.percent === 87
         );
       });
       expect(sawInitialInit).toBe(true);

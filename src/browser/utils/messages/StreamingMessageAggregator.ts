@@ -56,7 +56,13 @@ import type {
   OnChatCursor,
   OnChatHistoryCursor,
 } from "@/common/orpc/types";
-import { isInitStart, isInitOutput, isInitEnd, isMuxMessage } from "@/common/orpc/types";
+import {
+  isInitStart,
+  isInitOutput,
+  isInitProgress,
+  isInitEnd,
+  isMuxMessage,
+} from "@/common/orpc/types";
 import {
   buildAggregateResponseCompleteMetadata,
   buildResponseCompleteMetadata,
@@ -591,7 +597,8 @@ export class StreamingMessageAggregator {
   private initState: {
     status: "running" | "success" | "error";
     hookPath: string;
-    lines: Array<{ line: string; isError: boolean }>;
+    lines: Array<{ line: string; isError: boolean; step?: boolean }>;
+    progress: { label: string; percent: number } | null;
     exitCode: number | null;
     startTime: number;
     endTime: number | null;
@@ -3032,6 +3039,7 @@ export class StreamingMessageAggregator {
         status: "running",
         hookPath: data.hookPath,
         lines: [],
+        progress: null,
         exitCode: null,
         startTime: data.timestamp,
         endTime: null,
@@ -3061,13 +3069,27 @@ export class StreamingMessageAggregator {
         this.initState.lines.shift();
         this.initState.truncatedLines = (this.initState.truncatedLines ?? 0) + 1;
       }
-      this.initState.lines.push({ line, isError });
+      this.initState.lines.push({ line, isError, ...(data.step === true ? { step: true } : {}) });
+      if (data.step === true) {
+        this.initState.progress = null;
+      }
 
       // Throttle cache invalidation during fast streaming to avoid re-render per line.
       this.initOutputThrottleTimer ??= setTimeout(() => {
         this.initOutputThrottleTimer = null;
         this.invalidateCache();
       }, StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS);
+      return true;
+    }
+
+    if (isInitProgress(data)) {
+      if (this.initState?.status === "running") {
+        this.initState.progress = { label: data.label, percent: data.percent };
+        this.initOutputThrottleTimer ??= setTimeout(() => {
+          this.initOutputThrottleTimer = null;
+          this.invalidateCache();
+        }, StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS);
+      }
       return true;
     }
 
@@ -3080,6 +3102,7 @@ export class StreamingMessageAggregator {
       this.initState.exitCode = data.exitCode;
       this.initState.status = data.exitCode === 0 ? "success" : "error";
       this.initState.endTime = data.timestamp;
+      this.initState.progress = null;
       // Use backend truncation count if larger (covers replay of old data).
       if (data.truncatedLines && data.truncatedLines > (this.initState.truncatedLines ?? 0)) {
         this.initState.truncatedLines = data.truncatedLines;
@@ -3830,7 +3853,6 @@ export class StreamingMessageAggregator {
 
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);
 
-      // Add init state if present (ephemeral, appears at top)
       if (this.initState) {
         const durationMs =
           this.initState.endTime !== null
@@ -3839,16 +3861,23 @@ export class StreamingMessageAggregator {
         const initMessage: DisplayedMessage = {
           type: "workspace-init",
           id: "workspace-init",
-          historySequence: -1, // Appears before all history
+          historySequence: -1,
           status: this.initState.status,
           hookPath: this.initState.hookPath,
-          lines: [...this.initState.lines], // Shallow copy for React.memo change detection
+          lines: [...this.initState.lines],
+          progress: this.initState.progress,
           exitCode: this.initState.exitCode,
           timestamp: this.initState.startTime,
           durationMs,
           truncatedLines: this.initState.truncatedLines,
         };
-        resultMessages = [initMessage, ...resultMessages];
+        // Creation belongs to the first user turn, even though init starts before it is persisted.
+        const insertionIndex = resultMessages.findIndex((message) => message.type === "user") + 1;
+        resultMessages = [
+          ...resultMessages.slice(0, insertionIndex),
+          initMessage,
+          ...resultMessages.slice(insertionIndex),
+        ];
       }
 
       // Return the full array

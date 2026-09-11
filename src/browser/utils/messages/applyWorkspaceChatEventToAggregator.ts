@@ -10,6 +10,7 @@ import {
   isGoalBudgetLimitedEvent,
   isInitEnd,
   isInitOutput,
+  isInitProgress,
   isInitStart,
   isMuxMessage,
   isQueuedMessageChanged,
@@ -227,7 +228,13 @@ export function applyWorkspaceChatEventToAggregator(
   }
 
   // init-* and ChatXumMessage are handled via the aggregator's unified handleMessage.
-  if (isMuxMessage(event) || isInitStart(event) || isInitOutput(event) || isInitEnd(event)) {
+  if (
+    isMuxMessage(event) ||
+    isInitStart(event) ||
+    isInitOutput(event) ||
+    isInitProgress(event) ||
+    isInitEnd(event)
+  ) {
     aggregator.handleMessage(event);
     return "immediate";
   }

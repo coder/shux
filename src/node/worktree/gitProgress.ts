@@ -10,9 +10,10 @@ export class GitProgressParser {
 
   push(chunk: string): void {
     this.buffer += chunk;
-    const lines = this.buffer.split(/[\r\n]/);
+    const lines = this.buffer.split(/([\r\n])/);
     this.buffer = lines.pop() ?? "";
-    for (const line of lines) {
+    for (let index = 0; index < lines.length; index += 2) {
+      const line = lines[index];
       if (!line) continue;
       const match = /^(.+?):\s+(\d{1,3})%/.exec(line);
       if (!match) {
@@ -27,7 +28,7 @@ export class GitProgressParser {
         this.lastPercent = percent;
         this.onProgress(stage, percent);
       }
-      if (done) this.onOutput(line);
+      if (done || lines[index + 1] === "\n") this.onOutput(line);
     }
   }
 

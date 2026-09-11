@@ -267,7 +267,9 @@ describe("InitStateManager", () => {
       expect(progress).toEqual([]);
 
       await manager.endInit(workspaceId, 0);
-      expect(await manager.readInitStatus(workspaceId)).toEqual(manager.getInitState(workspaceId));
+      expect(await manager.readInitStatus(workspaceId)).toEqual(
+        manager.getInitState(workspaceId) ?? null
+      );
       expect((await manager.readInitStatus(workspaceId))?.lines).toEqual(initialState?.lines);
       manager.clearInMemoryState(workspaceId);
       await manager.replayInit(workspaceId);

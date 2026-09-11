@@ -1116,6 +1116,10 @@ export class WorkspaceStore {
       // we update aggregator state immediately but coalesce UI bumps to keep the renderer responsive.
       this.scheduleIdleStateBump(workspaceId);
     },
+    "init-progress": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.scheduleIdleStateBump(workspaceId);
+    },
     "init-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       // Avoid a double-bump if an init-output idle bump is pending.
