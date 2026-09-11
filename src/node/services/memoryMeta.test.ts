@@ -5,6 +5,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { MemoryMetaService, MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
+import { getErrorMessage } from "@/common/utils/errors";
 
 describe("memoryLogicalKey", () => {
   it("keys each scope by its stable identity, never the physical path", () => {
@@ -299,7 +300,11 @@ describe("MemoryMetaService", () => {
     const strictReader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
       Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
     try {
-      await expect(strict.getEntriesOrThrow()).rejects.toThrow(/could not be read/);
+      const failure = await strict.getEntriesOrThrow().then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(getErrorMessage(failure)).toContain("could not be read");
     } finally {
       strictReader.mockRestore();
     }
