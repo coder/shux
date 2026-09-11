@@ -2,6 +2,7 @@ import { describe, it, expect, spyOn } from "bun:test";
 
 import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -1966,6 +1967,116 @@ describe("MemoryService", () => {
       // Without the binary stray, the handover completes.
       await fsPromises.rm(path.join(legacyRoot, "binary.md"));
       await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+    });
+
+    it("never opens a non-regular entry at a destination: a FIFO there is occupied, not read", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(path.join(ownerRoot, "imported", "ws-child"), { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "child");
+      await fsPromises.writeFile(path.join(legacyRoot, "stuck.md"), "child too");
+      await fsPromises.writeFile(path.join(ownerRoot, "imported", "ws-child", "stuck.md"), "other");
+      try {
+        execFileSync("mkfifo", [path.join(ownerRoot, "note.md"), path.join(ownerRoot, "stuck.md")]);
+      } catch {
+        return; // no mkfifo here (non-POSIX host): nothing to exercise
+      }
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      // Opening a FIFO for reading blocks until a writer shows up; the pass
+      // must settle without one and treat the entry as owner state.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect((await fsPromises.lstat(path.join(ownerRoot, "note.md"))).isFIFO()).toBe(true);
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "note.md"), "utf-8")
+      ).toBe("child");
+      // Both slots occupied: a PERMANENT skip (memoized, refused by removal),
+      // not a hang and not a retry loop.
+      expect(
+        (await fsPromises.readdir(path.join(ownerRoot, "imported", "ws-child"))).sort()
+      ).toEqual(["note.md", "stuck.md"]);
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(
+        await fixture.service
+          .adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner")
+          .then(() => null, getErrorMessage)
+      ).toMatch(/1 legacy workspace memory note\(s\)/);
+    });
+
+    it("compares destination bytes strictly: a legacy U+FFFD note is not settled by an invalid-UTF-8 owner note", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "marker.md"), "decoded as \uFFFD here");
+      // Lossily decoded, this reads as exactly the legacy text.
+      const ownerBytes = Buffer.concat([
+        Buffer.from("decoded as "),
+        Buffer.from([0xff]),
+        Buffer.from(" here"),
+      ]);
+      await fsPromises.writeFile(path.join(ownerRoot, "marker.md"), ownerBytes);
+      // Complete handover: the note is represented byte-exact under the
+      // import directory, the owner's entry untouched.
+      await fixture.service.adoptLegacyPrivateStoreForRemoval("ws-child", "ws-owner");
+      expect(
+        await fsPromises.readFile(
+          path.join(ownerRoot, "imported", "ws-child", "marker.md"),
+          "utf-8"
+        )
+      ).toBe("decoded as \uFFFD here");
+      expect(
+        (await fsPromises.readFile(path.join(ownerRoot, "marker.md"))).equals(ownerBytes)
+      ).toBe(true);
+    });
+
+    it("treats an unreadable destination as transient: no copy, no record, retried on the next access", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const ownerRoot = path.join(fixture.config.sessionsDir, "ws-owner", "memory");
+      const legacyRoot = path.join(fixture.config.sessionsDir, "ws-child", "memory");
+      await fsPromises.mkdir(legacyRoot, { recursive: true });
+      await fsPromises.mkdir(ownerRoot, { recursive: true });
+      await fsPromises.writeFile(path.join(legacyRoot, "note.md"), "child");
+      await fsPromises.writeFile(path.join(ownerRoot, "note.md"), "owner");
+      const passes = spyOn(
+        fixture.service as unknown as { readOrQuarantineAdoptionManifest: () => Promise<unknown> },
+        "readOrQuarantineAdoptionManifest"
+      );
+      // EACCES on the owner's note: neither free nor different — a
+      // mismatch verdict would duplicate the child's note under imported/.
+      const realOpen = fsPromises.open.bind(fsPromises);
+      const denied = spyOn(fsPromises, "open").mockImplementation(((target, ...rest) =>
+        String(target).endsWith(path.join("ws-owner", "memory", "note.md"))
+          ? Promise.reject(
+              Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+            )
+          : realOpen(target as string, ...(rest as []))) as typeof fsPromises.open);
+      try {
+        await fixture.service.listIndexEntries({ ...fixture.ctx });
+      } finally {
+        denied.mockRestore();
+      }
+      expect(passes).toHaveBeenCalledTimes(1);
+      expect(await pathExists(path.join(ownerRoot, "imported"))).toBe(false);
+      expect(await pathExists(legacyAdoptionManifestPath(path.dirname(legacyRoot)))).toBe(false);
+      // Cleared: the next access re-runs the pass and settles the note.
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(2);
+      expect(
+        await fsPromises.readFile(path.join(ownerRoot, "imported", "ws-child", "note.md"), "utf-8")
+      ).toBe("child");
+      expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("owner");
+      await fixture.service.listIndexEntries({ ...fixture.ctx });
+      expect(passes).toHaveBeenCalledTimes(2);
     });
 
     it("never copies a legacy note whose name the memory path grammar rejects", async () => {

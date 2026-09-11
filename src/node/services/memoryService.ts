@@ -1522,7 +1522,22 @@ export class MemoryService extends EventEmitter {
           }
         }
         if (target === null) {
-          target = await this.legacyImportTarget(store, childId, relPath, content);
+          // A destination that cannot be inspected right now (EACCES, EIO on
+          // its lstat or read) is neither free nor different: the note waits
+          // for the next pass with no copy made and no record written.
+          try {
+            target = await this.legacyImportTarget(store, childId, relPath, content);
+          } catch (error) {
+            log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
+              childId,
+              owner,
+              relPath,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
           if (target === null) {
             skipped++;
             continue;
@@ -1784,26 +1799,9 @@ export class MemoryService extends EventEmitter {
         () => false
       );
       if (!contained) continue;
-      // A symlink is never a destination: the store's listing excludes links
-      // (and dotfiles), so a note "represented" through one would be
-      // invisible to the shared notebook, and a write would land through it.
-      const linkKind = await lstatKind(store.physicalPath(candidate));
-      if (linkKind === "unreadable") {
-        throw new Error(`cannot inspect adoption destination ${candidate}`);
-      }
-      if (linkKind === "symlink") continue;
-      // Strict: a destination that merely could not be stat'ed (EACCES, EIO)
-      // is not free — declaring it so would overwrite whatever the owner
-      // keeps there once the copy runs. The failure aborts the pass instead
-      // (access-time: retried; removal: session intact).
-      const kind = await store.kind(candidate, { strict: true });
-      if (kind === null) return { relPath: candidate, write: true };
-      if (kind === "file") {
-        const existing = await this.readBoundedTextFile(store, candidate, candidate).catch(
-          () => null
-        );
-        if (existing === content) return { relPath: candidate, write: false };
-      }
+      const destination = await this.inspectAdoptionDestination(store, candidate);
+      if (destination === "free") return { relPath: candidate, write: true };
+      if (destination.content === content) return { relPath: candidate, write: false };
     }
     return null;
   }
@@ -1820,14 +1818,44 @@ export class MemoryService extends EventEmitter {
       () => false
     );
     if (!contained) return null;
-    const linkKind = await lstatKind(store.physicalPath(relPath));
-    if (linkKind === "unreadable") throw new Error(`cannot inspect adopted copy ${relPath}`);
-    if (linkKind !== "other") return null; // missing, dir, or a symlink
+    const destination = await this.inspectAdoptionDestination(store, relPath);
+    return destination === "free" ? null : destination.content;
+  }
+
+  /**
+   * What an adoption destination in the owner store holds: "free" when
+   * nothing is there, else the text of a regular, in-cap, valid-UTF-8 file —
+   * or `content: null` for anything a legacy note can never equal (a
+   * directory, a symlink, a FIFO/socket/device, a file over the cap or not
+   * UTF-8), which is owner state the caller must neither read nor clobber.
+   * The type is settled by lstat BEFORE anything opens the entry: open() on a
+   * FIFO blocks until a peer shows up and would hang the pass. Destination
+   * bytes are decoded strictly for the same reason legacy bytes are: a lossy
+   * decode reads invalid UTF-8 as U+FFFD and would settle a legacy note that
+   * literally contains U+FFFD as "already present", leaving its only copy in
+   * the legacy directory. Throws when the entry cannot be inspected at all
+   * (EACCES, EIO): a transient failure the callers retry later, never a
+   * mismatch — declaring it free would clobber the owner's note, declaring it
+   * different would duplicate the child's under imported/<child>/.
+   */
+  private async inspectAdoptionDestination(
+    store: MemoryStore,
+    relPath: string
+  ): Promise<"free" | { content: string | null }> {
+    let isRegularFile: boolean;
     try {
-      return await this.readBoundedTextFile(store, relPath, relPath);
+      isRegularFile = (await fsPromises.lstat(store.physicalPath(relPath))).isFile();
     } catch (error) {
-      if (error instanceof MemoryCommandError) return null; // over the cap
+      if (isMissingPathError(error)) return "free";
       throw error;
+    }
+    if (!isRegularFile) return { content: null };
+    const bytes = await store.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
+    if (bytes.length > MEMORY_MAX_FILE_BYTES) return { content: null };
+    try {
+      return { content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
+      return { content: null };
     }
   }
 
