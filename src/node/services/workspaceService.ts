@@ -5855,11 +5855,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
-    // Set once removal passes its point of no return (session teardown and
-    // tombstone follow unconditionally); an abort before that leaves the
-    // workspace registered and intact, so the finally lifts the consolidation
-    // teardown gate the drains below installed.
-    let removalCommitted = false;
+    // Set once this attempt published the durable removal tombstone (sealed
+    // sub-agent handover, or the session-dir teardown). If the removal then
+    // ends with the workspace STILL REGISTERED — a refused checkout deletion,
+    // a later teardown step throwing, deregistration failing — the marker is
+    // rolled back in the finally (ownership-checked, r66): left in place it
+    // would refuse every later memory access and removal retry of a
+    // workspace that still exists. Only a completed deregistration keeps it.
+    let tombstonePublished = false;
     // r66: identifies THIS removal attempt in the durable tombstone so the
     // compensating rollback below cannot delete a concurrent backend
     // attempt's marker.
@@ -6098,6 +6101,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
           });
           sealedForRemoval = true;
+          tombstonePublished = true;
         }
 
         if (isMultiProject(metadata)) {
@@ -6395,7 +6399,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       //
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
-      removalCommitted = true;
       this.initStateManager.clearInMemoryState(workspaceId);
 
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
@@ -6503,10 +6506,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               ? undefined
               : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
         });
-        // Only once the session (and with it the transcript) is gone are the
-        // retryable harvest records truly unrecoverable; an aborted removal
-        // above must leave them retryable.
-        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+        tombstonePublished = true;
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the
@@ -6520,9 +6520,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // tombstone write itself failed): the workspace stays registered
           // with its session directory intact, so the consolidation teardown
           // gate is lifted again in the finally like any pre-commit abort.
-          removalCommitted = false;
           throw error;
         }
+        // Orphan path (r62): the directory was retained but the tombstone
+        // is durable, and deregistration proceeds below.
+        tombstonePublished = true;
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
       // The on-disk devtools.jsonl died with the session directory above; also drop any
@@ -6604,6 +6606,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+      // Only once the workspace is deregistered (and its session, with the
+      // transcript, gone) are the retryable harvest records truly
+      // unrecoverable; an aborted removal must leave them retryable.
+      await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
 
       // Deregistration succeeded: drop the workspace's activity/status entry
       // so extensionMetadata.json stays bounded (stale entries were
@@ -6636,11 +6642,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
-      if (!removalCommitted) {
-        // A sealed sub-agent whose checkout deletion was then refused
-        // (force=false) keeps its session dir and config entry: lift the
-        // tombstone again (ownership-checked, r66) so it stays usable.
-        if (sealedForRemoval) {
+      if (!removedFromConfig) {
+        // The workspace is still registered (a refused checkout deletion, a
+        // teardown step that threw, deregistration that failed): lift this
+        // attempt's tombstone again (ownership-checked, r66) so it stays
+        // usable, and the consolidation teardown gate with it.
+        if (tombstonePublished) {
           try {
             await rollbackRemovalTombstoneIfOwned({
               rootDir: this.config.rootDir,

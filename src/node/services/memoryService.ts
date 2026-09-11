@@ -410,6 +410,8 @@ interface MemoryStore {
    * the result as a best-effort prefix.
    */
   readFilePrefix(relPath: string, maxBytes: number): Promise<string>;
+  /** The same bounded prefix as raw bytes, for callers that must validate the encoding themselves. */
+  readFilePrefixBytes(relPath: string, maxBytes: number): Promise<Buffer>;
   /** Atomic write; creates parent directories. */
   writeFile(relPath: string, content: string): Promise<void>;
   /** Recursive delete of a file or directory. */
@@ -604,11 +606,15 @@ class LocalMemoryStore implements MemoryStore {
   }
 
   async readFilePrefix(relPath: string, maxBytes: number): Promise<string> {
+    return (await this.readFilePrefixBytes(relPath, maxBytes)).toString("utf-8");
+  }
+
+  async readFilePrefixBytes(relPath: string, maxBytes: number): Promise<Buffer> {
     const handle = await fsPromises.open(this.abs(relPath), "r");
     try {
       const buffer = Buffer.alloc(maxBytes);
       const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
-      return buffer.subarray(0, bytesRead).toString("utf-8");
+      return buffer.subarray(0, bytesRead);
     } finally {
       await handle.close();
     }
@@ -1343,7 +1349,13 @@ export class MemoryService extends EventEmitter {
     // Files adopted this pass (bytes written OR only their sidecar entries
     // folded in): either changes what the shared store's readers derive from it.
     let adoptedCount = 0;
+    // Notes left unrepresented, split by what a retry against the SAME legacy
+    // store could change: permanent skips (over the cap, doubly conflicting,
+    // not text, escaping destination) need the legacy or owner store to
+    // change first; transient ones (an fs error on a read, stage, install or
+    // sidecar write) may clear on their own, so they keep the pass unmemoized.
     let skipped = 0;
+    let transientSkips = 0;
     const pass = async (): Promise<void> => {
       await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
       const rootKindUnderLock = await lstatKind(legacyRoot);
@@ -1394,18 +1406,32 @@ export class MemoryService extends EventEmitter {
         });
       for (const relPath of files) {
         // Same read gates as a memory command: containment (no symlink
-        // escape), size cap, and text-only (a lossy utf-8 decode cannot be
-        // carried by a text write).
-        const content = await legacy
-          .assertContained(relPath)
-          .then(() => this.readBoundedTextFile(legacy, relPath, relPath))
-          .catch(() => null);
-        if (content === null || content.includes("\uFFFD")) {
-          // Dot-entries too (r73): `.note` is addressable, so a real note
-          // there may hold text `create` permitted (U+FFFD included) or be
-          // transiently unreadable — exempting dot-entries would report a
-          // complete handover and let removal take the only copy. A stray
-          // `.DS_Store` costs a forced removal, never a note.
+        // escape), size cap, and text-only. Dot-entries too (r73): `.note`
+        // is addressable, so a real note there may hold text `create`
+        // permitted or be transiently unreadable — exempting dot-entries
+        // would report a complete handover and let removal take the only
+        // copy. A stray `.DS_Store` costs a forced removal, never a note.
+        let bytes: Buffer;
+        try {
+          await legacy.assertContained(relPath);
+          bytes = await legacy.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
+        } catch (error) {
+          skipped++;
+          // An escaping path is permanent; a read failure (EACCES, EIO) may clear.
+          if (!(error instanceof MemoryCommandError)) transientSkips++;
+          continue;
+        }
+        if (bytes.length > MEMORY_MAX_FILE_BYTES) {
+          skipped++;
+          continue;
+        }
+        // Strict decode: invalid UTF-8 cannot be carried by a text write, but a
+        // note that legitimately contains U+FFFD must not be mistaken for one
+        // (a lossy decode would make the two indistinguishable).
+        let content: string;
+        try {
+          content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch {
           skipped++;
           continue;
         }
@@ -1454,6 +1480,7 @@ export class MemoryService extends EventEmitter {
               { childId, owner, relPath, target: previous.target, error }
             );
             skipped++;
+            transientSkips++;
             continue;
           }
           if (priorContent === content) {
@@ -1528,12 +1555,14 @@ export class MemoryService extends EventEmitter {
               error,
             });
             skipped++;
+            transientSkips++;
             continue;
           }
           const stagedStamp = await adoptionTargetStamp(stagingPath);
           if (stagedStamp === null) {
             await fsPromises.rm(stagingPath, { force: true });
             skipped++;
+            transientSkips++;
             continue;
           }
           adopted.set(relPath, {
@@ -1567,6 +1596,7 @@ export class MemoryService extends EventEmitter {
               }
             );
             skipped++;
+            transientSkips++;
             continue;
           }
           // The install: same session dir, so a plain rename (an EXDEV — the
@@ -1585,6 +1615,7 @@ export class MemoryService extends EventEmitter {
               error,
             });
             skipped++;
+            transientSkips++;
             continue;
           }
           remainingCapacity--;
@@ -1633,6 +1664,7 @@ export class MemoryService extends EventEmitter {
             // stranded under the child key, and removal must not delete the
             // child session (the only trigger for a retry) on that basis.
             skipped++;
+            transientSkips++;
             continue;
           }
         }
@@ -1662,13 +1694,20 @@ export class MemoryService extends EventEmitter {
     }
     // Recorded against the state observed BEFORE the pass: a foreign write
     // landing during it changes the stamp and re-runs the (idempotent) pass.
-    // Memoized even when notes were left unrepresented (owner store full,
-    // both destinations taken, unreadable, sidecar fold failed): an
-    // unchanged legacy store cannot adopt more on a retry, and re-walking it
-    // on every access would make a stuck note a per-access tax. Owner-side
-    // state the key does not observe (freed capacity) is picked up by the
-    // next legacy-store change, a process restart, or removal's forced pass.
-    this.legacyStoreCheckedAgainst.set(childId, checkKey);
+    // Memoized even when notes were left PERMANENTLY unrepresented (owner
+    // store full, both destinations taken, not text): an unchanged legacy
+    // store cannot adopt more on a retry, and re-walking it on every access
+    // would make a stuck note a per-access tax — owner-side state the key
+    // does not observe (freed capacity) is picked up by the next
+    // legacy-store change, a process restart, or removal's forced pass. A
+    // TRANSIENT failure (permission interval, ENOSPC, a sidecar write) may
+    // clear by itself, so the pass stays unmemoized and the next access
+    // retries it.
+    if (transientSkips === 0) {
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
+    } else {
+      this.legacyStoreCheckedAgainst.delete(childId);
+    }
     if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
     return { skipped };
   }

@@ -60,6 +60,8 @@ import type {
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
 import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
+import { MemoryService } from "./memoryService";
+import { MemoryMetaService } from "./memoryMeta";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -14792,6 +14794,87 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
       expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("a teardown step failing after the seal rolls the tombstone back and releases the gate", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: workspacePath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const config = buildConfig();
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      workspaceService.setSharedWorkspaceMemoryStore({
+        adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
+      });
+      // The consolidation drain runs once before the seal and again after the
+      // checkout deletion; the second call stands in for any teardown step
+      // that rejects once the child is durably tombstoned.
+      const calls: string[] = [];
+      let cancels = 0;
+      let failSecondCancel = true;
+      workspaceService.setMemoryConsolidationService({
+        triggerInBackground: () => undefined,
+        triggerHarvestThenSweepInBackground: () => undefined,
+        cancelInFlightConsolidation: () => {
+          calls.push("cancel");
+          cancels++;
+          return cancels === 2 && failSecondCancel
+            ? Promise.reject(new Error("sandbox teardown failed"))
+            : Promise.resolve();
+        },
+        releaseRemovalCancellation: () => {
+          calls.push("release");
+        },
+        finalizeHarvestsForRemoval: () => {
+          calls.push("finalize");
+          return Promise.resolve();
+        },
+      });
+      const failed = await workspaceService.remove(workspaceId);
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("sandbox teardown failed");
+      // Still registered: the sealed marker is gone, the gate lifted, and
+      // nothing was finalized.
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(calls).toContain("release");
+      expect(calls).not.toContain("finalize");
+      // The child's memory works again: its shared-store write is not
+      // refused by a stale tombstone.
+      const memoryService = new MemoryService(
+        {
+          rootDir,
+          sessionsDir: path.join(rootDir, "sessions"),
+          loadConfigOrDefault: config.loadConfigOrDefault,
+          configFileStamp: () => "stable",
+          onConfigChanged: () => undefined,
+        } as unknown as Config,
+        new MemoryMetaService(rootDir)
+      );
+      const created = await memoryService.create(
+        { runtime: null, checkoutCwd: "", workspaceId, projectPath: "" },
+        "/memories/workspace/after-abort.md",
+        "still usable",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      // A retried removal completes: cancelled, tombstoned, finalized, not released.
+      failSecondCancel = false;
+      calls.length = 0;
+      expect((await workspaceService.remove(workspaceId)).success).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+      expect(calls).toContain("finalize");
+      expect(calls).not.toContain("release");
     } finally {
       createRuntimeSpy.mockRestore();
     }
