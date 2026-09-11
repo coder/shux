@@ -1,3 +1,8 @@
+import {
+  isPluginMcpServerAllowed,
+  readPluginMcpPolicy,
+  PLUGIN_REGISTRY_FILE_NAME,
+} from "./registry";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
@@ -668,6 +673,7 @@ export async function loadPluginMcpServers(
       "loadPluginMcpServers: normalized info must carry provenance"
     );
     info.plugin.serverName = serverName;
+    if (plugin.componentPolicy !== undefined) info.plugin.componentPolicy = plugin.componentPolicy;
     servers[buildPluginServerKey(instanceId, serverName)] = info;
   }
 
@@ -815,6 +821,14 @@ export function createAgentPluginsMcpProvider(ctx: {
       }
     } catch (error) {
       log.warn(`Agent Plugins MCP discovery failed: ${getErrorMessage(error)}`);
+    }
+    // Descriptor reads await plugin files after discovery's registry read.
+    // Revoke against current consent before exposing any managed registration.
+    if (Object.values(merged).some((info) => info.plugin?.componentPolicy !== undefined)) {
+      const policy = await readPluginMcpPolicy(path.join(ctx.xumHome, PLUGIN_REGISTRY_FILE_NAME));
+      for (const [name, info] of Object.entries(merged)) {
+        if (!isPluginMcpServerAllowed(info.plugin, policy)) delete merged[name];
+      }
     }
     return merged;
   };

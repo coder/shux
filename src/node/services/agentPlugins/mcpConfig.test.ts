@@ -10,6 +10,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { readPluginMcpPolicy } from "./registry";
 import { createTestPluginInstallEntry } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
@@ -699,7 +700,14 @@ describe("createAgentPluginsMcpProvider", () => {
           })
         );
         const manager = new MCPServerManager(
-          new MCPConfigService(new Config(xumHome), { agentPluginsMcpProvider: provider })
+          new MCPConfigService(new Config(xumHome), { agentPluginsMcpProvider: provider }),
+          {
+            pluginInvalidation: {
+              keyPrefix: "plugin:",
+              readToken: () => Promise.resolve(undefined),
+              readComponentPolicy: () => readPluginMcpPolicy(registryPath),
+            },
+          }
         );
         try {
           const servers = await manager.listServers(home.path, overrides, true, context);
@@ -727,6 +735,18 @@ describe("createAgentPluginsMcpProvider", () => {
           expect(global[globalKey]?.plugin?.serverName).toBe("allowed");
           expect(loaded[keyFor("allowed")]?.plugin?.sourceScope).toBe("project");
           expect(loaded[keyFor("blocked")]).toBeUndefined();
+          for (const info of Object.values(loaded).filter(
+            (info) => info.plugin?.serverName === "allowed"
+          )) {
+            expect(info.plugin?.componentPolicy).toEqual({
+              registryPath: path.join(physicalHome, "plugins.json"),
+              name: "managed",
+            });
+          }
+          await fs.unlink(registryPath);
+          expect(
+            Object.keys(await manager.listServers(home.path, overrides, true, context))
+          ).toEqual([keyFor("unmanaged")]);
           await fs.writeFile(registryPath, "{");
           expect(
             Object.keys(await manager.listServers(home.path, overrides, true, context))
@@ -1018,5 +1038,44 @@ describe("resolveAgentPluginsMcpContext", () => {
         workspacePath
       )
     ).toBeNull();
+  });
+});
+
+test("MCP discovery rechecks selection after loading component files", async () => {
+  using tmp = new DisposableTempDir("plugin-mcp-discovery-policy");
+  await withHomeDir(tmp.path, async () => {
+    const xumHome = path.join(tmp.path, ".xum");
+    await writeDiscoverablePlugin(
+      path.join(xumHome, "plugins"),
+      "demo",
+      mcpDoc({ removed: STDIO_ENTRY })
+    );
+    const registry = path.join(xumHome, "plugins.json");
+    await fs.writeFile(
+      registry,
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("demo")] })
+    );
+    const original = fs.open;
+    const open = spyOn(fs, "open").mockImplementation(
+      async (...args: Parameters<typeof fs.open>) => {
+        const handle = await original(...args);
+        if (String(args[0]).endsWith("mcp.json")) {
+          await fs.writeFile(
+            `${registry}.tmp`,
+            JSON.stringify({
+              plugins: [createTestPluginInstallEntry("demo", { skills: [], mcpServers: [] })],
+            })
+          );
+          await fs.rename(`${registry}.tmp`, registry);
+        }
+        return handle;
+      }
+    );
+    try {
+      const provider = createAgentPluginsMcpProvider({ xumHome, isEnabled: () => true });
+      expect(await provider({ trusted: false })).toEqual({});
+    } finally {
+      open.mockRestore();
+    }
   });
 });

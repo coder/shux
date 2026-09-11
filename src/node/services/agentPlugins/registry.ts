@@ -1,4 +1,6 @@
+import type { MCPServerPluginProvenance } from "@/common/types/mcp";
 import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import {
   AgentPluginInstallEntrySchema,
   type AgentPluginImportedComponents,
@@ -125,5 +127,63 @@ export async function readPluginComponentImports(registryFile: string): Promise<
       error: getErrorMessage(error),
     });
     return null;
+  }
+}
+
+/** MCP-only content snapshot: skills/metadata changes must not recycle MCP clients. */
+export interface PluginMcpPolicy {
+  registryPath: string;
+  imports: Record<string, string[] | null> | null;
+}
+
+export function isPluginMcpServerAllowed(
+  plugin: MCPServerPluginProvenance | undefined,
+  policy: PluginMcpPolicy | undefined
+): boolean {
+  if (plugin?.componentPolicy === undefined) return true;
+  const owner = plugin.componentPolicy;
+  if (
+    policy?.registryPath !== owner.registryPath ||
+    policy.imports == null ||
+    !Object.hasOwn(policy.imports, owner.name)
+  )
+    return false;
+  const selected = policy.imports[owner.name];
+  return selected === null || selected.includes(plugin.serverName);
+}
+
+export async function readPluginMcpPolicy(registryFile: string): Promise<PluginMcpPolicy> {
+  try {
+    const home = path.dirname(registryFile);
+    const owner = await fsPromises.realpath(home);
+    const container = await fsPromises.realpath(path.join(owner, "plugins"));
+    const registryPath = path.join(owner, path.basename(registryFile));
+    const selection = await readPluginComponentImports(registryPath);
+    // The registry belongs to the pinned owner, not to an alias that can move
+    // during the read. Recheck both logical and canonical bindings.
+    if (
+      (await fsPromises.realpath(home)) !== owner ||
+      (await fsPromises.realpath(owner)) !== owner ||
+      (await fsPromises.realpath(path.join(home, "plugins"))) !== container ||
+      (await fsPromises.realpath(path.join(owner, "plugins"))) !== container
+    )
+      throw new Error("Managed plugin owner changed during policy read");
+    return {
+      registryPath,
+      imports:
+        selection === null
+          ? null
+          : Object.fromEntries(
+              [...selection.byName]
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(([name, components]) => [
+                  name,
+                  components === undefined ? null : [...new Set(components.mcpServers)].sort(),
+                ])
+            ),
+    };
+  } catch {
+    // Failure denies managed provenance only; unmanaged plugins do not consult this policy.
+    return { registryPath: registryFile, imports: null };
   }
 }

@@ -50,7 +50,6 @@ import {
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -62,7 +61,9 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import {
+  acquirePluginMutationLock,
   bumpContainerMutationEpoch,
+  MUTATION_LOCK_FILE,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
@@ -148,20 +149,8 @@ const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 
-/**
- * Cross-process mutation lock file in the staging root. The in-process
- * mutationQueue serializes one service instance, but two processes sharing
- * the same rootDir (ALLOW_MULTIPLE_INSTANCES, a desktop app alongside `mux
- * server`) each have their own queue: two concurrent mutations could both
- * read the same plugins.json snapshot and the later atomic write would
- * silently drop the earlier one's entry. Every mutation transaction
- * (registry read → directory moves → registry write) holds this lock.
- */
-const MUTATION_LOCK_FILE = "mutation.lock";
 /** How long an acquire waits on a live holder before failing (covers a full clone). */
 const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
-/** Pid-reuse guard: no plugin mutation legitimately runs this long. */
-const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
 
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
@@ -713,12 +702,8 @@ export class AgentPluginInstallService {
     // process sharing rootDir must not interleave its read-modify-write of
     // plugins.json (or its directory moves) with ours.
     const locked = async (): Promise<T> => {
-      const release = await acquireCrossProcessLock({
-        lockPath: path.join(this.stagingRoot, MUTATION_LOCK_FILE),
-        acquireTimeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
-        staleMs: MUTATION_LOCK_STALE_MS,
-        timeoutMessage:
-          "Another Mux process is currently modifying plugins. Wait for it to finish and try again.",
+      const release = await acquirePluginMutationLock(this.config.rootDir, {
+        timeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
       });
       try {
         return await fn();
@@ -1774,8 +1759,9 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.getComponents(args));
   }
 
-  addComponentsResult(args: Parameters<AgentPluginInstallService["addComponents"]>[0]) {
-    return this.captureResult(() => this.addComponents(args));
+  async setComponentsResult(args: Parameters<AgentPluginInstallService["setComponents"]>[0]) {
+    const result = await this.captureResult(() => this.setComponents(args));
+    return result.success ? { success: true as const, ...result.data } : result;
   }
 
   listResult() {
@@ -2715,22 +2701,38 @@ export class AgentPluginInstallService {
 
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
     this.assertEnabled();
-    return this.runExclusive(async () => {
-      const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
-      if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
-      return this.readInstalledComponents(entry);
-    });
+    // Inventory must not hold the writer lock over full-tree hashes and deny
+    // live MCP admission. Reuse discovery's journal/epoch bracket to reject
+    // overlapping installer moves, including a complete rollback or reinstall.
+    const gate = await journalDerivedDiscoveryGate([this.containerDir]);
+    const changed = () =>
+      new Error(
+        "Installed plugin files changed during component review. Refresh the component inventory."
+      );
+    if (gate.suppressed.length > 0) throw changed();
+    const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
+    if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
+    const inventory = await this.readInstalledComponents(entry);
+    if ((await gate.confirm()).length > 0) throw changed();
+    return inventory;
   }
 
-  async addComponents(
-    args: AgentPluginImportedComponents & {
-      name: string;
-      expectedLockedSha: string;
-      expectedContentHash: string;
-    }
-  ): Promise<AgentPluginInstallEntry> {
+  async setComponents(args: {
+    name: string;
+    expectedLockedSha: string;
+    expectedContentHash: string;
+    expectedImportedComponents: AgentPluginImportedComponents | null;
+    importedComponents: AgentPluginImportedComponents;
+  }): Promise<{ data: AgentPluginInstallEntry; cleanupWarning?: string }> {
     this.assertEnabled();
-    return this.runExclusive(async () => {
+    const selectionKey = (selection: AgentPluginImportedComponents | null) =>
+      selection === null
+        ? null
+        : JSON.stringify([
+            [...new Set(selection.skills)].sort(),
+            [...new Set(selection.mcpServers)].sort(),
+          ]);
+    const { data, changed } = await this.runExclusive(async () => {
       const { envelope, rawEntries } = await this.readRegistryDocument("strict");
       const entry = this.parseRegistryEntries(rawEntries, "strict").find(
         (entry) => entry.name === args.name
@@ -2738,23 +2740,27 @@ export class AgentPluginInstallService {
       if (entry === undefined) throw new Error(`No readable managed plugin named '${args.name}'.`);
       if (entry.lockedSha !== args.expectedLockedSha)
         throw new Error("Plugin changed since component review. Refresh the component inventory.");
+      if (
+        selectionKey(entry.importedComponents ?? null) !==
+        selectionKey(args.expectedImportedComponents)
+      )
+        throw new Error(
+          "Plugin selection changed since component review. Refresh the component inventory."
+        );
       const inventory = await this.readInstalledComponents(entry);
       if (inventory.contentHash !== args.expectedContentHash) {
         throw new Error(
           "Plugin files changed since component review. Refresh the component inventory."
         );
       }
-      const added = this.validateComponentImports(args, inventory);
-      // Legacy installs already import everything; do not silently convert their update behavior.
-      if (entry.importedComponents === undefined) return entry;
-      const importedComponents = {
-        skills: [...new Set([...entry.importedComponents.skills, ...added.skills])].sort(),
-        mcpServers: [
-          ...new Set([...entry.importedComponents.mcpServers, ...added.mcpServers]),
-        ].sort(),
+      const importedComponents = this.validateComponentImports(args.importedComponents, inventory);
+      // An unchanged legacy import-all selection must keep following future package inventory.
+      const previous = entry.importedComponents ?? {
+        skills: inventory.skills.map((skill) => skill.name),
+        mcpServers: inventory.mcpServers.map((server) => server.serverName),
       };
-      if (JSON.stringify(importedComponents) === JSON.stringify(entry.importedComponents))
-        return entry;
+      if (selectionKey(importedComponents) === selectionKey(previous))
+        return { data: entry, changed: false };
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) => {
@@ -2769,10 +2775,19 @@ export class AgentPluginInstallService {
           };
         })
       );
-      // Fresh discovery reads publish these additive imports. Do NOT bump the tree mutation
-      // epoch: it recycles every plugin server. An overlapping scan sees only a safe older subset.
-      return { ...entry, importedComponents };
+      return { data: { ...entry, importedComponents }, changed: true };
     });
+    if (!changed) return { data };
+    // Persist first and release the mutation lock: reconciliation rediscovers current policy.
+    // Never recycle the tree or prune workspace preferences for reversible selections.
+    try {
+      await this.deps.mcpServerManager?.reconcilePluginComponents();
+      return { data };
+    } catch (error) {
+      const cleanupWarning = `Components saved, but MCP cleanup needs retry: ${getErrorMessage(error)}`;
+      log.warn(cleanupWarning, { name: args.name });
+      return { data, cleanupWarning };
+    }
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */

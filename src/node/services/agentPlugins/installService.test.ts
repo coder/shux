@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,9 +7,13 @@ import * as path from "node:path";
 import { Config } from "@/node/config";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as mcpSdk from "@/node/services/mcpClient";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { readMutationEpochToken } from "./journals";
+import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken } from "./journals";
 import * as treeHash from "./treeHash";
+import { readPluginMcpPolicy } from "./registry";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { shellQuote } from "@/common/utils/shell";
@@ -280,9 +284,16 @@ describe("AgentPluginInstallService", () => {
       pluginInvalidation: {
         keyPrefix: "plugin:",
         readToken: () => readMutationEpochToken(stagingDir()),
+        readComponentPolicy: () => readPluginMcpPolicy(registryFile()),
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options }),
         readWorkspaceOverrides: async () =>
           JSON.parse(await fsPromises.readFile(overridesFile, "utf8")) as WorkspaceMCPOverrides,
       },
+    });
+    service = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: manager,
     });
     const request = {
       workspaceId: "imports-workspace",
@@ -329,12 +340,12 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(startsFile, "utf8")).toBe(starts);
       expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
       expect(await fsPromises.readFile(stateFile, "utf8")).toBe("preserve me");
-      await service.addComponents({
+      await service.setComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
         expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-        skills: [],
-        mcpServers: ["later"],
+        expectedImportedComponents: { skills: [], mcpServers: ["echo"] },
+        importedComponents: { skills: [], mcpServers: ["echo", "later"] },
       });
       const discovered = await configService.listServers(muxRoot, false);
       expect(discovered[key("later")]?.disabled).toBe(true);
@@ -344,12 +355,12 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
 
       // A saved enable override is honored only after import, without restarting either sibling.
-      await service.addComponents({
+      await service.setComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
         expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-        skills: [],
-        mcpServers: ["excluded"],
+        expectedImportedComponents: { skills: [], mcpServers: ["echo", "later"] },
+        importedComponents: { skills: [], mcpServers: ["echo", "later", "excluded"] },
       });
       expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(3);
       const afterEnabledAddition = await fsPromises.readFile(startsFile, "utf8");
@@ -360,6 +371,34 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(stateFile, "utf8")).toBe("preserve me");
       expect(await fsPromises.readFile(overridesFile, "utf8")).toBe(JSON.stringify(overrides));
       expect(request.overrides).toEqual(overrides);
+      const inventory = await service.getComponents({ name: "demo-plugin" });
+      const baseline = inventory.importedComponents ?? null;
+      const reduced = { skills: [], mcpServers: ["echo", "later"] };
+      const mutation = {
+        name: "demo-plugin",
+        expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
+      };
+      await service.setComponents({
+        ...mutation,
+        expectedImportedComponents: baseline,
+        importedComponents: reduced,
+      });
+      expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(2);
+      expect(await fsPromises.readFile(startsFile, "utf8")).toBe(afterEnabledAddition);
+      expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
+      if (!baseline) throw new Error("Expected an explicit saved selection");
+      await service.setComponents({
+        ...mutation,
+        expectedImportedComponents: reduced,
+        importedComponents: baseline,
+      });
+      expect((await manager.getToolsForWorkspace(request)).stats.startedServerCount).toBe(3);
+      const readdedStarts = await fsPromises.readFile(startsFile, "utf8");
+      expect(readdedStarts.slice(afterEnabledAddition.length)).toMatch(/^excluded /);
+      expect(await fsPromises.readFile(siblingStartsFile, "utf8")).toBe(siblingStarts);
+      expect(await fsPromises.readFile(stateFile, "utf8")).toBe("preserve me");
+      expect(await fsPromises.readFile(overridesFile, "utf8")).toBe(JSON.stringify(overrides));
     } finally {
       await manager.stopServersWithKeyPrefix("plugin:");
       manager.dispose();
@@ -441,21 +480,25 @@ describe("AgentPluginInstallService", () => {
       name: "demo-plugin",
       expectedLockedSha: reviewed.lockedSha,
       expectedContentHash: reviewed.contentHash,
-      skills: ["greet"],
-      mcpServers: ["echo"],
+      expectedImportedComponents: { skills: [], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
     };
-    expect((await service.addComponentsResult(request)).success).toBe(false);
+    expect((await service.setComponentsResult(request)).success).toBe(false);
     expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
     const refreshed = await service.getComponents({ name: "demo-plugin" });
     expect(refreshed.lockedSha).toBe(reviewed.lockedSha);
     expect(refreshed.contentHash).not.toBe(reviewed.contentHash);
-    const accepted = await service.addComponents({
+    const accepted = await service.setComponents({
       ...request,
       expectedContentHash: refreshed.contentHash,
     });
-    expect(accepted.importedComponents).toEqual({ skills: ["greet"], mcpServers: ["echo"] });
+    expect(accepted.data.importedComponents).toEqual({ skills: ["greet"], mcpServers: ["echo"] });
     expect(
-      await service.addComponents({ ...request, expectedContentHash: refreshed.contentHash })
+      await service.setComponents({
+        ...request,
+        expectedContentHash: refreshed.contentHash,
+        expectedImportedComponents: accepted.data.importedComponents ?? null,
+      })
     ).toEqual(accepted);
   });
 
@@ -498,8 +541,8 @@ describe("AgentPluginInstallService", () => {
         name: "demo-plugin",
         expectedLockedSha: reviewed.lockedSha,
         expectedContentHash: reviewed.contentHash,
-        skills: ["greet"],
-        mcpServers: ["echo"],
+        expectedImportedComponents: { skills: [], mcpServers: [] },
+        importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
       };
       if (retarget !== "stable") {
         await fsPromises.cp(targetA, targetB, { recursive: true });
@@ -508,14 +551,14 @@ describe("AgentPluginInstallService", () => {
         await fsPromises.unlink(logical);
         await fsPromises.symlink(targetB, logical, "dir");
         const before = await fsPromises.readFile(registryFile(), "utf8");
-        expect((await service.addComponentsResult(request)).success).toBe(false);
+        expect((await service.setComponentsResult(request)).success).toBe(false);
         expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
         const refreshed = await service.getComponents({ name: "demo-plugin" });
         expect(refreshed.contentHash).not.toBe(reviewed.contentHash);
         expect(refreshed.mcpServers).toEqual(reviewed.mcpServers);
         request.expectedContentHash = refreshed.contentHash;
       }
-      expect((await service.addComponents(request)).importedComponents).toEqual({
+      expect((await service.setComponents(request)).data.importedComponents).toEqual({
         skills: ["greet"],
         mcpServers: ["echo"],
       });
@@ -527,6 +570,125 @@ describe("AgentPluginInstallService", () => {
       const server = servers[key];
       if (server.transport !== "stdio") throw new Error("Expected the installed stdio server");
       expect(server.env?.DATA).toBe(getPluginDataPath(muxRoot, computePluginInstanceId(logical)));
+    }
+  );
+
+  test("component inventory does not contend with managed MCP admission", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const manager = new MCPServerManager(
+      new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+          xumHome: muxRoot,
+          isEnabled: () => true,
+        }),
+      }),
+      {
+        pluginInvalidation: {
+          keyPrefix: "plugin:",
+          readToken: () => Promise.resolve(undefined),
+          readComponentPolicy: () => readPluginMcpPolicy(registryFile()),
+          tryAcquireComponentPolicyLock: (options) =>
+            acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options }),
+        },
+      }
+    );
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const hash = treeHash.hashPluginTree;
+    let pause = true;
+    const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+      if (pause) {
+        pause = false;
+        entered.resolve();
+        await resume.promise;
+      }
+      return hash(...args);
+    });
+    const exec = mock(() => Promise.reject(new Error("admitted launch reached")));
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    const inventory = service.getComponents({ name: "demo-plugin" });
+    inventory.catch(() => undefined);
+    try {
+      await entered.promise;
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "echo"
+      );
+      const result = await manager.test({ projectPath: muxRoot, name: key });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected the injected launch failure");
+      expect(result.error).toContain("admitted launch reached");
+      const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+      await release();
+      resume.resolve();
+      expect((await inventory).skills.map((skill) => skill.name)).toEqual(["greet"]);
+    } finally {
+      resume.resolve();
+      await inventory.catch(() => undefined);
+      receipt.mockRestore();
+      runtime.mockRestore();
+      manager.dispose();
+    }
+  });
+
+  test("component inventory rejects a complete reinstall even when receipt bytes match", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const install = { source: preview.source, expectedSha: preview.lockedSha };
+    await service.install(install);
+    const reviewed = await service.getComponents({ name: "demo-plugin" });
+    const hash = treeHash.hashPluginTree;
+    let replace = true;
+    const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+      const result = await hash(...args);
+      if (replace) {
+        replace = false;
+        // Fail promptly on the old locked reader rather than deadlocking its
+        // in-process queue. The real uninstall/reinstall then spans the scan.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
+        await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+        await service.install(install);
+      }
+      return result;
+    });
+    try {
+      await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /changed.*review/i
+      );
+    } finally {
+      receipt.mockRestore();
+    }
+    const refreshed = await service.getComponents({ name: "demo-plugin" });
+    expect(refreshed.contentHash).toBe(reviewed.contentHash);
+    expect(refreshed.lockedSha).toBe(reviewed.lockedSha);
+    expect(refreshed.skills).toEqual(reviewed.skills);
+  });
+
+  test.each(["before", "during"])(
+    "component inventory rejects a pending installer journal created %s the scan",
+    async (when) => {
+      const preview = await service.preview({ input: remoteDir });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const journal = path.join(stagingDir(), "update-demo-plugin.json");
+      const hash = treeHash.hashPluginTree;
+      const receipt = spyOn(treeHash, "hashPluginTree").mockImplementation(async (...args) => {
+        const result = await hash(...args);
+        if (when === "during") await fsPromises.writeFile(journal, "{}");
+        return result;
+      });
+      try {
+        if (when === "before") await fsPromises.writeFile(journal, "{}");
+        await expect(service.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+          /changed.*review/i
+        );
+      } finally {
+        receipt.mockRestore();
+        await fsPromises.rm(journal, { force: true });
+      }
     }
   );
 
@@ -612,12 +774,337 @@ describe("AgentPluginInstallService", () => {
     expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
   });
 
-  test("concurrent additions union imports across service instances, preserve unknown names and survive restart", async () => {
+  test.each(["stdio", "http"] as const)(
+    "named %s admission pins an open policy inode against the real component setter",
+    async (transport) => {
+      if (transport === "http") {
+        await fsPromises.writeFile(
+          path.join(remoteDir, "mcp.json"),
+          JSON.stringify({
+            $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+            mcpServers: { echo: { type: "streamable-http", url: "https://mcp.example.test/echo" } },
+          })
+        );
+        await commitAll(remoteDir, "HTTP fixture");
+      }
+      const preview = await service.preview({ input: remoteDir });
+      const all = { skills: [], mcpServers: ["echo"] };
+      await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+        importedComponents: all,
+      });
+      const inventory = await service.getComponents({ name: "demo-plugin" });
+      const configService = new MCPConfigService(config, {
+        agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+          xumHome: muxRoot,
+          isEnabled: () => true,
+        }),
+      });
+      let finalRead = false;
+      let lockHeld = false;
+      const manager = new MCPServerManager(configService, {
+        pluginInvalidation: {
+          keyPrefix: "plugin:",
+          readToken: () => Promise.resolve(undefined),
+          readComponentPolicy: () => {
+            finalRead = true;
+            return readPluginMcpPolicy(registryFile()).finally(() => {
+              finalRead = false;
+            });
+          },
+          tryAcquireComponentPolicyLock: async (options) => {
+            const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0, ...options });
+            lockHeld = true;
+            return async () => {
+              await release();
+              lockHeld = false;
+            };
+          },
+        },
+      });
+      const opened = Promise.withResolvers<void>();
+      const resumeRead = Promise.withResolvers<void>();
+      const launched = Promise.withResolvers<void>();
+      const finishLaunch = Promise.withResolvers<never>();
+      finishLaunch.promise.catch(() => undefined);
+      const writerAttempted = Promise.withResolvers<boolean>();
+      const readFile = fsPromises.readFile;
+      let interceptRead = true;
+      const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.readFile>
+      ) => {
+        if (interceptRead && finalRead && args[0] === registryFile()) {
+          interceptRead = false;
+          const handle = await fsPromises.open(registryFile(), "r");
+          try {
+            opened.resolve();
+            await resumeRead.promise;
+            return await handle.readFile("utf8");
+          } finally {
+            await handle.close();
+          }
+        }
+        return readFile(...args);
+      }) as typeof fsPromises.readFile);
+      let observeWriter = false;
+      const link = fsPromises.link;
+      const linkSpy = spyOn(fsPromises, "link").mockImplementation(async (from, to) => {
+        try {
+          await link(from, to);
+          if (observeWriter && to === path.join(stagingDir(), MUTATION_LOCK_FILE))
+            writerAttempted.resolve(false);
+        } catch (error) {
+          if (observeWriter && to === path.join(stagingDir(), MUTATION_LOCK_FILE))
+            writerAttempted.resolve(true);
+          throw error;
+        }
+      });
+      let setterFinished = false;
+      const initiate = mock(() => {
+        expect(lockHeld).toBe(true);
+        expect(setterFinished).toBe(false);
+        launched.resolve();
+        return finishLaunch.promise;
+      });
+      const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        exec: initiate,
+      } as unknown as Runtime);
+      const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(initiate);
+      const key = buildPluginServerKey(
+        computePluginInstanceId(path.join(pluginsDir(), "demo-plugin")),
+        "echo"
+      );
+      let setter: Promise<unknown> | undefined;
+      const pending = manager.test({ projectPath: muxRoot, name: key });
+      try {
+        await opened.promise;
+        observeWriter = true;
+        setter = service
+          .setComponents({
+            name: "demo-plugin",
+            expectedLockedSha: inventory.lockedSha,
+            expectedContentHash: inventory.contentHash,
+            expectedImportedComponents: all,
+            importedComponents: { skills: [], mcpServers: [] },
+          })
+          .then((result) => {
+            setterFinished = true;
+            return result;
+          });
+        expect(await writerAttempted.promise).toBe(true);
+        expect(initiate).not.toHaveBeenCalled();
+        expect(setterFinished).toBe(false);
+        resumeRead.resolve();
+        await launched.promise;
+        // The setter can finish while the connection is still pending: admission
+        // owns the lock only through the real synchronous exec/client initiation.
+        await setter;
+        expect(lockHeld).toBe(false);
+        expect((await service.getComponents({ name: "demo-plugin" })).importedComponents).toEqual({
+          skills: [],
+          mcpServers: [],
+        });
+        expect(initiate).toHaveBeenCalledTimes(1);
+      } finally {
+        resumeRead.resolve();
+        finishLaunch.reject(new Error("connection probe complete"));
+        await pending;
+        await setter;
+        runtime.mockRestore();
+        client.mockRestore();
+        readSpy.mockRestore();
+        linkSpy.mockRestore();
+        manager.dispose();
+      }
+    }
+  );
+
+  test("replacement selections remove, mix, empty, and reject stale baselines without rewriting identity", async () => {
     const preview = await service.preview({ input: remoteDir });
+    const all = { skills: ["greet"], mcpServers: ["echo"] };
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: all,
+    });
+    const inventory = await service.getComponents({ name: installed.name });
+    const request = {
+      name: installed.name,
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: all,
+    };
+    const epoch = await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8");
+    for (const importedComponents of [
+      { skills: ["greet"], mcpServers: [] },
+      { skills: [], mcpServers: ["echo"] },
+      { skills: [], mcpServers: [] },
+    ]) {
+      const result = await service.setComponentsResult({ ...request, importedComponents });
+      expect(result).toEqual({ success: true, data: { ...installed, importedComponents } });
+      const before = await fsPromises.readFile(registryFile(), "utf8");
+      expect(
+        (await service.setComponentsResult({ ...request, importedComponents: all })).success
+      ).toBe(false);
+      expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+      request.expectedImportedComponents = importedComponents;
+    }
+    expect(await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8")).toBe(
+      epoch
+    );
+    expect(
+      await pathExists(path.join(pluginsDir(), installed.name, "skills", "greet", "SKILL.md"))
+    ).toBe(true);
+    expect((await service.list())[0]).toMatchObject({
+      managed: true,
+      present: true,
+      importedSkillCount: 0,
+      importedMcpServerCount: 0,
+    });
+    expect(
+      (
+        await service.setComponentsResult({
+          ...request,
+          expectedImportedComponents: null,
+          importedComponents: all,
+        })
+      ).success
+    ).toBe(false);
+  });
+
+  test.each([false, true])(
+    "effective component no-op leaves disk and runtime untouched (explicit: %s)",
+    async (explicit) => {
+      const preview = await service.preview({ input: remoteDir });
+      const all = { skills: ["greet"], mcpServers: ["echo"] };
+      await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+        ...(explicit ? { importedComponents: all } : {}),
+      });
+      const manager = new MCPServerManager(new MCPConfigService(config));
+      const withRuntime = new AgentPluginInstallService(config, {
+        isEnabled: () => true,
+        mcpServerManager: manager,
+      });
+      const inventory = await withRuntime.getComponents({ name: "demo-plugin" });
+      const before = await fsPromises.readFile(registryFile(), "utf8");
+      const empty = { skills: [], mcpServers: [] };
+      const reconcile = spyOn(manager, "reconcilePluginComponents").mockImplementation(async () => {
+        // Cleanup must run after releasing the component writer lock.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
+        expect(
+          (await withRuntime.getComponents({ name: "demo-plugin" })).importedComponents
+        ).toEqual(empty);
+      });
+      const write = spyOn(
+        withRuntime as unknown as { writeRegistry: () => Promise<void> },
+        "writeRegistry"
+      );
+      const request = {
+        name: "demo-plugin",
+        expectedLockedSha: inventory.lockedSha,
+        expectedContentHash: inventory.contentHash,
+        expectedImportedComponents: explicit ? all : null,
+      };
+      try {
+        const unchanged = await withRuntime.setComponentsResult({
+          ...request,
+          importedComponents: { skills: ["greet", "greet"], mcpServers: ["echo", "echo"] },
+        });
+        expect(unchanged).toMatchObject({ success: true });
+        expect(write).not.toHaveBeenCalled();
+        expect(reconcile).not.toHaveBeenCalled();
+        expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+        const changed = await withRuntime.setComponentsResult({
+          ...request,
+          importedComponents: empty,
+        });
+        expect(changed).toMatchObject({ success: true, data: { importedComponents: empty } });
+        expect(changed).not.toHaveProperty("cleanupWarning");
+        expect(write).toHaveBeenCalledTimes(1);
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        write.mockRestore();
+        reconcile.mockRestore();
+        manager.dispose();
+      }
+    }
+  );
+
+  test("cleanup failures report saved selections and reconciliation runs outside the mutation lock", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const all = { skills: ["greet"], mcpServers: ["echo"] };
     await service.install({
       source: preview.source,
       expectedSha: preview.lockedSha,
-      importedComponents: { skills: [], mcpServers: [] },
+      importedComponents: all,
+    });
+    const manager = new MCPServerManager(new MCPConfigService(config));
+    const withRuntime = new AgentPluginInstallService(config, {
+      isEnabled: () => true,
+      mcpServerManager: manager,
+    });
+    const inventory = await withRuntime.getComponents({ name: "demo-plugin" });
+    const empty = { skills: [], mcpServers: [] };
+    const request = {
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: all,
+      importedComponents: empty,
+    };
+    const reconcile = spyOn(manager, "reconcilePluginComponents").mockImplementationOnce(
+      async () => {
+        // Cleanup must run after releasing the component writer lock.
+        const release = await acquirePluginMutationLock(muxRoot, { timeoutMs: 0 });
+        await release();
+        expect(
+          (await withRuntime.getComponents({ name: request.name })).importedComponents
+        ).toEqual(empty);
+        throw new Error("client close failed");
+      }
+    );
+    const write = spyOn(
+      withRuntime as unknown as { writeRegistry: () => Promise<void> },
+      "writeRegistry"
+    ).mockImplementationOnce(() => Promise.reject(new Error("disk full")));
+    try {
+      expect(await withRuntime.setComponentsResult(request)).toEqual({
+        success: false,
+        error: "disk full",
+      });
+      expect(reconcile).not.toHaveBeenCalled();
+      const saved = await withRuntime.setComponentsResult(request);
+      expect(saved).toMatchObject({ success: true, data: { importedComponents: empty } });
+      if (!saved.success) throw new Error("Expected the selection to remain saved");
+      expect(saved.cleanupWarning).toContain("client close failed");
+      expect((await withRuntime.getComponents({ name: request.name })).importedComponents).toEqual(
+        empty
+      );
+      const readded = await withRuntime.setComponentsResult({
+        ...request,
+        expectedImportedComponents: empty,
+        importedComponents: all,
+      });
+      expect(readded).toMatchObject({ success: true, data: { importedComponents: all } });
+      expect(reconcile).toHaveBeenCalledTimes(2);
+    } finally {
+      write.mockRestore();
+      reconcile.mockRestore();
+      manager.dispose();
+    }
+  });
+
+  test("concurrent replacements reject stale selections, normalize sets and preserve unknown registry fields", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const initial = { skills: [], mcpServers: [] };
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: initial,
     });
     const [entry] = (await registry()) as Array<Record<string, unknown>>;
     await fsPromises.writeFile(
@@ -627,73 +1114,75 @@ describe("AgentPluginInstallService", () => {
         plugins: [
           {
             ...entry,
-            futureField: { preserve: true },
-            importedComponents: {
-              skills: ["removed-skill"],
-              mcpServers: ["removed-server"],
-              futureSelection: true,
-            },
+            futureField: true,
+            importedComponents: { ...initial, futureSelection: true },
           },
         ],
       })
     );
     const other = new AgentPluginInstallService(config, { isEnabled: () => true });
+    const inventory = await service.getComponents({ name: "demo-plugin" });
     const args = {
       name: "demo-plugin",
-      expectedLockedSha: preview.lockedSha,
-      expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: initial,
     };
-    const epoch = await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8");
-    await Promise.all([
-      service.addComponents({ ...args, skills: ["greet", "greet"], mcpServers: [] }),
-      other.addComponents({ ...args, skills: [], mcpServers: ["echo", "echo"] }),
+    const results = await Promise.all([
+      service.setComponentsResult({
+        ...args,
+        importedComponents: { skills: ["greet", "greet"], mcpServers: ["echo"] },
+      }),
+      other.setComponentsResult({
+        ...args,
+        importedComponents: { skills: ["greet"], mcpServers: [] },
+      }),
     ]);
-    const importedComponents = {
-      skills: ["greet", "removed-skill"],
-      mcpServers: ["echo", "removed-server"],
-    };
-    expect((await service.getComponents({ name: args.name })).importedComponents).toEqual(
-      importedComponents
-    );
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(results.filter((result) => !result.success)).toHaveLength(1);
+    const winner = results.find((result) => result.success);
+    if (!winner?.success || !winner.data.importedComponents)
+      throw new Error("Expected one saved replacement");
+    const selection = winner.data.importedComponents;
     const saved = await fsPromises.readFile(registryFile(), "utf8");
     expect(JSON.parse(saved)).toMatchObject({
       futureEnvelope: true,
-      plugins: [
-        {
-          futureField: { preserve: true },
-          importedComponents: { ...importedComponents, futureSelection: true },
-        },
-      ],
+      plugins: [{ futureField: true, importedComponents: { ...selection, futureSelection: true } }],
     });
-    await service.addComponents({ ...args, skills: ["greet"], mcpServers: ["echo"] });
-    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(saved);
-    // Selection additions must not publish the destructive epoch that retires unrelated MCP servers.
-    expect(await fsPromises.readFile(path.join(stagingDir(), "mutation-epoch"), "utf8")).toBe(
-      epoch
-    );
-    const restarted = new AgentPluginInstallService(config, { isEnabled: () => true });
-    expect((await restarted.getComponents({ name: args.name })).importedComponents).toEqual(
-      importedComponents
-    );
-    const stale = await restarted.addComponentsResult({
-      ...args,
-      expectedLockedSha: "e".repeat(40),
-      skills: [],
-      mcpServers: [],
-    });
-    expect(stale.success).toBe(false);
-    if (!stale.success) expect(stale.error).toMatch(/changed since/);
-    expect(
-      (await restarted.addComponentsResult({ ...args, skills: ["missing"], mcpServers: [] }))
-        .success
-    ).toBe(false);
     expect(
       (
-        await restarted.addComponentsResult({
+        await service.setComponentsResult({
+          ...args,
+          expectedImportedComponents: { ...selection, skills: ["greet", "greet"] },
+          importedComponents: selection,
+        })
+      ).success
+    ).toBe(true);
+    expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(saved);
+    const restarted = new AgentPluginInstallService(config, { isEnabled: () => true });
+    expect((await restarted.getComponents({ name: args.name })).importedComponents).toEqual(
+      selection
+    );
+    for (const importedComponents of [
+      { skills: ["missing"], mcpServers: [] },
+      { skills: [], mcpServers: ["missing"] },
+    ]) {
+      expect(
+        (
+          await restarted.setComponentsResult({
+            ...args,
+            expectedImportedComponents: selection,
+            importedComponents,
+          })
+        ).success
+      ).toBe(false);
+    }
+    expect(
+      (
+        await restarted.setComponentsResult({
           ...args,
           name: "not-installed",
-          skills: [],
-          mcpServers: [],
+          importedComponents: initial,
         })
       ).success
     ).toBe(false);
@@ -722,12 +1211,12 @@ describe("AgentPluginInstallService", () => {
       expect((await service.getComponentsResult({ name: "demo-plugin" })).success).toBe(false);
       expect(
         (
-          await service.addComponentsResult({
+          await service.setComponentsResult({
             name: "demo-plugin",
             expectedLockedSha: preview.lockedSha,
             expectedContentHash: contentHash,
-            skills: [],
-            mcpServers: ["echo"],
+            expectedImportedComponents: { skills: [], mcpServers: [] },
+            importedComponents: { skills: [], mcpServers: ["echo"] },
           })
         ).success
       ).toBe(false);
@@ -782,19 +1271,19 @@ describe("AgentPluginInstallService", () => {
     await writePluginFixture(remoteDir, { version: "2.0.0" });
     const nextSha = await commitAll(remoteDir, "metadata update");
     const [added, updated] = await Promise.all([
-      service.addComponents({
+      service.setComponents({
         name: "demo-plugin",
         expectedLockedSha: preview.lockedSha,
         expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-        skills: ["greet"],
-        mcpServers: [],
+        expectedImportedComponents: { skills: [], mcpServers: [] },
+        importedComponents: { skills: ["greet"], mcpServers: [] },
       }),
       service.update({ name: "demo-plugin" }),
     ]);
-    expect(added.importedComponents).toEqual({ skills: ["greet"], mcpServers: [] });
+    expect(added.data.importedComponents).toEqual({ skills: ["greet"], mcpServers: [] });
     expect(updated.lockedSha).toBe(nextSha);
     expect((await service.getComponents({ name: "demo-plugin" })).importedComponents).toEqual(
-      added.importedComponents
+      added.data.importedComponents
     );
   });
 
@@ -815,11 +1304,11 @@ describe("AgentPluginInstallService", () => {
       name: "demo-plugin",
       expectedLockedSha: preview.lockedSha,
       expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-      skills: ["greet"],
-      mcpServers: ["echo"],
+      expectedImportedComponents: { skills: [], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
     };
     try {
-      expect(await service.addComponentsResult(args)).toEqual({
+      expect(await service.setComponentsResult(args)).toEqual({
         success: false,
         error: "disk full",
       });
@@ -834,7 +1323,7 @@ describe("AgentPluginInstallService", () => {
     } finally {
       writeSpy.mockRestore();
     }
-    expect((await service.addComponents(args)).importedComponents).toEqual({
+    expect((await service.setComponents(args)).data.importedComponents).toEqual({
       skills: ["greet"],
       mcpServers: ["echo"],
     });
@@ -870,31 +1359,80 @@ describe("AgentPluginInstallService", () => {
     expect(updated.importedComponents).toEqual({ skills: ["greet"], mcpServers: [] });
     expect(
       (
-        await service.addComponentsResult({
+        await service.setComponentsResult({
           name: "demo-plugin",
           expectedLockedSha: preview.lockedSha,
           expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-          skills: [],
-          mcpServers: ["echo"],
+          expectedImportedComponents: { skills: [], mcpServers: [] },
+          importedComponents: { skills: [], mcpServers: ["echo"] },
         })
       ).success
     ).toBe(false);
-    expect((await service.getComponents({ name: "demo-plugin" })).skills).toEqual([]);
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    expect(inventory.skills).toEqual([]);
+    expect(inventory.importedComponents).toEqual({ skills: ["greet"], mcpServers: [] });
+    const request = {
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: inventory.importedComponents ?? null,
+    };
+    // Update preservation does not authorize importing an unavailable name on a later explicit save.
+    expect(
+      (
+        await service.setComponentsResult({
+          ...request,
+          importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+        })
+      ).success
+    ).toBe(false);
+    expect((await service.getComponents({ name: request.name })).importedComponents).toEqual(
+      inventory.importedComponents
+    );
+    const selection = { skills: [], mcpServers: ["echo"] };
+    expect(
+      await service.setComponentsResult({ ...request, importedComponents: selection })
+    ).toMatchObject({
+      success: true,
+      data: { importedComponents: selection },
+    });
+    await writePluginFixture(remoteDir, { version: "3.0.0" });
+    await commitAll(remoteDir, "restore the removed skill");
+    const restored = await service.previewUpdate({ name: request.name });
+    await service.update({
+      name: request.name,
+      consent: { fromSha: restored.fromSha, toSha: restored.toSha },
+    });
+    const after = await service.getComponents({ name: request.name });
+    expect(after.skills.map((skill) => skill.name)).toEqual(["greet"]);
+    expect(after.importedComponents).toEqual(selection);
   });
 
-  test("additions to legacy installs remain import-all on disk", async () => {
+  test("unchanged legacy selection remains import-all; changing it becomes explicit", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
     const before = await fsPromises.readFile(registryFile(), "utf8");
-    const updated = await service.addComponents({
+    const updated = await service.setComponents({
       name: "demo-plugin",
       expectedLockedSha: preview.lockedSha,
       expectedContentHash: (await service.getComponents({ name: "demo-plugin" })).contentHash,
-      skills: ["greet"],
-      mcpServers: [],
+      expectedImportedComponents: null,
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
     });
-    expect(updated.importedComponents).toBeUndefined();
+    expect(updated.data.importedComponents).toBeUndefined();
     expect(await fsPromises.readFile(registryFile(), "utf8")).toBe(before);
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    const changed = await service.setComponentsResult({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: null,
+      importedComponents: { skills: [], mcpServers: [] },
+    });
+    expect(changed).toMatchObject({
+      success: true,
+      data: { importedComponents: { skills: [], mcpServers: [] } },
+    });
   });
 
   test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {

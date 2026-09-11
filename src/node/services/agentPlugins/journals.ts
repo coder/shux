@@ -16,10 +16,30 @@
 import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 /** Staging dir name under the mux home dir — NOT under ~/.mux/plugins, which discovery scans. */
 export const STAGING_DIR_NAME = "plugin-staging";
+
+/** Shared by installer transactions and MCP's final component-policy admission. */
+export const MUTATION_LOCK_FILE = "mutation.lock";
+/** Pid-reuse guard; the shared lock renews the lease while a holder is alive. */
+const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
+
+export function acquirePluginMutationLock(
+  rootDir: string,
+  options: { timeoutMs: number; signal?: AbortSignal }
+): Promise<() => Promise<void>> {
+  return acquireCrossProcessLock({
+    lockPath: path.join(rootDir, STAGING_DIR_NAME, MUTATION_LOCK_FILE),
+    acquireTimeoutMs: options.timeoutMs,
+    staleMs: MUTATION_LOCK_STALE_MS,
+    signal: options.signal,
+    timeoutMessage:
+      "Another Mux process is currently modifying plugins. Wait for it to finish and try again.",
+  });
+}
 
 /**
  * Mutation-epoch handshake file in the staging root. The install service

@@ -88,12 +88,8 @@ const ComponentChooser: React.FC<{
               detail: `${server.transport} · ${server.summary}`,
             }));
       const imported = props.imported?.[group] ?? [];
-      const selectable = entries
-        .map((entry) => entry.name)
-        .filter((name) => !imported.includes(name));
-      const count = entries.filter(
-        ({ name }) => imported.includes(name) || props.selected[group].includes(name)
-      ).length;
+      const selectable = entries.map((entry) => entry.name);
+      const count = entries.filter(({ name }) => props.selected[group].includes(name)).length;
       const change = (names: string[]) => props.onChange({ ...props.selected, [group]: names });
       return (
         <fieldset
@@ -131,8 +127,8 @@ const ComponentChooser: React.FC<{
             <label key={name} className="flex items-start gap-2 text-xs">
               <Checkbox
                 aria-label={name}
-                checked={imported.includes(name) || props.selected[group].includes(name)}
-                disabled={props.disabled || imported.includes(name)}
+                checked={props.selected[group].includes(name)}
+                disabled={props.disabled}
                 onCheckedChange={(checked) =>
                   change(
                     checked === true
@@ -154,8 +150,9 @@ const ComponentChooser: React.FC<{
       );
     })}
     <p className="text-muted text-[11px]">
-      Importing MCP servers only makes them available; they stay disabled until enabled per
-      workspace.
+      {props.imported
+        ? "New MCP imports need workspace opt-in. Re-adding a server honors its saved workspace enablement."
+        : "Importing MCP servers only makes them available; they stay disabled until enabled per workspace."}
     </p>
     <p className="text-muted hidden text-[11px] md:block">
       Tab to navigate · Space to select · Enter to activate buttons
@@ -163,12 +160,43 @@ const ComponentChooser: React.FC<{
   </div>
 );
 
-const AddComponentsPanel: React.FC<{
+function effectiveImports(inventory: AgentPluginComponents): AgentPluginImportedComponents {
+  // Manage saves replace the selection; carrying unavailable names would defeat Clear/empty consent.
+  return {
+    skills: inventory.skills
+      .map((skill) => skill.name)
+      .filter(
+        (name) =>
+          !inventory.importedComponents || inventory.importedComponents.skills.includes(name)
+      ),
+    mcpServers: inventory.mcpServers
+      .map((server) => server.serverName)
+      .filter(
+        (name) =>
+          !inventory.importedComponents || inventory.importedComponents.mcpServers.includes(name)
+      ),
+  };
+}
+
+function sameImports(
+  a: AgentPluginImportedComponents | null,
+  b: AgentPluginImportedComponents | null
+): boolean {
+  if (a === null || b === null) return a === b;
+  return (["skills", "mcpServers"] as const).every(
+    (group) =>
+      a[group].every((name) => b[group].includes(name)) &&
+      b[group].every((name) => a[group].includes(name))
+  );
+}
+
+const ManageComponentsPanel: React.FC<{
   name: string;
-  onAdded: () => Promise<void>;
+  onSaved: () => Promise<void>;
   onClose: () => void;
 }> = (props) => {
   const { api } = useAPI();
+  // Keep the raw baseline (including legacy absence) separate from the visible selection.
   const [inventory, setInventory] = useState<AgentPluginComponents | null>(null);
   const [selected, setSelected] = useState<AgentPluginImportedComponents>({
     skills: [],
@@ -177,7 +205,7 @@ const AddComponentsPanel: React.FC<{
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [loadAttempt, setLoadAttempt] = useState(0);
-  const [added, setAdded] = useState(false);
+  const [saved, setSaved] = useState(false);
   const name = props.name;
 
   useEffect(() => {
@@ -186,8 +214,10 @@ const AddComponentsPanel: React.FC<{
     api.agentPlugins.getComponents({ name }).then(
       (result) => {
         if (ignore) return;
-        if (result.success) setInventory(result.data);
-        else setError(result.error);
+        if (result.success) {
+          setInventory(result.data);
+          setSelected(effectiveImports(result.data));
+        } else setError(result.error);
         setBusy(false);
       },
       (err: unknown) => {
@@ -202,66 +232,107 @@ const AddComponentsPanel: React.FC<{
     };
   }, [api, name, loadAttempt]);
 
-  const handleAdd = async () => {
-    if (!api || !inventory || busy || selected.skills.length + selected.mcpServers.length === 0)
-      return;
+  const imported = inventory ? effectiveImports(inventory) : { skills: [], mcpServers: [] };
+  const added = (["skills", "mcpServers"] as const).reduce(
+    (count, group) =>
+      count + selected[group].filter((name) => !imported[group].includes(name)).length,
+    0
+  );
+  const removed = (["skills", "mcpServers"] as const).reduce(
+    (count, group) =>
+      count + imported[group].filter((name) => !selected[group].includes(name)).length,
+    0
+  );
+  const handleSave = async () => {
+    if (!api || !inventory || busy || added + removed === 0) return;
     setBusy(true);
     setError(null);
-    setAdded(false);
+    setSaved(false);
+    let confirmed = false;
+    let responseLost = false;
+    let savedImports: AgentPluginImportedComponents | null = selected;
+    let warning: string | undefined;
     try {
-      const result = await api.agentPlugins.addComponents({
-        name,
-        expectedLockedSha: inventory.lockedSha,
-        expectedContentHash: inventory.contentHash,
-        ...selected,
-      });
+      const result = await api.agentPlugins
+        .setComponents({
+          name,
+          expectedLockedSha: inventory.lockedSha,
+          expectedContentHash: inventory.contentHash,
+          expectedImportedComponents: inventory.importedComponents ?? null,
+          importedComponents: selected,
+        })
+        .catch((err: unknown) => {
+          responseLost = true;
+          throw err;
+        });
       if (!result.success) throw new Error(result.error);
-      setInventory({ ...inventory, importedComponents: result.data.importedComponents });
-      setSelected({ skills: [], mcpServers: [] });
-      setAdded(true);
+      confirmed = true;
+      warning = result.cleanupWarning;
+      savedImports = result.data.importedComponents ?? null;
       publishAgentPluginsMutated();
-      await props.onAdded();
     } catch (err) {
       setError(getErrorMessage(err));
-      // Compare receipts rather than parsing backend error prose. Never retry choices
-      // against a different installed version without another explicit selection.
-      try {
-        const current = await api.agentPlugins.getComponents({ name });
-        if (
-          current.success &&
-          (current.data.lockedSha !== inventory.lockedSha ||
-            current.data.contentHash !== inventory.contentHash)
-        ) {
-          setInventory(current.data);
-          setSelected({ skills: [], mcpServers: [] });
-          setError(
-            "The installed plugin changed. Inventory refreshed; select components again before confirming."
-          );
-        }
-      } catch {
-        /* Keep the original mutation error and choices when the inventory is unreachable. */
+    }
+    // Refetch even after a lost response: a transport failure does not mean the write failed.
+    try {
+      const current = await api.agentPlugins.getComponents({ name });
+      if (!current.success) throw new Error(current.error);
+      const sameTree =
+        current.data.lockedSha === inventory.lockedSha &&
+        current.data.contentHash === inventory.contentHash;
+      if (
+        (confirmed || responseLost) &&
+        sameTree &&
+        sameImports(current.data.importedComponents ?? null, savedImports)
+      ) {
+        setInventory(current.data);
+        setSelected(effectiveImports(current.data));
+        setSaved(true);
+        setError(warning ?? null);
+        if (!confirmed) publishAgentPluginsMutated();
+        await props.onSaved();
+      } else if (
+        confirmed ||
+        !sameTree ||
+        !sameImports(current.data.importedComponents ?? null, inventory.importedComponents ?? null)
+      ) {
+        setSaved(false);
+        setInventory(current.data);
+        setSelected(effectiveImports(current.data));
+        setError(
+          "The installed plugin or selection changed. Inventory refreshed; review your choices and save again."
+        );
+        // A rejected stale save still discovered newer counts for the surrounding card.
+        await props.onSaved();
+      }
+    } catch (err) {
+      setError(
+        confirmed
+          ? `Components saved, but refreshing failed: ${getErrorMessage(err)}. Reopen to read the saved selection.`
+          : `Could not confirm the saved selection: ${getErrorMessage(err)}. Reopen to refresh before retrying.`
+      );
+      if (confirmed || responseLost) {
+        // Refresh counts for acknowledged or possible writes even without an inventory receipt.
+        if (!confirmed) publishAgentPluginsMutated();
+        await props.onSaved();
       }
     } finally {
       setBusy(false);
     }
   };
-  const imported = inventory?.importedComponents ?? {
-    skills: inventory?.skills.map((skill) => skill.name) ?? [],
-    mcpServers: inventory?.mcpServers.map((server) => server.serverName) ?? [],
-  };
-  const allImported =
-    inventory &&
-    inventory.skills.every((skill) => imported.skills.includes(skill.name)) &&
-    inventory.mcpServers.every((server) => imported.mcpServers.includes(server.serverName));
   return (
     <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
       <p className="text-foreground text-xs">
-        Add components from the installed version
+        Manage components from the installed version
         {inventory ? ` · ${inventory.lockedSha.slice(0, 12)}` : ""}. No remote fetch.
+      </p>
+      <p className="text-muted text-xs">
+        Removing imports keeps source files, plugin data, and workspace MCP settings. Uninstall is
+        separate.
       </p>
       {busy && (
         <p role="status" className="text-muted text-xs">
-          {inventory ? "Adding components…" : "Loading components…"}
+          {inventory ? "Saving components…" : "Loading components…"}
         </p>
       )}
       {error && (
@@ -269,34 +340,41 @@ const AddComponentsPanel: React.FC<{
           {error}
         </p>
       )}
-      {added && (
+      {saved && (
         <p role="status" className="text-accent text-xs">
-          Components imported.
+          Component selection saved.
         </p>
       )}
       {inventory && (
-        <ComponentChooser
-          inventory={inventory}
-          imported={imported}
-          selected={selected}
-          disabled={busy}
-          onChange={(selection) => {
-            setSelected(selection);
-            setAdded(false);
-          }}
-        />
-      )}
-      {allImported && (
-        <p className="text-muted text-xs">All available components are already imported.</p>
+        <>
+          <ComponentChooser
+            inventory={inventory}
+            imported={imported}
+            selected={selected}
+            disabled={busy}
+            onChange={(selection) => {
+              setSelected(selection);
+              setSaved(false);
+            }}
+          />
+          <p className="text-muted counter-nums text-xs">
+            {added} to add · {removed} to remove
+          </p>
+          {selected.skills.length + selected.mcpServers.length === 0 && (
+            <p className="text-muted text-xs">
+              No skills or MCP servers will be imported. The plugin stays installed.
+            </p>
+          )}
+        </>
       )}
       <div className="flex flex-wrap gap-2">
         {inventory ? (
           <Button
             size="sm"
-            disabled={busy || selected.skills.length + selected.mcpServers.length === 0}
-            onClick={() => void handleAdd()}
+            disabled={busy || added + removed === 0}
+            onClick={() => void handleSave()}
           >
-            Import selected
+            Save changes
           </Button>
         ) : (
           <Button
@@ -312,7 +390,7 @@ const AddComponentsPanel: React.FC<{
           </Button>
         )}
         <Button variant="ghost" size="sm" disabled={busy} onClick={props.onClose}>
-          {added ? "Done" : "Cancel"}
+          {saved ? "Done" : "Cancel"}
         </Button>
       </div>
     </div>
@@ -752,7 +830,7 @@ export const PluginsSettingsSection: React.FC = () => {
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
   const [componentsTarget, setComponentsTarget] = useState<string | null>(
-    initialIntent?.type === "add-components" ? initialIntent.name : null
+    initialIntent?.type === "manage-components" ? initialIntent.name : null
   );
   const [installSucceeded, setInstallSucceeded] = useState(false);
   /** Name of the plugin with an update/uninstall in flight. */
@@ -841,7 +919,7 @@ export const PluginsSettingsSection: React.FC = () => {
         case "open-add-panel":
           openAddPanel();
           break;
-        case "add-components":
+        case "manage-components":
           setComponentsTarget(intent.name);
           break;
         case "confirm-uninstall":
@@ -1113,9 +1191,9 @@ export const PluginsSettingsSection: React.FC = () => {
                             className="h-7 px-2 text-xs"
                             disabled={busyPlugin !== null}
                             onClick={() => setComponentsTarget(item.name)}
-                            aria-label={`Add components to ${item.name}`}
+                            aria-label={`Manage components for ${item.name}`}
                           >
-                            Add components
+                            Manage components
                           </Button>
                         )}
                         {updateAvailable && (
@@ -1159,10 +1237,10 @@ export const PluginsSettingsSection: React.FC = () => {
                       managed-registry name, so the managed row is the one
                       identity-correct anchor. */}
                   {item.managed && item.present && componentsTarget === item.name && (
-                    <AddComponentsPanel
+                    <ManageComponentsPanel
                       key={item.name}
                       name={item.name}
-                      onAdded={refresh}
+                      onSaved={refresh}
                       onClose={() => setComponentsTarget(null)}
                     />
                   )}

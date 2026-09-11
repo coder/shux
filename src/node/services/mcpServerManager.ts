@@ -1,3 +1,4 @@
+import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
@@ -1138,6 +1139,8 @@ interface MCPToolsForWorkspaceResult {
   enablementDerivedFrom?: MCPWorkspaceRequestOptions;
 }
 interface WorkspaceServers {
+  /** Removed selections are detached immediately, but leased calls keep their client alive. */
+  retiredPluginInstances?: Set<MCPServerInstance>;
   configSignature: string;
   instances: Map<string, MCPServerInstance>;
   /** Filters prompts while leased restarts can leave disabled clients cached. */
@@ -1193,6 +1196,13 @@ export interface MCPServerManagerOptions {
   pluginInvalidation?: {
     keyPrefix: string;
     readToken: () => Promise<string | undefined>;
+    /** Atomic plugins.json content, independent of tree replacement and override epochs. */
+    readComponentPolicy?: () => Promise<PluginMcpPolicy>;
+    /** Same writer lock as plugins.json mutations. Must try once, never queue/wait. */
+    tryAcquireComponentPolicyLock?: (options: {
+      signal?: AbortSignal;
+    }) => Promise<() => Promise<void>>;
+
     /**
      * Disk-authoritative workspace override read. A sibling's uninstall also
      * pruned plugin keys from workspace override FILES; the sweep uses this
@@ -1311,6 +1321,13 @@ export class MCPServerManager {
   private readonly prefixInvalidations = new Map<string, number>();
   /** See MCPServerManagerOptions.pluginInvalidation. */
   private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
+  private componentPolicy: PluginMcpPolicy | undefined;
+  private componentPolicyRevision = 0;
+  private readonly managedPluginServers = new Map<string, NonNullable<MCPServerInfo["plugin"]>>();
+  private readonly managedPluginInstances = new Map<
+    string,
+    NonNullable<NonNullable<MCPServerInfo["plugin"]>["componentPolicy"]>
+  >();
   private pluginInvalidationTokenSeen = false;
   private lastPluginInvalidationToken: string | undefined;
   private lastOverridesEpochToken: string | undefined;
@@ -1351,6 +1368,167 @@ export class MCPServerManager {
     this.pluginInvalidation = options?.pluginInvalidation;
   }
 
+  /** Call after the atomic selection write and after releasing the install lock. */
+  async reconcilePluginComponents(): Promise<void> {
+    await this.retireCrossProcessPluginInstances(true);
+  }
+
+  private componentAllowed(
+    name: string,
+    info?: MCPServerInfo,
+    policy = this.componentPolicy
+  ): boolean {
+    if (this.pluginInvalidation?.readComponentPolicy === undefined) return true;
+    return isPluginMcpServerAllowed(this.managedPluginServers.get(name) ?? info?.plugin, policy);
+  }
+
+  private async readComponentPolicy(): Promise<PluginMcpPolicy | undefined> {
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    if (read === undefined) return undefined;
+    try {
+      const result = await raceWithAbortAndTimeout(read(), { timeoutMs: CALL_GATE_TIMEOUT_MS });
+      if (result.kind === "ok") return result.value;
+    } catch (error) {
+      log.debug("MCP component policy unavailable", { error });
+    }
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+  }
+
+  private async withComponentPolicyFence<T>(
+    name: string,
+    info: MCPServerInfo | undefined,
+    dispatch: () => T,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<{ pending: T }> {
+    const release = await this.acquireComponentPolicyFence(name, info, options);
+    try {
+      const pending = dispatch();
+      // Observe early rejection while admission locks are being released.
+      Promise.resolve(pending).catch(() => undefined);
+      return { pending };
+    } finally {
+      await release();
+    }
+  }
+
+  private async acquireComponentPolicyFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<() => Promise<void>> {
+    // Ownership comes from the served provenance, never an unfenced policy read:
+    // a missing registry row must not turn a managed client into a legacy one.
+    const plugin = this.managedPluginServers.get(name) ?? info?.plugin;
+    if (plugin?.componentPolicy === undefined) return () => Promise.resolve();
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    const acquire = this.pluginInvalidation?.tryAcquireComponentPolicyLock;
+    const unavailable = () =>
+      new Error(
+        `MCP server '${name}' is unavailable while plugin components are being updated; retry`
+      );
+    if (read === undefined || acquire === undefined) throw unavailable();
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const checkActive = () => {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt) throw unavailable();
+    };
+    const bounded = async <V>(work: Promise<V>): Promise<V> => {
+      // A pre-aborted race does not subscribe to work; still observe late rejection.
+      work.catch(() => undefined);
+      const result = await raceWithAbortAndTimeout(work, {
+        timeoutMs: Math.max(0, deadlineAt - Date.now()),
+        signal: options.signal,
+      });
+      checkActive();
+      if (result.kind !== "ok") throw unavailable();
+      return result.value;
+    };
+    checkActive();
+    // Overrides are locked first. Uninstall takes the plugin lock and then prunes
+    // overrides, so waiting here would deadlock. A contended try-lock fails closed
+    // and lets the outer finally release overrides; no admission retry loop.
+    const acquisition = acquire({ signal: options.signal });
+    let release: () => Promise<void>;
+    try {
+      release = await bounded(acquisition);
+    } catch {
+      acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+      checkActive();
+      throw unavailable();
+    }
+    try {
+      // Atomic rename alone is insufficient: readFile may still own the old inode.
+      // Acquire BEFORE opening policy; the caller releases after admission.
+      checkActive();
+      const policy = await bounded(read());
+      checkActive();
+      if (!this.componentAllowed(name, info, policy))
+        throw new Error(`MCP server '${name}' is disabled by component policy`);
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
+    }
+  }
+
+  private async refreshComponentPolicy(): Promise<Error | undefined> {
+    let cleanupError: Error | undefined;
+    const previous = this.componentPolicy;
+    const policy = await this.readComponentPolicy();
+    if (JSON.stringify(policy) !== JSON.stringify(this.componentPolicy)) {
+      this.componentPolicy = policy;
+      this.componentPolicyRevision++;
+    }
+    for (const [workspaceId, entry] of this.workspaceServers) {
+      const readded = [...this.managedPluginServers.keys()].filter(
+        (name) =>
+          !this.componentAllowed(name, undefined, previous) &&
+          this.componentAllowed(name) &&
+          !entry.instances.has(name) &&
+          Object.hasOwn(JSON.parse(entry.configSignature) as object, name)
+      );
+      this.markServersForRetry(entry, readded);
+      const denied = new Set(
+        [...entry.enabledServerNames, ...entry.instances.keys()].filter(
+          (name) => !this.componentAllowed(name, entry.enabledServers[name])
+        )
+      );
+      for (const name of denied) {
+        entry.enabledServerNames.delete(name);
+        delete entry.enabledServers[name];
+        entry.retryingTimedOutServerNames?.delete(name);
+      }
+      entry.timedOutServerNames =
+        entry.timedOutServerNames?.filter((name) => this.componentAllowed(name)) ?? [];
+      entry.stats = this.createWorkspaceStats(
+        entry.enabledServerNames.size,
+        new Map([...entry.instances].filter(([name]) => entry.enabledServerNames.has(name))),
+        entry.stats.failedServerNames.filter((name) => this.componentAllowed(name))
+      );
+      for (const name of denied) {
+        const instance = entry.instances.get(name);
+        if (!instance) continue;
+        entry.instances.delete(name);
+        (entry.retiredPluginInstances ??= new Set()).add(instance);
+      }
+      // Keep admitted leased calls alive without letting a readd overwrite
+      // their retired client. Only active instances participate in retention.
+      if (this.getLeaseCount(workspaceId) > 0) continue;
+      const retired = entry.retiredPluginInstances;
+      for (const instance of retired ?? []) {
+        try {
+          await instance.close();
+          retired?.delete(instance);
+        } catch (error) {
+          cleanupError ??= error instanceof Error ? error : new Error(getErrorMessage(error));
+          log.warn("Failed to close removed plugin component", { name: instance.name, error });
+        }
+      }
+      if (retired?.size === 0) delete entry.retiredPluginInstances;
+    }
+    return cleanupError;
+  }
+
   /**
    * Retire cached plugin instances when a SIBLING process mutated a plugin
    * (see MCPServerManagerOptions.pluginInvalidation). Runs before every
@@ -1359,7 +1537,7 @@ export class MCPServerManager {
    * The first read only records the token: no plugin instance can predate it
    * because this method guards every serve path.
    */
-  private async retireCrossProcessPluginInstances(): Promise<void> {
+  private async retireCrossProcessPluginInstances(reportCleanupErrors = false): Promise<void> {
     const invalidation = this.pluginInvalidation;
     if (invalidation === undefined) {
       return;
@@ -1371,7 +1549,10 @@ export class MCPServerManager {
     // replaced tree. Queued serves wait for the in-flight sweep, then see the
     // published token and proceed; a failed sweep leaves the token
     // unpublished so the next serve retries it.
+    let cleanupError: Error | undefined;
     const run = async (): Promise<void> => {
+      if (invalidation.readComponentPolicy !== undefined)
+        cleanupError = await this.refreshComponentPolicy();
       const [token, overridesEpoch] = await Promise.all([
         invalidation.readToken(),
         invalidation.readOverridesEpoch?.(),
@@ -1427,6 +1608,12 @@ export class MCPServerManager {
     };
     const next = this.pluginInvalidationQueue.then(run, run);
     this.pluginInvalidationQueue = next.catch(() => undefined);
+    // Explicit saves report cleanup failures only after publishing policy/epoch work.
+    // Automatic MCP boundaries keep retained clients usable and retry retired clients later.
+    if (reportCleanupErrors) {
+      await next;
+      if (cleanupError !== undefined) throw cleanupError;
+    }
     return next;
   }
 
@@ -1858,6 +2045,14 @@ export class MCPServerManager {
 
     if (current === 1) {
       this.workspaceLeases.delete(workspaceId);
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined) {
+        this.retireCrossProcessPluginInstances().catch((error: unknown) => {
+          log.warn("Failed to reconcile plugin components after lease release", {
+            workspaceId,
+            error,
+          });
+        });
+      }
       return;
     }
 
@@ -1874,8 +2069,9 @@ export class MCPServerManager {
 
   private cleanupIdleServers(): void {
     const now = Date.now();
+    let retryRetiredComponents = false;
     for (const [workspaceId, entry] of this.workspaceServers) {
-      if (entry.instances.size === 0) continue;
+      if (entry.instances.size === 0 && !entry.retiredPluginInstances?.size) continue;
 
       // Never tear down a workspace's MCP servers while a stream is running.
       if (this.getLeaseCount(workspaceId) > 0) {
@@ -1884,12 +2080,23 @@ export class MCPServerManager {
 
       const idleMs = now - entry.lastActivity;
       if (idleMs >= IDLE_TIMEOUT_MS) {
+        // Do not evict retry ownership while retired clients still fail to close.
+        // Once they close, a later idle sweep resumes normal workspace eviction.
+        if (entry.retiredPluginInstances?.size) {
+          retryRetiredComponents = true;
+          continue;
+        }
         log.info("[MCP] Stopping idle servers", {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
+    }
+    if (retryRetiredComponents) {
+      this.retireCrossProcessPluginInstances().catch((error: unknown) => {
+        log.warn("Failed to retry idle plugin component cleanup", { error });
+      });
     }
   }
 
@@ -1961,7 +2168,21 @@ export class MCPServerManager {
     for (const [name, command] of Object.entries(this.inlineServers)) {
       inlineAsInfo[name] = { transport: "stdio", command, disabled: false };
     }
-    return { ...configServers, ...inlineAsInfo };
+    const servers = { ...configServers, ...inlineAsInfo };
+    for (const [name, info] of Object.entries(servers)) {
+      const plugin = info.plugin;
+      if (plugin === undefined) continue;
+      // The logical instance prefix includes scope/alias identity. Remember
+      // the installation, so a vanished row cannot expose previously hidden siblings.
+      const instanceKey = name.slice(0, -plugin.serverName.length);
+      const owner = plugin.componentPolicy ?? this.managedPluginInstances.get(instanceKey);
+      if (owner === undefined) continue;
+      this.managedPluginInstances.set(instanceKey, { ...owner });
+      this.managedPluginServers.set(name, { ...plugin, componentPolicy: { ...owner } });
+    }
+    return Object.fromEntries(
+      Object.entries(servers).filter(([name, info]) => this.componentAllowed(name, info))
+    );
   }
 
   /**
@@ -1984,6 +2205,8 @@ export class MCPServerManager {
     trusted = false,
     agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<MCPServerMap> {
+    if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+      await this.retireCrossProcessPluginInstances();
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
     const enabled = this.applyServerOverrides(allServers, overrides);
     return this.filterServersByPolicy(enabled);
@@ -2127,6 +2350,8 @@ export class MCPServerManager {
       // advance the live baseline while this operation is still in flight —
       // the live field would then match the fresh read and accept a result
       // derived from pre-eviction state.
+      const componentPolicyUsed = JSON.stringify(this.componentPolicy);
+      const componentRevisionUsed = this.componentPolicyRevision;
       const pluginTokenUsed = this.lastPluginInvalidationToken;
       const overridesEpochUsed = this.lastOverridesEpochToken;
       const result = await operation();
@@ -2143,9 +2368,15 @@ export class MCPServerManager {
       // accepted — a parallel read could capture the old epoch while the
       // slower token read settles, accepting a pair a sibling revocation
       // completed in between.
+      const componentPolicy =
+        this.pluginInvalidation.readComponentPolicy !== undefined
+          ? await this.readComponentPolicy()
+          : undefined;
       const token = await this.pluginInvalidation.readToken();
       const overridesEpoch = await this.pluginInvalidation.readOverridesEpoch?.();
       if (
+        componentPolicyUsed === JSON.stringify(componentPolicy) &&
+        componentRevisionUsed === this.componentPolicyRevision &&
         token === pluginTokenUsed &&
         overridesEpoch === overridesEpochUsed &&
         !isWorkspaceOverridesEpochUnreadable(overridesEpoch)
@@ -2557,7 +2788,7 @@ export class MCPServerManager {
             retriedInstances,
             startupEpoch,
             workspaceId,
-            (invalidatedRetryKeys) => {
+            (invalidatedRetryKeys, failedRetirements) => {
               // Recheck ownership INSIDE the synchronous callback: a
               // removal-style stopServers (or config-change replacement)
               // landing while the awaited invalidation scan yielded has
@@ -2568,6 +2799,8 @@ export class MCPServerManager {
                 retryOwnershipLost = true;
                 return;
               }
+              for (const instance of failedRetirements)
+                (existing.retiredPluginInstances ??= new Set()).add(instance);
               for (const [serverName, instance] of retriedInstances) {
                 existing.instances.set(serverName, instance);
               }
@@ -2668,7 +2901,7 @@ export class MCPServerManager {
     }
 
     const additiveServerNames = existing
-      ? this.getAdditiveServerNames(existing, signatureEntries)
+      ? this.getRetainableServerAdditions(existing, signatureEntries)
       : undefined;
 
     // If a stream is actively running, avoid closing MCP clients out from under it.
@@ -2742,7 +2975,7 @@ export class MCPServerManager {
           restartedInstances,
           startupEpoch,
           workspaceId,
-          (invalidatedRestartKeys) => {
+          (invalidatedRestartKeys, failedRetirements) => {
             // Same ownership recheck as the timed-out retry path: a removal
             // or replacement landing during the awaited scan must not let
             // this merge revive clients on a detached entry.
@@ -2751,6 +2984,8 @@ export class MCPServerManager {
               return;
             }
 
+            for (const instance of failedRetirements)
+              (existing.retiredPluginInstances ??= new Set()).add(instance);
             for (const [serverName, instance] of restartedInstances) {
               existing.instances.set(serverName, instance);
             }
@@ -2922,7 +3157,7 @@ export class MCPServerManager {
       }
 
       const addedServerNames = current
-        ? this.getAdditiveServerNames(current, signatureEntries)
+        ? this.getRetainableServerAdditions(current, signatureEntries)
         : undefined;
       if (additiveServerNames !== undefined && addedServerNames === undefined) {
         // A newer additive request may have won the lock. Never roll it back
@@ -2999,7 +3234,7 @@ export class MCPServerManager {
         instances,
         startupEpoch,
         workspaceId,
-        (invalidatedKeys) => {
+        (invalidatedKeys, failedRetirements) => {
           // Recheck the removal-stop epoch INSIDE the synchronous publication
           // callback: a stopServers(workspaceId) landing while the awaited
           // invalidation scan yielded found no cache entry to close, so
@@ -3010,6 +3245,8 @@ export class MCPServerManager {
           }
           if (retained) {
             if (this.workspaceServers.get(workspaceId) !== retained) return;
+            for (const instance of failedRetirements)
+              (retained.retiredPluginInstances ??= new Set()).add(instance);
             for (const [name, instance] of instances) retained.instances.set(name, instance);
             retained.configSignature = signature;
             retained.enabledServerNames = enabledServerNames;
@@ -3028,6 +3265,7 @@ export class MCPServerManager {
           entry = {
             configSignature: signature,
             instances,
+            ...(failedRetirements.size > 0 ? { retiredPluginInstances: failedRetirements } : {}),
             enabledServerNames,
             enabledServers,
             enabledServersGeneration: configGenerationUsed,
@@ -3304,21 +3542,27 @@ export class MCPServerManager {
     return descriptors;
   }
 
-  private getAdditiveServerNames(
+  private getRetainableServerAdditions(
     entry: WorkspaceServers,
     next: Record<string, unknown>
   ): string[] | undefined {
     if ([...entry.instances.values()].some((instance) => instance.isClosed)) return undefined;
     // Signatures are in-process JSON of launch settings, including resolved secrets.
     const previous = JSON.parse(entry.configSignature) as Record<string, unknown>;
-    if (Object.keys(next).length <= Object.keys(previous).length) return undefined;
+    const added = Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
+    const removed = Object.keys(previous).filter((name) => !Object.hasOwn(next, name));
+    if (added.length === 0 && removed.length === 0) return undefined;
+    // Only selection removals are non-disruptive. Unrelated configuration
+    // changes retain the existing full-restart/deferred-restart behavior.
+    if (removed.some((name) => this.componentAllowed(name))) return undefined;
     if (
       Object.keys(previous).some(
-        (name) => JSON.stringify(previous[name]) !== JSON.stringify(next[name])
+        (name) =>
+          Object.hasOwn(next, name) && JSON.stringify(previous[name]) !== JSON.stringify(next[name])
       )
     )
       return undefined;
-    return Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
+    return added;
   }
 
   private async computeSignatureEntries(
@@ -3799,7 +4043,12 @@ export class MCPServerManager {
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           let pending: ReturnType<MCPServerInstance["getPrompt"]> | "retry";
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            pending = dispatch();
+            ({ pending } = await this.withComponentPolicyFence(
+              serverName,
+              undefined,
+              dispatch,
+              options
+            ));
           } else {
             // ONE deadline for acquisition and the fenced epoch read: the outer
             // abort race cannot stop this callback, so a stalled home filesystem
@@ -3829,7 +4078,10 @@ export class MCPServerManager {
               ) {
                 return { epochMoved: true } as const;
               }
-              pending = dispatch();
+              ({ pending } = await this.withComponentPolicyFence(serverName, undefined, dispatch, {
+                signal: options?.signal,
+                timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+              }));
             } finally {
               await release();
             }
@@ -3919,6 +4171,18 @@ export class MCPServerManager {
     // on an unrelated healthy client, so tearing down the whole workspace
     // set here would close it underneath them.
     for (const [workspaceId, entry] of this.workspaceServers) {
+      // Tree replacement also stops deselected clients held by active leases,
+      // but those clients must never become restart candidates.
+      for (const instance of entry.retiredPluginInstances ?? []) {
+        if (!instance.name.startsWith(prefix)) continue;
+        try {
+          await instance.close();
+          entry.retiredPluginInstances?.delete(instance);
+        } catch (error) {
+          log.warn("Failed to stop retired MCP server", { error, name: instance.name });
+        }
+      }
+      if (entry.retiredPluginInstances?.size === 0) delete entry.retiredPluginInstances;
       const removedKeys: string[] = [];
       for (const [serverKey, instance] of [...entry.instances]) {
         if (!serverKey.startsWith(prefix)) {
@@ -4019,16 +4283,37 @@ export class MCPServerManager {
    * after publication, so it sees the published entry and closes matches.
    *
    * `publish` MUST NOT await; it receives every key closed across all scans
-   * and must queue them for retry (see closeInvalidatedInstances docs).
+   * and must queue them for retry (see closeInvalidatedInstances docs). Failed
+   * component closes transfer to the published entry's retired-client set so
+   * they remain retryable without exposing their tools or blocking a readd.
    */
   private async closeInvalidatedInstancesThenPublish(
     instances: Map<string, MCPServerInstance>,
     startedAtEpoch: number,
     workspaceId: string,
-    publish: (invalidatedKeys: string[]) => void
+    publish: (invalidatedKeys: string[], failedRetirements: Set<MCPServerInstance>) => void
   ): Promise<void> {
     const invalidatedKeys: string[] = [];
+    const removedComponents: string[] = [];
+    const failedRetirements = new Set<MCPServerInstance>();
     for (;;) {
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+        await this.retireCrossProcessPluginInstances();
+      for (const [name, instance] of instances) {
+        if (this.componentAllowed(name)) continue;
+        instances.delete(name);
+        removedComponents.push(name);
+        // Even remove->readd during awaited cleanup requires a fresh startup;
+        // equality of the final content snapshot alone cannot detect that ABA.
+        this.componentPolicyRevision++;
+        try {
+          await instance.close();
+        } catch (error) {
+          failedRetirements.add(instance);
+          log.warn("Failed to close removed plugin startup", { name, error });
+        }
+      }
+      if (removedComponents.length > 0) await this.retireCrossProcessPluginInstances();
       const clockBeforeScan = this.prefixInvalidationClock;
       invalidatedKeys.push(
         ...(await this.closeInvalidatedInstances(instances, startedAtEpoch, workspaceId))
@@ -4036,7 +4321,10 @@ export class MCPServerManager {
       // Terminates: the clock only advances on stopServersWithKeyPrefix
       // calls, which are finite user-driven plugin update/uninstall events.
       if (this.prefixInvalidationClock === clockBeforeScan) {
-        publish(invalidatedKeys);
+        publish(
+          [...invalidatedKeys, ...removedComponents].filter((name) => this.componentAllowed(name)),
+          failedRetirements
+        );
         return;
       }
     }
@@ -4062,7 +4350,7 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of entry.instances.values()) {
+    for (const instance of [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])]) {
       try {
         await instance.close();
       } catch (error) {
@@ -4198,13 +4486,23 @@ export class MCPServerManager {
       if (server.transport !== "stdio" && server.managed === "claude-design") {
         return this.configService.claudeDesign.test();
       }
+      const testNamedServer = async (
+        launch: Parameters<typeof runServerTest>[0]
+      ): Promise<MCPTestResult> => {
+        // Admit the named test after disk/OAuth preparation, before its connection
+        // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
+        try {
+          const { pending } = await this.withComponentPolicyFence(trimmedName, server, () =>
+            runServerTest(launch, projectPath, `server "${trimmedName}"`)
+          );
+          return await pending;
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      };
       if (server.transport === "stdio") {
         const launch = await prepareStdioLaunch(server);
-        return runServerTest(
-          { transport: "stdio", ...launch },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({ transport: "stdio", ...launch });
       }
 
       try {
@@ -4215,16 +4513,12 @@ export class MCPServerManager {
           serverUrl: server.url,
         });
 
-        return runServerTest(
-          {
-            transport: server.transport,
-            url: server.url,
-            headers: resolved.headers,
-            ...(authProvider ? { authProvider } : {}),
-          },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({
+          transport: server.transport,
+          url: server.url,
+          headers: resolved.headers,
+          ...(authProvider ? { authProvider } : {}),
+        });
       } catch (error) {
         const message = getErrorMessage(error);
         return { success: false, error: message };
@@ -4685,13 +4979,20 @@ export class MCPServerManager {
           if (decide() === "retry") {
             continue;
           }
+          // Recheck live authorization synchronously after the fenced read.
+          const dispatch = (): Promise<unknown> | "retry" =>
+            decide() === "retry" ? "retry" : Promise.resolve(originalExecute(args, context));
           const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
           const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
           if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
-            // No cross-process writers to fence: the checks above ran in the
-            // same synchronous block as this invocation start.
-            const result: unknown = await Promise.resolve(originalExecute(args, context));
-            return result;
+            const { pending } = await this.withComponentPolicyFence(
+              serverName,
+              servedInfo,
+              dispatch,
+              { signal: abortSignal, timeoutMs: remainingMs() }
+            );
+            if (pending === "retry") continue;
+            return await pending;
           }
           // Cross-process fence. The bracket's postflight epoch read and this
           // invocation are separated by promise continuations, and a sibling
@@ -4721,7 +5022,7 @@ export class MCPServerManager {
             acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
             throw error;
           }
-          let pending: Promise<unknown> | undefined;
+          let pending: Promise<unknown> | "retry";
           try {
             const epochNow = await bounded(readOverridesEpoch());
             if (
@@ -4733,15 +5034,14 @@ export class MCPServerManager {
               // iteration's preflight evicts and re-derives from disk.
               continue;
             }
-            // Process-local state may have moved during the two awaits above.
-            if (decide() === "retry") {
-              continue;
-            }
-            // Synchronous from the last check to the invocation start, under the lock.
-            pending = Promise.resolve(originalExecute(args, context));
+            ({ pending } = await this.withComponentPolicyFence(serverName, servedInfo, dispatch, {
+              signal: abortSignal,
+              timeoutMs: remainingMs(),
+            }));
           } finally {
             await release();
           }
+          if (pending === "retry") continue;
           return await pending;
         }
         throw new Error(
@@ -5128,10 +5428,13 @@ export class MCPServerManager {
    * the epoch) before the read — observed here, the launch refused — or
    * waits until the process exists, after which the bracket's postflight
    * closes it. The lock is released as soon as exec returned; the MCP
-   * handshake never runs under it. Without cross-process tracking there is
-   * nothing to fence: plain launch.
+   * handshake never runs under it. Managed components also acquire the
+   * plugin writer lock after overrides, through the same launch interval.
+   * Untracked, unmanaged servers retain their plain launch path.
    */
   private async launchUnderOverrideFence<T>(
+    name: string,
+    info: MCPServerInfo,
     /** `launchSignal` aborts with the startup signal AND at an `abortAfterMs` deadline. */
     launch: (launchSignal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
@@ -5159,19 +5462,20 @@ export class MCPServerManager {
   ): Promise<T> {
     const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
     const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
-    if (
-      acquireOverridesLock === undefined ||
-      readOverridesEpoch === undefined ||
-      !this.pluginInvalidationTokenSeen
-    ) {
-      return launch(signal);
-    }
-    // ONE deadline for acquisition and the fenced read (see getPrompt).
+    const trackOverrides =
+      acquireOverridesLock !== undefined &&
+      readOverridesEpoch !== undefined &&
+      this.pluginInvalidationTokenSeen;
+    const plugin = this.managedPluginServers.get(name) ?? info.plugin;
+    if (!trackOverrides && plugin?.componentPolicy === undefined) return launch(signal);
+    // ONE deadline for acquisition and the fenced reads (see getPrompt).
     const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
-    const release = await acquireOverridesLock({
-      timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
-      signal,
-    });
+    const release = trackOverrides
+      ? await acquireOverridesLock({
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        })
+      : () => Promise.resolve();
     let released = false;
     const releaseOnce = async () => {
       if (!released) {
@@ -5180,26 +5484,36 @@ export class MCPServerManager {
       }
     };
     let pending: Promise<T> | undefined;
+    let releaseComponents: (() => Promise<void>) | undefined;
     try {
-      const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
-        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+      if (trackOverrides) {
+        const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        });
+        if (epochRead.kind !== "ok") {
+          throw new Error(
+            epochRead.kind === "aborted"
+              ? "MCP server startup was aborted"
+              : "MCP server startup could not read the workspace MCP settings marker in time; retry"
+          );
+        }
+        if (
+          epochRead.value !== this.lastOverridesEpochToken ||
+          isWorkspaceOverridesEpochUnreadable(epochRead.value)
+        ) {
+          throw new Error(
+            "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+          );
+        }
+      }
+      // Try the plugin writer lock SECOND: uninstall holds it while pruning
+      // overrides. Keep it through actual exec/connection initiation, not the
+      // earlier discovery or semaphore wait, so removal cannot precede a spawn.
+      releaseComponents = await this.acquireComponentPolicyFence(name, info, {
         signal,
+        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
       });
-      if (epochRead.kind !== "ok") {
-        throw new Error(
-          epochRead.kind === "aborted"
-            ? "MCP server startup was aborted"
-            : "MCP server startup could not read the workspace MCP settings marker in time; retry"
-        );
-      }
-      if (
-        epochRead.value !== this.lastOverridesEpochToken ||
-        isWorkspaceOverridesEpochUnreadable(epochRead.value)
-      ) {
-        throw new Error(
-          "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
-        );
-      }
       if (options?.abortAfterMs !== undefined) {
         const { ms, serverName } = options.abortAfterMs;
         const launchAbort = new AbortController();
@@ -5241,7 +5555,11 @@ export class MCPServerManager {
       // Released here — BEFORE the remaining wait on a still-pending remote
       // handshake below: every settings save and prune would otherwise queue
       // behind an endpoint-controlled request for the whole startup deadline.
-      await releaseOnce();
+      try {
+        await releaseComponents?.();
+      } finally {
+        await releaseOnce();
+      }
     }
     return await pending;
   }
@@ -5264,6 +5582,8 @@ export class MCPServerManager {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
       const execStream = await this.launchUnderOverrideFence(
+        name,
+        info,
         (launchSignal) =>
           runtime.exec(launch.command, {
             cwd: launch.cwd ?? workspacePath,
@@ -5549,6 +5869,8 @@ export class MCPServerManager {
     // client but cannot undo traffic or credentials already sent.
     const tryHttp = () =>
       this.launchUnderOverrideFence(
+        name,
+        info,
         () =>
           createMCPClient({
             transport: {
@@ -5564,6 +5886,8 @@ export class MCPServerManager {
 
     const trySse = () =>
       this.launchUnderOverrideFence(
+        name,
+        info,
         () =>
           createMCPClient({
             transport: {

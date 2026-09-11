@@ -8,6 +8,7 @@ import { preloadTestModules } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo } from "../../ipc/helpers";
 import { createAppHarness, type AppHarness } from "../harness";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -89,7 +90,7 @@ describeIntegration("Selective plugin imports", () => {
     await cleanupTempGitRepo(remote);
   });
 
-  test("empty install retains choices after failure; add is additive, cancellable, keyboard accessible and retryable", async () => {
+  test("empty install retains choices after failure; management is reversible, cancellable, keyboard accessible and retryable", async () => {
     const { canvas, user } = await openPreview(app, remote);
     for (const checkbox of canvas.getAllByRole("checkbox"))
       expect(checkbox.getAttribute("aria-checked")).toBe("true");
@@ -121,35 +122,35 @@ describeIntegration("Selective plugin imports", () => {
     expect(installSpy).toHaveBeenCalledTimes(2);
     expect((await inventory(app)).importedComponents).toEqual({ skills: [], mcpServers: [] });
 
-    await user.click(canvas.getByRole("button", { name: "Add components to review-tools" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
     await canvas.findByRole("checkbox", { name: "research" });
-    expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+    expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
       true
     );
     await user.click(canvas.getByRole("checkbox", { name: "review" }));
     await user.click(canvas.getByRole("button", { name: "Cancel" }));
     expect((await inventory(app)).importedComponents?.skills).toEqual([]);
-    await user.click(canvas.getByRole("button", { name: "Add components to review-tools" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
     expect(
       (await canvas.findByRole("checkbox", { name: "review" })).getAttribute("aria-checked")
     ).toBe("false");
     await user.click(canvas.getByRole("checkbox", { name: "review" }));
     jest
-      .spyOn(app.env.services.agentPluginInstallService, "addComponents")
+      .spyOn(app.env.services.agentPluginInstallService, "setComponents")
       .mockRejectedValueOnce(new Error("Registry busy"));
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByText("Registry busy");
     await waitFor(() =>
-      expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+      expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
         false
       )
     );
     expect(canvas.getByRole("checkbox", { name: "review" }).getAttribute("aria-checked")).toBe(
       "true"
     );
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByText(/1 of 2 skills imported/);
-    expect(canvas.getByRole("checkbox", { name: "review" }).hasAttribute("disabled")).toBe(true);
+    expect(canvas.getByRole("checkbox", { name: "review" }).hasAttribute("disabled")).toBe(false);
     expect((await inventory(app)).importedComponents).toEqual({
       skills: ["review"],
       mcpServers: [],
@@ -159,17 +160,278 @@ describeIntegration("Selective plugin imports", () => {
         within(canvas.getByRole("group", { name })).getByRole("button", { name: "Select all" })
       );
     }
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByText(/2 of 2 skills imported/);
-    await canvas.findByText(/already imported/);
-    expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+
+    expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
       true
     );
     expect((await inventory(app)).importedComponents).toEqual({
       skills: ["research", "review"],
       mcpServers: ["reference"],
     });
+    // Imported rows stay editable, and clearing all keeps the package installed.
+    await user.click(canvas.getByRole("checkbox", { name: "review" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
+    await canvas.findByText(/1 of 2 skills imported/);
+    await user.click(canvas.getByRole("button", { name: "Done" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+    expect(
+      (await canvas.findByRole("checkbox", { name: "review" })).getAttribute("aria-checked")
+    ).toBe("false");
+    expect(canvas.queryByText("Component selection saved.")).toBeNull();
+    for (const name of ["Skills", "MCP servers"]) {
+      await user.click(
+        within(canvas.getByRole("group", { name })).getByRole("button", { name: "Clear" })
+      );
+    }
+    const save = canvas.getByRole("button", { name: "Save changes" });
+    expect(save.hasAttribute("disabled")).toBe(false);
+    save.focus();
+    await user.keyboard("{Enter}");
+    await canvas.findByText(/0 of 2 skills imported/);
+    expect((await inventory(app)).importedComponents).toEqual({ skills: [], mcpServers: [] });
+    expect(
+      canvas.getByRole("button", { name: "Manage components for review-tools" })
+    ).toBeDefined();
+    await user.click(canvas.getByRole("button", { name: "Done" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+    for (const checkbox of await canvas.findAllByRole("checkbox"))
+      expect(checkbox.getAttribute("aria-checked")).toBe("false");
   }, 120000);
+
+  test.each(["lost response", "cleanup warning", "selection conflict"] as const)(
+    "management recovers from %s using persisted selection, without automatic resubmission",
+    async (failure) => {
+      const { canvas, user } = await openPreview(app, remote);
+      await user.click(canvas.getByRole("checkbox", { name: "research" }));
+      await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+      await user.click(await canvas.findByRole("checkbox", { name: "review" }));
+      await user.click(canvas.getByRole("checkbox", { name: "research" }));
+      const backend = app.env.services.agentPluginInstallService;
+      const original = backend.setComponentsResult.bind(backend);
+      const mutation = jest
+        .spyOn(backend, "setComponentsResult")
+        .mockImplementationOnce(async (input) => {
+          if (failure === "selection conflict") {
+            // Another settings client wins the compare-and-swap after this panel's review.
+            await backend.setComponents({
+              ...input,
+              importedComponents: { skills: [], mcpServers: ["reference"] },
+            });
+          }
+          const result = await original(input);
+          if (failure === "lost response") throw new Error("Connection lost after persistence");
+          return failure === "cleanup warning" && result.success
+            ? { ...result, cleanupWarning: "Components saved; MCP cleanup needs retry" }
+            : result;
+        });
+      await user.click(canvas.getByRole("button", { name: "Save changes" }));
+      await waitFor(() =>
+        expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
+          true
+        )
+      );
+      if (failure === "selection conflict") {
+        await canvas.findByRole("alert");
+        await canvas.findByText(/0 of 2 skills imported/);
+        await canvas.findByText(/1 of 1 MCP servers imported/);
+        await waitFor(() =>
+          expect(
+            canvas.getByRole("checkbox", { name: "reference" }).getAttribute("aria-checked")
+          ).toBe("true")
+        );
+        expect(
+          canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")
+        ).toBe("false");
+        expect(mutation).toHaveBeenCalledTimes(1);
+        await user.click(canvas.getByRole("checkbox", { name: "research" }));
+        await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+        await user.click(canvas.getByRole("button", { name: "Save changes" }));
+      }
+      await waitFor(() =>
+        expect(canvas.getByRole("button", { name: "Done" }).hasAttribute("disabled")).toBe(false)
+      );
+      expect((await inventory(app)).importedComponents).toEqual({
+        skills: ["research"],
+        mcpServers: [],
+      });
+      expect(mutation).toHaveBeenCalledTimes(failure === "selection conflict" ? 2 : 1);
+      expect(canvas.getByRole("checkbox", { name: "review" }).getAttribute("aria-checked")).toBe(
+        "false"
+      );
+      if (failure === "cleanup warning")
+        expect(canvas.getByRole("alert").textContent).toContain("cleanup");
+      else expect(canvas.queryByRole("alert")).toBeNull();
+      await user.click(canvas.getByRole("button", { name: "Done" }));
+      await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+      expect(
+        (await canvas.findByRole("checkbox", { name: "research" })).getAttribute("aria-checked")
+      ).toBe("true");
+      expect(canvas.queryByRole("alert")).toBeNull();
+    },
+    120000
+  );
+
+  test.each(["lost response", "acknowledged save", "rejected save"] as const)(
+    "%s with failed confirmation invalidates availability and counts only when a commit is possible",
+    async (failure) => {
+      const { canvas, user } = await openPreview(app, remote);
+      await user.click(canvas.getByRole("checkbox", { name: "research" }));
+      await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+      await user.click(await canvas.findByRole("checkbox", { name: "review" }));
+
+      // Model a still-mounted availability consumer with real discovery, not an event-name assertion.
+      const readSkills = () => app.env.orpc.agentSkills.list({ workspaceId: app.workspaceId });
+      let available = await readSkills();
+      expect(available.some((skill) => skill.name === "review")).toBe(true);
+      let consumerRefresh = Promise.resolve();
+      let refreshCount = 0;
+      const unsubscribe = subscribeAgentPluginsMutated(() => {
+        refreshCount++;
+        consumerRefresh = readSkills().then((skills) => {
+          available = skills;
+        });
+      });
+      const backend = app.env.services.agentPluginInstallService;
+      const original = backend.setComponentsResult.bind(backend);
+      const mutation = jest
+        .spyOn(backend, "setComponentsResult")
+        .mockImplementationOnce(async (input) => {
+          if (failure === "rejected save") return { success: false, error: "Registry unavailable" };
+          const result = await original(input);
+          expect(result.success).toBe(true);
+          if (failure === "acknowledged save") return result;
+          throw new Error("Connection lost after persistence");
+        });
+      jest
+        .spyOn(backend, "getComponents")
+        .mockRejectedValueOnce(new Error("Confirmation unavailable"));
+      try {
+        await user.click(canvas.getByRole("button", { name: "Save changes" }));
+        await waitFor(() =>
+          expect(
+            canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")
+          ).toBe(false)
+        );
+        await consumerRefresh;
+        expect(available.some((skill) => skill.name === "review")).toBe(
+          failure === "rejected save"
+        );
+        expect(refreshCount).toBe(failure === "rejected save" ? 0 : 1);
+        expect(
+          canvas.getByText(
+            failure === "rejected save" ? /1 of 2 skills imported/ : /0 of 2 skills imported/
+          )
+        ).toBeDefined();
+        expect(canvas.getByRole("alert")).toBeDefined();
+        expect(canvas.queryByRole("button", { name: "Done" })).toBeNull();
+        expect(canvas.getByRole("checkbox", { name: "review" }).getAttribute("aria-checked")).toBe(
+          "false"
+        );
+        expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
+          false
+        );
+        expect(mutation).toHaveBeenCalledTimes(1);
+        await user.click(canvas.getByRole("button", { name: "Cancel" }));
+        await user.click(
+          canvas.getByRole("button", { name: "Manage components for review-tools" })
+        );
+        expect(
+          (await canvas.findByRole("checkbox", { name: "review" })).getAttribute("aria-checked")
+        ).toBe(failure === "rejected save" ? "true" : "false");
+        expect(
+          canvas.getByText(
+            failure === "rejected save" ? /1 of 2 skills imported/ : /0 of 2 skills imported/
+          )
+        ).toBeDefined();
+      } finally {
+        unsubscribe();
+        await consumerRefresh;
+      }
+    },
+    120000
+  );
+
+  test.each([
+    { skills: ["review"], mcpServers: [] },
+    { skills: ["research"], mcpServers: ["reference"] },
+  ])(
+    "acknowledged save superseded before confirmation shows the current selection: %j",
+    async (latest) => {
+      const { canvas, user } = await openPreview(app, remote);
+      await user.click(canvas.getByRole("checkbox", { name: "research" }));
+      await user.click(canvas.getByRole("checkbox", { name: "reference" }));
+      await user.click(canvas.getByRole("button", { name: "Install" }));
+      await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
+      await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
+      await user.click(await canvas.findByRole("checkbox", { name: "review" }));
+      const backend = app.env.services.agentPluginInstallService;
+      const read = backend.getComponents.bind(backend);
+      const mutation = jest.spyOn(backend, "setComponentsResult");
+      jest.spyOn(backend, "getComponents").mockImplementationOnce(async (input) => {
+        // This read starts only after our acknowledged write; another writer wins before it returns.
+        const receipt = await read(input);
+        expect(receipt.importedComponents).toEqual({ skills: [], mcpServers: [] });
+        await backend.setComponents({
+          name: input.name,
+          expectedLockedSha: receipt.lockedSha,
+          expectedContentHash: receipt.contentHash,
+          expectedImportedComponents: receipt.importedComponents ?? null,
+          importedComponents: latest,
+        });
+        return read(input);
+      });
+      await user.click(canvas.getByRole("button", { name: "Save changes" }));
+      await waitFor(() =>
+        expect(
+          canvas.getByRole("checkbox", { name: latest.skills[0] }).getAttribute("aria-checked")
+        ).toBe("true")
+      );
+      expect(canvas.getByRole("alert")).toBeDefined();
+      expect(canvas.queryByRole("button", { name: "Done" })).toBeNull();
+      await waitFor(() =>
+        expect(canvas.getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(false)
+      );
+      expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
+        true
+      );
+      expect(canvas.getByText(/1 of 2 skills imported/)).toBeDefined();
+      expect(
+        canvas.getByText(
+          latest.mcpServers.length ? /1 of 1 MCP servers imported/ : /0 of 1 MCP servers imported/
+        )
+      ).toBeDefined();
+      for (const name of ["review", "research"]) {
+        expect(canvas.getByRole("checkbox", { name }).getAttribute("aria-checked")).toBe(
+          latest.skills.includes(name) ? "true" : "false"
+        );
+      }
+      expect(canvas.getByRole("checkbox", { name: "reference" }).getAttribute("aria-checked")).toBe(
+        latest.mcpServers.length ? "true" : "false"
+      );
+      expect(mutation).toHaveBeenCalledTimes(1);
+      for (const group of ["Skills", "MCP servers"]) {
+        await user.click(
+          within(canvas.getByRole("group", { name: group })).getByRole("button", { name: "Clear" })
+        );
+      }
+      await user.click(canvas.getByRole("button", { name: "Save changes" }));
+      await canvas.findByText(/0 of 2 skills imported/);
+      await waitFor(() =>
+        expect(canvas.getByRole("button", { name: "Done" }).hasAttribute("disabled")).toBe(false)
+      );
+      expect(mutation).toHaveBeenCalledTimes(2);
+      expect(canvas.queryByRole("alert")).toBeNull();
+    },
+    120000
+  );
 
   test.each(["button", "keyboard", "palette"] as const)(
     "reopening installation via %s clears prior success through the next failed attempt",
@@ -221,7 +483,7 @@ describeIntegration("Selective plugin imports", () => {
     await user.click(canvas.getByRole("checkbox", { name: "reference" }));
     await user.click(canvas.getByRole("button", { name: "Install" }));
     await canvas.findByText(/1 of 2 skills imported/, {}, { timeout: 10000 });
-    await user.click(canvas.getByRole("button", { name: "Add components to review-tools" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
     await user.click(await canvas.findByRole("checkbox", { name: "research" }));
     const before = await inventory(app);
     const skillFile = path.join(
@@ -233,12 +495,12 @@ describeIntegration("Selective plugin imports", () => {
       "SKILL.md"
     );
     await fs.appendFile(skillFile, "Changed local skill instructions\n");
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await waitFor(() => {
       expect(canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")).toBe(
         "false"
       );
-      expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+      expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
         true
       );
     });
@@ -248,7 +510,7 @@ describeIntegration("Selective plugin imports", () => {
     expect(refreshed.contentHash).not.toBe(before.contentHash);
     expect(refreshed.importedComponents?.skills).toEqual(["review"]);
     await user.click(canvas.getByRole("checkbox", { name: "research" }));
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByText(/2 of 2 skills imported/);
     expect((await inventory(app)).importedComponents?.skills).toEqual(["research", "review"]);
   }, 120000);
@@ -268,7 +530,7 @@ describeIntegration("Selective plugin imports", () => {
     jest
       .spyOn(app.env.services.agentPluginInstallService, "getComponents")
       .mockRejectedValueOnce(new Error("Inventory unavailable"));
-    await user.click(canvas.getByRole("button", { name: "Add components to review-tools" }));
+    await user.click(canvas.getByRole("button", { name: "Manage components for review-tools" }));
     await canvas.findByText("Inventory unavailable");
     await user.click(canvas.getByRole("button", { name: "Retry inventory" }));
     await user.click(await canvas.findByRole("checkbox", { name: "research" }));
@@ -281,14 +543,14 @@ describeIntegration("Selective plugin imports", () => {
     await waitFor(async () => expect((await inventory(app)).lockedSha).not.toBe(before.lockedSha), {
       timeout: 10000,
     });
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByRole("alert");
     await waitFor(() =>
       expect(canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")).toBe(
         "false"
       )
     );
-    expect(canvas.getByRole("button", { name: "Import selected" }).hasAttribute("disabled")).toBe(
+    expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
       true
     );
     expect((await inventory(app)).importedComponents).toEqual({
@@ -296,7 +558,7 @@ describeIntegration("Selective plugin imports", () => {
       mcpServers: [],
     });
     await user.click(canvas.getByRole("checkbox", { name: "research" }));
-    await user.click(canvas.getByRole("button", { name: "Import selected" }));
+    await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByText(/2 of 2 skills imported/);
     expect((await inventory(app)).importedComponents?.skills).toEqual(["research", "review"]);
   }, 120000);

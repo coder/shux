@@ -1742,14 +1742,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             },
             {
-              id: CommandIds.pluginsAddComponents(),
-              title: "Add Plugin Components…",
-              subtitle: "Import more skills or MCP servers from the installed version",
+              id: CommandIds.pluginsManageComponents(),
+              title: "Manage Plugin Components…",
+              subtitle: "Choose which installed skills and MCP servers are imported",
               section: section.settings,
-              keywords: ["plugin", "add", "import", "skill", "mcp", "components"],
+              keywords: [
+                "plugin",
+                "manage",
+                "add",
+                "remove",
+                "import",
+                "skill",
+                "mcp",
+                "components",
+              ],
               run: () => undefined,
               prompt: {
-                title: "Add Plugin Components",
+                title: "Manage Plugin Components",
                 fields: [
                   {
                     type: "select",
@@ -1771,7 +1780,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   },
                 ],
                 onSubmit: (values) => {
-                  publishPluginsSectionIntent({ type: "add-components", name: values.pluginName });
+                  publishPluginsSectionIntent({
+                    type: "manage-components",
+                    name: values.pluginName,
+                  });
                   openSettings("plugins");
                 },
               },

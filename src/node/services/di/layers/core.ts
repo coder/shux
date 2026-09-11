@@ -1,3 +1,7 @@
+import {
+  readPluginMcpPolicy,
+  PLUGIN_REGISTRY_FILE_NAME,
+} from "@/node/services/agentPlugins/registry";
 import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { ClaudeDesignService } from "@/node/services/claudeDesignService";
 import * as os from "os";
@@ -6,7 +10,11 @@ import { Context, Effect, Layer } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { secretsToRecord } from "@/common/types/secrets";
 import { isMultiProject } from "@/common/utils/multiProject";
-import { STAGING_DIR_NAME, readMutationEpochToken } from "@/node/services/agentPlugins/journals";
+import {
+  acquirePluginMutationLock,
+  STAGING_DIR_NAME,
+  readMutationEpochToken,
+} from "@/node/services/agentPlugins/journals";
 import {
   PLUGIN_SERVER_KEY_PREFIX,
   createAgentPluginsMcpProvider,
@@ -373,6 +381,10 @@ export const MCPServerManagerLive = Layer.effect(
         telemetryService: opts.telemetryService,
         pluginInvalidation: {
           keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
+          readComponentPolicy: () =>
+            readPluginMcpPolicy(path.join(mcpConfig.rootDir, PLUGIN_REGISTRY_FILE_NAME)),
+          tryAcquireComponentPolicyLock: (options) =>
+            acquirePluginMutationLock(mcpConfig.rootDir, { timeoutMs: 0, ...options }),
           readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
           // Bounded/cancellable like the send path's own read: a distrusted or
           // cold serve re-reads through here, and an unreachable SSH/Docker
