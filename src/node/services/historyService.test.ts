@@ -2691,17 +2691,55 @@ describe("HistoryService", () => {
       expect(reseeded).toBeLessThan(Number.MAX_SAFE_INTEGER);
     });
 
+    it("refuses a reseed it cannot persist without quarantining the malformed file", async () => {
+      const workspaceId = "workspace1";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      const segmentPath = path.join(workspaceDir, "history-segment.json");
+      // A readable start at the ceiling: the first append of that segment is
+      // refused (the sequence could not be retired), but the start is cached.
+      await fs.writeFile(segmentPath, JSON.stringify({ start: Number.MAX_SAFE_INTEGER - 1 }));
+      expect(
+        (await service.appendToHistory(workspaceId, createMuxMessage("m1", "user", "x"))).success
+      ).toBe(false);
+      // The file then turns malformed: the reseed floors at the cached start
+      // and would land past the ceiling. It refuses BEFORE renaming, so the
+      // malformed file stays in place and the next attempt does not read an
+      // absent file as segment 0 and reuse the retired identity.
+      await fs.writeFile(segmentPath, "garbage");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const refused = await service.appendToHistory(
+          workspaceId,
+          createMuxMessage(`m${attempt + 2}`, "user", "x")
+        );
+        expect(refused.success).toBe(false);
+        if (!refused.success) expect(refused.error).toContain("safe successor");
+        expect(await fs.readFile(segmentPath, "utf-8")).toBe("garbage");
+      }
+      expect((await fs.readdir(workspaceDir)).filter((name) => name.includes(".corrupt-"))).toEqual(
+        []
+      );
+    });
+
     it("ignores persisted sequences without a safe successor for the append and clear floors", async () => {
       const workspaceId = "workspace2";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(workspaceDir, { recursive: true });
-      // Hand-edited rows at and past 2^53 - 1 cannot floor a counter that
-      // has to move; they are skipped like fractional sequences (never
-      // refused), so the user can still send and /clear removes them.
+      // Hand-edited rows at and past 2^53 - 2 cannot floor a counter that
+      // has to move, nor open the segment that retires them (2^53 - 2 would
+      // put the next start at 2^53 - 1, which the reader rejects); they are
+      // skipped like fractional sequences (never refused), so the user can
+      // still send and /clear removes them.
       await fs.writeFile(
         path.join(workspaceDir, "chat.jsonl"),
         [
           { ...createMuxMessage("sane", "user", "sane", { historySequence: 4 }), workspaceId },
+          {
+            ...createMuxMessage("below", "user", "below the edge", {
+              historySequence: Number.MAX_SAFE_INTEGER - 1,
+            }),
+            workspaceId,
+          },
           {
             ...createMuxMessage("edge", "user", "at the edge", {
               historySequence: Number.MAX_SAFE_INTEGER,

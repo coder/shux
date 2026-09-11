@@ -198,11 +198,22 @@ function stripContextUsage(message: MuxMessage): MuxMessage {
 }
 
 /**
- * A persisted history sequence the counter can be floored at: a nonnegative
- * integer whose successor is still a safe integer (see getNewestHistorySequence).
+ * A history segment start that can be persisted AND read back: a nonnegative
+ * integer whose successor is still a safe integer (`start + 1` past 2^53 no
+ * longer moves). One predicate for the writer and the reader, so the service
+ * never persists a start it would treat as malformed on the next read.
+ */
+function isUsableHistorySegmentStart(value: unknown): value is number {
+  return isNonNegativeInteger(value) && Number.isSafeInteger(value + 1);
+}
+
+/**
+ * A history sequence the counter can be floored at and that a full clear can
+ * retire (see getNewestHistorySequence): a nonnegative integer whose successor
+ * is a usable segment start, so every floor derived from it stays writable.
  */
 function isUsableHistorySequence(value: unknown): value is number {
-  return isNonNegativeInteger(value) && Number.isSafeInteger(value + 1);
+  return isNonNegativeInteger(value) && isUsableHistorySegmentStart(value + 1);
 }
 
 /** The persisted row's segment stamp, kept across in-place replacement (see MuxMetadata.historySegment). */
@@ -1891,10 +1902,11 @@ export class HistoryService {
 
     for (const message of messages) {
       const sequence = message.metadata?.historySequence;
-      // A sequence without a safe successor (>= 2^53 - 1; a hand-edited row)
-      // is malformed like a fraction: it cannot floor a counter that has to
-      // move, so it is skipped — appends continue from the sane rows and a
-      // clear removes it — rather than refusing every append and clear.
+      // A sequence whose successor is not a usable segment start (>= 2^53 - 2;
+      // a hand-edited row) is malformed like a fraction: it cannot floor a
+      // counter that has to move nor be retired by a clear, so it is skipped —
+      // appends continue from the sane rows and a clear removes it — rather
+      // than refusing every append and clear.
       if (!isUsableHistorySequence(sequence)) {
         continue;
       }
@@ -1937,10 +1949,9 @@ export class HistoryService {
       typeof parsed === "object" && parsed !== null
         ? (parsed as { start?: unknown }).start
         : undefined;
-    // The start itself AND the sequences assigned from it must stay safe
-    // (`start + 1` past 2^53 no longer moves): a file at the boundary is
-    // malformed too and reseeds (which then refuses an unsafe reseed).
-    return isNonNegativeInteger(start) && Number.isSafeInteger(start + 1) ? start : null;
+    // Same predicate as the writer: a file at the boundary is malformed too
+    // and reseeds (which refuses an unusable reseed before touching the file).
+    return isUsableHistorySegmentStart(start) ? start : null;
   }
 
   /**
@@ -1959,13 +1970,6 @@ export class HistoryService {
     workspaceId: string,
     visibleMaxSequence: number
   ): Promise<number> {
-    const segmentPath = this.getHistorySegmentPath(workspaceId);
-    const quarantinePath = `${segmentPath}.corrupt-${Date.now()}`;
-    log.warn("Quarantining malformed history segment file and reseeding the segment", {
-      workspaceId,
-      quarantinePath,
-    });
-    await fs.rename(segmentPath, quarantinePath);
     // An empty history after a restart leaves no row, counter or cached start
     // to floor at, and a small reseed (1) could repeat the identity of an
     // earlier segment that a late backend still names in its policy records.
@@ -1979,18 +1983,36 @@ export class HistoryService {
         this.historySegmentStarts.get(workspaceId) ?? 0,
         Date.now()
       ) + 1;
+    // Refuse BEFORE quarantining: a rename followed by a refused write would
+    // leave no segment file, and the next read would restart the segment at
+    // 0 — the retired range's identity reused, which the file exists to prevent.
+    this.requireUsableHistorySegmentStart(workspaceId, start);
+    const segmentPath = this.getHistorySegmentPath(workspaceId);
+    const quarantinePath = `${segmentPath}.corrupt-${Date.now()}`;
+    log.warn("Quarantining malformed history segment file and reseeding the segment", {
+      workspaceId,
+      quarantinePath,
+    });
+    await fs.rename(segmentPath, quarantinePath);
     await this.writeHistorySegmentStart(workspaceId, start);
     return start;
   }
 
-  private async writeHistorySegmentStart(workspaceId: string, start: number): Promise<void> {
-    // Reachable from persisted data (an absurd sequence in a hand-edited row):
-    // refuse rather than persist a start that `+ 1` cannot move past.
-    if (!isNonNegativeInteger(start) || !Number.isSafeInteger(start)) {
+  /**
+   * Reachable from persisted data (the cached counter or start of a
+   * hand-edited history at the 2^53 boundary): refuse rather than persist a
+   * start the reader would reject.
+   */
+  private requireUsableHistorySegmentStart(workspaceId: string, start: number): void {
+    if (!isUsableHistorySegmentStart(start)) {
       throw new Error(
-        `Cannot open a new history segment for ${workspaceId}: start ${start} is not a safe integer`
+        `Cannot open a new history segment for ${workspaceId}: start ${String(start)} has no safe successor`
       );
     }
+  }
+
+  private async writeHistorySegmentStart(workspaceId: string, start: number): Promise<void> {
+    this.requireUsableHistorySegmentStart(workspaceId, start);
     await ensurePrivateDir(this.getSessionDir(workspaceId));
     await writeFileAtomic(this.getHistorySegmentPath(workspaceId), JSON.stringify({ start }));
     this.historySegmentStarts.set(workspaceId, start);
@@ -2892,16 +2914,18 @@ export class HistoryService {
   }
 
   /**
-   * `max persisted sequence + 1`, refused when that is not a safe integer.
-   * Reachable from persisted data (a hand-edited row at 2^53 - 1): an unsafe
-   * next sequence would stop moving under `+ 1` and let a later finalization
-   * replace an unrelated row, so appends fail instead of assigning it.
+   * `max persisted sequence + 1`, refused when that is not itself a usable
+   * sequence. Reachable from persisted data (a hand-edited segment start at
+   * the 2^53 boundary): a row assigned there could not floor the counter on
+   * the next load (its duplicate would let a later finalization replace an
+   * unrelated row) nor be retired by a clear, so appends fail instead of
+   * writing it.
    */
   private async getNextPersistedHistorySequence(workspaceId: string): Promise<number> {
     const nextSeqNum = (await this.getMaxHistorySequence(workspaceId)) + 1;
-    if (!isNonNegativeInteger(nextSeqNum) || !Number.isSafeInteger(nextSeqNum)) {
+    if (!isUsableHistorySequence(nextSeqNum)) {
       throw new Error(
-        `History sequences of ${workspaceId} are exhausted: next sequence ${nextSeqNum} is not a safe integer`
+        `History sequences of ${workspaceId} are exhausted: next sequence ${String(nextSeqNum)} has no safe successor`
       );
     }
     return nextSeqNum;
