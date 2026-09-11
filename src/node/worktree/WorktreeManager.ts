@@ -26,6 +26,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
+import { GitProgressParser } from "./gitProgress";
 
 type GitExecOptions = Pick<ExecFileAsyncOptions, "env" | "signal" | "timeoutMs"> | undefined;
 
@@ -169,27 +170,62 @@ export class WorktreeManager {
           params.abortSignal
         ));
 
-      // Create worktree (git worktree is typically fast)
-      if (branchExists) {
-        // Branch exists, just add a worktree pointing to the existing ref without rewriting it.
-        using proc = execFileAsync(
+      // Separate checkout so large repositories can stream file materialization progress.
+      // Restore flows may supply an exact saved commit instead of the current trunk.
+      const newBranchBase = startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
+      using addProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          projectPath,
+          "worktree",
+          "add",
+          "--no-checkout",
+          ...(branchExists
+            ? [workspacePath, branchName]
+            : ["-b", branchName, workspacePath, newBranchBase]),
+        ],
+        noHooksEnv
+      );
+      const addResult = await addProc.result;
+      createdBranch = !branchExists;
+      for (const line of addResult.stdout.split(/[\r\n]/)) {
+        if (line) initLogger.logStdout(line);
+      }
+      for (const line of addResult.stderr.split(/[\r\n]/)) {
+        if (line) initLogger.logStderr(line);
+      }
+
+      initLogger.logStep("Checking out files...");
+      const progress = new GitProgressParser(
+        (stage, percent) => initLogger.logProgress?.(stage, percent),
+        (line) => initLogger.logStderr(line)
+      );
+      try {
+        using checkoutProc = execFileAsync(
           "git",
-          ["-C", projectPath, "worktree", "add", workspacePath, branchName],
-          noHooksEnv
+          ["-C", workspacePath, "checkout", "--progress", "--force", branchName],
+          { ...noHooksEnv, onStderrData: (chunk) => progress.push(chunk) }
         );
-        await proc.result;
-      } else {
-        // Branch doesn't exist, create from the requested start point when provided. Restore flows
-        // use this to recreate archived branches from exact saved commits instead of fetching origin.
-        const newBranchBase =
-          startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
-        using proc = execFileAsync(
-          "git",
-          ["-C", projectPath, "worktree", "add", "-b", branchName, workspacePath, newBranchBase],
-          noHooksEnv
-        );
-        await proc.result;
-        createdBranch = true;
+        const { stdout } = await checkoutProc.result;
+        for (const line of stdout.split(/[\r\n]/)) {
+          if (line) initLogger.logStdout(line);
+        }
+      } catch (error) {
+        try {
+          await this.rollbackFailedWorkspaceCreation({
+            projectPath,
+            workspacePath,
+            branchName,
+            createdBranch,
+            trusted: params.trusted,
+          });
+        } catch {
+          // Preserve the checkout error even when best-effort cleanup fails.
+        }
+        throw error;
+      } finally {
+        progress.flush();
       }
       worktreeCreated = true;
 

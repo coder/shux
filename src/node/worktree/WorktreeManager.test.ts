@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
+import { existsSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
@@ -161,6 +162,162 @@ describe("WorktreeManager constructor", () => {
 });
 
 describe("WorktreeManager.createWorkspace", () => {
+  for (const existing of [false, true]) {
+    it(`populates a clean ${existing ? "existing-branch" : "new-branch"} worktree and streams checkout output`, async () => {
+      const branchName = "feature-progress";
+      const fixture = await createWorktreeManagerFixture({
+        existingBranchName: existing ? branchName : undefined,
+      });
+      const realExecFile = disposableExec.execFileAsync;
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const progress: Array<[string, number]> = [];
+      const initLogger = {
+        ...fixture.initLogger,
+        logStdout: (line: string) => stdout.push(line),
+        logStderr: (line: string) => stderr.push(line),
+        logProgress: (label: string, percent: number) => progress.push([label, percent]),
+      };
+      const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+      const hookMarker = path.join(fixture.rootDir, "checkout-hook-ran");
+      const hook = path.join(fixture.projectPath, ".git", "hooks", "post-checkout");
+      let checkoutStarted = false;
+      const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+        (file, args, options) => {
+          if (file === "git" && args[2] === "checkout") {
+            checkoutStarted = true;
+            expect(existsSync(path.join(workspacePath, "README.md"))).toBe(false);
+            options?.onStderrData?.("Updating files: 25% (1/4)\rUpdating fi");
+            options?.onStderrData?.("les: 100% (4/4), done.\n");
+          }
+          const proc = realExecFile(file, args, options);
+          if (file === "git" && args[2] === "worktree" && args[3] === "add") {
+            // --no-checkout usually emits only stderr, so supply stdout to cover both streams.
+            const result = proc.result;
+            Object.defineProperty(proc, "result", {
+              value: result.then((output) => ({
+                ...output,
+                stdout: "worktree metadata ready\r\n",
+              })),
+            });
+          }
+          return proc;
+        }
+      );
+      try {
+        let expectedContent = "hello\n";
+        if (existing) {
+          execFileSync("git", ["checkout", branchName], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+          expectedContent = "existing branch contents\n";
+          await fsPromises.writeFile(path.join(fixture.projectPath, "README.md"), expectedContent);
+          execFileSync("git", ["commit", "-am", "branch contents"], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["checkout", "main"], { cwd: fixture.projectPath, stdio: "ignore" });
+        }
+        await fsPromises.writeFile(hook, '#!/bin/sh\nprintf ran > "' + hookMarker + '"\n');
+        await fsPromises.chmod(hook, 0o755);
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: false,
+          initLogger,
+        });
+        expect(result).toEqual({ success: true, workspacePath });
+        expect(checkoutStarted).toBe(true);
+        expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
+          expectedContent
+        );
+        expect(
+          execFileSync("git", ["status", "--porcelain"], { cwd: workspacePath }).toString()
+        ).toBe("");
+        expect(
+          execFileSync("git", ["branch", "--show-current"], { cwd: workspacePath })
+            .toString()
+            .trim()
+        ).toBe(branchName);
+        expect(existsSync(hookMarker)).toBe(false);
+        expect(stdout).toContain("worktree metadata ready");
+        expect(stderr.some((line) => line.includes("Preparing worktree"))).toBe(true);
+        expect(stderr).toContain("Updating files: 100% (4/4), done.");
+        expect(stderr.some((line) => line.includes(branchName))).toBe(true);
+        expect(progress).toEqual([
+          ["Updating files", 25],
+          ["Updating files", 100],
+        ]);
+      } finally {
+        execSpy.mockRestore();
+        await fixture.cleanup();
+      }
+    }, 20_000);
+
+    it(`removes a failed ${existing ? "existing-branch" : "new-branch"} worktree checkout`, async () => {
+      const branchName = "feature-checkout-failure";
+      const fixture = await createWorktreeManagerFixture({
+        existingBranchName: existing ? branchName : undefined,
+      });
+      const stderr: string[] = [];
+      try {
+        await fsPromises.writeFile(
+          path.join(fixture.projectPath, ".gitattributes"),
+          "README.md filter=fail\n"
+        );
+        execFileSync("git", ["add", ".gitattributes"], {
+          cwd: fixture.projectPath,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["commit", "-m", "require checkout filter"], {
+          cwd: fixture.projectPath,
+          stdio: "ignore",
+        });
+        if (existing) {
+          execFileSync("git", ["branch", "-f", branchName, "main"], {
+            cwd: fixture.projectPath,
+            stdio: "ignore",
+          });
+        }
+        execFileSync("git", ["config", "filter.fail.smudge", "exit 1"], {
+          cwd: fixture.projectPath,
+        });
+        execFileSync("git", ["config", "filter.fail.required", "true"], {
+          cwd: fixture.projectPath,
+        });
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: { ...fixture.initLogger, logStderr: (line) => stderr.push(line) },
+        });
+        expect(result.success).toBe(false);
+        if (result.success) throw new Error("Expected checkout to fail");
+        expect(result.error).toContain("smudge filter fail failed");
+        expect(stderr.some((line) => line.includes("smudge filter fail failed"))).toBe(true);
+        const workspacePath = fixture.manager.getWorkspacePath(fixture.projectPath, branchName);
+        expect(existsSync(workspacePath)).toBe(false);
+        expect(
+          execFileSync("git", ["worktree", "list", "--porcelain"], {
+            cwd: fixture.projectPath,
+          }).toString()
+        ).not.toContain(workspacePath);
+        expect(
+          execFileSync("git", ["branch", "--list", branchName], { cwd: fixture.projectPath })
+            .toString()
+            .trim()
+        ).toBe(existing ? branchName : "");
+      } finally {
+        await fixture.cleanup();
+      }
+    }, 20_000);
+  }
+
   const rollbackCases = [
     {
       name: "rolls back failed new worktrees when submodule materialization fails",
