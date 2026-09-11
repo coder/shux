@@ -2674,6 +2674,39 @@ describe("HistoryService", () => {
       expect(msg.metadata?.historySegment).toBeGreaterThan(1);
     });
 
+    it("treats a segment start at the safe-integer boundary as malformed and refuses unsafe next sequences", async () => {
+      const workspaceId = "workspace1";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      // `start` is safe but `start + 1` is not: the file cannot seed a
+      // counter that moves, so it is quarantined and reseeded like any other
+      // malformed file.
+      const segmentPath = path.join(workspaceDir, "history-segment.json");
+      await fs.writeFile(segmentPath, JSON.stringify({ start: Number.MAX_SAFE_INTEGER }));
+      const msg = createMuxMessage("msg1", "user", "Hello");
+      expect((await service.appendToHistory(workspaceId, msg)).success).toBe(true);
+      const reseeded = msg.metadata?.historySegment;
+      if (reseeded === undefined) throw new Error("expected a reseeded stamp");
+      expect(Number.isSafeInteger(reseeded + 1)).toBe(true);
+      expect(reseeded).toBeLessThan(Number.MAX_SAFE_INTEGER);
+      // A persisted row at the boundary leaves no safe next sequence: the
+      // append refuses rather than assign a value `+ 1` cannot move past.
+      const other = "workspace2";
+      await fs.mkdir(path.join(config.sessionsDir, other), { recursive: true });
+      await fs.writeFile(
+        path.join(config.sessionsDir, other, "chat.jsonl"),
+        JSON.stringify({
+          ...createMuxMessage("edge", "user", "at the edge", {
+            historySequence: Number.MAX_SAFE_INTEGER,
+          }),
+          workspaceId: other,
+        }) + "\n"
+      );
+      const refused = await service.appendToHistory(other, createMuxMessage("m", "user", "x"));
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("safe integer");
+    });
+
     it("refuses to open a segment above an unsafe persisted sequence", async () => {
       const workspaceId = "workspace1";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);

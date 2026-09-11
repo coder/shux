@@ -1925,7 +1925,10 @@ export class HistoryService {
       typeof parsed === "object" && parsed !== null
         ? (parsed as { start?: unknown }).start
         : undefined;
-    return isNonNegativeInteger(start) && Number.isSafeInteger(start) ? start : null;
+    // The start itself AND the sequences assigned from it must stay safe
+    // (`start + 1` past 2^53 no longer moves): a file at the boundary is
+    // malformed too and reseeds (which then refuses an unsafe reseed).
+    return isNonNegativeInteger(start) && Number.isSafeInteger(start + 1) ? start : null;
   }
 
   /**
@@ -2871,12 +2874,24 @@ export class HistoryService {
     // User rationale: a stale partial or hand-edited chat.jsonl can leave an old
     // historySequence at the tail. Initializing from the tail would make the next
     // live message look like an edit/truncation to the renderer, so scan for max.
-    const nextSeqNum = (await this.getMaxHistorySequence(workspaceId)) + 1;
-    assert(
-      isNonNegativeInteger(nextSeqNum),
-      "next history sequence counter must be a non-negative integer"
-    );
+    const nextSeqNum = await this.getNextPersistedHistorySequence(workspaceId);
     this.sequenceCounters.set(workspaceId, nextSeqNum);
+    return nextSeqNum;
+  }
+
+  /**
+   * `max persisted sequence + 1`, refused when that is not a safe integer.
+   * Reachable from persisted data (a hand-edited row at 2^53 - 1): an unsafe
+   * next sequence would stop moving under `+ 1` and let a later finalization
+   * replace an unrelated row, so appends fail instead of assigning it.
+   */
+  private async getNextPersistedHistorySequence(workspaceId: string): Promise<number> {
+    const nextSeqNum = (await this.getMaxHistorySequence(workspaceId)) + 1;
+    if (!isNonNegativeInteger(nextSeqNum) || !Number.isSafeInteger(nextSeqNum)) {
+      throw new Error(
+        `History sequences of ${workspaceId} are exhausted: next sequence ${nextSeqNum} is not a safe integer`
+      );
+    }
     return nextSeqNum;
   }
 
@@ -3196,7 +3211,7 @@ export class HistoryService {
    * precedes every operation (active file is bounded by rotation).
    */
   private async refreshSequenceCounterUnderWriteLock(workspaceId: string): Promise<void> {
-    const persistedNext = (await this.getMaxHistorySequence(workspaceId)) + 1;
+    const persistedNext = await this.getNextPersistedHistorySequence(workspaceId);
     const cached = this.sequenceCounters.get(workspaceId);
     if (cached === undefined || persistedNext > cached) {
       this.sequenceCounters.set(workspaceId, persistedNext);

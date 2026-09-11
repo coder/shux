@@ -9705,6 +9705,19 @@ describe("WorkspaceService initialize", () => {
           })
         ).toBe(true);
         expect(persistedFor(60)).not.toBe(true);
+        // Healed on that write (no fast path on a corrupt container's blanket
+        // deny, r83): the container is a plain object again holding this
+        // epoch's deny, and the next epoch's first turn grants normally.
+        const healed = findWorkspaceEntry(realConfig.loadConfigOrDefault(), "policy-scratch")!
+          .workspace.workspaceMemoryWritableByEpoch;
+        expect(healed).toEqual({ "60": false });
+        expect(
+          await service.recordWorkspaceMemoryWritable("policy-scratch", true, {
+            epochHasPriorTurns: false,
+            policyEpoch: 62,
+          })
+        ).toBe(true);
+        expect(persistedFor(62)).toBe(true);
         setWorkspaceMemoryWritableForEpoch(corrupted, 61, true);
         expect(corrupted.workspaceMemoryWritableByEpoch).toEqual({ "61": true });
       }

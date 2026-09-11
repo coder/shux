@@ -367,6 +367,7 @@ import {
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   setWorkspaceMemoryWritableForEpoch,
+  hasMalformedWorkspaceMemoryPolicyRecords,
   workspaceMemoryWritableForEpoch,
 } from "@/node/services/workspaceMemoryPolicyEpochs";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
@@ -4462,10 +4463,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       (mirror ?? true) &&
       writable;
     // Fast path (no write): the outcome cannot differ from the stored value —
-    // it is already false, or already true and this turn grants.
+    // it is already false, or already true and this turn grants. Not when
+    // the stored "false" is a corrupt container's blanket deny: the write
+    // below replaces the container with a healed record (this epoch stays
+    // denied; later epochs read their own records again).
     if (
-      stored === false ||
-      (stored === true && conjunction(stored, carriedFor(before.workspace)))
+      !hasMalformedWorkspaceMemoryPolicyRecords(before.workspace) &&
+      (stored === false || (stored === true && conjunction(stored, carriedFor(before.workspace))))
     ) {
       session?.recordWorkspaceMemoryWritable(stored);
       return true;

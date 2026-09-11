@@ -53,6 +53,17 @@ export function workspaceMemoryWritableForEpoch(
 }
 
 /**
+ * Whether the persisted container is corrupt (present but not a plain
+ * object). Every epoch then reads as a deny; the next write replaces the
+ * container (setWorkspaceMemoryWritableForEpoch), so writers must not take
+ * a no-write fast path on the strength of that deny or the corruption — and
+ * the blanket deny — would outlive every epoch until a destructive clear.
+ */
+export function hasMalformedWorkspaceMemoryPolicyRecords(entry: WorkspaceConfigEntry): boolean {
+  return policyRecords(entry) === null;
+}
+
+/**
  * The persisted container: `undefined` when absent, `null` when present but
  * not a plain object (raw JSON, no schema validation upstream).
  */
