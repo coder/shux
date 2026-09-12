@@ -341,6 +341,7 @@ import {
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
   type SendMessageInternalOptions,
+  type TurnAcceptanceOrigin,
   type WorkspaceHost,
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
@@ -2695,6 +2696,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           muxMetadata: dispatch.muxMetadata,
         },
         {
+          acceptanceOrigin: "automatic",
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
@@ -11393,6 +11395,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // ahead of the user's intervention while the fallback persists the
           // rejected row and applies goal safety.
           return await session.sendMessage(message, normalizedOptions, {
+            acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
@@ -11573,6 +11576,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           message,
           continuationSendState.options,
           {
+            acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             authoredAtMs,
@@ -11690,6 +11694,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // recovery admit an exec turn ahead of the accepted manual send. Refusal
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
+        acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
           this.advanceContextMutationEpoch(workspaceId);
@@ -11810,7 +11815,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async resumeStream(
     workspaceId: string,
     options: SendMessageOptions,
-    internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
+    internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
+      allowQueuedAgentTask?: boolean;
+      agentInitiated?: boolean;
+    }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
@@ -11965,6 +11974,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // started (or refused), so no follow-up redispatched from within the
       // resumed turn itself can observe the reservation and self-veto.
       const result = await session.resumeStream(normalizedOptions, {
+        acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
         agentInitiated: internal?.agentInitiated,
       });
       sessionInvisiblePreflight.release();
@@ -15421,6 +15431,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         editMessageId: undefined,
       },
       {
+        acceptanceOrigin: "automatic",
         skipAutoResumeReset: true,
         synthetic: true,
         agentInitiated: true,
@@ -15501,6 +15512,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         muxMetadata,
       },
       {
+        acceptanceOrigin: "automatic",
         // Idle compaction runs in background; avoid mutating auto-resume counters.
         skipAutoResumeReset: true,
         // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
@@ -15811,6 +15823,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         queueDispatchMode: whenBusy,
       },
       {
+        acceptanceOrigin: "automatic",
         // Heartbeats run in background; avoid mutating auto-resume counters.
         skipAutoResumeReset: true,
         // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
@@ -15849,6 +15862,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         ...(whenBusy !== "skip" ? { queueDispatchMode: whenBusy } : {}),
       },
       {
+        acceptanceOrigin: "automatic",
         // Heartbeats run in background; avoid mutating auto-resume counters.
         skipAutoResumeReset: true,
         // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
@@ -15896,6 +15910,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         muxMetadata: compactionMuxMetadata,
       },
       {
+        acceptanceOrigin: "automatic",
         skipAutoResumeReset: true,
         synthetic: true,
         requireIdle: true,

@@ -464,27 +464,26 @@ describe("WorkspaceGoalService", () => {
     const publicationGate = new Promise<void>((resolve) => {
       releasePublication = resolve;
     });
+    let markPublicationEntered!: () => void;
+    const publicationEntered = new Promise<void>((resolve) => {
+      markPublicationEntered = resolve;
+    });
     const pushSnapshotSpy = spyOn(
       service as unknown as { pushSnapshot: (workspaceId: string, goal: unknown) => Promise<void> },
       "pushSnapshot"
     ).mockImplementation(async () => {
+      markPublicationEntered();
       await publicationGate;
     });
+    const pausePromise = service.setGoal({
+      workspaceId,
+      status: "paused",
+      initiator: "user",
+    });
     try {
-      const pausePromise = service.setGoal({
-        workspaceId,
-        status: "paused",
-        initiator: "user",
-      });
-      const goalPath = path.join(config.sessionsDir, workspaceId, "goal.json");
-      await waitForCondition(async () => {
-        try {
-          const raw = JSON.parse(await fs.readFile(goalPath, "utf-8")) as { status?: string };
-          return raw.status === "paused";
-        } catch {
-          return false;
-        }
-      });
+      // Atomic rename makes the file visible before write-file-atomic finishes
+      // cleanup. Publication entry proves writeGoal completed its generation bump.
+      await publicationEntered;
       // The durable pause has committed but publication (and the finalization
       // hold arming) has not — the captured probe must already be stale.
       expect(admission.admissionStale()).toBe(true);
@@ -493,7 +492,12 @@ describe("WorkspaceGoalService", () => {
       expect(paused.success).toBe(true);
     } finally {
       releasePublication();
-      pushSnapshotSpy.mockRestore();
+      try {
+        // Drain the write even if an assertion fails, before fixture cleanup runs.
+        await pausePromise;
+      } finally {
+        pushSnapshotSpy.mockRestore();
+      }
     }
   });
 

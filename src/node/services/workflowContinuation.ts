@@ -67,6 +67,7 @@ export async function sendWorkflowRunTerminalContinuation(
         },
       },
       {
+        acceptanceOrigin: "automatic",
         skipAutoResumeReset: true,
         synthetic: true,
         agentInitiated: true,
