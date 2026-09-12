@@ -859,6 +859,65 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([
+    { inputTokens: 110_000, automatic: true },
+    { inputTokens: 1_000, automatic: true },
+    { inputTokens: 110_000, automatic: false },
+  ])(
+    "token-budget send preserves scoped Stop recovery (tokens=$inputTokens, automatic=$automatic)",
+    async ({ inputTokens, automatic }) => {
+      const h = await setup();
+      await h.session.cancelCompaction();
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("canceled-summary", "assistant", "Canceled summary", {
+          model,
+          compactionBoundary: true,
+          compacted: "user",
+          contextUsage: { inputTokens, outputTokens: 10, totalTokens: inputTokens + 10 },
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: { text: "old continuation", model, agentId: "exec" },
+          },
+        })
+      );
+      expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+      const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+      const stopped = await storage.read();
+      expect(stopped?.scope.kind).toBe("summary");
+      const result = await h.session.sendMessage("Fresh input", options, {
+        acceptanceOrigin: automatic ? "automatic" : "manual",
+        synthetic: automatic,
+      });
+      const latest = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      assert(latest.success);
+      const activeSummary = latest.data.some((row) => row.id === "canceled-summary");
+      expect(await storage.read()).toEqual(automatic ? stopped : null);
+      await h.session.dispose();
+      const restarted = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      harnesses.push(restarted);
+      expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+      // Recovery after restart must still find and clean the canceled handoff in its epoch.
+      expect({
+        accepted: result.success,
+        providerStarts: h.requests.length,
+        resets: rolloverRows(latest.data).length,
+        activeSummary,
+        remainingStop: await storage.read(),
+      }).toEqual({
+        accepted: !automatic || inputTokens === 1_000,
+        providerStarts: !automatic || inputTokens === 1_000 ? 1 : 0,
+        resets: automatic ? 0 : 1,
+        activeSummary: automatic,
+        remainingStop: null,
+      });
+    }
+  );
+
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);

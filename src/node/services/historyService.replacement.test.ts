@@ -2321,6 +2321,61 @@ describe("compaction replacement acceptance", () => {
     );
   });
 
+  it.each([false, true])(
+    "automatic reset preserves scoped cancellation under its write lock (peer narrowing=%s)",
+    async (peerNarrowing) => {
+      await stop.cancel();
+      const expected = await capture();
+      assert(expected.nonce);
+      const summary = { id: "canceled-summary", sequence: 0, pendingFollowUp: { text: "old" } };
+      if (!peerNarrowing) await stop.narrow(expected.nonce, summary);
+      const before = await fs.readFile(chatPath);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
+      spyOn(workspaceFileLocks, "withLock").mockImplementationOnce(async (key, operation) => {
+        entered.resolve();
+        await release.promise;
+        return withLock(key, operation);
+      });
+      const committed = mock(() => undefined);
+      const accepting = history.acceptCompactionReplacement(
+        workspaceId,
+        expected,
+        {
+          kind: "append",
+          preserveCancellation: true,
+          messages: [
+            createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" }),
+            createMuxMessage("trigger", "user", "Fresh automatic input"),
+          ],
+        },
+        { isCurrent: () => true, onCommitted: committed }
+      );
+      await entered.promise;
+      let stopBefore: Buffer<ArrayBuffer>;
+      const storage = history.getCompactionCancellationStorage(workspaceId);
+      try {
+        if (peerNarrowing) {
+          const foreign = new CompactionCancellation(
+            new HistoryService(fixture.config).getCompactionCancellationStorage(workspaceId)
+          );
+          await foreign.read();
+          await foreign.narrow(expected.nonce, summary);
+        }
+        expect((await storage.read())?.scope.kind).toBe("summary");
+        stopBefore = await fs.readFile(storage.path);
+      } finally {
+        release.resolve();
+      }
+      expect(await accepting).toEqual(Ok({ kind: "skipped" }));
+      expect(committed).not.toHaveBeenCalled();
+      expect(await fs.readFile(chatPath)).toEqual(before);
+      expect(await fs.readFile(storage.path)).toEqual(stopBefore);
+      expect(await capture()).toEqual(expected);
+    }
+  );
+
   it.each([
     "commit",
     "foreign-before",

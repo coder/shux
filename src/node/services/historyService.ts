@@ -3608,6 +3608,15 @@ export class HistoryService {
         if (prepared.kind === "append") {
           messages = prepared.messages;
           if (messages.length === 0) return Ok({ kind: "skipped" });
+          // Automatic rollover must leave a canceled summary reachable to active-boundary
+          // recovery. Recheck under this lock: a peer can narrow Stop without changing its nonce.
+          if (
+            prepared.preserveCancellation &&
+            messages.some((message) => message.metadata?.contextBoundaryKind === "reset") &&
+            (await this.getCompactionCancellationStorage(workspaceId).read())?.scope.kind ===
+              "summary"
+          )
+            return Ok({ kind: "skipped" });
           const trigger = messages.at(-1)!;
           if (
             new Set(messages.map((message) => message.id)).size !== messages.length ||
