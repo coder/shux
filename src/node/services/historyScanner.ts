@@ -1,5 +1,6 @@
 import { createScanner, SyntaxKind } from "jsonc-parser";
 import * as fs from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { createHash } from "node:crypto";
@@ -76,7 +77,44 @@ function decodeResetEscapes(text: string): string {
 function compactResetProbe(text: string): string {
   // Corruption may insert raw or escaped control separators where JSON permits
   // whitespace. Remove them before retaining overlap, including long runs.
-  return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+  return stripEscapedResetSeparators(stripRawResetSeparators(text));
+}
+
+function stripRawResetSeparators(text: string): string {
+  return text.replace(/[\s\p{Cc}]/gu, "");
+}
+function stripEscapedResetSeparators(text: string): string {
+  return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+}
+
+/** Streaming counterpart of hasRawResetMarker; each transform keeps only a partial escape. */
+export function createRawHistoryResetProbe() {
+  const decoder = new StringDecoder("utf8");
+  let compactTail = "";
+  let decodeTail = "";
+  let markerTail = "";
+  let found = false;
+  // Separator removal accepts uppercase U/X; decoding keeps its existing case policy.
+  const partialEscape = (text: string) => /\\(?:u[\da-f]{0,3}|x[\da-f]?|)$/i.exec(text)?.[0] ?? "";
+  const pushText = (text: string, final = false) => {
+    text = compactTail + stripRawResetSeparators(text);
+    compactTail = final ? "" : partialEscape(text);
+    text =
+      decodeTail + stripEscapedResetSeparators(text.slice(0, text.length - compactTail.length));
+    decodeTail = final ? "" : partialEscape(text);
+    text = markerTail + decodeResetEscapes(text.slice(0, text.length - decodeTail.length));
+    found ||= text.includes(SESSION_HISTORY_RESET_NEEDLE);
+    markerTail = text.slice(-(SESSION_HISTORY_RESET_NEEDLE.length - 1));
+  };
+  return {
+    push(bytes: Uint8Array) {
+      if (!found) pushText(decoder.write(bytes));
+    },
+    finish() {
+      pushText(decoder.end(), true);
+      return found;
+    },
+  };
 }
 
 export function hasRawResetMarker(text: string): boolean {
@@ -154,6 +192,15 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   state.resetProbe = reverse
     ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
     : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+}
+
+/** Feed one oversized row in reverse byte ranges, using the provider's unchanged recognizer. */
+export function createUnreadableHistoryResetProbe() {
+  const state: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
+  return {
+    push: (bytes: Buffer) => addHistoryResetProbe(state, bytes, true),
+    hasReset: () => state.possibleReset,
+  };
 }
 
 function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {

@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { SESSION_HISTORY_SCAN_CHUNK_BYTES } from "@/common/constants/contextBudget";
 import {
   scanHistoryRows,
+  scanHistoryRowsFromHandle,
   type HistoryRowDescriptor,
   type HistoryRowToken,
 } from "./historyRowScanner";
@@ -727,6 +728,42 @@ describe("raw history row scanner", () => {
       expect(await scanning).toBe(reason);
       expect(begin).not.toHaveBeenCalled();
       expect(opened?.fd).toBe(-1);
+    }
+  );
+
+  it.each(["complete", "stop", "abort", "throw"] as const)(
+    "leaves a borrowed snapshot handle open after %s",
+    async (mode) => {
+      await fs.writeFile(filePath, "{}\n{}\n");
+      await using handle = await fs.open(filePath, "r");
+      const { size } = await handle.stat();
+      const controller = new AbortController();
+      const failure = new Error("borrowed visitor failure");
+      const reason = mode === "throw" ? failure : { interrupted: mode };
+      let finishedRows = 0;
+      const result = await scanHistoryRowsFromHandle(
+        handle,
+        size,
+        () => ({
+          token() {
+            /* The ownership control does not retain provisional tokens. */
+          },
+          finish() {
+            finishedRows++;
+            if (mode === "abort") controller.abort(reason);
+            if (mode === "throw") throw failure;
+            return mode !== "stop";
+          },
+        }),
+        { signal: controller.signal }
+      ).catch((error: unknown) => error);
+      expect(result).toBe(mode === "abort" || mode === "throw" ? reason : mode === "complete");
+      expect(finishedRows).toBe(mode === "complete" ? 2 : 1);
+      // Only the caller may close this handle; positional scanning does not consume its cursor.
+      const byte = Buffer.alloc(1);
+      expect((await handle.read(byte, 0, 1, null)).bytesRead).toBe(1);
+      expect(byte.toString()).toBe("{");
+      expect(handle.fd).not.toBe(-1);
     }
   );
 

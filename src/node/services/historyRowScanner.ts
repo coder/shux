@@ -49,6 +49,26 @@ export async function scanHistoryRows(
     signal?.throwIfAborted();
     const { size } = await handle.stat();
     signal?.throwIfAborted();
+    return await scanHistoryRowsFromHandle(handle, size, beginRow, { signal, decoding });
+  } finally {
+    // Resource disposal is asynchronous too; cancellation during cleanup must remain observable.
+    signal?.throwIfAborted();
+  }
+}
+
+/**
+ * Scan a borrowed handle through its captured size, so callers can inspect the same
+ * inode for additional evidence. The caller owns the handle and its disposal.
+ */
+export async function scanHistoryRowsFromHandle(
+  handle: fs.FileHandle,
+  size: number,
+  beginRow: (start: number) => HistoryRowVisitor,
+  options: { signal?: AbortSignal; decoding?: "strict" | "replacement" } = {}
+): Promise<boolean> {
+  const { signal, decoding = "strict" } = options;
+  signal?.throwIfAborted();
+  try {
     const buffer = Buffer.alloc(SESSION_HISTORY_SCAN_CHUNK_BYTES);
     let position = 0;
     let row: ReturnType<typeof createRow> | undefined;
@@ -87,7 +107,7 @@ export async function scanHistoryRows(
       await row?.close();
     }
   } finally {
-    // Resource disposal is asynchronous too; cancellation during cleanup must remain observable.
+    // Parser disposal is awaited too; observe cancellation before returning to the owner.
     signal?.throwIfAborted();
   }
 }
