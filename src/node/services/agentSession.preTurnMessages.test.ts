@@ -75,7 +75,12 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
-      { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [payload],
+      }
     );
     expect(result.success).toBe(true);
 
@@ -113,7 +118,12 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
-      { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [payload],
+      }
     );
     expect(result.success).toBe(false);
 

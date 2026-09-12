@@ -164,7 +164,7 @@ describe("AgentSession MCP prompt snapshots", () => {
     }
   });
 
-  test("rolls back persisted snapshot rows when the user row append fails", async () => {
+  test("publishes no snapshot rows when manual trigger acceptance fails", async () => {
     const getPrompt = mock(() => Promise.resolve({ text: "Expanded prompt" }));
     const harness = await createAgentSessionHarness({
       workspaceId: "workspace",
@@ -172,13 +172,10 @@ describe("AgentSession MCP prompt snapshots", () => {
     });
 
     try {
-      const realAppend = harness.historyService.appendToHistory.bind(harness.historyService);
-      const appendToHistory = spyOn(harness.historyService, "appendToHistory").mockImplementation(
-        async (workspaceId: string, message: MuxMessage) => {
-          if (message.metadata?.mcpPromptSnapshot) return realAppend(workspaceId, message);
-          return Err("disk full");
-        }
-      );
+      const acceptance = spyOn(
+        harness.historyService,
+        "acceptCompactionReplacement"
+      ).mockResolvedValueOnce(Err("disk full"));
 
       const result = await harness.session.sendMessage("Using MCP prompt coder/review: src", {
         model: "anthropic:claude-3-5-sonnet-latest",
@@ -186,7 +183,7 @@ describe("AgentSession MCP prompt snapshots", () => {
         muxMetadata: promptMetadata(),
       });
       expect(result.success).toBe(false);
-      appendToHistory.mockRestore();
+      acceptance.mockRestore();
 
       const history = await harness.historyService.getLastMessages("workspace", 10);
       expect(history.success).toBe(true);

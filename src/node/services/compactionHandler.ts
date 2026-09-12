@@ -365,6 +365,7 @@ export class CompactionHandler {
   async appendHeartbeatContextResetBoundary(params: {
     boundaryText: string;
     pendingFollowUp: CompactionFollowUpRequest;
+    publication?: ContinuousCompactionPublication;
     isCurrent?: () => boolean;
   }): Promise<Result<{ summaryMessageId: string }, string>> {
     assert(
@@ -375,11 +376,15 @@ export class CompactionHandler {
     const preparation = this.beginPreparation(params.isCurrent ?? (() => true));
     const { boundaryText } = params;
     const pendingFollowUp = structuredClone(params.pendingFollowUp);
-    const publication = {
-      generation: await this.historyService
-        .getContinuousCompactionJournal(this.workspaceId)
-        .captureGeneration(),
-    };
+    // Session callers capture before cancellation admission; never adopt a Stop that lands
+    // while the heartbeat gate or boundary preparation is awaiting disk I/O.
+    const publication = params.publication
+      ? structuredClone(params.publication)
+      : {
+          generation: await this.historyService
+            .getContinuousCompactionJournal(this.workspaceId)
+            .captureGeneration(),
+        };
     await this.retirePartial(preparation);
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -505,19 +510,18 @@ export class CompactionHandler {
   async handleCompletion(
     event: StreamEndEvent,
     compactionRequestMessageId?: string,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean = () => true,
+    publication?: ContinuousCompactionPublication
   ): Promise<boolean> {
     const preparation = this.beginPreparation(isCurrent);
     event = structuredClone(event);
-    // Capture before reading history so a reset during classification cannot adopt old rows.
-    // Defer storage errors until classification: ordinary completion must still run its policy.
-    const generation = await this.historyService
-      .getContinuousCompactionJournal(this.workspaceId)
-      .captureGeneration()
-      .then(
-        (value) => Ok(value),
-        (error: unknown) => Err(error)
-      );
+    publication = publication && structuredClone(publication);
+    // Live producers retain their admission generation: completion after Stop must not
+    // adopt its new frontier. Legacy/unowned callers may capture only without Stop debt.
+    // Defer errors until classification so ordinary completion still runs its policy.
+    const capture = publication
+      ? Ok({ nonce: null, generation: publication.generation })
+      : await this.historyService.captureCompactionReplacement(this.workspaceId);
     // The current stream identifies its request when available. Synthetic prompt snapshots can
     // follow that request in history, so the last user row is not always the compaction request.
     const historyResult = compactionRequestMessageId
@@ -539,8 +543,9 @@ export class CompactionHandler {
       return false;
     }
 
-    if (!generation.success) throw generation.error;
-    const publication = { generation: generation.data };
+    if (!capture.success) throw new Error(capture.error);
+    if (capture.data.nonce !== null) return false;
+    publication ??= { generation: capture.data.generation };
 
     // Determine idle-compaction (auto-triggered due to inactivity) up-front so the
     // post-stream failure paths below can report a terminal outcome to the idle loop.

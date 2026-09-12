@@ -1,3 +1,4 @@
+import nodeAssert from "node:assert/strict";
 import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
@@ -17,6 +18,7 @@ import {
   ProviderModelFactory,
 } from "./providerModelFactory";
 import { HistoryService } from "./historyService";
+import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -1270,6 +1272,116 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   afterEach(() => {
     mock.restore();
   });
+
+  it.each([false, true])(
+    "carries final recorded admission into the engine (prepared=%s)",
+    async (prepared) => {
+      using xumHome = new DisposableTempDir("ai-service-final-admission");
+      const metadata = createLocalWorkspaceMetadata("final-admission", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const previewFence = mock((_construct: () => void) => Promise.resolve());
+      const finalFence = mock((_construct: () => void) =>
+        Promise.reject(new Error("final construction frontier superseded"))
+      );
+      const previewCheck = mock(() => Promise.resolve());
+      const finalCheck = mock(() => Promise.reject(new Error("original frontier superseded")));
+      const options = {
+        workspaceId: metadata.id,
+        messages: [createMuxMessage("admitted-user", "user", "continue")],
+        modelString: "openai:gpt-5.2",
+      };
+      if (prepared) {
+        const candidate = await harness.service.prepareStreamMessage({
+          ...options,
+          assertAdmissionCurrent: previewCheck,
+          withAdmissionCurrent: previewFence,
+        });
+        if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+        await using request = candidate.data;
+        expect(
+          (
+            await request.start({
+              ...options,
+              assertAdmissionCurrent: finalCheck,
+              withAdmissionCurrent: finalFence,
+            })
+          ).success
+        ).toBe(true);
+      } else {
+        expect(
+          (
+            await harness.service.streamMessage({
+              ...options,
+              assertAdmissionCurrent: finalCheck,
+              withAdmissionCurrent: finalFence,
+            })
+          ).success
+        ).toBe(true);
+      }
+      expect(harness.startStreamCalls).toHaveLength(1);
+      const gate = harness.startStreamCalls[0].assertAdmissionCurrent;
+      expect(gate).toBeDefined();
+      nodeAssert(gate);
+      await nodeAssert.rejects(gate(), /original frontier superseded/);
+      expect(finalCheck).toHaveBeenCalledTimes(1);
+      expect(previewCheck).not.toHaveBeenCalled();
+      const fence = harness.startStreamCalls[0].withAdmissionCurrent;
+      nodeAssert(fence);
+      const construct = mock(() => undefined);
+      await nodeAssert.rejects(fence(construct), /final construction frontier superseded/);
+      expect(finalFence).toHaveBeenCalledTimes(1);
+      expect(previewFence).not.toHaveBeenCalled();
+      expect(construct).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([false, true])(
+    "mock playback retains its awaited admission check (stale=%s)",
+    async (stale) => {
+      using xumHome = new DisposableTempDir("ai-service-mock-admission");
+      const { service, historyService } = createBasicAIService(xumHome.path);
+      service.enableMockMode();
+      const player = service.mockAiStreamPlayer;
+      nodeAssert(player);
+      const workspaceId = "mock-admission";
+      const captured = await historyService.captureCompactionReplacement(workspaceId);
+      nodeAssert(captured.success);
+      if (stale)
+        await new CompactionCancellation(
+          historyService.getCompactionCancellationStorage(workspaceId)
+        ).cancel();
+      let checked = false;
+      const play = spyOn(player, "play").mockImplementation(async () => {
+        expect(checked).toBe(true);
+        expect(
+          (
+            await historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("played", "assistant", "done")
+            )
+          ).success
+        ).toBe(true);
+        return { success: true, data: undefined };
+      });
+      const result = await service.streamMessage({
+        workspaceId,
+        messages: [createMuxMessage("mock-input", "user", "hello")],
+        modelString: "openai:gpt-5.2",
+        assertAdmissionCurrent: async () => {
+          const current = await historyService.captureCompactionReplacement(workspaceId);
+          nodeAssert(current.success);
+          if (
+            current.data.nonce !== captured.data.nonce ||
+            current.data.generation !== captured.data.generation
+          )
+            throw new Error("Mock admission superseded");
+          checked = true;
+        },
+      });
+      expect(result.success).toBe(!stale);
+      expect(play).toHaveBeenCalledTimes(stale ? 0 : 1);
+    }
+  );
 
   it.each(["request-row", "idle-row", "agent", "send-metadata", "ordinary", "historical"] as const)(
     "keeps oversized compaction recovery outside token-budget preflight: %s",

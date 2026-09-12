@@ -43,6 +43,11 @@ export interface CompactionCancellationRecord {
   scope: { kind: "unresolved" } | ({ kind: "summary" } & CompactionCancellationSummary);
 }
 
+export interface CompactionHistoryDeletion {
+  readonly percentage: number;
+  onCommitted?: (deletedSequences: number[]) => undefined;
+}
+
 export interface CompactionCancellationPublication {
   attempts: number;
   // The adapter records each admitted/advanced frontier BEFORE any subsequent failing await.
@@ -60,12 +65,18 @@ export type CompactionCancellationMutation =
       kind: "publish";
       record: CompactionCancellationRecord;
       publication: CompactionCancellationPublication;
+      /** Explicit full deletion owns row removal; never serialized or used by ordinary Stop. */
+      fullHistoryDeletion?: CompactionHistoryDeletion;
+      /** In-memory completion of the captured engine and terminal policy, never serialized. */
+      settled?: Promise<void>;
+      onCaptured?: (capture: CompactionReplacementCapture) => void;
     }
   | { kind: "narrow"; record: CompactionCancellationRecord }
   | {
       kind: "retire";
       nonce: string;
       replacementWitness?: CompactionCancellationReplacementWitness;
+      expectedCapture?: CompactionReplacementCapture;
       onRetired?: (
         predecessor: CompactionReplacementCapture,
         successor: CompactionReplacementCapture
@@ -77,7 +88,7 @@ export type CompactionCancellationMutationOutcome = "applied" | "superseded";
 /** Only successfully read bytes with invalid JSON/schema authorize automatic repair. */
 export class MalformedCompactionCancellationError extends Error {}
 
-/** Unsupported or oversized records must be preserved instead of repaired or overwritten. */
+/** Automatic readers must preserve unsupported or oversized records instead of repairing them. */
 export class CompactionCancellationReadRefusedError extends Error {}
 
 export interface CompactionCancellationStorage {
@@ -140,8 +151,10 @@ function serializeCancellation(record: CompactionCancellationRecord) {
   return { contents, record: CancellationRecordSchema.parse(JSON.parse(contents)) };
 }
 
-/** Inactive real adapter. H2b supplies accepted-row verification; H2c wires runtime consumers. */
+/** Durable cancellation adapter; replacement retirement verifies accepted history rows. */
 export class FileCompactionCancellationStorage implements CompactionCancellationStorage {
+  private readonly deletedHistories = new WeakSet<CompactionCancellationPublication>();
+  private readonly attemptedHistoryDeletions = new WeakSet<CompactionCancellationPublication>();
   readonly path: string;
 
   constructor(
@@ -225,7 +238,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       throw error;
     }
     if (!isCurrent()) return "superseded";
-    return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
+    const write = this.history.withCompactionStorageLock(this.workspaceId, async (_, checkLock) => {
       if (!isCurrent()) return "superseded";
       if (
         mutation.kind === "publish" &&
@@ -234,10 +247,9 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       )
         throw new Error("Cancellation frontier was not captured; a new Stop is required");
       const current = await this.read().catch((error: unknown) => {
-        if (mutation.kind !== "publish" || error instanceof CompactionCancellationReadRefusedError)
-          throw error;
-        // Explicit Stop may overwrite unreadable state, inheriting its unknown
-        // full-clear obligation. Reads and automatic repair never gain this authority.
+        if (mutation.kind !== "publish") throw error;
+        // Publication is explicit Stop/manual intervention, including downgrade recovery.
+        // Unknown bytes inherit retention; automatic reads/repair never gain this authority.
         return undefined;
       });
       if (mutation.kind === "publish") {
@@ -267,22 +279,82 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           isCurrent
         );
         if (!advanced) return "superseded";
-        return (await publishCompactionFile(
-          this.path,
-          contents,
-          isCurrent,
-          () => {
-            frontier.nonce = committed.nonce;
-            // Install inherited retention before cleanup can admit a newer read.
-            onCommitted(committed);
-          },
-          checkLock
-        ))
-          ? "applied"
-          : "superseded";
+        // A durable Stop must already be safe for older readers, which only inspect
+        // summary/partial metadata. Failed cleanup leaves exact retry debt, not a receipt.
+        if (mutation.fullHistoryDeletion) {
+          if (!this.deletedHistories.has(publication)) {
+            // A failed transaction may already have removed bytes. Only a NEW explicit
+            // Clear may retry deletion; nonce/generation alone cannot fence ordinary appends.
+            if (this.attemptedHistoryDeletions.has(publication))
+              throw new Error("History deletion was not confirmed; start a new explicit clear.");
+            this.attemptedHistoryDeletions.add(publication);
+            if (
+              !(await this.history.clearCompactionHistoryUnderHistoryLock(
+                this.workspaceId,
+                mutation.fullHistoryDeletion.percentage,
+                isCurrent,
+                checkLock,
+                (sequences) => {
+                  this.deletedHistories.add(publication);
+                  mutation.fullHistoryDeletion?.onCommitted?.(sequences);
+                  return undefined;
+                }
+              ))
+            )
+              return "superseded";
+          }
+        } else if (
+          !(await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
+            this.workspaceId,
+            isCurrent,
+            checkLock
+          ))
+        )
+          return "superseded";
+        if (
+          !(await publishCompactionFile(
+            this.path,
+            contents,
+            isCurrent,
+            () => {
+              frontier.nonce = committed.nonce;
+              // Install inherited retention before cleanup can admit a newer read.
+              onCommitted(committed);
+            },
+            checkLock
+          ))
+        )
+          return "superseded";
+        return "applied";
       }
       const nonce = mutation.kind === "retire" ? mutation.nonce : mutation.record.nonce;
-      if (current?.nonce !== nonce) return "superseded";
+      if (current?.nonce !== nonce) {
+        // A peer may finish this accepted replacement first. Absence alone is not proof:
+        // a later Stop can retire too, while this request's old witness remains in history.
+        const expected = mutation.kind === "retire" ? mutation.expectedCapture : undefined;
+        if (
+          current !== null ||
+          expected?.nonce !== nonce ||
+          mutation.kind !== "retire" ||
+          mutation.replacementWitness?.nonce !== nonce
+        )
+          return "superseded";
+        try {
+          const generation = await this.history
+            .getContinuousCompactionJournal(this.workspaceId)
+            .captureGenerationUnderHistoryLock();
+          if (generation !== expected.generation) return "superseded";
+          if (!verifyReplacementUnderHistoryLock || !(await verifyReplacementUnderHistoryLock()))
+            throw new Error("Replacement witness was not verified");
+          await checkLock();
+          if (!isCurrent()) return "superseded";
+          onCommitted(null, { nonce, generation });
+          return "applied";
+        } catch (error) {
+          if (!isCurrent()) return "superseded";
+          throw error;
+        }
+      }
       if (mutation.kind === "narrow") {
         if (current.retainUntilReplacement) return "superseded";
         const { contents, record: committed } = serializeCancellation(mutation.record);
@@ -331,6 +403,28 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       rmSync(this.path, { force: true });
       onCommitted(null, retiredPredecessor);
       return "applied";
+    });
+    const outcome = await write;
+    if (mutation.kind !== "publish" || !mutation.settled || outcome !== "applied") return outcome;
+    // Settlement may write a final partial/legacy summary after the first cleanup.
+    // Never hold history locks while joining those writers, or let an old Stop clear a successor.
+    await mutation.settled;
+    return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
+      if (!isCurrent()) return "superseded";
+      const current = await this.read();
+      const generation = await this.history
+        .getContinuousCompactionJournal(this.workspaceId)
+        .captureGenerationUnderHistoryLock();
+      const frontier = mutation.publication.predecessor;
+      if (current?.nonce !== frontier?.nonce || generation !== frontier?.generation)
+        return "superseded";
+      return (await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
+        this.workspaceId,
+        isCurrent,
+        checkLock
+      ))
+        ? "applied"
+        : "superseded";
     });
   }
 
@@ -404,8 +498,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
 }
 
 /**
- * Inactive cancellation state core. Stop's retry identity outlives failed turn preparation;
- * a later delivery must supply the storage adapter and activate every recovery consumer.
+ * Stop's retry identity outlives failed turn preparation. AgentSession shares this authority
+ * across manual replacement acceptance and every automatic recovery consumer.
  * Injected-adapter tests establish state invariants, not filesystem or cross-process CAS.
  */
 export class CompactionCancellation {
@@ -487,21 +581,34 @@ export class CompactionCancellation {
 
   cancel(options?: {
     retainUntilReplacement?: boolean;
+    settled?: Promise<void>;
+    onCaptured?: (capture: CompactionReplacementCapture) => void;
+    fullHistoryDeletion?: CompactionHistoryDeletion;
   }): Promise<CompactionCancellationMutationOutcome> {
     this.current = {
       version: 1,
       nonce: randomUUID(),
       scope: { kind: "unresolved" },
-      ...(options?.retainUntilReplacement || this.current?.retainUntilReplacement
+      ...(options?.fullHistoryDeletion ||
+      options?.retainUntilReplacement ||
+      this.current?.retainUntilReplacement
         ? { retainUntilReplacement: true }
         : {}),
     };
-    return this.persist({ kind: "publish", record: this.current, publication: { attempts: 0 } });
+    return this.persist({
+      kind: "publish",
+      record: this.current,
+      publication: { attempts: 0 },
+      fullHistoryDeletion: options?.fullHistoryDeletion && { ...options.fullHistoryDeletion },
+      onCaptured: options?.onCaptured,
+      ...(options?.settled ? { settled: options.settled } : {}),
+    });
   }
 
   async readForReplacement(): Promise<CompactionCancellationRecord | null> {
     for (;;) {
       if (this.blocksRecovery) {
+        const mutation = this.mutation;
         const pending = this.pending;
         const retryFailed = !this.inFlight;
         try {
@@ -509,7 +616,17 @@ export class CompactionCancellation {
         } catch (error) {
           // Retry already-failed debt; readers joining an in-flight attempt share its
           // outcome instead of turning one failure into a chain of additional retries.
-          if (pending !== this.pending) continue;
+          if (pending !== this.pending || mutation !== this.mutation) continue;
+          if (
+            mutation?.kind === "narrow" &&
+            error instanceof CompactionCancellationReadRefusedError
+          ) {
+            // A legitimate follow-up can exceed the sidecar cap. Only explicit
+            // replacement may supersede that exact failed refinement, preserving
+            // Stop until a replacement commits; automatic readers keep the debt.
+            await this.cancel({ retainUntilReplacement: true });
+            continue;
+          }
           if (!retryFailed) throw error;
           const retried = this.retry();
           try {
@@ -530,8 +647,7 @@ export class CompactionCancellation {
         if (this.current === undefined) return this.refreshForReplacement();
         // A Stop or newer read can commit after reading resolves but before we resume.
         if (!this.blocksRecovery) return this.effectiveRecord();
-      } catch (error) {
-        if (error instanceof CompactionCancellationReadRefusedError) throw error;
+      } catch {
         // Refresh unknown state once; propagate that read's failure instead of repeatedly
         // publishing fallback Stops that a foreign cancellation keeps superseding.
         if (this.current === undefined && (this.mutation !== mutation || this.pending !== pending))
@@ -606,17 +722,32 @@ export class CompactionCancellation {
 
   retireReplacement(
     witness: CompactionCancellationReplacementWitness,
-    onRetired?: Extract<CompactionCancellationMutation, { kind: "retire" }>["onRetired"]
+    onRetired?: Extract<CompactionCancellationMutation, { kind: "retire" }>["onRetired"],
+    expectedCapture?: CompactionReplacementCapture
   ) {
-    if (this.current?.nonce !== witness.nonce) return Promise.resolve(undefined);
     // An ordinary cleanup retry must retain the original queued-work receipt obligation.
-    if (this.mutation?.kind === "retire" && this.mutation.nonce === witness.nonce)
+    if (this.mutation?.kind === "retire" && this.mutation.nonce === witness.nonce) {
       onRetired ??= this.mutation.onRetired;
+      expectedCapture ??= this.mutation.expectedCapture;
+    }
+    if (this.current?.nonce !== witness.nonce) {
+      const ownedNonce =
+        this.mutation?.kind === "retire" ? this.mutation.nonce : this.mutation?.record.nonce;
+      // A read may already have observed the peer's deletion. Only the original
+      // capture may ask storage to prove that absence; never replace newer local work.
+      if (
+        this.current != null ||
+        expectedCapture?.nonce !== witness.nonce ||
+        (ownedNonce != null && ownedNonce !== witness.nonce)
+      )
+        return Promise.resolve(undefined);
+    }
     this.replacementNonce = witness.nonce;
     return this.persist({
       kind: "retire",
       nonce: witness.nonce,
       replacementWitness: { ...witness },
+      expectedCapture: expectedCapture && { ...expectedCapture },
       onRetired,
     });
   }
@@ -662,6 +793,17 @@ export class CompactionCancellation {
           (record, retired) => {
             if (!isCurrent()) return;
             this.current = structuredClone(record);
+            if (
+              mutation.kind === "publish" &&
+              record &&
+              mutation.publication.predecessor?.nonce === record.nonce
+            ) {
+              // This receipt belongs to the initiating Stop, even if cleanup later yields to a peer.
+              mutation.onCaptured?.({
+                nonce: record.nonce,
+                generation: mutation.publication.predecessor.generation,
+              });
+            }
             // Commit invalidates pre-deletion reads before lock release. A later foreign
             // read must survive acknowledgment delayed by adapter cleanup.
             this.acceptedReadGeneration = ++this.readGeneration;

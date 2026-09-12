@@ -62,7 +62,7 @@ async function fixture() {
     assert(result.success);
     return result.data;
   };
-  return { ...h, inputs, skills, prompts, rows };
+  return { ...h, inputs, skills, prompts, rows, stream: spyOn(h.aiService, "streamMessage") };
 }
 
 afterEach(async () => {
@@ -106,7 +106,7 @@ describe("prepared history publication", () => {
       (["result", "rejection"] as const).map((outcome) => ({ failure, outcome }))
     )
   )(
-    "a failed $failure append ($outcome) rolls back only this attempt's previously published rows",
+    "a failed automatic $failure append ($outcome) rolls back only this attempt's previously published rows",
     async ({ failure, outcome }) => {
       const h = await fixture();
       const foreign = createMuxMessage("foreign", "assistant", "concurrent input");
@@ -131,7 +131,7 @@ describe("prepared history publication", () => {
       else appends.mockRejectedValueOnce(new Error("injected write failure"));
       const start = spyOn(h.aiService, "streamMessage");
       const result = await h.session
-        .sendMessage("inspect input", options)
+        .sendMessage("inspect input", options, { acceptanceOrigin: "automatic" })
         .catch((error: unknown) => error);
       expect(appends.mock.calls.slice(0, -1).map(([, row]) => row.id)).toEqual(earlier);
       expect(foreign.metadata?.historySequence).toBe(1);
@@ -143,7 +143,7 @@ describe("prepared history publication", () => {
   );
 
   test.each(["file", "skill", "prompt", "trigger"])(
-    "cancellation after %s publication still runs the existing rollback checkpoint",
+    "automatic cancellation after %s publication still runs the existing rollback checkpoint",
     async (after) => {
       const h = await fixture();
       const controller = new AbortController();
@@ -159,6 +159,7 @@ describe("prepared history publication", () => {
       const start = spyOn(h.aiService, "streamMessage");
       expect(
         await h.session.sendMessage("inspect input", options, {
+          acceptanceOrigin: "automatic",
           cancelSignal: controller.signal,
           onCanceled: canceled,
           onAccepted: accepted,
@@ -171,8 +172,87 @@ describe("prepared history publication", () => {
     }
   );
 
-  test("on-send compaction publishes only the request carrying the deferred user input", async () => {
+  test.each(["skill", "prompt"] as const)(
+    "manual %s materialization failure leaves no orphaned prefixes or accepted Stop",
+    async (failure) => {
+      const h = await fixture();
+      await h.session.cancelCompaction(true);
+      const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+      const stop = await storage.read();
+      h[failure === "skill" ? "skills" : "prompts"].mockRejectedValueOnce(
+        new Error("materialization failed")
+      );
+      expect((await h.session.sendMessage("inspect input", options)).success).toBe(false);
+      expect(await h.rows()).toEqual([]);
+      expect((await storage.read())?.nonce).toBe(stop?.nonce);
+      expect(h.stream).not.toHaveBeenCalled();
+    }
+  );
+
+  test("manual prefixes commit with the trigger and survive cancellation in the durable receipt", async () => {
     const h = await fixture();
+    await h.session.cancelCompaction(true);
+    const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+    const stop = await storage.read();
+    const controller = new AbortController();
+    const canceled = mock(() => undefined);
+    const accepted = mock(() => undefined);
+    const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+      async (id, capture, operation, observer) => {
+        expect(await h.rows()).toEqual([]);
+        assert(operation.kind === "append");
+        expect(operation.messages.slice(0, -1).map((row) => row.id)).toEqual([
+          "file",
+          "skill",
+          "prompt",
+        ]);
+        return publish(id, capture, operation, {
+          ...observer,
+          onCommitted: (receipt) => {
+            observer.onCommitted(receipt);
+            controller.abort();
+          },
+        });
+      }
+    );
+    expect(
+      await h.session.sendMessage("inspect input", options, {
+        cancelSignal: controller.signal,
+        onCanceled: canceled,
+        onAccepted: accepted,
+      })
+    ).toEqual(Ok(undefined));
+    const rows = await h.rows();
+    expect(rows).toHaveLength(4);
+    expect(rows.at(-1)?.metadata?.compactionReplacementNonce).toBe(stop?.nonce);
+    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(canceled).not.toHaveBeenCalled();
+    expect(await storage.read()).toBeNull();
+  });
+
+  test("Stop before a manual batch commits leaves every prefix and trigger unpublished", async () => {
+    const h = await fixture();
+    const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        await h.session.cancelCompaction(true);
+        return publish(...args);
+      }
+    );
+    expect((await h.session.sendMessage("inspect input", options)).success).toBe(false);
+    expect(await h.rows()).toEqual([]);
+    expect(
+      await h.historyService.getCompactionCancellationStorage(workspaceId).read()
+    ).not.toBeNull();
+    expect(h.stream).not.toHaveBeenCalled();
+  });
+
+  test("on-send compaction accepts only the request carrying the deferred user input", async () => {
+    const h = await fixture();
+    await h.session.cancelCompaction(true);
+    const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+    const stop = await storage.read();
     spyOn(h.inputs.compactionMonitor, "checkBeforeSend").mockReturnValue({
       shouldShowWarning: true,
       shouldForceCompact: true,
@@ -185,6 +265,8 @@ describe("prepared history publication", () => {
     expect(await h.session.sendMessage("inspect input", options)).toEqual(Ok(undefined));
     const rows = await h.rows();
     expect(rows).toHaveLength(1);
+    expect(rows[0].metadata?.compactionReplacementNonce).toBe(stop?.nonce);
+    expect(await storage.read()).toBeNull();
     const request = rows[0].metadata?.muxMetadata;
     assert(request?.type === "compaction-request");
     expect(request.parsed.followUpContent?.text).toBe("inspect input");

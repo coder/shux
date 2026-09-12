@@ -19,7 +19,7 @@ import type {
   ToolCallStartEvent,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
@@ -49,7 +49,8 @@ import {
 import { z } from "zod";
 import * as modelStatsModule from "@/common/utils/tokens/modelStats";
 import { SessionUsageService } from "./sessionUsageService";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
+import { CompactionCancellation } from "./compactionCancellation";
 import { createTestHistoryService } from "./testHistoryService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { closeScopeBounded } from "./di/appRuntime";
@@ -1717,58 +1718,75 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
 
-  test("closing the engine scope while the turn-envelope write is pending cancels the STARTING stream inside the close", async () => {
-    // startStream registers the stream, then awaits onStreamConstructed (the
-    // durable turn-envelope write) before launching processing. Supervision
-    // starts at registration, so a shutdown landing inside that await cancels
-    // the STARTING stream through the same hard-interrupt path a user stop
-    // takes there — before closeScopeBounded resolves, not after teardown has
-    // moved on and the envelope write finally returns.
-    const workspaceId = "supervised-starting-window-workspace";
-    const { streamManager, events, engineScope } =
-      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
-    const messageId = `${workspaceId}-msg`;
-    await appendPartialAssistantForTests(workspaceId, messageId, 1);
-    let releaseEnvelope!: () => void;
-    const envelopeWritten = new Promise<void>((resolve) => {
-      releaseEnvelope = resolve;
-    });
-    const startPromise = streamManager.startStream(
-      testStartOptions({
-        workspaceId,
-        messageId,
-        model: createTestLanguageModel(),
-        tools: {},
-        onStreamConstructed: () => envelopeWritten,
-      })
-    );
-    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
-    const deadline = Date.now() + 5_000;
-    while (!workspaceStreams.has(workspaceId)) {
-      if (Date.now() > deadline) throw new Error("stream never registered");
-      await new Promise((resolve) => setTimeout(resolve, 5));
+  test.each(["envelope", "construction fence"] as const)(
+    "closing the engine scope while %s is pending cancels the STARTING stream inside the close",
+    async (held) => {
+      // startStream registers the stream, then awaits onStreamConstructed (the
+      // durable turn-envelope write) before launching processing. Supervision
+      // starts at registration, so a shutdown landing inside that await cancels
+      // the STARTING stream through the same hard-interrupt path a user stop
+      // takes there — before closeScopeBounded resolves, not after teardown has
+      // moved on and the envelope write finally returns.
+      const workspaceId = "supervised-starting-window-workspace";
+      const { streamManager, events, engineScope } =
+        createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+      const messageId = `${workspaceId}-msg`;
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      let releaseEnvelope!: () => void;
+      const envelopeWritten = new Promise<void>((resolve) => {
+        releaseEnvelope = resolve;
+      });
+      const captured = await historyService.captureCompactionReplacement(workspaceId);
+      if (!captured.success) throw new Error(captured.error);
+      const startPromise = streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId,
+          model: createTestLanguageModel(),
+          tools: {},
+          onStreamConstructed: held === "envelope" ? () => envelopeWritten : undefined,
+          withAdmissionCurrent:
+            held === "construction fence"
+              ? async (construct) => {
+                  const result = await historyService.runWithCompactionAdmission(
+                    workspaceId,
+                    captured.data,
+                    construct
+                  );
+                  if (!result.success) throw new Error(result.error);
+                  await envelopeWritten;
+                }
+              : undefined,
+        })
+      );
+      const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+      const deadline = Date.now() + 5_000;
+      while (!workspaceStreams.has(workspaceId)) {
+        if (Date.now() > deadline) throw new Error("stream never registered");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      await closeScopeBounded(engineScope);
+
+      // Cancelled inside the close: abort delivered, registry cleared, no
+      // stream-start ever emitted for it.
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+      expect((terminalEvents(events)[0] as StreamAbortEvent).abortReason).toBe("system");
+      expect(workspaceStreams.size).toBe(0);
+
+      releaseEnvelope();
+      const result = await startPromise;
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("expected Ok");
+      expect(await result.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "system",
+      });
+      expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
+      expect(terminalEvents(events)).toHaveLength(1);
+      expect(streamManager.isStreaming(workspaceId)).toBe(false);
     }
-
-    await closeScopeBounded(engineScope);
-
-    // Cancelled inside the close: abort delivered, registry cleared, no
-    // stream-start ever emitted for it.
-    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
-    expect((terminalEvents(events)[0] as StreamAbortEvent).abortReason).toBe("system");
-    expect(workspaceStreams.size).toBe(0);
-
-    releaseEnvelope();
-    const result = await startPromise;
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error("expected Ok");
-    expect(await result.data.completion).toMatchObject({
-      status: "aborted",
-      abortReason: "system",
-    });
-    expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
-    expect(terminalEvents(events)).toHaveLength(1);
-    expect(streamManager.isStreaming(workspaceId)).toBe(false);
-  });
+  );
 
   test("a provider whose iterator rejects on abort is still recorded as an abort, not a failure", async () => {
     // Some transports surface a cancellation as an iterator rejection rather
@@ -2982,6 +3000,8 @@ describe("StreamManager - call settings overrides", () => {
 });
 
 describe("StreamManager - language model cleanup", () => {
+  afterEach(() => mock.restore());
+
   const runtime = LOCAL_TEST_RUNTIME;
 
   function createCleanupModel(modelId: string): {
@@ -3151,6 +3171,104 @@ describe("StreamManager - language model cleanup", () => {
     expect(getCleanupCalls()).toBe(1);
   });
 
+  test.each([
+    "before provider",
+    "after check",
+    "during envelope",
+    "local abort",
+    "local envelope abort",
+  ] as const)("recorded admission gates startup and releases resources: %s", async (timing) => {
+    using tempDir = new DisposableTempDir("admission-stream");
+    const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+    spyOn(runtime, "resolvePath").mockResolvedValue(tempDir.path);
+    const workspaceId = `admission-${timing}`;
+    const streamManager = new StreamManager(historyService);
+    const { model, getCleanupCalls } = createCleanupModel(workspaceId);
+    if (typeof model === "string" || !("doStream" in model))
+      throw new Error("Expected provider model");
+    const providerEntered = Promise.withResolvers<void>();
+    let providerSignal: AbortSignal | undefined;
+    const provider = spyOn(model, "doStream").mockImplementation(
+      ({ abortSignal }: { abortSignal?: AbortSignal }) => {
+        providerSignal = abortSignal;
+        providerEntered.resolve();
+        return new Promise<never>((_, reject) => {
+          if (!abortSignal) return reject(new Error("Expected provider abort signal"));
+          const aborted = () =>
+            reject(new Error("Provider aborted", { cause: abortSignal.reason }));
+          if (abortSignal.aborted) aborted();
+          else abortSignal.addEventListener("abort", aborted, { once: true });
+        });
+      }
+    );
+    const constructed = spyOn(aiSdk, "streamText");
+    const captured = await historyService.captureCompactionReplacement(workspaceId);
+    if (!captured.success) throw new Error(captured.error);
+    const foreign = new CompactionCancellation(
+      new HistoryService(historyConfig).getCompactionCancellationStorage(workspaceId)
+    );
+    const abort = new AbortController();
+    const events: unknown[] = [];
+    onTurnEngineEvent(streamManager, "stream-start", (event) => events.push(event));
+    const acquire = streamManager.createTempDirForStream.bind(streamManager);
+    spyOn(streamManager, "createTempDirForStream").mockImplementationOnce(async (...args) => {
+      const dir = await acquire(...args);
+      if (timing === "before provider") await foreign.cancel();
+      return dir;
+    });
+    let checks = 0;
+    try {
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId: "gated-start",
+          runtime,
+          model,
+          abortSignal: abort.signal,
+          assertAdmissionCurrent: async () => {
+            checks += 1;
+            const current = await historyService.captureCompactionReplacement(workspaceId);
+            if (!current.success) throw new Error(current.error);
+            if (timing === "local abort") abort.abort();
+            if (timing === "after check" && checks === 1) await foreign.cancel();
+            if (
+              current.data.nonce !== captured.data.nonce ||
+              current.data.generation !== captured.data.generation
+            )
+              throw new Error("Recorded admission was superseded");
+          },
+          withAdmissionCurrent: async (construct) => {
+            const result = await historyService.runWithCompactionAdmission(
+              workspaceId,
+              captured.data,
+              construct
+            );
+            if (!result.success) throw new Error(result.error);
+          },
+          onStreamConstructed: async () => {
+            await providerEntered.promise;
+            if (timing === "local envelope abort") abort.abort();
+            await foreign.cancel();
+          },
+        })
+      );
+      expect(result.success).toBe(timing === "local abort" || timing === "local envelope abort");
+      expect(checks).toBe(timing === "during envelope" ? 2 : 1);
+      // The first gate prevents streamText itself and the underlying provider call.
+      // A Stop during the envelope can only prevent processing of the constructed stream.
+      const reachedProvider = timing === "during envelope" || timing === "local envelope abort";
+      expect(constructed).toHaveBeenCalledTimes(reachedProvider ? 1 : 0);
+      expect(provider).toHaveBeenCalledTimes(reachedProvider ? 1 : 0);
+      if (reachedProvider) expect(providerSignal?.aborted).toBe(true);
+      expect(events).toHaveLength(0);
+      expect(getWorkspaceStreamsForTests(streamManager).has(workspaceId)).toBe(false);
+      expect(getCleanupCalls()).toBe(1);
+      if (result.success) expect((await result.data.completion).status).toBe("aborted");
+    } finally {
+      abort.abort();
+    }
+  });
+
   test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
     const streamManager = new StreamManager(historyService);
     const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
@@ -3275,25 +3393,52 @@ describe("StreamManager - language model cleanup", () => {
     expect(getCleanupCalls()).toBe(1);
   });
 
-  test("runs model cleanup when stream creation throws before processing", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { model, getCleanupCalls } = createCleanupModel("cleanup-create-throw-model");
-    const replaceCreateStreamResult = Reflect.set(streamManager, "createStreamResult", () => {
-      throw new Error("create stream failed");
-    });
-    expect(replaceCreateStreamResult).toBe(true);
+  test.each(["factory", "fence release"] as const)(
+    "runs model cleanup when %s throws before processing",
+    async (failure) => {
+      const streamManager = new StreamManager(historyService);
+      const { model, getCleanupCalls } = createCleanupModel("cleanup-create-throw-model");
+      if (failure === "factory") {
+        const replaceCreateStreamResult = Reflect.set(streamManager, "createStreamResult", () => {
+          throw new Error("create stream failed");
+        });
+        expect(replaceCreateStreamResult).toBe(true);
+      }
 
-    const result = await streamManager.startStream(
-      testStartOptions({
-        workspaceId: "cleanup-create-throw-workspace",
-        messageId: "cleanup-create-throw-message",
-        model,
-      })
-    );
+      const workspaceId = "cleanup-create-throw-workspace";
+      const captured = await historyService.captureCompactionReplacement(workspaceId);
+      if (!captured.success) throw new Error(captured.error);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          withAdmissionCurrent: async (construct) => {
+            const result = await historyService.runWithCompactionAdmission(
+              workspaceId,
+              captured.data,
+              construct
+            );
+            if (!result.success) throw new Error(result.error);
+            expect(getWorkspaceStreamsForTests(streamManager).has(workspaceId)).toBe(true);
+            throw new Error("fence release failed");
+          },
+          messageId: "cleanup-create-throw-message",
+          model,
+        })
+      );
 
-    expect(result.success).toBe(false);
-    expect(getCleanupCalls()).toBe(1);
-  });
+      expect(result.success).toBe(false);
+      expect(getCleanupCalls()).toBe(1);
+      expect(getWorkspaceStreamsForTests(streamManager).has(workspaceId)).toBe(false);
+      expect(
+        (
+          await historyService.appendToHistory(
+            workspaceId,
+            createMuxMessage("after-error", "user", "retry")
+          )
+        ).success
+      ).toBe(true);
+    }
+  );
 });
 
 describe("StreamManager - turn completion", () => {

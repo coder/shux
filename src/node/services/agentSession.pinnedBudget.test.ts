@@ -541,7 +541,7 @@ describe("pinned full-payload rollover admission", () => {
     } = fixture;
     const beginStart = spyOn(manager, "beginStreamStart");
     const accepted = mock(() => undefined);
-    spyOn(historyService, "appendManyToHistory").mockResolvedValueOnce(
+    spyOn(historyService, "acceptCompactionReplacement").mockResolvedValueOnce(
       Err("injected rollover append failure")
     );
     try {
@@ -923,18 +923,23 @@ describe("pinned full-payload rollover admission", () => {
     }
   );
   test.each([false, true])(
-    "cancellation during rollover append follows the durable rollback outcome (rollback fails=%s)",
+    "cancellation after rollover publication follows the durable rollback outcome (rollback fails=%s)",
     async (rollbackFails) => {
       const fixture = await setup("small");
       const { h, historyService, before, start, assembly, modelCleanup } = fixture;
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
-      const append = historyService.appendManyToHistory.bind(historyService);
-      spyOn(historyService, "appendManyToHistory").mockImplementationOnce(async (...args) => {
-        entered.resolve();
-        await release.promise;
-        return append(...args);
-      });
+      const publish = historyService.acceptCompactionReplacement.bind(historyService);
+      spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await publish(...args);
+          expect(result).toEqual(Ok({ kind: "accepted", witness: null }));
+          // Hold after the real receipt: cancellation must exercise rollback of durable rows.
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
       const rollback = spyOn(historyService, "deleteMessages");
       if (rollbackFails) rollback.mockResolvedValueOnce(Err("injected durable rollback failure"));
       const controller = new AbortController();
@@ -945,6 +950,7 @@ describe("pinned full-payload rollover admission", () => {
         "Wake retained when rollback fails",
         { model, agentId: "exec", experiments: { tokenBudget: true } },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelSignal: controller.signal,

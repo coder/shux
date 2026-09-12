@@ -108,8 +108,9 @@ describe("runtime compaction preparation admission", () => {
           "request"
         )
         .catch((error: unknown) => error);
-      assert(failure instanceof Error && "code" in failure);
-      expect(failure.code).toBe("EISDIR");
+      assert(failure instanceof Error);
+      expect(failure.message).toContain("Failed to capture replacement");
+      expect(failure.message).toContain("EISDIR");
       const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
       assert(history.success);
       expect(history.data.map((row) => row.id)).toEqual(["request"]);
@@ -154,13 +155,26 @@ describe("runtime compaction preparation admission", () => {
           emitter: new EventEmitter(),
         });
         const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
-        const capture = journal.captureGeneration.bind(journal);
-        spyOn(journal, "captureGeneration").mockImplementationOnce(async () => {
-          const generation = await capture();
-          entered.resolve();
-          await release.promise;
-          return generation;
-        });
+        if (route === "heartbeat") {
+          const capture = journal.captureGeneration.bind(journal);
+          spyOn(journal, "captureGeneration").mockImplementationOnce(async () => {
+            const generation = await capture();
+            entered.resolve();
+            await release.promise;
+            return generation;
+          });
+        } else {
+          // Manual/idle completion captures the Stop frontier through HistoryService.
+          const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+          spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+            async (...args) => {
+              const captured = await capture(...args);
+              entered.resolve();
+              await release.promise;
+              return captured;
+            }
+          );
+        }
         const event: StreamEndEvent = {
           type: "stream-end",
           workspaceId,

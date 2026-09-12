@@ -490,6 +490,53 @@ export function createStreamCollector(
 }
 
 /**
+ * Helper: Resume stream and wait for successful completion
+ * Uses StreamCollector for ORPC-native event handling
+ */
+export async function resumeAndWaitForSuccess(
+  workspaceId: string,
+  client: OrpcTestClient,
+  model: string,
+  timeoutMs = 15000,
+  options?: {
+    toolPolicy?: Array<{ regex_match: string; action: "enable" | "disable" | "require" }>;
+  }
+): Promise<void> {
+  const collector = createStreamCollector(client, workspaceId);
+  collector.start();
+
+  try {
+    // Finish replay before resuming so the previous stream's error cannot be
+    // mistaken for a failure of the new attempt. Live errors remain checked below.
+    await collector.waitForSubscription(5000);
+    collector.clear();
+    const resumeResult = await client.workspace.resumeStream({
+      workspaceId,
+      options: { model, agentId: "exec", toolPolicy: options?.toolPolicy },
+    });
+
+    if (!resumeResult.success) {
+      throw new Error(`Resume failed: ${resumeResult.error}`);
+    }
+
+    // Wait for stream-end event after resume
+    const streamEnd = await collector.waitForEvent("stream-end", timeoutMs);
+
+    if (!streamEnd) {
+      throw new Error("Stream did not complete after resume");
+    }
+
+    // Check for errors
+    const hasError = collector.hasError();
+    if (hasError) {
+      throw new Error("Resumed stream encountered an error");
+    }
+  } finally {
+    collector.stop();
+  }
+}
+
+/**
  * Assert that a stream completed successfully.
  * Provides helpful error messages when assertions fail.
  */

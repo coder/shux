@@ -1443,15 +1443,66 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     return predicate();
   }
 
-  test("applies compaction when synthetic agent-initiated send crosses the threshold", async () => {
+  test("unresolved Stop refuses automatic guidance before creating a compaction continuation", async () => {
+    const workspaceId = "ws-unresolved-stop-guidance";
+    const fixture = await createGuidanceHarness({ workspaceId });
+    try {
+      expect(await fixture.session.interruptStream()).toEqual(Ok(undefined));
+      const accepted = mock(() => undefined);
+      const result = await fixture.session.sendMessage(
+        "Guidance that would otherwise force compaction",
+        { model: "openai:gpt-4o", agentId: "exec" },
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          agentInitiated: true,
+          startStreamInBackground: true,
+          onAccepted: accepted,
+        }
+      );
+      expect(result.success).toBe(false);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(fixture.streamHistories).toEqual([]);
+      expect(await fixture.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(
+        Ok([])
+      );
+      expect(fixture.session.isBusy()).toBe(false);
+      expect(fixture.session.queuedMessageEntryCount()).toBe(0);
+    } finally {
+      await fixture.session.dispose();
+    }
+  });
+
+  test("applies compaction for fresh automatic guidance without Stop", async () => {
     const fixture = await createGuidanceHarness({
       workspaceId: "ws-auto-compaction-synthetic-guidance",
+    });
+
+    const monitor = (fixture.session as unknown as { compactionMonitor: CompactionMonitor })
+      .compactionMonitor;
+    let firstCheck = true;
+    spyOn(monitor, "checkBeforeSend").mockImplementation(() => {
+      const high = firstCheck;
+      firstCheck = false;
+      return {
+        shouldShowWarning: high,
+        shouldForceCompact: high,
+        usagePercentage: high ? 95 : 1,
+        thresholdPercentage: 70,
+        contextTokens: high ? 95_000 : 1_000,
+        maxTokens: 100_000,
+      };
     });
 
     const result = await fixture.session.sendMessage(
       "Updated guidance from parent: focus on the failing tests.",
       { model: "openai:gpt-4o", agentId: "exec" },
-      { synthetic: true, agentInitiated: true, startStreamInBackground: true }
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        startStreamInBackground: true,
+      }
     );
     expect(result.success).toBe(true);
 
@@ -1481,6 +1532,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         history.some(
           (message) =>
             message.role === "user" &&
+            message.metadata?.muxMetadata?.type !== "compaction-request" &&
             message.parts.some(
               (part) => part.type === "text" && part.text.includes("focus on the failing tests")
             )

@@ -43,6 +43,63 @@ describe("compaction replacement acceptance", () => {
     await fixture.cleanup();
   });
 
+  it("keeps a competing Stop outside provider construction and copies the entry capture", async () => {
+    const captured = await capture();
+    const journal = history.getContinuousCompactionJournal(workspaceId);
+    const read = journal.captureGenerationUnderHistoryLock.bind(journal);
+    const compared = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(journal, "captureGenerationUnderHistoryLock").mockImplementationOnce(async () => {
+      const generation = await read();
+      compared.resolve();
+      await release.promise;
+      return generation;
+    });
+    const order: string[] = [];
+    const construction = history.runWithCompactionAdmission(workspaceId, captured, () => {
+      expect(nodeFs.existsSync(historyWriteLockPath(fixture.config.rootDir, workspaceId))).toBe(
+        true
+      );
+      order.push("registered");
+    });
+    await compared.promise;
+    // Caller mutation cannot replace the original frontier while the lock is awaited.
+    captured.nonce = "later-unowned-stop";
+    const foreign = new CompactionCancellation(
+      new HistoryService(fixture.config).getCompactionCancellationStorage(workspaceId)
+    );
+    const stopped = foreign.cancel().then((result) => {
+      order.push("stopped");
+      return result;
+    });
+    release.resolve();
+    expect(await construction).toEqual(Ok(undefined));
+    expect(await stopped).toBe("applied");
+    expect(order).toEqual(["registered", "stopped"]);
+  });
+
+  it("refuses an older provider capture and releases the lock when construction throws", async () => {
+    const captured = await capture();
+    await stop.cancel();
+    const construct = mock(() => undefined);
+    expect(
+      (await history.runWithCompactionAdmission(workspaceId, captured, construct)).success
+    ).toBe(false);
+    expect(construct).not.toHaveBeenCalled();
+    const current = await capture();
+    const thrown = await history.runWithCompactionAdmission(workspaceId, current, () => {
+      throw new Error("provider construction failed");
+    });
+    expect(thrown.success).toBe(false);
+    expect(
+      await history.appendToHistory(
+        workspaceId,
+        createMuxMessage("after-factory-error", "user", "retry")
+      )
+    ).toEqual(Ok(undefined));
+    expect((await rows()).some((row) => row.id === "after-factory-error")).toBe(true);
+  });
+
   async function capture() {
     const result = await history.captureCompactionReplacement(workspaceId);
     assert(result.success);

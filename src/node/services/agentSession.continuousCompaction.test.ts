@@ -1115,14 +1115,18 @@ describe("AgentSession continuous compaction wiring", () => {
             return read(...args);
           });
         } else {
-          const update = h.historyService.cleanupCompactionFollowUp.bind(h.historyService);
-          spyOn(h.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
-            async (...args) => {
-              entered.resolve();
-              await release.promise;
-              return update(...args);
-            }
+          // Hard Stop now owns the durable follow-up clear before completion dispatch.
+          const update = h.historyService.neutralizeCompactionRecoveryUnderHistoryLock.bind(
+            h.historyService
           );
+          spyOn(
+            h.historyService,
+            "neutralizeCompactionRecoveryUnderHistoryLock"
+          ).mockImplementationOnce(async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return update(...args);
+          });
           await h.session.interruptStream({ abandonPartial: true });
         }
         return true;

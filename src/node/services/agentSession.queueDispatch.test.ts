@@ -3,6 +3,8 @@ import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import * as fsPromises from "node:fs/promises";
+import * as nodeFs from "node:fs";
+import * as path from "node:path";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
@@ -13,6 +15,11 @@ import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSessi
 import type { AIService } from "./aiService";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
+import {
+  CompactionCancellation,
+  type CompactionReplacementCapture,
+  FileCompactionCancellationStorage,
+} from "./compactionCancellation";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -66,6 +73,458 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test.each(["before write", "failed flush"] as const)(
+    "Stop restores only unpublished queued input when held at %s",
+    async (phase) => {
+      const workspaceId = `queue-visible-publication-${phase}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+      const chatPath = path.join(path.dirname(storage.path), "chat.jsonl");
+      const open = fsPromises.open;
+      let appendFd: number | undefined;
+      let failed = false;
+      const opening = spyOn(fsPromises, "open").mockImplementation(
+        async (...args: Parameters<typeof open>) => {
+          const handle = await open(...args);
+          if (args[0] === chatPath && args[1] === "a" && appendFd === undefined) {
+            appendFd = handle.fd;
+            if (phase === "before write") {
+              entered.resolve();
+              await release.promise;
+            } else {
+              const close = handle.close.bind(handle);
+              spyOn(handle, "close").mockImplementationOnce(async () => {
+                entered.resolve();
+                await release.promise;
+                await close();
+              });
+            }
+          }
+          return handle;
+        }
+      );
+      const sync = nodeFs.fsyncSync;
+      const flushing = spyOn(nodeFs, "fsyncSync").mockImplementation((fd) => {
+        if (phase === "failed flush" && fd === appendFd && !failed) {
+          failed = true;
+          throw new Error("queued input flush failed");
+        }
+        sync(fd);
+      });
+      const accepted = mock(() => undefined);
+      const failedPreparation = mock((error: unknown) => {
+        entered.reject(error);
+      });
+      const stream = spyOn(h.aiService, "streamMessage");
+      let stopping: ReturnType<typeof h.session.interruptStream> | undefined;
+      try {
+        h.session.queueMessage(
+          "first input",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            onAccepted: accepted,
+            onAcceptedPreStreamFailure: failedPreparation,
+          }
+        );
+        h.session.queueMessage("later input", { model: TEST_MODEL, agentId: "exec" });
+        h.session.sendQueuedMessages();
+        await entered.promise;
+        expect(failed).toBe(phase === "failed flush");
+        const visible = await fsPromises.readFile(chatPath, "utf8");
+        expect(visible.includes("first input")).toBe(phase === "failed flush");
+        stopping = h.session.interruptStream();
+        release.resolve();
+        expect(await stopping).toEqual(Ok(undefined));
+        await h.session.waitForIdle();
+        h.session.restoreQueueToInput();
+        expect(
+          h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+        ).toEqual([phase === "failed flush" ? "later input" : "first input\nlater input"]);
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
+          phase === "failed flush" ? 1 : 0
+        );
+        expect(accepted).not.toHaveBeenCalled();
+        expect(failedPreparation).toHaveBeenCalledTimes(1);
+        expect(stream).not.toHaveBeenCalled();
+        expect(await storage.read()).not.toBeNull();
+      } finally {
+        release.resolve();
+        opening.mockRestore();
+        flushing.mockRestore();
+        await stopping;
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["local", "foreign"] as const)(
+    "Send Now cannot replace a later %s Stop during workspace cleanup",
+    async (kind) => {
+      const workspaceId = `send-now-owned-stop-${kind}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const failed = Promise.withResolvers<void>();
+      let admission = h.session.captureCompactionAdmission("manual");
+      let capture: CompactionReplacementCapture | undefined;
+      const stream = spyOn(h.aiService, "streamMessage");
+      try {
+        h.session.queueMessage(
+          "owned draft",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            compactionAdmissionStale: () => admission(),
+            refreshCompactionAdmission: (isStale) => {
+              admission = isStale;
+            },
+            onAcceptedPreStreamFailure: () => failed.resolve(),
+          }
+        );
+        const first = h.session.interruptStream({
+          onCompactionCanceled: (receipt) => {
+            capture = receipt;
+          },
+        });
+        const ownAdmission = h.session.captureCompactionAdmission("manual");
+        expect(await first).toEqual(Ok(undefined));
+        expect(capture).toBeDefined();
+        if (kind === "local") expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+        else
+          await new CompactionCancellation(
+            h.historyService.getCompactionCancellationStorage(workspaceId)
+          ).cancel();
+        const successor = await h.historyService
+          .getCompactionCancellationStorage(workspaceId)
+          .read();
+        h.session.sendNextUserQueuedMessage({ isStale: ownAdmission, readCapture: () => capture });
+        expect(
+          await waitForCondition(
+            () =>
+              stream.mock.calls.length > 0 ||
+              h.events.some((event) => event.type === "restore-to-input")
+          )
+        ).toBe(true);
+        expect(stream).not.toHaveBeenCalled();
+        await failed.promise;
+        await h.session.waitForIdle();
+        expect(
+          h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+        ).toEqual(["owned draft"]);
+        expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+        expect(await h.historyService.getCompactionCancellationStorage(workspaceId).read()).toEqual(
+          successor
+        );
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["Stop retry", "capture"] as const)(
+    "Send Now restores unpublished input after a fresh admission fails at %s",
+    async (failure) => {
+      const workspaceId = `queue-send-now-failure-${failure}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const accepted = mock(() => undefined);
+      const failed = Promise.withResolvers<void>();
+      const stream = spyOn(h.aiService, "streamMessage");
+      let admission = h.session.captureCompactionAdmission("manual");
+      let refreshed = false;
+      // Record the queue's original frontier before injecting failure into Send Now's
+      // explicit fresh acquisition; eager queue capture must not consume the fault.
+      const original = await h.historyService.captureCompactionReplacement(workspaceId);
+      const injection =
+        failure === "Stop retry"
+          ? spyOn(FileCompactionCancellationStorage.prototype, "mutate").mockImplementation(() =>
+              Promise.reject(new Error("Stop persistence unavailable"))
+            )
+          : spyOn(h.historyService, "captureCompactionReplacement").mockResolvedValueOnce(
+              Err("capture unavailable")
+            );
+      try {
+        expect(original.success).toBe(true);
+        h.session.queueMessage(
+          "send now draft",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            readCompactionAdmission: () => Promise.resolve(original),
+            compactionAdmissionStale: () => admission(),
+            refreshCompactionAdmission: () => {
+              admission = h.session.captureCompactionAdmission("manual");
+              refreshed = true;
+            },
+            onAccepted: accepted,
+            onAcceptedPreStreamFailure: () => failed.resolve(),
+          }
+        );
+        expect((await h.session.cancelCompaction()).success).toBe(failure !== "Stop retry");
+        expect(h.session.sendNextUserQueuedMessage()).toBe(true);
+        await failed.promise;
+        await h.session.waitForIdle();
+        expect(refreshed).toBe(failure !== "capture");
+        expect(admission()).toBe(failure === "capture");
+        expect(
+          h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+        ).toEqual(["send now draft"]);
+        expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+        expect(accepted).not.toHaveBeenCalled();
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        injection.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "queued gate rejection restores only an unwritten row (write fails=%s)",
+    async (writeFails) => {
+      const workspaceId = `queue-rejected-publication-${writeFails}`;
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        captureEvents: true,
+        workspaceGoalService: {
+          assertPricedModelForBudgetedGoal: () =>
+            Promise.resolve(Err({ type: "unknown", raw: "pricing refused" })),
+        } as unknown as WorkspaceGoalService,
+      });
+      const failed = Promise.withResolvers<void>();
+      const goalSafety = spyOn(
+        h.session as unknown as {
+          applyManualUserMessageGoalSafety(): Promise<void>;
+        },
+        "applyManualUserMessageGoalSafety"
+      ).mockResolvedValue(undefined);
+      const append = writeFails
+        ? spyOn(h.historyService, "acceptCompactionReplacement").mockResolvedValueOnce(
+            Err("disk unavailable")
+          )
+        : undefined;
+      try {
+        h.session.queueMessage(
+          "rejected draft",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            onAcceptedPreStreamFailure: () => failed.resolve(),
+          }
+        );
+        h.session.sendQueuedMessages();
+        await failed.promise;
+        await h.session.waitForIdle();
+        expect(
+          h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+        ).toEqual(writeFails ? ["rejected draft"] : []);
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
+          writeFails ? 0 : 1
+        );
+      } finally {
+        append?.mockRestore();
+        goalSafety.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "Send Now refreshes the queued capture and restores only a later Stop (stopped=%s)",
+    async (stopped) => {
+      const workspaceId = `queue-send-now-stop-${stopped}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+      const held = spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await capture(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+      const stream = spyOn(h.aiService, "streamMessage");
+      const accepted = Promise.withResolvers<void>();
+      let admission = h.session.captureCompactionAdmission("manual");
+      try {
+        h.session.queueMessage(
+          "send now input",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            compactionAdmissionStale: () => admission(),
+            refreshCompactionAdmission: () => {
+              admission = h.session.captureCompactionAdmission("manual");
+            },
+            onAccepted: () => accepted.resolve(),
+          }
+        );
+        expect(await h.session.cancelCompaction()).toEqual(Ok(undefined));
+        expect(h.session.sendNextUserQueuedMessage()).toBe(true);
+        await entered.promise;
+        if (stopped) {
+          expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+          h.session.restoreQueueToInput();
+        }
+        release.resolve();
+        if (stopped) await h.session.waitForIdle();
+        else {
+          await accepted.promise;
+          // Once the row is durable, a later Stop must not offer it as unsent input again.
+          expect(await h.session.cancelCompaction()).toEqual(Ok(undefined));
+          h.session.restoreQueueToInput();
+        }
+        const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
+          stopped ? 0 : 1
+        );
+        expect(
+          h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
+        ).toEqual(stopped ? ["send now input"] : []);
+        if (stopped) expect(stream).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        held.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["automatic-visible", "automatic-hidden", "caller-canceled", "caller-stale"] as const)(
+    "Stop does not restore a dequeued %s candidate over later manual input",
+    async (kind) => {
+      const workspaceId = `queue-stop-control-${kind}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const controller = new AbortController();
+      let stale = false;
+      const send = h.session.sendMessage.bind(h.session);
+      const held = spyOn(h.session, "sendMessage").mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return send(...args);
+      });
+      const stream = spyOn(h.aiService, "streamMessage");
+      try {
+        h.session.queueMessage(
+          "revoked candidate",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            acceptanceOrigin: kind.startsWith("automatic") ? "automatic" : "manual",
+            synthetic: kind === "automatic-hidden",
+            cancelSignal: controller.signal,
+            admissionStale: () => stale,
+          }
+        );
+        h.session.queueMessage("later manual", { model: TEST_MODEL, agentId: "exec" });
+        h.session.sendQueuedMessages();
+        await entered.promise;
+        if (kind === "caller-canceled") controller.abort();
+        if (kind === "caller-stale") stale = true;
+        expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+        h.session.restoreQueueToInput();
+        release.resolve();
+        await h.session.waitForIdle();
+        expect(h.events.filter((event) => event.type === "restore-to-input")).toMatchObject([
+          { text: "later manual", fileParts: [] },
+        ]);
+        expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        held.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test.each(["held", "refused", "raw command"] as const)(
+    "Stop restores dequeued manual input and later queued input together (%s)",
+    async (restoreAt) => {
+      const workspaceId = `queue-stop-restore-${restoreAt}`;
+      const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+      const held = spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await capture(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        }
+      );
+      const stream = spyOn(h.aiService, "streamMessage");
+      const accepted = mock(() => undefined);
+      const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+      const laterFileParts = [{ url: "data:text/plain;base64,dGFpbA==", mediaType: "text/plain" }];
+      const reviews = [
+        { filePath: "src/file.ts", lineRange: "1", selectedCode: "call()", userNote: "check this" },
+      ];
+      try {
+        h.session.queueMessage(
+          "first\nsecond",
+          {
+            model: TEST_MODEL,
+            agentId: "exec",
+            fileParts,
+            muxMetadata:
+              restoreAt === "raw command"
+                ? {
+                    type: "agent-skill",
+                    rawCommand: "/init",
+                    skillName: "init",
+                    scope: "built-in",
+                    reviews,
+                  }
+                : { type: "normal", reviews },
+          },
+          {
+            onAccepted: accepted,
+          }
+        );
+        h.session.queueMessage("later input", {
+          model: TEST_MODEL,
+          agentId: "exec",
+          fileParts: laterFileParts,
+        });
+        h.session.sendQueuedMessages();
+        await entered.promise;
+        expect(h.session.queuedMessageEntryCount()).toBe(1);
+        expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+        if (restoreAt === "held") h.session.restoreQueueToInput();
+        release.resolve();
+        await h.session.waitForIdle();
+        if (restoreAt === "refused") h.session.restoreQueueToInput();
+        expect(h.events.filter((event) => event.type === "restore-to-input")).toEqual([
+          {
+            type: "restore-to-input",
+            workspaceId,
+            text: `${restoreAt === "raw command" ? "/init" : "first\nsecond"}\nlater input`,
+            fileParts: [...fileParts, ...laterFileParts],
+            reviews,
+          },
+        ]);
+        expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+        expect(stream).not.toHaveBeenCalled();
+        expect(accepted).not.toHaveBeenCalled();
+        expect(h.session.hasQueuedMessages()).toBe(false);
+      } finally {
+        release.resolve();
+        held.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
     let calls = 0;
@@ -85,7 +544,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "failed startup",
         { model: TEST_MODEL, agentId: "exec" },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
       session.queueMessage("successor", { model: TEST_MODEL, agentId: "exec" });
       session.sendQueuedMessages();
@@ -127,6 +586,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           "failed head",
           { model: TEST_MODEL, agentId: "exec" },
           {
+            acceptanceOrigin: "automatic",
             synthetic: true,
             onAcceptedPreStreamFailure: async (error) => {
               failures.push(error);
@@ -214,7 +674,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
             await session.sendMessage(
               "start",
               { model: TEST_MODEL, agentId: "exec" },
-              { synthetic: true, agentInitiated: true }
+              { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
             )
           ).success
         ).toBe(true);
@@ -326,7 +786,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "queued continuation",
         { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
       expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
       expect(session.hasQueuedOrDispatchingEntry(differentCorrelation)).toBe(true);
@@ -334,7 +794,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "second queued continuation",
         { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
       expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
 
@@ -342,6 +802,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "unrelated predecessor",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
         }
       );
@@ -373,12 +834,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "manual message",
         { model: TEST_MODEL, agentId: "exec" },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
       session.queueMessage(
         "workspace-turn follow-up",
         { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
 
       // Queued stage: the manual head entry is the candidate (no metadata).
@@ -409,7 +870,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "workspace-turn follow-up",
         { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
       // Force the dequeue-to-stream-start window with PREPARING already
       // released (a background send can resolve before stream-start): the
@@ -444,7 +905,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           muxMetadata: WORKSPACE_TURN_CORRELATION,
           queueDispatchMode: "turn-end",
         },
-        { synthetic: true }
+        { acceptanceOrigin: "automatic", synthetic: true }
       );
 
       const cutter = session.getQueueCutCutter();
@@ -573,6 +1034,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelSignal: controller.signal,
@@ -621,6 +1083,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           "Background monitor wake",
           { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
           {
+            acceptanceOrigin: "automatic",
             synthetic: true,
             agentInitiated: true,
             cancelSignal: controller.signal,
@@ -710,7 +1173,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const dispatchMode = session.queueMessage(
         "[Scheduled heartbeat] check in",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
-        { synthetic: true, dedupeKey: "heartbeat-request" }
+        { acceptanceOrigin: "automatic", synthetic: true, dedupeKey: "heartbeat-request" }
       );
       expect(dispatchMode).toBe("turn-end");
       expect(session.hasQueuedDedupeKey("heartbeat-request")).toBe(true);
@@ -720,7 +1183,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         session.queueMessage(
           "[Scheduled heartbeat] check in",
           { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
-          { synthetic: true, dedupeKey: "heartbeat-request" }
+          { acceptanceOrigin: "automatic", synthetic: true, dedupeKey: "heartbeat-request" }
         )
       ).toBeNull();
 
@@ -767,7 +1230,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "hidden predecessor",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
-        { synthetic: true, agentInitiated: true }
+        { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true }
       );
       session.queueMessage("my queued follow-up", {
         model: TEST_MODEL,
@@ -806,7 +1269,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.queueMessage(
         "[Scheduled heartbeat] check in",
         { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" },
-        { synthetic: true, dedupeKey: "heartbeat-request" }
+        { acceptanceOrigin: "automatic", synthetic: true, dedupeKey: "heartbeat-request" }
       );
       expect(session.hasQueuedMessages()).toBe(true);
 
@@ -866,6 +1329,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           onCanceled: (reason) => {
@@ -926,6 +1390,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1012,6 +1477,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1097,6 +1563,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1183,6 +1650,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1279,6 +1747,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelSignal: controller.signal,
@@ -1371,6 +1840,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelSignal: controller.signal,
@@ -1431,6 +1901,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1490,6 +1961,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "Background monitor wake",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           cancelState,
@@ -1583,6 +2055,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         "queued peer trigger",
         { model: TEST_MODEL, agentId: "exec" },
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           // Peer sends refund their family-message reservation through this hook; a dispatch
           // that REJECTS (throws) instead of returning Err must reach it just like the

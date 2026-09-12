@@ -92,7 +92,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
   it("treats missing edit target as no-op (allows recovery after compaction)", async () => {
     const { session, historyService, streamMessage } = await createSessionHarness("ws-test");
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
-    const appendToHistory = spyOn(historyService, "appendToHistory");
+    const acceptance = spyOn(historyService, "acceptCompactionReplacement");
 
     const result = await session.sendMessage("hello", {
       model: TEST_MODEL,
@@ -102,7 +102,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(result.success).toBe(true);
     expect(truncateAfterMessage.mock.calls).toHaveLength(1);
-    expect(appendToHistory.mock.calls).toHaveLength(1);
+    expect(acceptance.mock.calls).toHaveLength(1);
 
     await session.waitForIdle();
     expect(streamMessage.mock.calls).toHaveLength(1);
@@ -140,7 +140,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       createMuxMessage("assistant-original", "assistant", "reply", { historySequence: 1 })
     );
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
-    const appendToHistory = spyOn(historyService, "appendToHistory");
+    const acceptance = spyOn(historyService, "acceptCompactionReplacement");
 
     const result = await session.sendMessage("edited", {
       model: "invalid-model",
@@ -153,7 +153,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       expect(result.error.type).toBe("invalid_model_string");
     }
     expect(truncateAfterMessage).not.toHaveBeenCalled();
-    expect(appendToHistory).not.toHaveBeenCalled();
+    expect(acceptance).not.toHaveBeenCalled();
     expect(streamMessage).not.toHaveBeenCalled();
 
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -172,7 +172,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const originalMessageId = "user-message-with-image";
     await seedImageMessage(workspaceId, historyService, originalMessageId);
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
-    const appendToHistory = spyOn(historyService, "appendToHistory");
+    const acceptance = spyOn(historyService, "acceptCompactionReplacement");
 
     const result = await session.sendMessage("edited", {
       model: TEST_MODEL,
@@ -183,9 +183,11 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(result.success).toBe(true);
     expect(truncateAfterMessage.mock.calls).toHaveLength(1);
-    expect(appendToHistory.mock.calls).toHaveLength(1);
+    expect(acceptance.mock.calls).toHaveLength(1);
 
-    const appendedMessage = appendToHistory.mock.calls[0][1];
+    const persisted = await historyService.getLastMessages(workspaceId, 1);
+    if (!persisted.success) throw new Error(persisted.error);
+    const appendedMessage = persisted.data[0];
     const appendedFileParts = appendedMessage.parts.filter(
       (part) => part.type === "file"
     ) as Array<{ type: "file"; url: string; mediaType: string }>;
@@ -199,7 +201,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const originalMessageId = "user-message-with-image";
     const originalImageUrl = await seedImageMessage(workspaceId, historyService, originalMessageId);
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
-    const appendToHistory = spyOn(historyService, "appendToHistory");
+    const acceptance = spyOn(historyService, "acceptCompactionReplacement");
     const result = await session.sendMessage("edited", {
       model: TEST_MODEL,
       agentId: "exec",
@@ -208,9 +210,11 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(result.success).toBe(true);
     expect(truncateAfterMessage.mock.calls).toHaveLength(1);
-    expect(appendToHistory.mock.calls).toHaveLength(1);
+    expect(acceptance.mock.calls).toHaveLength(1);
 
-    const appendedMessage = appendToHistory.mock.calls[0][1];
+    const persisted = await historyService.getLastMessages(workspaceId, 1);
+    if (!persisted.success) throw new Error(persisted.error);
+    const appendedMessage = persisted.data[0];
     const appendedFileParts = appendedMessage.parts.filter(
       (part) => part.type === "file"
     ) as Array<{ type: "file"; url: string; mediaType: string }>;
@@ -300,8 +304,6 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       workspaceId,
       streamHandler
     );
-    const appendToHistory = spyOn(historyService, "appendToHistory");
-
     try {
       const firstSendPromise = session.sendMessage("original", {
         model: TEST_MODEL,
@@ -313,9 +315,9 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       );
       expect(sawPreparingTurn).toBe(true);
 
-      const originalMessage = appendToHistory.mock.calls
-        .map((call) => call[1])
-        .find((message) => message.role === "user" && message.parts[0]?.type === "text");
+      const persisted = await historyService.getLastMessages(workspaceId, 1);
+      if (!persisted.success) throw new Error(persisted.error);
+      const originalMessage = persisted.data[0];
       const originalMessageId = originalMessage?.id;
       expect(typeof originalMessageId).toBe("string");
 
@@ -382,10 +384,10 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     });
     const observed: { busyDuringTruncate: boolean | null } = { busyDuringTruncate: null };
     const realTruncate = historyService.truncateAfterMessage.bind(historyService);
-    spyOn(historyService, "truncateAfterMessage").mockImplementation(async (wsId, messageId) => {
+    spyOn(historyService, "truncateAfterMessage").mockImplementation(async (...args) => {
       observed.busyDuringTruncate = session.isBusy();
       await truncateGate;
-      return realTruncate(wsId, messageId);
+      return realTruncate(...args);
     });
 
     const sendPromise = session.sendMessage("edited", {

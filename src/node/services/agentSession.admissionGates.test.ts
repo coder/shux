@@ -74,6 +74,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("family-payload-stale", "assistant", "untrusted payload", {
@@ -110,6 +111,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stale", "assistant", "untrusted payload", {
@@ -152,6 +154,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stuck", "assistant", "untrusted payload", {
@@ -196,6 +199,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "hello",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         onAccepted: () => {
           acceptedCalls += 1;

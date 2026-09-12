@@ -71,15 +71,16 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     historyCleanup = cleanup;
 
     const messages: MuxMessage[] = [];
-    const realAppend = historyService.appendToHistory.bind(historyService);
-    const appendToHistory = spyOn(historyService, "appendToHistory").mockImplementation(
-      async (wId: string, message: MuxMessage) => {
-        messages.push(message);
-        return realAppend(wId, message);
-      }
-    );
+    const send = session.sendMessage.bind(session);
+    spyOn(session, "sendMessage").mockImplementation(async (...args) => {
+      const result = await send(...args);
+      const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!persisted.success) throw new Error(persisted.error);
+      messages.splice(0, messages.length, ...persisted.data);
+      return result;
+    });
 
-    return { session, appendToHistory, messages, historyService };
+    return { session, messages, historyService };
   }
 
   it("persists a synthetic agent skill snapshot before the user message", async () => {
@@ -90,7 +91,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody: "Follow this skill.",
     });
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -108,7 +109,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(result.success).toBe(true);
 
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     const [snapshotMessage, userMessage] = messages;
 
     expect(snapshotMessage.role).toBe("user");
@@ -141,7 +142,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath: projectPath,
       runtimeConfig: { type: "worktree", srcBaseDir },
@@ -161,7 +162,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(result.success).toBe(true);
 
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     const [snapshotMessage] = messages;
 
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
@@ -197,7 +198,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       "utf-8"
     );
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath: subprojectPath,
       aiServiceOverrides: {
@@ -227,7 +228,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(result.success).toBe(true);
 
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     const [snapshotMessage] = messages;
 
     expect(snapshotMessage.metadata?.agentSkillSnapshot?.skillName).toBe("plugin-skill");
@@ -243,7 +244,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody: "Follow this skill.",
     });
 
-    const { session, appendToHistory } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -261,7 +262,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const first = await session.sendMessage("do X", baseOptions);
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("do Y", {
       ...baseOptions,
@@ -273,9 +274,9 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(second.success).toBe(true);
     // First send: snapshot + user. Second send: user only.
-    expect(appendToHistory.mock.calls).toHaveLength(3);
+    expect(messages).toHaveLength(3);
 
-    const appendedIds = appendToHistory.mock.calls.map((call) => call[1].id);
+    const appendedIds = messages.map((message) => message.id);
     const secondSendAppendedIds = appendedIds.slice(2);
     expect(secondSendAppendedIds).toHaveLength(1);
     expect(secondSendAppendedIds[0]).toStartWith("user-");
@@ -292,7 +293,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillBody,
     });
 
-    const { session, appendToHistory, messages } = await createSessionHarness({
+    const { session, messages } = await createSessionHarness({
       workspaceId,
       workspacePath,
     });
@@ -310,7 +311,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const first = await session.sendMessage("do X", baseOptions);
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const firstSnapshot = messages[0];
     expect(firstSnapshot.id).toStartWith("agent-skill-snapshot-");
@@ -337,7 +338,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(second.success).toBe(true);
 
     // Second send should persist a new snapshot (frontmatter differs) + user message.
-    expect(appendToHistory.mock.calls).toHaveLength(4);
+    expect(messages).toHaveLength(4);
 
     const secondSnapshot = messages[2];
     expect(secondSnapshot.id).toStartWith("agent-skill-snapshot-");
@@ -360,7 +361,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         { skillName: "beta-skill", skillBody: "Follow beta." },
       ],
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -375,7 +376,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(3);
+    expect(messages).toHaveLength(3);
 
     const [alphaSnapshot, betaSnapshot, userMessage] = messages;
     expect(alphaSnapshot.metadata?.synthetic).toBe(true);
@@ -395,7 +396,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "test-skill",
       skillBody: "Follow slash skill.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -410,7 +411,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const [snapshotMessage, userMessage] = messages;
     expect(snapshotMessage.metadata?.synthetic).toBe(true);
@@ -425,7 +426,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "valid-skill",
       skillBody: "Follow valid skill.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -440,7 +441,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     expect(messages[0].metadata?.agentSkillSnapshot?.skillName).toBe("valid-skill");
     expect(getMessageText(messages[0])).toContain("Follow valid skill.");
     expect(getMessageText(messages[1])).toBe("do X");
@@ -451,7 +452,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "alpha-skill",
       skillBody: "Follow alpha.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -466,7 +467,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     expect(messages[0].metadata?.agentSkillSnapshot?.skillName).toBe("alpha-skill");
     expect(getMessageText(messages[0])).toContain("Follow alpha.");
     expect(getMessageText(messages[1])).toBe("do X");
@@ -474,7 +475,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
   it("still throws when a slash skill name is invalid", async () => {
     const { workspacePath } = await createTestWorkspaceWithSkills({ skills: [] });
-    const { session, appendToHistory } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -496,12 +497,12 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       throw new Error("Expected invalid slash skill failure to use unknown error shape");
     }
     expect(result.error.raw).toContain("Invalid agent skill name");
-    expect(appendToHistory.mock.calls).toHaveLength(0);
+    expect(messages).toHaveLength(0);
   });
 
   it("still throws when a slash skill is missing", async () => {
     const { workspacePath } = await createTestWorkspaceWithSkills({ skills: [] });
-    const { session, appendToHistory } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -515,7 +516,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(appendToHistory.mock.calls).toHaveLength(0);
+    expect(messages).toHaveLength(0);
   });
 
   it("dedupes against recent history per-skill", async () => {
@@ -525,7 +526,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         { skillName: "beta-skill", skillBody: "Follow beta." },
       ],
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const first = await session.sendMessage("first", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -536,7 +537,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("second", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -551,7 +552,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(second.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(4);
+    expect(messages).toHaveLength(4);
     expect(messages[2].metadata?.agentSkillSnapshot?.skillName).toBe("beta-skill");
     expect(getMessageText(messages[2])).toContain("Follow beta.");
     expect(getMessageText(messages[3])).toBe("second");
@@ -562,7 +563,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "fix-issue",
       skillBody: "Fix issue $1 with priority $2.\nSummary: $ARGUMENTS",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("Using skill fix-issue: 123 high", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -577,7 +578,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const [snapshotMessage, userMessage] = messages;
     expect(getMessageText(snapshotMessage)).toContain(
@@ -592,7 +593,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "fix-issue",
       skillBody: "Fix issue $ARGUMENTS.",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const baseOptions = {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -610,7 +611,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("Using skill fix-issue: 456", {
       ...baseOptions,
@@ -626,7 +627,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     // Different arguments produce different substituted bodies, so the sha256 dedupe
     // must NOT collapse the second snapshot: snapshot + user, snapshot + user.
-    expect(appendToHistory.mock.calls).toHaveLength(4);
+    expect(messages).toHaveLength(4);
 
     const firstSnapshot = messages[0];
     const secondSnapshot = messages[2];
@@ -642,7 +643,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "fix-issue",
       skillBody: "Fix issue $ARGUMENTS.",
     });
-    const { session, appendToHistory } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const options = {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -658,12 +659,12 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const first = await session.sendMessage("Using skill fix-issue: 123", options);
     expect(first.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
 
     const second = await session.sendMessage("Using skill fix-issue: 123", options);
     expect(second.success).toBe(true);
     // Identical substituted body → snapshot deduped; only the user message is appended.
-    expect(appendToHistory.mock.calls).toHaveLength(3);
+    expect(messages).toHaveLength(3);
   });
 
   it("leaves placeholders in inline-referenced skill bodies untouched", async () => {
@@ -672,7 +673,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "fix-issue",
       skillBody,
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("Please follow $fix-issue for 123", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -684,7 +685,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     // Inline refs carry no argument concept: the body must stay byte-identical.
     expect(getMessageText(messages[0])).toContain(skillBody);
   });
@@ -696,7 +697,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "no-placeholders",
       skillBody,
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("Using skill no-placeholders: 123 high", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -711,7 +712,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     // Fallback: no placeholders → body untouched; the arguments stay visible in the
     // user message only.
     expect(getMessageText(messages[0])).toContain(skillBody);
@@ -722,7 +723,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       skillName: "fix-issue",
       skillBody: "Fix issue [$1] with [$ARGUMENTS].",
     });
-    const { session, appendToHistory, messages } = await createSessionHarness({ workspacePath });
+    const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("Use skill fix-issue", {
       model: "anthropic:claude-3-5-sonnet-latest",
@@ -737,7 +738,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(appendToHistory.mock.calls).toHaveLength(2);
+    expect(messages).toHaveLength(2);
     expect(getMessageText(messages[0])).toContain("Fix issue [] with [].");
   });
 

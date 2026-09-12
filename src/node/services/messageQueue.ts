@@ -1,7 +1,9 @@
+import type { CompactionReplacementCapture } from "./compactionCancellation";
+import { Err, type Result } from "@/common/types/result";
 import { randomUUID } from "node:crypto";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import assert from "@/common/utils/assert";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
@@ -97,6 +99,11 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
+export type QueuedInput = Pick<
+  Extract<WorkspaceChatMessage, { type: "restore-to-input" }>,
+  "text" | "fileParts" | "reviews"
+>;
+
 /** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
 export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
   return typeof signal.reason === "string"
@@ -166,6 +173,15 @@ interface QueuedMessageInternalOptions {
    * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
    */
   admissionStale?: () => boolean;
+  /** Stop capture shared by otherwise batchable additions; caller probes remain isolated. */
+  compactionAdmissionStale?: () => boolean;
+  /** The original acquired storage frontier survives preflight, batching, and queue waits. */
+  readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
+  /** Reauthorize this manual entry only when the user explicitly selects Send now. */
+  refreshCompactionAdmission?: (
+    isStale: () => boolean,
+    capture?: CompactionReplacementCapture
+  ) => void;
 }
 
 type QueueClearCallbacks = Pick<
@@ -208,7 +224,12 @@ interface QueueEntry {
   agentInitiatedCount: number;
   // Keep per-add origins so removing a keyed manual add cannot promote remaining
   // automatic work into replacement authority. This does not change queue grouping.
-  acceptanceOrigins: Array<{ origin: TurnAcceptanceOrigin; dedupeKey?: string }>;
+  acceptanceOrigins: Array<
+    { origin: TurnAcceptanceOrigin; dedupeKey?: string } & Pick<
+      QueuedMessageInternalOptions,
+      "compactionAdmissionStale" | "refreshCompactionAdmission" | "readCompactionAdmission"
+    >
+  >;
   /**
    * Timestamp of the latest add batched into this entry. Dispatch exposes it so
    * goal safety can tell messages typed before a goal existed (queued while the
@@ -254,6 +275,26 @@ interface QueueEntry {
  */
 export class MessageQueue {
   private entries: QueueEntry[] = [];
+
+  /** Carry queued work across only its own durably committed context reset. */
+  advanceCompactionAdmission(
+    predecessor: CompactionReplacementCapture,
+    successor: CompactionReplacementCapture
+  ): void {
+    for (const entry of this.entries)
+      for (const add of entry.acceptanceOrigins) {
+        const read = add.readCompactionAdmission;
+        if (read)
+          add.readCompactionAdmission = async () => {
+            const captured = await read();
+            return captured.success &&
+              captured.data.nonce === predecessor.nonce &&
+              captured.data.generation === predecessor.generation
+              ? { success: true, data: { ...successor } }
+              : captured;
+          };
+      }
+  }
 
   /**
    * Check if the queue currently contains a compaction request.
@@ -713,9 +754,13 @@ export class MessageQueue {
     if (internal?.admissionStale != null) {
       entry.admissionStale = internal.admissionStale;
     }
-
     entry.addCount += 1;
-    entry.acceptanceOrigins.push({ origin: internal?.acceptanceOrigin ?? "manual" });
+    entry.acceptanceOrigins.push({
+      origin: internal?.acceptanceOrigin ?? "manual",
+      compactionAdmissionStale: internal?.compactionAdmissionStale,
+      readCompactionAdmission: internal?.readCompactionAdmission,
+      refreshCompactionAdmission: internal?.refreshCompactionAdmission,
+    });
     // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): batched sends can finish
     // preflight out of authoring order. Keep the NEWEST authoring time for
     // the entry — a plain overwrite would let an older pre-goal message mask
@@ -844,6 +889,28 @@ export class MessageQueue {
     return this.getReviewsForEntries(this.getVisibleEntries());
   }
 
+  /** Stop restores authored input, including an entry already dequeued into preparation. */
+  getInputForRestore(): QueuedInput | undefined {
+    return this.inputForRestore(this.entries);
+  }
+
+  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
+    const restorable = entries.filter(
+      (entry) =>
+        entry.userAuthored &&
+        this.getAcceptanceOrigin(entry) === "manual" &&
+        !entry.cancelSignal?.aborted &&
+        entry.admissionStale?.() !== true
+    );
+    return restorable.length > 0
+      ? {
+          text: this.getDisplayTextForEntries(restorable),
+          fileParts: this.getFilePartsForEntries(restorable),
+          reviews: this.getReviewsForEntries(restorable),
+        }
+      : undefined;
+  }
+
   /** Whether a user-visible queued entry is a compaction request. */
   hasVisibleCompactionRequest(): boolean {
     return this.getVisibleEntries().some((entry) => isCompactionMetadata(entry.muxMetadata));
@@ -967,7 +1034,12 @@ export class MessageQueue {
 
   /** Capture before admission publication; observers may remove or reorder the head. */
   peekNext():
-    | { identity: object; muxMetadata: unknown; acceptanceOrigin: TurnAcceptanceOrigin }
+    | {
+        identity: object;
+        muxMetadata: unknown;
+        acceptanceOrigin: TurnAcceptanceOrigin;
+        inputForRestore: () => QueuedInput | undefined;
+      }
     | undefined {
     const entry = this.entries[0];
     return entry
@@ -975,6 +1047,7 @@ export class MessageQueue {
           identity: entry,
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
+          inputForRestore: () => this.inputForRestore([entry]),
         }
       : undefined;
   }
@@ -1017,6 +1090,53 @@ export class MessageQueue {
     const allAddsAreAgentInitiated =
       entry.addCount > 0 && entry.agentInitiatedCount === entry.addCount;
     const automaticAcceptance = this.getAcceptanceOrigin(entry) === "automatic";
+    // Stop fences every add without sealing ordinary follow-ups. Keep the probes
+    // with their origins so keyed removal also removes only that add's authority.
+    const admissionStale = entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale)
+      ? () =>
+          entry.admissionStale?.() === true ||
+          entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
+      : entry.admissionStale;
+    const readCompactionAdmission = entry.acceptanceOrigins.some(
+      (add) => add.readCompactionAdmission
+    )
+      ? async (): Promise<Result<CompactionReplacementCapture>> => {
+          const captures = await Promise.all(
+            entry.acceptanceOrigins.map(
+              (add) => add.readCompactionAdmission?.() ?? Promise.resolve(undefined)
+            )
+          );
+          const first = captures.find((capture) => capture !== undefined);
+          if (!first?.success) return first ?? Err("Queued admission has no captured frontier.");
+          // A batch cannot promote an older add into a newer add's replacement authority.
+          if (
+            captures.some(
+              (capture) =>
+                capture &&
+                (!capture.success ||
+                  capture.data.nonce !== first.data.nonce ||
+                  capture.data.generation !== first.data.generation)
+            )
+          )
+            return Err("Queued admission spans different Stop frontiers.");
+          return first;
+        }
+      : undefined;
+    const refreshCompactionAdmission =
+      readCompactionAdmission ||
+      entry.acceptanceOrigins.some(
+        (add) => add.origin === "manual" && add.refreshCompactionAdmission
+      )
+        ? (isStale: () => boolean, capture?: CompactionReplacementCapture) => {
+            for (const add of entry.acceptanceOrigins) {
+              if (add.origin !== "manual") continue;
+              if (capture)
+                add.readCompactionAdmission = () =>
+                  Promise.resolve({ success: true, data: capture });
+              add.refreshCompactionAdmission?.(isStale, capture);
+            }
+          }
+        : undefined;
     const hasInternalOptions =
       automaticAcceptance ||
       allAddsAreSynthetic ||
@@ -1025,7 +1145,9 @@ export class MessageQueue {
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
-      entry.admissionStale != null ||
+      admissionStale != null ||
+      refreshCompactionAdmission != null ||
+      readCompactionAdmission != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
@@ -1046,7 +1168,9 @@ export class MessageQueue {
           ...(entry.onPreTurnRowsPersisted != null
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
-          ...(entry.admissionStale != null ? { admissionStale: entry.admissionStale } : {}),
+          ...(admissionStale != null ? { admissionStale } : {}),
+          ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
+          ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
         }
       : undefined;
 

@@ -3417,7 +3417,17 @@ describe("TaskService", () => {
     }
   );
 
-  test.each(["running", "awaiting_report", "stopped", "opted-out"] as const)(
+  const startupGuidanceStates = [
+    "running",
+    "awaiting_report",
+    "stopped",
+    "opted-out",
+    "compaction-stopped",
+    "compaction-unrecorded",
+    "compaction-unsupported",
+    "compaction-during-probe",
+  ] as const;
+  test.each([...startupGuidanceStates])(
     "startup restores question guidance only as a queue (%s)",
     async (state) => {
       const config = await createTestConfig(rootDir);
@@ -3484,11 +3494,50 @@ describe("TaskService", () => {
         config,
         historyService,
       });
-      workspaceService.getStartupRecoveryState = () => session.getStartupRecoveryState();
+      if (state === "compaction-stopped") {
+        expect(await session.cancelCompaction(true)).toEqual(Ok(undefined));
+      }
+      if (state === "compaction-unrecorded") {
+        const publication = spyOn(
+          historyService,
+          "withCompactionStorageLock"
+        ).mockRejectedValueOnce(new Error("Stop publication unavailable"));
+        expect((await session.cancelCompaction(true)).success).toBe(false);
+        publication.mockRestore();
+      }
+      if (state === "compaction-during-probe") {
+        const readTail = historyService.getLastMessages.bind(historyService);
+        spyOn(historyService, "getLastMessages").mockImplementationOnce(async (...args) => {
+          const result = await readTail(...args);
+          expect(await session.cancelCompaction(true)).toEqual(Ok(undefined));
+          return result;
+        });
+      }
+      if (state === "compaction-unsupported") {
+        await fsPromises.writeFile(
+          historyService.getCompactionCancellationStorage(childId).path,
+          JSON.stringify({ version: 99, futureIntent: "Stop" })
+        );
+      }
+      workspaceService.getStartupRecoveryState = () =>
+        session.getStartupRecoveryState(
+          state === "compaction-unrecorded" || state === "compaction-unsupported" ? 25 : undefined
+        );
       try {
         await taskService.initialize();
         expect(compaction).not.toHaveBeenCalled();
-        if (state === "stopped" || state === "opted-out") {
+        if (state === "compaction-unrecorded" || state === "compaction-unsupported") {
+          expect(sends).toHaveLength(0);
+          expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toEqual(guidance);
+          expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+          return;
+        }
+        if (
+          state === "stopped" ||
+          state === "opted-out" ||
+          state === "compaction-stopped" ||
+          state === "compaction-during-probe"
+        ) {
           expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
           expect(sends).toHaveLength(0);
           return;

@@ -47,7 +47,11 @@ describe("preparation admission", () => {
       await release.promise;
       return Ok(createStartedTurnHandle(h.session.closingSignal));
     });
-    h.session.queueMessage("head", { ...options, muxMetadata: metadata }, { synthetic: true });
+    h.session.queueMessage(
+      "head",
+      { ...options, muxMetadata: metadata },
+      { acceptanceOrigin: "automatic", synthetic: true }
+    );
     h.session.queueMessage("tail", options);
     let observed = false;
     h.session.onChatEvent(({ message }) => {
@@ -81,7 +85,11 @@ describe("preparation admission", () => {
       started.resolve();
       return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
     });
-    h.session.queueMessage("removed", options, { synthetic: true, onCanceled: canceled });
+    h.session.queueMessage("removed", options, {
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+      onCanceled: canceled,
+    });
     let removed = false;
     h.session.onChatEvent(({ message }) => {
       if (message.type !== "stream-lifecycle" || message.phase !== "preparing" || removed) return;
@@ -188,6 +196,7 @@ describe("preparation admission", () => {
         return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
       });
       h.session.queueMessage("failed", options, {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         onAcceptedPreStreamFailure: async () => {
           if (++cleanups === 1) throw new Error("cleanup transient");
@@ -263,7 +272,7 @@ describe("preparation admission", () => {
     }
   );
 
-  test("a superseded direct append rolls back only its own row and preserves replacement thinking and retry state", async () => {
+  test("a superseded automatic append rolls back only its own row and preserves replacement thinking and retry state", async () => {
     const h = await harness("superseded-direct-state");
     const appended = Promise.withResolvers<void>();
     const releaseAppend = Promise.withResolvers<void>();
@@ -281,7 +290,7 @@ describe("preparation admission", () => {
       await releaseProvider.promise;
       return Ok(createStartedTurnHandle(h.session.closingSignal));
     });
-    const oldSend = h.session.sendMessage("old", options);
+    const oldSend = h.session.sendMessage("old", options, { acceptanceOrigin: "automatic" });
     await appended.promise;
     const replacement = h.session.sendMessage("replacement", {
       ...options,
@@ -310,7 +319,7 @@ describe("preparation admission", () => {
     }
   });
 
-  test("a stale on-send compaction append is rolled back before its request can be replayed", async () => {
+  test("a stale automatic on-send compaction append is rolled back before its request can be replayed", async () => {
     const h = await harness("stale-compaction-append");
     const monitor = (h.session as unknown as { compactionMonitor: CompactionMonitor })
       .compactionMonitor;
@@ -332,6 +341,7 @@ describe("preparation admission", () => {
     });
     const stream = spyOn(h.aiService, "streamMessage");
     const result = await h.session.sendMessage("deferred question", options, {
+      acceptanceOrigin: "automatic",
       admissionStale: () => stale,
     });
     expect(result.success).toBe(false);

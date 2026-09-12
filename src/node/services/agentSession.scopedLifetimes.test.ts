@@ -17,6 +17,42 @@ const workspaceId = "scoped-turn";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
 
 describe("AgentSession scoped turn lifetimes", () => {
+  test("cleared direct queue admission remains supervised until its disk capture settles", async () => {
+    const appFiberScope = Scope.makeUnsafe("parallel");
+    const h = await createAgentSessionHarness({ workspaceId, appFiberScope });
+    const stream = spyOn(h.aiService, "streamMessage");
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await capture(...args);
+        entered.resolve();
+        await release.promise;
+        return result;
+      }
+    );
+    h.session.queueMessage("clear before capture returns", options);
+    await entered.promise;
+    h.session.clearQueue();
+    let closed = false;
+    const closing = runner.runPromise(Scope.close(appFiberScope, Exit.void)).then(() => {
+      closed = true;
+    });
+    try {
+      await runner.runPromise(Effect.yieldNow);
+      expect(closed).toBe(false);
+      release.resolve();
+      await closing;
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await closing;
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
   test("queue clear publication cannot outrun its cancellation refund", async () => {
     const appFiberScope = Scope.makeUnsafe("parallel");
     const entered = Promise.withResolvers<void>();
@@ -104,6 +140,7 @@ describe("AgentSession scoped turn lifetimes", () => {
         });
       };
       h.session.queueMessage("queued", options, {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         onAcceptedPreStreamFailure: () => {
           entered.resolve();
@@ -143,10 +180,10 @@ describe("AgentSession scoped turn lifetimes", () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const h = await createAgentSessionHarness({ workspaceId, appFiberScope });
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementation(async (id, message) => {
-      const result = await append(id, message);
-      if (message.role === "user") {
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+      const result = await append(...args);
+      if (result.success && result.data.kind === "accepted") {
         entered.resolve();
         await release.promise;
       }
@@ -166,9 +203,11 @@ describe("AgentSession scoped turn lifetimes", () => {
       release.resolve();
       await Promise.all([send, closing]);
       expect(spyOn(h.aiService, "streamMessage")).not.toHaveBeenCalled();
-      // The joined append is then rolled back: the refused turn leaves no row for startup recovery.
+      // The history receipt accepted the user input before shutdown; retain it for explicit resume.
       const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history).toEqual(Ok([]));
+      expect(history.success && history.data.at(-1)?.parts).toMatchObject([
+        { type: "text", text: "persist before preparing" },
+      ]);
     } finally {
       release.resolve();
       await send;
@@ -278,19 +317,26 @@ describe("AgentSession scoped turn lifetimes", () => {
           (await goalService.setGoal({ workspaceId, objective: "Continue until interrupted" }))
             .success
         ).toBe(true);
-        const append = h.historyService.appendToHistory.bind(h.historyService);
-        spyOn(h.historyService, "appendToHistory").mockImplementation(async (id, message) => {
-          if (message.metadata?.contextBudgetRejected && heldWrite === "history") {
-            entered.resolve();
-            await release.promise;
+        const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+        spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+          async (...args) => {
+            const result = await accept(...args);
+            const operation = args[2];
+            const rejected =
+              operation.kind === "append" &&
+              operation.messages.some((message) => message.metadata?.contextBudgetRejected);
+            // Hold a real publication receipt: close before the CAS correctly refuses the row.
+            if (rejected && heldWrite === "history") {
+              entered.resolve();
+              await release.promise;
+            }
+            if (rejected) {
+              writes.push("history");
+              if (closed) writesAfterDrain.push("history");
+            }
+            return result;
           }
-          const result = await append(id, message);
-          if (message.metadata?.contextBudgetRejected) {
-            writes.push("history");
-            if (closed) writesAfterDrain.push("history");
-          }
-          return result;
-        });
+        );
         const setGoal = goalService.setGoal.bind(goalService);
         spyOn(goalService, "setGoal").mockImplementation(async (input) => {
           if (input.status === "paused" && heldWrite === "goal") {
