@@ -322,7 +322,11 @@ export interface WorkspaceLiveActivity {
   desktopViewers: boolean;
 }
 
+/** Who requested acceptance, independent of transcript visibility and provider billing. */
+export type TurnAcceptanceOrigin = "manual" | "automatic";
+
 export interface SendMessageInternalOptions {
+  acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
   synthetic?: boolean;
@@ -397,7 +401,11 @@ export interface WorkspaceTurnHost {
   resumeStream(
     workspaceId: string,
     options: SendMessageOptions,
-    internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
+    internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
+      allowQueuedAgentTask?: boolean;
+      agentInitiated?: boolean;
+    }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
   replaceHistory(

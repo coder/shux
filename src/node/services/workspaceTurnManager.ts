@@ -1559,6 +1559,7 @@ export class WorkspaceTurnManager {
           : {}),
       },
       {
+        acceptanceOrigin: "automatic",
         startStreamInBackground: true,
         requireIdle: !queuedForExistingWorkspace,
         onCanceled: async (reason) => {

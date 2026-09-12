@@ -10,6 +10,41 @@ describe("MessageQueue", () => {
     queue = new MessageQueue();
   });
 
+  describe("acceptance origin", () => {
+    it("preserves automatic origin across batching without changing visibility or billing", () => {
+      const internal = { acceptanceOrigin: "automatic" as const };
+      queue.add("first", undefined, internal);
+      queue.add("second", undefined, internal);
+      expect(queue.getMessages()).toEqual(["first", "second"]);
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.message).toBe("first\nsecond");
+      expect(dispatched.internal).toEqual(internal);
+      expect(queue.isEmpty()).toBe(true);
+    });
+
+    it("removing a keyed manual add restores the remaining automatic origin", () => {
+      const automatic = { acceptanceOrigin: "automatic" as const };
+      queue.addOnce("automatic", undefined, "auto:1", automatic);
+      queue.addOnce("manual", undefined, "manual:1");
+      expect(queue.peekNext()?.acceptanceOrigin).toBe("manual");
+      expect(queue.removeByDedupeKeyPrefix("manual:").removedCount).toBe(1);
+      expect(queue.dequeueNext()).toMatchObject({ message: "automatic", internal: automatic });
+    });
+
+    it("retains file-only origin and ignores duplicate adds that were never queued", () => {
+      const file = { type: "file" as const, url: "file:///input.txt", mediaType: "text/plain" };
+      const automatic = { acceptanceOrigin: "automatic" as const };
+      queue.addOnce("", { model: "test", agentId: "exec", fileParts: [file] }, "files", automatic);
+      expect(queue.addOnce("duplicate manual", undefined, "files")).toBe(false);
+      queue.add("automatic text", undefined, automatic);
+      expect(queue.dequeueNext()).toMatchObject({
+        message: "automatic text",
+        options: { fileParts: [file] },
+        internal: automatic,
+      });
+    });
+  });
+
   describe("authoredAtMs", () => {
     it("returns the request-entry authoring time from dequeueNext when provided", () => {
       // Codex P2 (PRRT_kwDOPxxmWM6b-orA): the sender captures authoring time

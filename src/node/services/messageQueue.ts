@@ -7,6 +7,7 @@ import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelop
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
+import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 
 // Type guard for compaction request metadata (for display text)
 interface CompactionMetadata {
@@ -116,6 +117,7 @@ export type QueueCutCutter =
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
 interface QueuedMessageInternalOptions {
+  acceptanceOrigin?: TurnAcceptanceOrigin;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   synthetic?: boolean;
@@ -204,6 +206,9 @@ interface QueueEntry {
   addCount: number;
   syntheticCount: number;
   agentInitiatedCount: number;
+  // Keep per-add origins so removing a keyed manual add cannot promote remaining
+  // automatic work into replacement authority. This does not change queue grouping.
+  acceptanceOrigins: Array<{ origin: TurnAcceptanceOrigin; dedupeKey?: string }>;
   /**
    * Timestamp of the latest add batched into this entry. Dispatch exposes it so
    * goal safety can tell messages typed before a goal existed (queued while the
@@ -557,6 +562,7 @@ export class MessageQueue {
     const entry = this.addInternal(message, options, internal);
     if (entry != null && dedupeKey !== undefined) {
       entry.dedupeKeys.add(dedupeKey);
+      entry.acceptanceOrigins.at(-1)!.dedupeKey = dedupeKey;
     }
     return entry != null;
   }
@@ -635,6 +641,7 @@ export class MessageQueue {
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
+        acceptanceOrigins: [],
         // 0, not Date.now(): every add (including the entry-creating one)
         // folds its authoring time in below via max(); seeding with the
         // creation wall clock would swallow an authoredAtMs captured before
@@ -708,6 +715,7 @@ export class MessageQueue {
     }
 
     entry.addCount += 1;
+    entry.acceptanceOrigins.push({ origin: internal?.acceptanceOrigin ?? "manual" });
     // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): batched sends can finish
     // preflight out of authoring order. Keep the NEWEST authoring time for
     // the entry — a plain overwrite would let an older pre-goal message mask
@@ -915,6 +923,9 @@ export class MessageQueue {
         entry.addCount -= matchingKeys.length;
         entry.syntheticCount = Math.min(entry.syntheticCount, entry.addCount);
         entry.agentInitiatedCount = Math.min(entry.agentInitiatedCount, entry.addCount);
+        entry.acceptanceOrigins = entry.acceptanceOrigins.filter(
+          (add) => add.dedupeKey == null || !matchingKeySet.has(add.dedupeKey)
+        );
         return [entry];
       }
       if (entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null) {
@@ -948,10 +959,24 @@ export class MessageQueue {
     return true;
   }
 
+  private getAcceptanceOrigin(entry: QueueEntry): TurnAcceptanceOrigin {
+    return entry.acceptanceOrigins.every((add) => add.origin === "automatic")
+      ? "automatic"
+      : "manual";
+  }
+
   /** Capture before admission publication; observers may remove or reorder the head. */
-  peekNext(): { identity: object; muxMetadata: unknown } | undefined {
+  peekNext():
+    | { identity: object; muxMetadata: unknown; acceptanceOrigin: TurnAcceptanceOrigin }
+    | undefined {
     const entry = this.entries[0];
-    return entry ? { identity: entry, muxMetadata: entry.muxMetadata } : undefined;
+    return entry
+      ? {
+          identity: entry,
+          muxMetadata: entry.muxMetadata,
+          acceptanceOrigin: this.getAcceptanceOrigin(entry),
+        }
+      : undefined;
   }
 
   /**
@@ -991,7 +1016,9 @@ export class MessageQueue {
     const allAddsAreSynthetic = entry.addCount > 0 && entry.syntheticCount === entry.addCount;
     const allAddsAreAgentInitiated =
       entry.addCount > 0 && entry.agentInitiatedCount === entry.addCount;
+    const automaticAcceptance = this.getAcceptanceOrigin(entry) === "automatic";
     const hasInternalOptions =
+      automaticAcceptance ||
       allAddsAreSynthetic ||
       allAddsAreAgentInitiated ||
       entry.onAccepted != null ||
@@ -1002,6 +1029,7 @@ export class MessageQueue {
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
+          ...(automaticAcceptance ? { acceptanceOrigin: "automatic" as const } : {}),
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
           ...(entry.goalKind != null ? { goalKind: entry.goalKind, goalId: entry.goalId } : {}),

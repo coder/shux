@@ -71,6 +71,7 @@ import {
 export type { StreamErrorRecoveryOutcome } from "./turnCoordinator";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
+import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -774,6 +775,7 @@ interface CachedMemoryContext {
 }
 
 interface SendMessageInternalOptions {
+  acceptanceOrigin?: TurnAcceptanceOrigin;
   preparation?: PreparationAttempt;
   /** A dequeued send keeps its admission owner through acceptance and startup failure. */
   turnReservation?: TurnId;
@@ -860,6 +862,7 @@ interface SendMessageInternalOptions {
 // Enqueueing creates no preparation attempt. Once dispatched, Promise success alone cannot
 // distinguish cancellation, a background transfer, and delivery to terminal policy.
 interface PreparationAttempt {
+  acceptanceOrigin: TurnAcceptanceOrigin;
   preparedRequest?: PreparedStreamMessage;
   owner?: TurnId;
   expectedTurn: TurnId;
@@ -1684,6 +1687,7 @@ export class AgentSession {
     }
 
     const result = await this.resumeStream(request.options, {
+      acceptanceOrigin: "automatic",
       agentInitiated: request.agentInitiated === true ? true : undefined,
       goalKind: request.goalKind,
       goalId: request.goalId,
@@ -3306,6 +3310,7 @@ export class AgentSession {
     if (internal?.preparation)
       return this.prepareMessage(message, options, internal, internal.preparation);
     const attempt: PreparationAttempt = {
+      acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
       owner: internal?.turnReservation,
       expectedTurn: this.coordinator.turnId,
       outcome: "preparing",
@@ -3417,6 +3422,24 @@ export class AgentSession {
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
+    // All prepared rows share publication bookkeeping while retaining their current write
+    // order and rollback checkpoints. Prefixes alone never establish trigger acceptance.
+    const publishPreparedHistory = async (
+      publication:
+        | { kind: "prefix"; message: MuxMessage }
+        | { kind: "trigger"; messages: MuxMessage[] }
+    ): Promise<Result<void>> => {
+      const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
+      // Preserve the same rollback checkpoints for unexpected service rejection as for
+      // ordinary Result failures; earlier prefixes may already be durable.
+      const result = await (
+        messages.length === 1
+          ? this.historyService.appendToHistory(this.workspaceId, messages[0])
+          : this.historyService.appendManyToHistory(this.workspaceId, messages)
+      ).catch((error: unknown) => Err(getErrorMessage(error)));
+      if (result.success) persistedCancelableMessageIds.push(...messages.map((row) => row.id));
+      return result;
+    };
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
     /**
@@ -4110,14 +4133,13 @@ export class AgentSession {
           );
 
         // Persist compaction request (NOT the user message — it's the follow-up)
-        const appendCompactionResult = await this.historyService.appendToHistory(
-          this.workspaceId,
-          autoCompactionMessage
-        );
+        const appendCompactionResult = await publishPreparedHistory({
+          kind: "trigger",
+          messages: [autoCompactionMessage],
+        });
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
-        persistedCancelableMessageIds.push(autoCompactionMessage.id);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
         }
@@ -4186,14 +4208,13 @@ export class AgentSession {
     }
 
     if (shouldPersistTurnSnapshots && !tokenBudgetActive && snapshotResult?.snapshotMessage) {
-      const snapshotAppendResult = await this.historyService.appendToHistory(
-        this.workspaceId,
-        snapshotResult.snapshotMessage
-      );
+      const snapshotAppendResult = await publishPreparedHistory({
+        kind: "prefix",
+        message: snapshotResult.snapshotMessage,
+      });
       if (!snapshotAppendResult.success) {
         return Err(createUnknownSendMessageError(snapshotAppendResult.error));
       }
-      persistedCancelableMessageIds.push(snapshotResult.snapshotMessage.id);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -4201,15 +4222,14 @@ export class AgentSession {
 
     if (shouldPersistTurnSnapshots && !tokenBudgetActive && skillSnapshotMessages.length > 0) {
       for (const snapshotMessage of skillSnapshotMessages) {
-        const skillSnapshotAppendResult = await this.historyService.appendToHistory(
-          this.workspaceId,
-          snapshotMessage
-        );
+        const skillSnapshotAppendResult = await publishPreparedHistory({
+          kind: "prefix",
+          message: snapshotMessage,
+        });
         if (!skillSnapshotAppendResult.success) {
           await rollbackPersistedTurnRows();
           return Err(createUnknownSendMessageError(skillSnapshotAppendResult.error));
         }
-        persistedCancelableMessageIds.push(snapshotMessage.id);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
         }
@@ -4218,15 +4238,14 @@ export class AgentSession {
 
     if (shouldPersistTurnSnapshots && !tokenBudgetActive && mcpPromptSnapshotMessages.length > 0) {
       for (const snapshotMessage of mcpPromptSnapshotMessages) {
-        const appendResult = await this.historyService.appendToHistory(
-          this.workspaceId,
-          snapshotMessage
-        );
+        const appendResult = await publishPreparedHistory({
+          kind: "prefix",
+          message: snapshotMessage,
+        });
         if (!appendResult.success) {
           await rollbackPersistedTurnRows();
           return Err(createUnknownSendMessageError(appendResult.error));
         }
-        persistedCancelableMessageIds.push(snapshotMessage.id);
         if (await cancelBeforeAcceptance()) {
           return Ok(undefined);
         }
@@ -4342,16 +4361,14 @@ export class AgentSession {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
         // Ordinary sends stay append-only; only coupled snapshots/boundaries need an atomic batch.
+        const publish = () => publishPreparedHistory({ kind: "trigger", messages: batch });
         const appended = contextRollover
-          ? await this.appendContextRolloverRows(batch)
-          : batch.length === 1
-            ? await this.historyService.appendToHistory(this.workspaceId, userMessage)
-            : await this.historyService.appendManyToHistory(this.workspaceId, batch);
+          ? await this.appendContextRolloverRows(batch, publish)
+          : await publish();
         if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
       }
-      persistedCancelableMessageIds.push(...batch.map((row) => row.id));
       if (contextRollover) {
         const sequences = [batch[0], batch[1], userMessage].map(
           (row) => row.metadata?.historySequence
@@ -4367,18 +4384,14 @@ export class AgentSession {
       }
       if (await cancelBeforeAcceptance()) return Ok(undefined);
     } else if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
-      const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
-        ...internal.preTurnMessages,
-        userMessage,
-      ]);
+      const batchAppendResult = await publishPreparedHistory({
+        kind: "trigger",
+        messages: [...internal.preTurnMessages, userMessage],
+      });
       if (!batchAppendResult.success) {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(batchAppendResult.error));
       }
-      persistedCancelableMessageIds.push(
-        ...internal.preTurnMessages.map((message) => message.id),
-        userMessage.id
-      );
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -4386,12 +4399,14 @@ export class AgentSession {
       // When on-send compaction triggers, the user message is NOT persisted to
       // history (it's sent as follow-up after compaction). Otherwise, persist
       // normally.
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
+      const appendResult = await publishPreparedHistory({
+        kind: "trigger",
+        messages: [userMessage],
+      });
       if (!appendResult.success) {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(appendResult.error));
       }
-      persistedCancelableMessageIds.push(userMessage.id);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
@@ -4768,6 +4783,7 @@ export class AgentSession {
   async resumeStream(
     options: SendMessageOptions,
     internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
       agentInitiated?: boolean;
       goalKind?: GoalSyntheticMessageKind;
       goalId?: string;
@@ -4829,6 +4845,7 @@ export class AgentSession {
     }
 
     const attempt: PreparationAttempt = {
+      acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
       expectedTurn: expectedTurnId,
       outcome: "preparing",
       durability: "accepted",
@@ -5104,10 +5121,14 @@ export class AgentSession {
     }
   }
 
-  private async appendContextRolloverRows(rows: MuxMessage[]): Promise<Result<void>> {
+  private async appendContextRolloverRows(
+    rows: MuxMessage[],
+    publish: () => Promise<Result<void>> = () =>
+      this.historyService.appendManyToHistory(this.workspaceId, rows)
+  ): Promise<Result<void>> {
     let appended: Result<void>;
     try {
-      appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
+      appended = await publish();
     } catch (error) {
       appended = Err(getErrorMessage(error));
     }
@@ -5963,6 +5984,7 @@ export class AgentSession {
       },
       args.dedupeKey,
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
         sealed: true,
@@ -6806,6 +6828,7 @@ export class AgentSession {
         fallback?.messageText ?? followUp.text,
         fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
         {
+          acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
@@ -6891,7 +6914,11 @@ export class AgentSession {
           ...autoCompactionRequest.sendOptions,
           muxMetadata: autoCompactionRequest.metadata,
         },
-        { synthetic: true, agentInitiated: autoCompactionRequest.agentInitiated }
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          agentInitiated: autoCompactionRequest.agentInitiated,
+        }
       );
       if (!sendResult.success) {
         log.warn("Failed to dispatch mid-stream compaction request", {
@@ -9200,6 +9227,7 @@ export class AgentSession {
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
       synthetic?: boolean;
       agentInitiated?: boolean;
       /** Request-entry authoring time captured before send preflight awaits (see MessageQueue). */
@@ -9710,6 +9738,7 @@ export class AgentSession {
     }
     const expectedTurnId = this.coordinator.turnId;
     const attempt: PreparationAttempt = {
+      acceptanceOrigin: candidate.acceptanceOrigin,
       expectedTurn: expectedTurnId,
       outcome: "preparing",
       durability: "rollback-eligible",
@@ -9734,6 +9763,7 @@ export class AgentSession {
       if (this.messageQueue.peekNext()?.identity !== candidate.identity) return Ok(undefined);
       attempt.queued = true;
       const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
       attempt.onFailure = internal?.onAcceptedPreStreamFailure;
       this.dispatchingQueuedEntry = true;
       this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
@@ -9750,6 +9780,7 @@ export class AgentSession {
         this.messageQueue.getNextDispatchableMode() === "tool-end"
       );
       return this.sendMessage(message, options, {
+        acceptanceOrigin: attempt.acceptanceOrigin,
         ...internal,
         enqueuedAtMs,
         turnReservation: preparedTurn,
@@ -10156,6 +10187,7 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       startStreamInBackground,
+      acceptanceOrigin: "automatic",
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,

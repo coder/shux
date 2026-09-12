@@ -35,6 +35,7 @@ import {
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
+import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
@@ -510,6 +511,7 @@ interface WorkflowResultContinuationSender {
     message: string,
     options: SendMessageOptions,
     internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
       skipAutoResumeReset?: boolean;
       synthetic?: boolean;
       agentInitiated?: boolean;
@@ -2133,6 +2135,7 @@ export class TurnRequestBuilder {
                     },
                   },
                   {
+                    acceptanceOrigin: "automatic",
                     skipAutoResumeReset: true,
                     synthetic: true,
                     agentInitiated: true,
