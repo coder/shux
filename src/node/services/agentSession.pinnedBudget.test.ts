@@ -214,6 +214,26 @@ async function setup(
   };
 }
 
+// These controls explicitly Stop before disposal, so their fake engine must complete that
+// started turn on Stop. The closing signal still retires the subsequent ordinary control turn.
+function completeStartedTurnsOnStop(fixture: Awaited<ReturnType<typeof setup>>) {
+  let stopping = new AbortController();
+  fixture.start.mockImplementation(async (options) => {
+    stopping = new AbortController();
+    await options.onStreamConstructed?.();
+    return Ok(
+      createStartedTurnHandle(
+        AbortSignal.any([fixture.h.session.closingSignal, stopping.signal]),
+        options.messageId
+      )
+    );
+  });
+  spyOn(fixture.manager, "stopStream").mockImplementation(() => {
+    stopping.abort();
+    return Promise.resolve(Ok(undefined));
+  });
+}
+
 describe("pinned full-payload rollover admission", () => {
   test.each(
     (["system", "advertised-schema", "deferred-schema"] as const).flatMap((kind) =>
@@ -627,6 +647,7 @@ describe("pinned full-payload rollover admission", () => {
 
   test("a final-flush turn never starts MCP servers", async () => {
     const fixture = await setup("small");
+    completeStartedTurnsOnStop(fixture);
     const { h, service, start } = fixture;
     const mcpServerManager = service.turnRequestBuilderBindings.mcpServerManager!;
     const startServers = spyOn(mcpServerManager, "getToolsForWorkspace");
@@ -687,6 +708,7 @@ describe("pinned full-payload rollover admission", () => {
 
   test("a final-flush fallback runs at its own inherent thinking minimum with a matching cap", async () => {
     const fixture = await setup("small");
+    completeStartedTurnsOnStop(fixture);
     const { h, config, start } = fixture;
     // gpt-5.2 cannot go below medium thinking, and the user floor for it is higher still; the
     // flush must ignore the floor (housekeeping) but size its cap for the model's own minimum.

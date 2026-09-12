@@ -1443,117 +1443,91 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     return predicate();
   }
 
-  test("unresolved Stop refuses automatic guidance before creating a compaction continuation", async () => {
-    const workspaceId = "ws-unresolved-stop-guidance";
-    const fixture = await createGuidanceHarness({ workspaceId });
-    try {
-      expect(await fixture.session.interruptStream()).toEqual(Ok(undefined));
-      const accepted = mock(() => undefined);
+  test.each([false, true])(
+    "applies compaction for fresh automatic guidance after settled Stop (%s)",
+    async (stopped) => {
+      const fixture = await createGuidanceHarness({
+        workspaceId: "ws-auto-compaction-synthetic-guidance",
+      });
+
+      const monitor = (fixture.session as unknown as { compactionMonitor: CompactionMonitor })
+        .compactionMonitor;
+      let firstCheck = true;
+      spyOn(monitor, "checkBeforeSend").mockImplementation(() => {
+        const high = firstCheck;
+        firstCheck = false;
+        return {
+          shouldShowWarning: high,
+          shouldForceCompact: high,
+          usagePercentage: high ? 95 : 1,
+          thresholdPercentage: 70,
+          contextTokens: high ? 95_000 : 1_000,
+          maxTokens: 100_000,
+        };
+      });
+      if (stopped) expect(await fixture.session.interruptStream()).toEqual(Ok(undefined));
+
       const result = await fixture.session.sendMessage(
-        "Guidance that would otherwise force compaction",
+        "Updated guidance from parent: focus on the failing tests.",
         { model: "openai:gpt-4o", agentId: "exec" },
         {
           acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
           startStreamInBackground: true,
-          onAccepted: accepted,
         }
       );
-      expect(result.success).toBe(false);
-      expect(accepted).not.toHaveBeenCalled();
-      expect(fixture.streamHistories).toEqual([]);
-      expect(await fixture.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(
-        Ok([])
+      expect(result.success).toBe(true);
+
+      // First stream must carry the persisted compaction request.
+      await waitFor(() => fixture.streamHistories.length >= 1);
+      expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
+      const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
       );
-      expect(fixture.session.isBusy()).toBe(false);
-      expect(fixture.session.queuedMessageEntryCount()).toBe(0);
-    } finally {
+      expect(firstRequestHasCompactionRequest).toBe(true);
+
+      // Compaction must complete: a boundary summary lands in durable history.
+      const boundaryLanded = await waitFor(async () => {
+        const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
+          "ws-auto-compaction-synthetic-guidance"
+        );
+        return (
+          historyResult.success &&
+          historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
+        );
+      });
+      expect(boundaryLanded).toBe(true);
+
+      // The original guidance text is re-dispatched as the post-compaction follow-up.
+      const followUpDispatched = await waitFor(() =>
+        fixture.streamHistories.some((history) =>
+          history.some(
+            (message) =>
+              message.role === "user" &&
+              message.metadata?.muxMetadata?.type !== "compaction-request" &&
+              message.parts.some(
+                (part) => part.type === "text" && part.text.includes("focus on the failing tests")
+              )
+          )
+        )
+      );
+      expect(followUpDispatched).toBe(true);
+
+      expect(
+        fixture.events.some(
+          (event) => (event as { type?: string }).type === "auto-compaction-triggered"
+        )
+      ).toBe(true);
+      expect(
+        fixture.events.some(
+          (event) => (event as { type?: string }).type === "auto-compaction-completed"
+        )
+      ).toBe(true);
+
       await fixture.session.dispose();
     }
-  });
-
-  test("applies compaction for fresh automatic guidance without Stop", async () => {
-    const fixture = await createGuidanceHarness({
-      workspaceId: "ws-auto-compaction-synthetic-guidance",
-    });
-
-    const monitor = (fixture.session as unknown as { compactionMonitor: CompactionMonitor })
-      .compactionMonitor;
-    let firstCheck = true;
-    spyOn(monitor, "checkBeforeSend").mockImplementation(() => {
-      const high = firstCheck;
-      firstCheck = false;
-      return {
-        shouldShowWarning: high,
-        shouldForceCompact: high,
-        usagePercentage: high ? 95 : 1,
-        thresholdPercentage: 70,
-        contextTokens: high ? 95_000 : 1_000,
-        maxTokens: 100_000,
-      };
-    });
-
-    const result = await fixture.session.sendMessage(
-      "Updated guidance from parent: focus on the failing tests.",
-      { model: "openai:gpt-4o", agentId: "exec" },
-      {
-        acceptanceOrigin: "automatic",
-        synthetic: true,
-        agentInitiated: true,
-        startStreamInBackground: true,
-      }
-    );
-    expect(result.success).toBe(true);
-
-    // First stream must carry the persisted compaction request.
-    await waitFor(() => fixture.streamHistories.length >= 1);
-    expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
-    const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
-      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
-    );
-    expect(firstRequestHasCompactionRequest).toBe(true);
-
-    // Compaction must complete: a boundary summary lands in durable history.
-    const boundaryLanded = await waitFor(async () => {
-      const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
-        "ws-auto-compaction-synthetic-guidance"
-      );
-      return (
-        historyResult.success &&
-        historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
-      );
-    });
-    expect(boundaryLanded).toBe(true);
-
-    // The original guidance text is re-dispatched as the post-compaction follow-up.
-    const followUpDispatched = await waitFor(() =>
-      fixture.streamHistories.some((history) =>
-        history.some(
-          (message) =>
-            message.role === "user" &&
-            message.metadata?.muxMetadata?.type !== "compaction-request" &&
-            message.parts.some(
-              (part) => part.type === "text" && part.text.includes("focus on the failing tests")
-            )
-        )
-      )
-    );
-    expect(followUpDispatched).toBe(true);
-
-    expect(
-      fixture.events.some(
-        (event) => (event as { type?: string }).type === "auto-compaction-triggered"
-      )
-    ).toBe(true);
-    expect(
-      fixture.events.some(
-        (event) => (event as { type?: string }).type === "auto-compaction-completed"
-      )
-    ).toBe(true);
-
-    await fixture.session.dispose();
-  });
+  );
 
   // Characterization: sends carrying preTurnMessages (family-message payloads)
   // intentionally skip on-send compaction. The trigger row references its

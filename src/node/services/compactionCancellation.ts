@@ -15,6 +15,8 @@ import { log } from "./log";
 export interface CompactionReplacementCapture {
   nonce: string | null;
   generation: string | undefined;
+  /** Settlement must have been observed at admission, not adopted from a later read. */
+  cancellationVersion?: 1 | 2;
 }
 
 export type CompactionReplacementOperation =
@@ -37,7 +39,9 @@ export interface CompactionCancellationSummary {
 }
 
 export interface CompactionCancellationRecord {
-  version: 1;
+  version: 1 | 2;
+  /** V2 alone proves a successful physical Stop and final cleanup at this generation. */
+  settledGeneration?: string;
   nonce: string;
   retainUntilReplacement?: boolean;
   scope: { kind: "unresolved" } | ({ kind: "summary" } & CompactionCancellationSummary);
@@ -68,8 +72,11 @@ export type CompactionCancellationMutation =
       /** Explicit full deletion owns row removal; never serialized or used by ordinary Stop. */
       fullHistoryDeletion?: CompactionHistoryDeletion;
       /** In-memory completion of the captured engine and terminal policy, never serialized. */
-      settled?: Promise<void>;
+      settled?: Promise<boolean | void>;
       onCaptured?: (capture: CompactionReplacementCapture) => void;
+      onInitialSettlement?: () => void;
+      /** Exact V2 commit receipt, distinct from an applied mutation retaining V1. */
+      onSettled?: (capture: CompactionReplacementCapture) => void;
     }
   | { kind: "narrow"; record: CompactionCancellationRecord }
   | {
@@ -124,7 +131,7 @@ export interface CompactionCancellationStorage {
   ): Promise<CompactionCancellationRecord | null>;
 }
 
-const CancellationRecordSchema = z.strictObject({
+const LegacyCancellationRecordSchema = z.strictObject({
   version: z.literal(1),
   nonce: z.string().min(1),
   retainUntilReplacement: z.boolean().optional(),
@@ -138,6 +145,17 @@ const CancellationRecordSchema = z.strictObject({
     }),
   ]),
 });
+
+const SettledCancellationRecordSchema = LegacyCancellationRecordSchema.extend({
+  version: z.literal(2),
+  retainUntilReplacement: z.literal(false).optional(),
+  scope: z.strictObject({ kind: z.literal("unresolved") }),
+  settledGeneration: z.string().min(1),
+});
+const CancellationRecordSchema = z.union([
+  LegacyCancellationRecordSchema,
+  SettledCancellationRecordSchema,
+]);
 
 function assertCancellationSize(contents: string): void {
   if (Buffer.byteLength(contents, "utf8") > SESSION_HISTORY_MAX_LINE_BYTES)
@@ -202,9 +220,16 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         isPlainObject(parsed) &&
         typeof parsed.version === "number" &&
         Number.isInteger(parsed.version) &&
-        parsed.version > 1
+        parsed.version > 2
       )
         throw new CompactionCancellationReadRefusedError("Unsupported cancellation record version");
+      if (
+        isPlainObject(parsed) &&
+        parsed.version === 2 &&
+        (!SettledCancellationRecordSchema.safeParse(parsed).success ||
+          hasAmbiguousResetKeys(contents))
+      )
+        throw new CompactionCancellationReadRefusedError("Unsupported settled cancellation record");
       if (hasAmbiguousResetKeys(contents)) throw new Error("Duplicate cancellation fields");
       return CancellationRecordSchema.parse(parsed);
     } catch (error) {
@@ -356,7 +381,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         }
       }
       if (mutation.kind === "narrow") {
-        if (current.retainUntilReplacement) return "superseded";
+        if (current.retainUntilReplacement || current.version !== mutation.record.version)
+          return "superseded";
         const { contents, record: committed } = serializeCancellation(mutation.record);
         if (current.scope.kind !== "unresolved") {
           if (!isDeepStrictEqual(current, committed)) return "superseded";
@@ -405,10 +431,11 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
       return "applied";
     });
     const outcome = await write;
+    if (mutation.kind === "publish") mutation.onInitialSettlement?.();
     if (mutation.kind !== "publish" || !mutation.settled || outcome !== "applied") return outcome;
     // Settlement may write a final partial/legacy summary after the first cleanup.
     // Never hold history locks while joining those writers, or let an old Stop clear a successor.
-    await mutation.settled;
+    const physicallyStopped = await mutation.settled;
     return this.history.withCompactionStorageLock(this.workspaceId, async (_dir, checkLock) => {
       if (!isCurrent()) return "superseded";
       const current = await this.read();
@@ -416,11 +443,36 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         .getContinuousCompactionJournal(this.workspaceId)
         .captureGenerationUnderHistoryLock();
       const frontier = mutation.publication.predecessor;
-      if (current?.nonce !== frontier?.nonce || generation !== frontier?.generation)
+      if (!current || current.nonce !== frontier?.nonce || generation !== frontier?.generation)
         return "superseded";
-      return (await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
-        this.workspaceId,
+      if (
+        !(await this.history.neutralizeCompactionRecoveryUnderHistoryLock(
+          this.workspaceId,
+          isCurrent,
+          checkLock
+        ))
+      )
+        return "superseded";
+      if (
+        !physicallyStopped ||
+        current.version !== 1 ||
+        current.scope.kind !== "unresolved" ||
+        current.retainUntilReplacement ||
+        generation === undefined
+      )
+        return "applied";
+      // The existing second cleanup joins the old producer; only its exact durable frontier
+      // may qualify a later automatic replacement. Older readers preserve V2 as unsupported.
+      const { contents, record } = serializeCancellation({
+        ...current,
+        version: 2,
+        settledGeneration: generation,
+      });
+      return (await publishCompactionFile(
+        this.path,
+        contents,
         isCurrent,
+        () => onCommitted(record),
         checkLock
       ))
         ? "applied"
@@ -581,8 +633,10 @@ export class CompactionCancellation {
 
   cancel(options?: {
     retainUntilReplacement?: boolean;
-    settled?: Promise<void>;
+    settled?: Promise<boolean | void>;
     onCaptured?: (capture: CompactionReplacementCapture) => void;
+    onInitialSettlement?: () => void;
+    onSettled?: (capture: CompactionReplacementCapture) => void;
     fullHistoryDeletion?: CompactionHistoryDeletion;
   }): Promise<CompactionCancellationMutationOutcome> {
     this.current = {
@@ -601,6 +655,8 @@ export class CompactionCancellation {
       publication: { attempts: 0 },
       fullHistoryDeletion: options?.fullHistoryDeletion && { ...options.fullHistoryDeletion },
       onCaptured: options?.onCaptured,
+      onInitialSettlement: options?.onInitialSettlement,
+      onSettled: options?.onSettled,
       ...(options?.settled ? { settled: options.settled } : {}),
     });
   }
@@ -701,6 +757,7 @@ export class CompactionCancellation {
       this.pending !== pending ||
       this.replacementNonce === nonce ||
       this.current?.nonce !== nonce ||
+      this.current.version === 2 ||
       this.current.scope.kind !== "unresolved" ||
       this.current.retainUntilReplacement
     )
@@ -802,7 +859,14 @@ export class CompactionCancellation {
               mutation.onCaptured?.({
                 nonce: record.nonce,
                 generation: mutation.publication.predecessor.generation,
+                cancellationVersion: record.version,
               });
+              if (record.version === 2)
+                mutation.onSettled?.({
+                  nonce: record.nonce,
+                  generation: record.settledGeneration,
+                  cancellationVersion: 2,
+                });
             }
             // Commit invalidates pre-deletion reads before lock release. A later foreign
             // read must survive acknowledgment delayed by adapter cleanup.
@@ -810,7 +874,13 @@ export class CompactionCancellation {
             if (mutation.kind === "retire" && record === null && retired) {
               try {
                 mutation.onRetired?.(
-                  { ...retired },
+                  {
+                    ...retired,
+                    // The transition carries the admission it retired, not later settlement proof.
+                    ...(mutation.expectedCapture?.cancellationVersion === undefined
+                      ? {}
+                      : { cancellationVersion: mutation.expectedCapture.cancellationVersion }),
+                  },
                   { nonce: null, generation: retired.generation }
                 );
               } catch (error) {

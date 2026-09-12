@@ -3442,7 +3442,11 @@ export class HistoryService {
     const cancellation = await this.getCompactionCancellationStorage(workspaceId).read();
     const generation =
       await this.getContinuousCompactionJournal(workspaceId).captureGenerationUnderHistoryLock();
-    return { nonce: cancellation?.nonce ?? null, generation };
+    return {
+      nonce: cancellation?.nonce ?? null,
+      generation,
+      ...(cancellation ? { cancellationVersion: cancellation.version } : {}),
+    };
   }
 
   captureCompactionReplacement(

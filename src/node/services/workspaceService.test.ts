@@ -1,5 +1,8 @@
 import type { TurnCompletion } from "./streamManager";
-import { FileCompactionCancellationStorage } from "./compactionCancellation";
+import {
+  FileCompactionCancellationStorage,
+  type CompactionCancellation,
+} from "./compactionCancellation";
 import { CompactionPendingState } from "./compactionPendingState";
 import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -20,7 +23,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
-import { EventEmitter } from "events";
+import { EventEmitter, once } from "events";
 import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
@@ -764,29 +767,171 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  async function expectMonitorDeferredUntilManual(
-    h: Awaited<ReturnType<typeof createActiveWakeHarness>>,
-    requestsBeforeReplacement: number
-  ): Promise<void> {
-    // V1 cannot prove that an unresolved Stop's producers settled. Preserve attention until
-    // manual replacement; the V2 layer separately permits fresh automatic replacement.
-    expect(h.requests).toHaveLength(requestsBeforeReplacement);
-    expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
-    expect(await h.session.isAutomaticSendBlocked()).toBe(true);
-    expect(h.session.isBusy()).toBe(false);
-    await h.reconciler.reconcile(h.workspaceId);
-    expect(h.requests).toHaveLength(requestsBeforeReplacement);
-    expect(h.internal.pendingBashMonitorWakeIdleWaitsByOwner.has(h.workspaceId)).toBe(false);
-    expect(
-      await h.session.sendMessage("manual replacement", { model: h.model, agentId: "exec" })
-    ).toEqual(Ok(undefined));
-    await h.complete();
-    await h.reconciler.reconcile(h.workspaceId);
-    expect(h.requests).toHaveLength(requestsBeforeReplacement + 2);
-    expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
-  }
+  test("output after retirement wakes when fast Stop settlement completes", async () => {
+    const h = await createActiveWakeHarness();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let stopping: ReturnType<WorkspaceService["interruptStream"]> | undefined;
+    try {
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          terminateAllDescendantAgentTasks: async () => {
+            entered.resolve();
+            await release.promise;
+            return [];
+          },
+        })
+      );
+      stopping = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+      await entered.promise;
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(0);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+      const launched = once(h.launched, "start");
+      release.resolve();
+      expect(await stopping).toEqual(Ok(undefined));
+      await launched;
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+    } finally {
+      release.resolve();
+      await stopping;
+      await h.finish();
+    }
+  });
 
-  test("hard Stop retires old attention and defers fresh attention until manual replacement", async () => {
+  test("outer Stop preserves physical completion through exact cleanup retry", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      spyOn(h.historyService, "neutralizeCompactionRecoveryUnderHistoryLock").mockRejectedValueOnce(
+        new Error("cleanup unavailable")
+      );
+      expect(await h.service.interruptStream(h.workspaceId)).toEqual(Err(STOP_UNRECORDED_MESSAGE));
+      const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+      const cancellation = (
+        h.session as unknown as { compactionCancellation: CompactionCancellation }
+      ).compactionCancellation;
+      // Downgrade cleanup fails before publication; the local Stop still owns its exact retry.
+      expect(await storage.read()).toBeNull();
+      const failed = await cancellation.read();
+      expect(failed).toMatchObject({ version: 1 });
+      expect(cancellation.needsPersistence).toBe(true);
+      expect(await cancellation.retry()).toBe("applied");
+      expect(await storage.read()).toMatchObject({ version: 2, nonce: failed?.nonce });
+      expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("failed descendant Stop cleanup stays V1 across restart", async () => {
+    const h = await createActiveWakeHarness();
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        terminateAllDescendantAgentTasks: () => Promise.reject(new Error("descendant unavailable")),
+      })
+    );
+    const foreign = await createAgentSessionHarness({
+      workspaceId: h.workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    try {
+      // Preserve the existing API result; swallowed cleanup errors confer no settlement proof.
+      expect(await h.service.interruptStream(h.workspaceId)).toEqual(Ok(undefined));
+      expect(
+        await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+      ).toMatchObject({ version: 1 });
+      expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+    } finally {
+      await foreign.session.dispose();
+      await foreign.cleanup();
+      await h.finish();
+    }
+  });
+
+  test.each(
+    (["retirement", "descendants"] as const).flatMap((phase) =>
+      [false, true].map((superseded) => ({ phase, superseded }))
+    )
+  )(
+    "hard Stop remains V1 until outer $phase finishes across instances (superseded=$superseded)",
+    async ({ phase, superseded }) => {
+      const h = await createActiveWakeHarness();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      if (phase === "retirement") {
+        const consume = h.reconciler.consumeCurrent.bind(h.reconciler);
+        spyOn(h.reconciler, "consumeCurrent").mockImplementationOnce(async (...args) => {
+          const result = await consume(...args);
+          entered.resolve();
+          await release.promise;
+          return result;
+        });
+      } else {
+        h.service.setAgentTaskIntegration(
+          makeAgentTaskIntegrationFake({
+            terminateAllDescendantAgentTasks: async () => {
+              entered.resolve();
+              await release.promise;
+              return [];
+            },
+          })
+        );
+      }
+      const foreign = await createAgentSessionHarness({
+        workspaceId: h.workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      let stopping: Promise<unknown> | undefined;
+      try {
+        stopping = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+        await entered.promise;
+        expect(
+          await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+        ).toMatchObject({ version: 1, scope: { kind: "unresolved" } });
+        expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+        expect(
+          (
+            await foreign.session.sendMessage(
+              "too early",
+              { model: h.model, agentId: "exec" },
+              { acceptanceOrigin: "automatic" }
+            )
+          ).success
+        ).toBe(false);
+        if (superseded) expect(await foreign.session.cancelCompaction()).toEqual(Ok(undefined));
+        const successor = superseded
+          ? await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+          : null;
+        release.resolve();
+        expect(await stopping).toEqual(Ok(undefined));
+        const completed = await h.historyService
+          .getCompactionCancellationStorage(h.workspaceId)
+          .read();
+        if (superseded) expect(completed).toEqual(successor);
+        else expect(completed).toMatchObject({ version: 2 });
+        expect(
+          (
+            await foreign.session.sendMessage(
+              "fresh after cleanup",
+              { model: h.model, agentId: "exec" },
+              { acceptanceOrigin: "automatic" }
+            )
+          ).success
+        ).toBe(!superseded);
+      } finally {
+        release.resolve();
+        await stopping;
+        await foreign.session.dispose();
+        await foreign.cleanup();
+        await h.finish();
+      }
+    }
+  );
+
+  test("hard Stop retires owed attention without disarming future idle wakes", async () => {
     const h = await createActiveWakeHarness();
     try {
       await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
@@ -806,43 +951,50 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.requests).toHaveLength(1);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
       await h.addAttention(20);
-      await expectMonitorDeferredUntilManual(h, 1);
+      expect(h.requests).toHaveLength(2);
     } finally {
       await h.finish();
     }
   });
 
-  test("retained Stop leaves fresh monitor attention owed without spinning and manual replacement re-arms it", async () => {
-    const h = await createActiveWakeHarness();
-    const internal = h.internal as typeof h.internal & {
-      scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId: string): void;
-    };
-    // Suppress a broken immediate retry so the refusal is a bounded assertion, not a timeout.
-    const idleRetry = spyOn(
-      internal,
-      "scheduleBashMonitorWakeReconcileAfterIdle"
-    ).mockImplementation(() => undefined);
-    try {
-      await h.session.cancelCompaction(true);
-      const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
-      const stop = await storage.read();
-      await h.addAttention(20);
-      expect(idleRetry).not.toHaveBeenCalled();
-      expect(h.requests).toHaveLength(0);
-      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
-      expect((await storage.read())?.nonce).toBe(stop?.nonce);
-      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
-      expect(history).toEqual(Ok([]));
-      idleRetry.mockRestore();
-      await h.session.sendMessage("manual replacement", { model: h.model, agentId: "exec" });
-      await h.complete();
-      await h.reconciler.reconcile(h.workspaceId);
-      expect(h.requests).toHaveLength(2);
-      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
-    } finally {
-      await h.finish();
+  test.each(["retained", "generation mismatch"] as const)(
+    "%s Stop leaves fresh monitor attention owed without spinning and manual replacement re-arms it",
+    async (kind) => {
+      const h = await createActiveWakeHarness();
+      const internal = h.internal as typeof h.internal & {
+        scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId: string): void;
+      };
+      // Suppress a broken immediate retry so the refusal is a bounded assertion, not a timeout.
+      const idleRetry = spyOn(
+        internal,
+        "scheduleBashMonitorWakeReconcileAfterIdle"
+      ).mockImplementation(() => undefined);
+      try {
+        if (kind === "retained") await h.session.cancelCompaction(true);
+        else {
+          expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+          await h.historyService.getContinuousCompactionJournal(h.workspaceId).advanceGeneration();
+        }
+        const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+        const stop = await storage.read();
+        await h.addAttention(20);
+        expect(idleRetry).not.toHaveBeenCalled();
+        expect(h.requests).toHaveLength(0);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+        expect((await storage.read())?.nonce).toBe(stop?.nonce);
+        const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+        expect(history).toEqual(Ok([]));
+        idleRetry.mockRestore();
+        await h.session.sendMessage("manual replacement", { model: h.model, agentId: "exec" });
+        await h.complete();
+        await h.reconciler.reconcile(h.workspaceId);
+        expect(h.requests).toHaveLength(2);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      } finally {
+        await h.finish();
+      }
     }
-  });
+  );
 
   test("a cancellation write failure still completes successful hard-Stop cleanup", async () => {
     const h = await createActiveWakeHarness();
@@ -969,14 +1121,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // The stop's idle reconcile retried the retirement instead of re-dispatching the output.
       expect(h.requests).toHaveLength(1);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      const woke = new Promise<void>((resolve) => h.launched.once("start", resolve));
       await h.addAttention(20);
-      await expectMonitorDeferredUntilManual(h, 1);
+      await woke;
+      expect(h.requests).toHaveLength(2);
     } finally {
       await h.finish();
     }
   });
 
-  test("a failed hard Stop keeps owed attention until manual replacement", async () => {
+  test("a failed hard Stop keeps owed attention for the idle wake", async () => {
     const h = await createActiveWakeHarness();
     try {
       await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
@@ -987,16 +1141,162 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           .success
       ).toBe(false);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+      const woke = new Promise<void>((resolve) => h.launched.once("start", resolve));
       await h.complete();
+      await woke;
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
       await h.reconciler.reconcile(h.workspaceId);
-      await expectMonitorDeferredUntilManual(h, 1);
+      expect(h.requests).toHaveLength(2);
     } finally {
       await h.finish();
     }
   });
 
-  test("an interrupt without retireBashMonitorAttention preserves owed attention until manual replacement", async () => {
+  test.each([
+    "success",
+    "failure",
+    "partial failure",
+    "superseded",
+    "local supersession",
+    "closing",
+  ] as const)(
+    "failed physical Stop waits for its outer cleanup before natural completion qualifies (%s)",
+    async (outcome) => {
+      const h = await createActiveWakeHarness();
+      const release = Promise.withResolvers<void>();
+      const terminate = mock(async () => {
+        await release.promise;
+        if (outcome === "failure") throw new Error("descendant cleanup failed");
+        return [];
+      });
+      if (outcome === "partial failure") {
+        spyOn(h.historyService, "deletePartial").mockImplementationOnce(async () => {
+          await release.promise;
+          throw new Error("partial cleanup failed");
+        });
+      }
+      const releaseLatch = mock(() => undefined);
+      const restoreQueue = spyOn(h.session, "restoreQueueToInput");
+      h.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          terminateAllDescendantAgentTasks: terminate,
+          latchHardInterruptCascade: () => releaseLatch,
+        })
+      );
+      const foreign = await createAgentSessionHarness({
+        workspaceId: h.workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      try {
+        await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+        await h.addAttention(10);
+        h.stopStream.mockResolvedValueOnce(Err("stop failed"));
+        // The original physical error returns while descendant cleanup is still held.
+        expect(
+          await h.service.interruptStream(h.workspaceId, {
+            retireBashMonitorAttention: true,
+            abandonPartial: outcome === "partial failure",
+          })
+        ).toEqual(Err("stop failed"));
+        expect(terminate).toHaveBeenCalledTimes(outcome === "partial failure" ? 0 : 1);
+        expect(releaseLatch).not.toHaveBeenCalled();
+        expect(restoreQueue).not.toHaveBeenCalled();
+        const cleanup = [
+          ...(h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+            .pendingWorkspaceCleanup,
+        ];
+        expect(cleanup).toHaveLength(1);
+        await h.complete();
+        const storage = h.historyService.getCompactionCancellationStorage(h.workspaceId);
+        const stopped = await storage.read();
+        expect(stopped).toMatchObject({ version: 1 });
+        expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+        expect(h.requests).toHaveLength(1);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+        if (outcome === "superseded") {
+          expect(await foreign.session.cancelCompaction()).toEqual(Ok(undefined));
+        }
+        if (outcome === "local supersession") {
+          expect(await h.session.cancelCompaction()).toEqual(Ok(undefined));
+        }
+        if (outcome === "closing") h.session.beginShutdown();
+        const successor = await storage.read();
+        const woke = outcome === "success" ? once(h.launched, "start") : undefined;
+        release.resolve();
+        await Promise.all(cleanup);
+        expect(releaseLatch).toHaveBeenCalledTimes(1);
+        expect(restoreQueue).toHaveBeenCalledTimes(
+          outcome === "partial failure" || outcome === "local supersession" || outcome === "closing"
+            ? 0
+            : 1
+        );
+        if (woke) {
+          await woke;
+          expect(h.requests).toHaveLength(2);
+          expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+        } else {
+          expect(await storage.read()).toEqual(
+            outcome === "superseded" || outcome === "local supersession" ? successor : stopped
+          );
+          expect(await foreign.session.isAutomaticSendBlocked()).toBe(true);
+          expect(h.requests).toHaveLength(1);
+        }
+      } finally {
+        release.resolve();
+        await foreign.session.dispose();
+        await foreign.cleanup();
+        await h.finish();
+      }
+    }
+  );
+
+  test("failed Stop monitor retirement debt does not hold workspace cleanup during shutdown", async () => {
+    const h = await createActiveWakeHarness();
+    const release = Promise.withResolvers<void>();
+    const releaseLatch = mock(() => undefined);
+    h.service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        latchHardInterruptCascade: () => releaseLatch,
+        terminateAllDescendantAgentTasks: async () => {
+          await release.promise;
+          return [];
+        },
+      })
+    );
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      // A persistence failure has no retirement receipt. Only the finalizer may await its retry.
+      spyOn(h.reconciler, "consumeCurrent").mockRejectedValueOnce(new Error("retirement failed"));
+      h.stopStream.mockResolvedValueOnce(Err("stop failed"));
+      expect(
+        await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true })
+      ).toEqual(Err("stop failed"));
+      const cleanup = [
+        ...(h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+          .pendingWorkspaceCleanup,
+      ];
+      expect(cleanup).toHaveLength(1);
+      release.resolve();
+      await h.complete();
+      h.service.beginShutdown();
+      await h.session.finishShutdown();
+      await Promise.all(cleanup);
+      expect(releaseLatch).toHaveBeenCalledTimes(1);
+      expect(
+        (h.service as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> })
+          .pendingWorkspaceCleanup.size
+      ).toBe(0);
+      expect(
+        await h.historyService.getCompactionCancellationStorage(h.workspaceId).read()
+      ).toMatchObject({ version: 1 });
+    } finally {
+      release.resolve();
+      await h.finish();
+    }
+  });
+
+  test("an interrupt without retireBashMonitorAttention keeps owed attention for the idle wake", async () => {
     const h = await createActiveWakeHarness();
     try {
       await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
@@ -1010,7 +1310,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
       await h.reconciler.reconcile(h.workspaceId);
-      await expectMonitorDeferredUntilManual(h, 1);
+      expect(h.requests).toHaveLength(2);
     } finally {
       await h.finish();
     }
@@ -1058,7 +1358,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.session.isBusy()).toBe(false);
       expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
       await h.addAttention(20);
-      await expectMonitorDeferredUntilManual(h, 0);
+      expect(h.requests).toHaveLength(1);
     } finally {
       await h.finish();
     }
@@ -1238,8 +1538,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       release.resolve();
       expect((await stop).success).toBe(true);
       await Promise.all([attention, later]);
-      // Only the frontier the Stop saw was retired; the newer output remains owed.
-      await expectMonitorDeferredUntilManual(h, 0);
+      // Only the frontier the Stop saw was retired; the newer output woke the idle agent.
+      expect(h.requests).toHaveLength(1);
     } finally {
       release.resolve();
       await h.finish();
@@ -7649,6 +7949,110 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       } finally {
         release.resolve();
         await dispatch;
+        await workspaceService.disposeSession(workspaceId);
+        await foreign.session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each(["pricing", "queue"] as const)(
+    "automatic family work admitted before a foreign Stop stays fenced through %s",
+    async (stage) => {
+      const { config, historyService, workspaceService, goalService, cleanup } =
+        await createServices();
+      const workspaceId = `foreign-family-${stage}`;
+      await config.addWorkspace("/tmp/foreign-family-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "foreign-family-project",
+        projectPath: "/tmp/foreign-family-project",
+        runtimeConfig: { type: "local" },
+      });
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService,
+        workspaceGoalService: goalService,
+      });
+      const foreign = await createAgentSessionHarness({
+        workspaceId,
+        config,
+        historyService: new HistoryService(config),
+      });
+      workspaceService.registerSession(workspaceId, h.session);
+      const streamStarted = Promise.withResolvers<void>();
+      const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+        streamStarted.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("prior", "user", "old request")
+      );
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const failed = Promise.withResolvers<void>();
+      const price = goalService.assertPricedModelForBudgetedGoal.bind(goalService);
+      const busy = stage === "queue" ? spyOn(h.session, "isBusy").mockReturnValue(true) : undefined;
+      if (stage === "pricing")
+        spyOn(goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+          async (...args) => {
+            entered.resolve();
+            await release.promise;
+            return price(...args);
+          }
+        );
+      const options = { model: "openai:gpt-4o", agentId: "exec" };
+      const dispatched = workspaceService.sendMessage(workspaceId, "stale child trigger", options, {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [
+          createMuxMessage("child-payload", "assistant", "stale child payload", {
+            synthetic: true,
+          }),
+        ],
+        onAcceptedPreStreamFailure: () => {
+          failed.resolve();
+        },
+      });
+      try {
+        if (stage === "pricing") await entered.promise;
+        else {
+          expect(await dispatched).toEqual(Ok(undefined));
+          expect(h.session.hasQueuedMessages()).toBe(true);
+        }
+        expect(await foreign.session.interruptStream()).toEqual(Ok(undefined));
+        const stopped = await historyService.getCompactionCancellationStorage(workspaceId).read();
+        expect(stopped?.version).toBe(2);
+        release.resolve();
+        busy?.mockRestore();
+        if (stage === "queue") {
+          h.session.drainQueuedMessagesIfIdle();
+          await Promise.race([failed.promise, streamStarted.promise]);
+          expect(stream).not.toHaveBeenCalled();
+          await h.session.waitForIdle();
+        } else expect((await dispatched).success).toBe(false);
+        const rows = await historyService.getLastMessages(workspaceId, 10);
+        expect(rows.success && rows.data.map((row) => row.id)).toEqual(["prior"]);
+        expect(stream).not.toHaveBeenCalled();
+        expect(await historyService.getCompactionCancellationStorage(workspaceId).read()).toEqual(
+          stopped
+        );
+        // The fence belongs to the old admission, not to the automatic origin itself.
+        expect(
+          await workspaceService.sendMessage(workspaceId, "fresh child trigger", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            agentInitiated: true,
+          })
+        ).toEqual(Ok(undefined));
+        expect(stream).toHaveBeenCalledTimes(1);
+      } finally {
+        release.resolve();
+        busy?.mockRestore();
+        await dispatched;
         await workspaceService.disposeSession(workspaceId);
         await foreign.session.dispose();
         await cleanup();

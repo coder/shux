@@ -27,6 +27,8 @@ import type { ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
+import { HistoryService } from "./historyService";
+import { CompactionCancellation } from "./compactionCancellation";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -37,6 +39,7 @@ const sendOptions: SendMessageOptions = {
 };
 
 interface SessionInternals {
+  interruptForCompaction(): Promise<void>;
   coordinator: TurnCoordinator;
   runContinuousCompactionObservation<T>(
     observe: (token: CompactionToken) => Promise<T>
@@ -1061,6 +1064,38 @@ describe("AgentSession continuous compaction wiring", () => {
         expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
           text: "Continue",
         });
+      mock.restore();
+    }
+  );
+
+  test.each(["legacy", "continuous resume", "continuous compact"] as const)(
+    "%s cannot adopt a foreign settled Stop while stopping its source stream",
+    async (route) => {
+      const h = await setup(route === "continuous resume" ? 72 : 76);
+      const state = internals(h.session);
+      spyOn(state.continuousCompactor, "observe").mockResolvedValue("none");
+      const starts = mockAbortableStream(h);
+      expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+      const before = await rows(h);
+      const foreignHistory = new HistoryService(h.config);
+      const storage = foreignHistory.getCompactionCancellationStorage(workspaceId);
+      const foreign = new CompactionCancellation(storage);
+      assert(h.aiService.stopStream != null, "Expected the installed abortable stream");
+      const stopStream = h.aiService.stopStream.bind(h.aiService);
+      let stopped: Awaited<ReturnType<typeof storage.read>> | undefined;
+      spyOn(h.aiService, "stopStream").mockImplementationOnce(async (...args) => {
+        const result = await stopStream(...args);
+        await foreign.cancel({ settled: Promise.resolve(true) });
+        stopped = await storage.read();
+        return result;
+      });
+      if (route === "legacy") await state.interruptForCompaction();
+      else expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      assert(stopped, "Expected the foreign Stop to settle before continuation");
+      expect(stopped.version).toBe(2);
+      expect(await storage.read()).toEqual(stopped);
+      expect(starts).toHaveBeenCalledTimes(1);
+      expect(await rows(h)).toEqual(before);
       mock.restore();
     }
   );

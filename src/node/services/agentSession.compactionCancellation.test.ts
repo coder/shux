@@ -9,6 +9,7 @@ import nodeAssert from "node:assert/strict";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import type { FileChangeTracker } from "./utils/fileChangeTracker";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { TurnCompletion } from "./streamManager";
@@ -18,14 +19,11 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { HistoryService } from "./historyService";
 import {
   FileCompactionCancellationStorage,
+  type CompactionReplacementCapture,
   CompactionCancellation,
   CompactionCancellationReadRefusedError,
 } from "./compactionCancellation";
-import {
-  createAgentSessionHarness,
-  createStartedTurnHandle,
-  type AgentSessionHarness,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "cancellation-runtime";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -73,6 +71,53 @@ afterEach(async () => {
 });
 
 describe("compaction cancellation runtime", () => {
+  test("an unsupported scoped V2 cannot authorize legacy compaction", async () => {
+    const h = await fixture();
+    await h.session.cancelCompaction();
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("canceled-summary", "assistant", "summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "old continuation", model: options.model, agentId: "exec" },
+        },
+      })
+    );
+    expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+    const stopped = await h.storage.read();
+    expect(stopped?.scope.kind).toBe("summary");
+    const captured = await h.historyService.captureCompactionReplacement(workspaceId);
+    assert(captured.success);
+    const unsupported = JSON.stringify({
+      ...stopped,
+      version: 2,
+      settledGeneration: captured.data.generation,
+    });
+    await fileIO.writeFile(h.storage.path, unsupported);
+    const before = await h.rows();
+    spyOn(h.state.compactionMonitor, "getThreshold").mockReturnValue(0.7);
+    spyOn(h.state.compactionMonitor, "checkBeforeSend").mockReturnValue({
+      shouldShowWarning: true,
+      shouldForceCompact: true,
+      usagePercentage: 95,
+      contextTokens: 95_000,
+      maxTokens: 100_000,
+      thresholdPercentage: 70,
+    });
+    expect(
+      (
+        await h.session.sendMessage("fresh automatic input", options, {
+          acceptanceOrigin: "automatic",
+        })
+      ).success
+    ).toBe(false);
+    expect(await h.rows()).toEqual(before);
+    expect(await fileIO.readFile(h.storage.path, "utf8")).toBe(unsupported);
+    expect(h.stream).not.toHaveBeenCalled();
+  });
+
   test.each([95, 10])(
     "automatic input preserves scoped Stop cleanup debt at %s percent usage",
     async (usagePercentage) => {
@@ -301,6 +346,54 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
+  test.each(["absent", "V1"] as const)(
+    "heartbeat reset keeps its original admission across foreign settlement (%s)",
+    async (origin) => {
+      const h = await fixture();
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("before-reset", "user", "keep context")
+      );
+      const peer = new CompactionCancellation(
+        new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
+      );
+      const published = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<boolean>();
+      const stopping =
+        origin === "V1"
+          ? peer.cancel({ settled: finish.promise, onCaptured: () => published.resolve() })
+          : undefined;
+      if (stopping) await published.promise;
+      const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await capture(...args);
+          assert(result.success);
+          expect(result.data.cancellationVersion).toBe(origin === "V1" ? 1 : undefined);
+          if (stopping) {
+            finish.resolve(true);
+            await stopping;
+          } else await peer.cancel({ settled: Promise.resolve(true) });
+          const current = await new HistoryService(h.config).captureCompactionReplacement(
+            workspaceId
+          );
+          assert(current.success);
+          expect(current.data.cancellationVersion).toBe(2);
+          expect(current.data.generation === result.data.generation).toBe(origin === "V1");
+          return result;
+        }
+      );
+      const result = await h.session.appendHeartbeatContextResetBoundary({
+        boundaryText: "stale reset",
+        pendingFollowUp: { text: "stale heartbeat", ...options },
+      });
+      expect(result.success).toBe(false);
+      expect((await h.rows()).map((row) => row.id)).toEqual(["before-reset"]);
+      expect((await h.storage.read())?.version).toBe(2);
+      expect(h.stream).not.toHaveBeenCalled();
+    }
+  );
+
   test.each([false, true])(
     "reset preserves scoped cancellation debt until recovery (restart=%s)",
     async (restart) => {
@@ -345,11 +438,433 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
-  test("unresolved Stop refuses fresh automatic input across restart until manual replacement", async () => {
+  test.each(
+    [false, true].flatMap((restart) =>
+      (["present", "missing", "write failure"] as const).map((sidecar) => ({ restart, sidecar }))
+    )
+  )(
+    "fresh reset after settled Stop preserves its follow-up ($restart, $sidecar)",
+    async ({ restart, sidecar }) => {
+      const h = await fixture();
+      expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+      const pendingPath = path.join(h.config.sessionsDir, workspaceId, "post-compaction.json");
+      if (sidecar === "write failure") {
+        await fileIO.mkdir(pendingPath);
+        await fileIO.writeFile(path.join(pendingPath, "unrelated"), "preserve");
+      }
+      const reset = await h.session.appendHeartbeatContextResetBoundary({
+        boundaryText: "fresh reset",
+        pendingFollowUp: { text: "fresh heartbeat", model: options.model, agentId: "exec" },
+      });
+      expect(reset.success).toBe(true);
+      assert(reset.success);
+      if (sidecar === "missing") await fileIO.rm(pendingPath, { force: true });
+      let session = h.session;
+      if (restart) {
+        await session.dispose();
+        const fresh = await createAgentSessionHarness({
+          workspaceId,
+          config: h.config,
+          historyService: new HistoryService(h.config),
+        });
+        fixtures.push(fresh);
+        session = fresh.session;
+      }
+      expect(
+        await session.dispatchPendingCompactionFollowUpIfNeeded(reset.data.summaryMessageId)
+      ).toBe(true);
+      expect(
+        (await h.rows()).some(
+          (row) =>
+            row.role === "user" &&
+            row.parts.some((part) => part.type === "text" && part.text === "fresh heartbeat")
+        )
+      ).toBe(true);
+    }
+  );
+
+  test("fresh heartbeat recovery preserves durable work when frontier capture fails transiently", async () => {
+    const h = await fixture();
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const reset = await h.session.appendHeartbeatContextResetBoundary({
+      boundaryText: "fresh reset",
+      pendingFollowUp: { text: "retry this heartbeat", model: options.model, agentId: "exec" },
+    });
+    assert(reset.success);
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    const generationPath = path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE);
+    const durablePaths = [
+      path.join(sessionDir, "chat.jsonl"),
+      path.join(sessionDir, "post-compaction.json"),
+      h.storage.path,
+      generationPath,
+    ];
+    const before = await Promise.all(durablePaths.map((file) => fileIO.readFile(file)));
+    const stopped = await h.storage.read();
+    expect(stopped?.version).toBe(2);
+    let failed = false;
+    const readFile = fs.promises.readFile;
+    const read = spyOn(fs.promises, "readFile").mockImplementation(
+      new Proxy(readFile, {
+        apply(target, receiver, args) {
+          if (!failed && args[0] === generationPath) {
+            failed = true;
+            return Promise.reject(
+              Object.assign(new Error("transient capture read"), { code: "EACCES" })
+            );
+          }
+          return Reflect.apply(target, receiver, args) as ReturnType<typeof readFile>;
+        },
+      })
+    );
+    try {
+      const failure = await h.session
+        .dispatchPendingCompactionFollowUpIfNeeded(reset.data.summaryMessageId)
+        .catch((error: unknown) => error);
+      nodeAssert(failure instanceof Error);
+      expect(failure.message).toContain("transient capture read");
+      expect(failed).toBe(true);
+      expect(await h.storage.read()).toEqual(stopped);
+      expect(await Promise.all(durablePaths.map((file) => fileIO.readFile(file)))).toEqual(before);
+      expect(h.stream).not.toHaveBeenCalled();
+    } finally {
+      read.mockRestore();
+    }
+    expect(
+      await h.session.dispatchPendingCompactionFollowUpIfNeeded(reset.data.summaryMessageId)
+    ).toBe(true);
+    expect(h.stream).toHaveBeenCalledTimes(1);
+    expect(
+      (await h.rows()).filter(
+        (row) =>
+          row.role === "user" &&
+          row.parts.some((part) => part.type === "text" && part.text === "retry this heartbeat")
+      )
+    ).toHaveLength(1);
+  });
+
+  test.each([
+    "missing generation",
+    "old generation",
+    "local Stop",
+    "foreign Stop",
+    "late foreign Stop",
+    "publication failure",
+  ] as const)("fresh reset recovery refuses stale authority (%s)", async (change) => {
+    const h = await fixture();
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const reset = await h.session.appendHeartbeatContextResetBoundary({
+      boundaryText: "fresh reset",
+      pendingFollowUp: { text: "fresh heartbeat", model: options.model, agentId: "exec" },
+    });
+    assert(reset.success);
+    const summary = (await h.rows())[0];
+    const publicationId = summary.metadata?.compactionPublicationId;
+    assert(summary.metadata);
+    if (change === "missing generation" || change === "old generation") {
+      delete summary.metadata.compactionPublicationId;
+      summary.metadata.compactionPublicationGeneration =
+        change === "old generation" ? "old" : undefined;
+      expect(await h.historyService.updateHistory(workspaceId, summary)).toEqual(Ok(undefined));
+      expect((await h.rows())[0].metadata?.compactionPublicationId).toBe(publicationId);
+      await h.session.dispose();
+    } else if (change === "local Stop") await h.session.cancelCompaction();
+    else if (change === "foreign Stop") await new CompactionCancellation(h.storage).cancel();
+    let session = h.session;
+    if (change === "missing generation" || change === "old generation") {
+      const fresh = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      fixtures.push(fresh);
+      session = fresh.session;
+    }
+    if (change === "late foreign Stop") {
+      const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          await new CompactionCancellation(h.storage).cancel();
+          return accept(...args);
+        }
+      );
+    } else if (change === "publication failure") {
+      spyOn(h.historyService, "acceptCompactionReplacement").mockResolvedValueOnce(
+        Err("disk unavailable")
+      );
+    }
+    const dispatch = session.dispatchPendingCompactionFollowUpIfNeeded(reset.data.summaryMessageId);
+    if (change === "late foreign Stop" || change === "publication failure")
+      await nodeAssert.rejects(dispatch);
+    else expect(await dispatch).toBe(false);
+    expect((await h.rows()).some((row) => row.role === "user")).toBe(false);
+    expect(h.stream).not.toHaveBeenCalled();
+  });
+
+  test("abandoned outer Stop completion remains V1 and disposal does not join itself", async () => {
+    const h = await fixture();
+    let finalize: ((success: boolean | Promise<boolean>) => Promise<unknown>) | undefined;
+    expect(
+      await h.session.interruptStream({
+        deferCompactionSettlement: (complete) => {
+          finalize = complete;
+        },
+      })
+    ).toEqual(Ok(undefined));
+    expect(await h.storage.read()).toMatchObject({ version: 1 });
+    await h.session.dispose();
+    expect(await finalize?.(true)).toEqual(Ok(undefined));
+    expect(await h.storage.read()).toMatchObject({ version: 1 });
+  });
+
+  test.each(
+    (["complete", "supersede", "dispose"] as const).flatMap((finish) =>
+      [false, true].map((physicalSuccess) => ({ finish, physicalSuccess }))
+    )
+  )(
+    "Stop supervises captured startup until $finish (physicalSuccess=$physicalSuccess)",
+    async ({ finish, physicalSuccess }) => {
+      const h = await fixture();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const qualified = Promise.withResolvers<void>();
+      const notify = mock(() => qualified.resolve());
+      h.stream.mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        return Err({ type: "unknown", raw: "startup failed" });
+      });
+      const sending = h.session.sendMessage("held startup", options);
+      try {
+        await entered.promise;
+        spyOn(h.aiService, "stopStream").mockResolvedValueOnce(
+          physicalSuccess ? Ok(undefined) : Err("stop failed")
+        );
+        expect(await h.session.interruptStream({ onCompactionSettled: notify })).toEqual(
+          physicalSuccess ? Ok(undefined) : Err("stop failed")
+        );
+        expect(await h.storage.read()).toMatchObject({ version: 1 });
+        expect(await h.session.isAutomaticSendBlocked()).toBe(true);
+        let disposing: Promise<void> | undefined;
+        if (finish === "supersede")
+          expect(await h.session.cancelCompaction(true)).toEqual(Ok(undefined));
+        if (finish === "dispose") disposing = h.session.dispose();
+        release.resolve();
+        await sending;
+        if (finish === "complete") {
+          await qualified.promise;
+          expect(await h.storage.read()).toMatchObject({ version: 2 });
+          expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+        } else {
+          await disposing;
+          expect(notify).not.toHaveBeenCalled();
+          expect(await h.storage.read()).toMatchObject({ version: 1 });
+        }
+      } finally {
+        release.resolve();
+        await sending;
+      }
+    }
+  );
+
+  test.each(["foreign Stop", "generation"] as const)(
+    "a superseded deferred Stop cannot notify (%s)",
+    async (superseded) => {
+      const h = await fixture();
+      const notify = mock(() => undefined);
+      let finalize: ((complete: boolean | Promise<boolean>) => Promise<unknown>) | undefined;
+      expect(
+        await h.session.interruptStream({
+          onCompactionSettled: notify,
+          deferCompactionSettlement: (complete) => {
+            finalize = complete;
+          },
+        })
+      ).toEqual(Ok(undefined));
+      if (superseded === "foreign Stop") await new CompactionCancellation(h.storage).cancel();
+      else await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      const successor = await h.storage.read();
+      const finished = Promise.withResolvers<void>();
+      const enter = h.state.coordinator.enterExecution.bind(h.state.coordinator);
+      spyOn(h.state.coordinator, "enterExecution").mockImplementationOnce(() => {
+        const lease = enter();
+        return {
+          [Symbol.dispose]: () => {
+            lease[Symbol.dispose]();
+            finished.resolve();
+          },
+        };
+      });
+      await finalize?.(Promise.resolve(true));
+      await finished.promise;
+      expect(notify).not.toHaveBeenCalled();
+      expect(await h.storage.read()).toEqual(successor);
+    }
+  );
+
+  test.each(["foreign Stop", "generation"] as const)(
+    "a committed Stop cannot notify after persisted ownership changes (%s)",
+    async (superseded) => {
+      const h = await fixture();
+      const notify = mock(() => undefined);
+      const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          expect(await h.storage.read()).toMatchObject({ version: 2 });
+          if (superseded === "foreign Stop") await new CompactionCancellation(h.storage).cancel();
+          else
+            await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+          return capture(...args);
+        }
+      );
+      expect(await h.session.interruptStream({ onCompactionSettled: notify })).toEqual(
+        Ok(undefined)
+      );
+      expect(notify).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([false, true])(
+    "failed V2 durability cannot notify (after receipt=%s)",
+    async (afterReceipt) => {
+      const h = await fixture();
+      const notify = mock(() => undefined);
+      const lock = h.historyService.withCompactionStorageLock.bind(h.historyService);
+      let calls = 0;
+      spyOn(h.historyService, "withCompactionStorageLock").mockImplementation(async (...args) => {
+        if (++calls !== 2) return lock(...args);
+        if (afterReceipt) await lock(...args);
+        throw new Error("settlement durability unavailable");
+      });
+      expect(await h.session.interruptStream({ onCompactionSettled: notify })).toMatchObject({
+        success: false,
+        streamStopped: true,
+      });
+      expect(await h.storage.read()).toMatchObject({ version: afterReceipt ? 2 : 1 });
+      expect(notify).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([false, true])(
+    "throwing settlement observer preserves Stop and releases ownership (deferred=%s)",
+    async (deferred) => {
+      const h = await fixture();
+      const notify = mock(() => {
+        throw new Error("observer unavailable");
+      });
+      let finalize: ((complete: boolean | Promise<boolean>) => Promise<unknown>) | undefined;
+      expect(
+        await h.session.interruptStream({
+          onCompactionSettled: notify,
+          deferCompactionSettlement: deferred
+            ? (complete) => {
+                finalize = complete;
+              }
+            : undefined,
+        })
+      ).toEqual(Ok(undefined));
+      if (deferred) {
+        const finished = Promise.withResolvers<void>();
+        const enter = h.state.coordinator.enterExecution.bind(h.state.coordinator);
+        spyOn(h.state.coordinator, "enterExecution").mockImplementationOnce(() => {
+          const lease = enter();
+          return {
+            [Symbol.dispose]: () => {
+              lease[Symbol.dispose]();
+              finished.resolve();
+            },
+          };
+        });
+        expect(await finalize?.(Promise.resolve(true))).toEqual(Ok(undefined));
+        await finished.promise;
+      }
+      expect(notify).toHaveBeenCalledTimes(1);
+      expect(await h.storage.read()).toMatchObject({ version: 2 });
+      await h.session.dispose();
+    }
+  );
+
+  test("automatic input captured during V1 cleanup cannot adopt its later V2 settlement", async () => {
+    const h = await fixture();
+    const foreignHistory = new HistoryService(h.config);
+    const foreign = new CompactionCancellation(
+      foreignHistory.getCompactionCancellationStorage(workspaceId)
+    );
+    const published = Promise.withResolvers<void>();
+    const settlement = Promise.withResolvers<boolean>();
+    const capturedReceipts: CompactionReplacementCapture[] = [];
+    const settledReceipts: CompactionReplacementCapture[] = [];
+    const stopping = foreign.cancel({
+      settled: settlement.promise,
+      onCaptured: (capture) => {
+        capturedReceipts.push(capture);
+        published.resolve();
+      },
+      onSettled: (capture) => settledReceipts.push(capture),
+    });
+    await published.promise;
+    const initial = await h.storage.read();
+    assert(initial?.version === 1);
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let capturedGeneration: string | undefined;
+    const capture = h.historyService.captureCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "captureCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await capture(...args);
+        assert(result.success);
+        expect(result.data.nonce).toBe(initial.nonce);
+        capturedGeneration = result.data.generation;
+        entered.resolve();
+        await resume.promise;
+        return result;
+      }
+    );
+    const accepted = mock(() => undefined);
+    const send = h.session.sendMessage("input admitted during cleanup", options, {
+      acceptanceOrigin: "automatic",
+      onAccepted: accepted,
+    });
+    try {
+      await entered.promise;
+      settlement.resolve(true);
+      expect(await stopping).toBe("applied");
+      const settled = await h.storage.read();
+      assert(settled?.version === 2);
+      expect(settled.nonce).toBe(initial.nonce);
+      expect(settled.settledGeneration).toBe(capturedGeneration);
+      expect(capturedReceipts).toEqual([
+        { nonce: initial.nonce, generation: capturedGeneration, cancellationVersion: 1 },
+        { nonce: initial.nonce, generation: capturedGeneration, cancellationVersion: 2 },
+      ]);
+      expect(settledReceipts).toEqual([
+        { nonce: initial.nonce, generation: capturedGeneration, cancellationVersion: 2 },
+      ]);
+      resume.resolve();
+      expect((await send).success).toBe(false);
+      expect(await h.storage.read()).toEqual(settled);
+      expect(await h.rows()).toEqual([]);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(h.stream).not.toHaveBeenCalled();
+      expect(
+        await h.session.sendMessage("fresh input after settlement", options, {
+          acceptanceOrigin: "automatic",
+        })
+      ).toEqual(Ok(undefined));
+      expect((await h.rows()).at(-1)?.metadata?.compactionReplacementNonce).toBe(settled.nonce);
+      expect(await h.storage.read()).toBeNull();
+    } finally {
+      settlement.resolve(false);
+      resume.resolve();
+      await Promise.allSettled([send, stopping]);
+    }
+  });
+
+  test("settled Stop qualifies only durable fresh automatic input across restart", async () => {
     const h = await fixture();
     expect(await h.session.interruptStream()).toEqual(Ok(undefined));
     const stopped = await h.storage.read();
-    expect(stopped).toMatchObject({ version: 1, scope: { kind: "unresolved" } });
+    assert(stopped?.version === 2);
     await h.session.dispose();
     const fresh = await createAgentSessionHarness({
       workspaceId,
@@ -357,86 +872,397 @@ describe("compaction cancellation runtime", () => {
       historyService: new HistoryService(h.config),
     });
     fixtures.push(fresh);
-    const stream = spyOn(fresh.aiService, "streamMessage");
-    const accepted = mock(() => undefined);
+    expect(
+      await fresh.session.sendMessage("fresh automatic input", options, {
+        acceptanceOrigin: "automatic",
+      })
+    ).toEqual(Ok(undefined));
+    expect((await h.rows()).at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await h.storage.read()).toBeNull();
+  });
+
+  test.each(["invalid", "write failure", "canceled", "generation"] as const)(
+    "refused fresh automatic input preserves settled Stop (%s)",
+    async (failure) => {
+      const h = await fixture();
+      expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+      const stopped = await h.storage.read();
+      assert(stopped?.version === 2);
+      const cancel = new AbortController();
+      if (failure === "canceled") cancel.abort();
+      if (failure === "write failure")
+        spyOn(h.historyService, "acceptCompactionReplacement").mockResolvedValueOnce(
+          Err("write unavailable")
+        );
+      if (failure === "generation")
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+      const result = await h.session.sendMessage(
+        "refused automatic input",
+        failure === "invalid" ? { ...options, model: "invalid" } : options,
+        {
+          acceptanceOrigin: "automatic",
+          cancelSignal: cancel.signal,
+        }
+      );
+      if (failure !== "canceled") expect(result.success).toBe(false);
+      expect(await h.storage.read()).toEqual(stopped);
+      expect(await h.rows()).toEqual([]);
+      expect(await h.session.resumeStream(options, { acceptanceOrigin: "automatic" })).toEqual(
+        Ok({ started: false })
+      );
+      expect(h.stream).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([false, true])(
+    "automatic admission cannot replace a foreign Stop first observed after its gate (prior=%s)",
+    async (prior) => {
+      const h = await fixture();
+      if (prior) expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+      const foreignHistory = new HistoryService(h.config);
+      const foreign = new CompactionCancellation(
+        foreignHistory.getCompactionCancellationStorage(workspaceId)
+      );
+      const gate = h.session.isAutomaticSendBlocked.bind(h.session);
+      spyOn(h.session, "isAutomaticSendBlocked").mockImplementationOnce(async () => {
+        const blocked = await gate();
+        expect(blocked).toBe(false);
+        await foreign.cancel({ settled: Promise.resolve(true) });
+        return blocked;
+      });
+      const accepted = mock(() => undefined);
+      const result = await h.session.sendMessage("already admitted automatic input", options, {
+        acceptanceOrigin: "automatic",
+        onAccepted: accepted,
+      });
+      expect(result.success).toBe(false);
+      expect(await h.storage.read()).toMatchObject({ version: 2 });
+      expect(await h.rows()).toEqual([]);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(h.stream).not.toHaveBeenCalled();
+      // The same persisted frontier is legitimate for a genuinely later admission.
+      expect(
+        await h.session.sendMessage("fresh automatic input", options, {
+          acceptanceOrigin: "automatic",
+        })
+      ).toEqual(Ok(undefined));
+      expect(await h.storage.read()).toBeNull();
+    }
+  );
+
+  test.each([
+    ["absent", "after early read"],
+    ["scoped V1", "after early read"],
+    ["absent", "before publication lock"],
+    ["scoped V1", "before publication lock"],
+  ] as const)(
+    "ordinary automatic publication fences a late foreign Stop from %s (%s)",
+    async (frontier, timing) => {
+      const h = await fixture();
+      if (frontier === "scoped V1") {
+        await h.session.cancelCompaction();
+        const stop = await h.storage.read();
+        assert(stop);
+        await h.state.compactionCancellation.narrow(stop.nonce, {
+          id: "old-summary",
+          pendingFollowUp: { text: "canceled continuation" },
+        });
+      }
+      const foreignHistory = new HistoryService(h.config);
+      const foreign = new CompactionCancellation(
+        foreignHistory.getCompactionCancellationStorage(workspaceId)
+      );
+      if (timing === "before publication lock") {
+        const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+        spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+          async (...args) => {
+            // All request preparation completed against the old frontier; the CAS must recheck it.
+            await foreign.cancel({ settled: Promise.resolve(true) });
+            return publish(...args);
+          }
+        );
+      } else {
+        const state = h.session as unknown as {
+          readCompactionCancellation(): ReturnType<FileCompactionCancellationStorage["read"]>;
+        };
+        const read = state.readCompactionCancellation.bind(state);
+        let reads = 0;
+        spyOn(state, "readCompactionCancellation").mockImplementation(async () => {
+          const record = await read();
+          if (++reads === 2) await foreign.cancel({ settled: Promise.resolve(true) });
+          return record;
+        });
+      }
+      const accepted = mock(() => undefined);
+      expect(
+        (
+          await h.session.sendMessage("older automatic input", options, {
+            acceptanceOrigin: "automatic",
+            onAccepted: accepted,
+          })
+        ).success
+      ).toBe(false);
+      expect(await h.rows()).toEqual([]);
+      expect(await h.storage.read()).toMatchObject({ version: 2 });
+      expect(accepted).not.toHaveBeenCalled();
+      expect(h.stream).not.toHaveBeenCalled();
+      expect(
+        await h.session.sendMessage("fresh automatic input", options, {
+          acceptanceOrigin: "automatic",
+        })
+      ).toEqual(Ok(undefined));
+      expect(await h.storage.read()).toBeNull();
+    }
+  );
+
+  test.each([false, true])(
+    "ordinary automatic receipt keeps rollback ownership (rollback fails=%s)",
+    async (rollbackFails) => {
+      const h = await fixture();
+      const cancel = new AbortController();
+      let rowsPersisted = false;
+      let budgetReserved = true;
+      const accepted = mock(() => undefined);
+      const canceled = mock(() => {
+        if (!rowsPersisted) budgetReserved = false;
+      });
+      const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await publish(...args);
+          assert(result.success && result.data.kind === "accepted");
+          expect(result.data.witness).toBeNull();
+          expect(rowsPersisted).toBe(false);
+          cancel.abort();
+          return result;
+        }
+      );
+      if (rollbackFails)
+        spyOn(h.historyService, "deleteMessages").mockResolvedValueOnce(
+          Err("rollback unavailable")
+        );
+      expect(
+        await h.session.sendMessage("ordinary trigger", options, {
+          acceptanceOrigin: "automatic",
+          cancelSignal: cancel.signal,
+          onAccepted: accepted,
+          onCanceled: canceled,
+          preTurnMessages: [
+            createMuxMessage("ordinary-payload", "assistant", "reserved payload", {
+              synthetic: true,
+            }),
+          ],
+          onPreTurnRowsPersisted: () => {
+            rowsPersisted = true;
+          },
+          onAcceptedPreStreamFailure: () => {
+            if (!rowsPersisted) budgetReserved = false;
+          },
+        })
+      ).toEqual(Ok(undefined));
+      expect(await h.rows()).toHaveLength(rollbackFails ? 2 : 0);
+      expect(rowsPersisted).toBe(rollbackFails);
+      expect(budgetReserved).toBe(rollbackFails);
+      expect(accepted).toHaveBeenCalledTimes(rollbackFails ? 1 : 0);
+      expect(canceled).toHaveBeenCalledTimes(rollbackFails ? 0 : 1);
+    }
+  );
+
+  test("generation-mismatched settled Stop blocks idle automatic reconciliation", async () => {
+    const h = await fixture();
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+    await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+    expect(await h.session.isAutomaticSendBlocked()).toBe(true);
     expect(
       (
-        await fresh.session.sendMessage("fresh automatic input", options, {
+        await h.session.sendMessage("deferred input", options, {
           acceptanceOrigin: "automatic",
-          onAccepted: accepted,
         })
       ).success
     ).toBe(false);
-    expect(accepted).not.toHaveBeenCalled();
-    expect(stream).not.toHaveBeenCalled();
+    expect(await h.session.isAutomaticSendBlocked()).toBe(true);
     expect(await h.rows()).toEqual([]);
-    expect(await h.storage.read()).toEqual(stopped);
-    expect(fresh.session.isBusy()).toBe(false);
-    expect(await fresh.session.sendMessage("manual replacement", options)).toEqual(Ok(undefined));
-    expect(stream).toHaveBeenCalledTimes(1);
-    expect(await h.storage.read()).toBeNull();
-    expect(
-      (await h.rows()).map((row) =>
-        row.parts.map((part) => (part.type === "text" ? part.text : part.type))
-      )
-    ).toEqual([["manual replacement"]]);
+    expect(h.stream).not.toHaveBeenCalled();
   });
 
-  test("refused queued automatic ownership settles before idle and the manual successor", async () => {
+  test("a throwing acceptance observer cannot skip settled Stop retirement", async () => {
     const h = await fixture();
     expect(await h.session.interruptStream()).toEqual(Ok(undefined));
-    const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const started = Promise.withResolvers<void>();
-    const accepted = mock(() => undefined);
-    let released = false;
-    const owner: Disposable = {
-      [Symbol.dispose]: () => {
-        released = true;
-      },
-    };
-    const failed = mock(async () => {
-      entered.resolve();
-      await release.promise;
-      owner[Symbol.dispose]();
+    const stopped = await h.storage.read();
+    assert(stopped?.version === 2);
+    let budgetReserved = true;
+    let rowsPersisted = false;
+    const accepted = mock(() => {
+      expect(rowsPersisted).toBe(true);
+      throw new Error("acceptance observer failed");
     });
-    h.stream.mockImplementation(() => {
-      expect(released).toBe(true);
-      started.resolve();
-      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+    const canceled = mock(() => undefined);
+    const failed = mock(() => {
+      if (!rowsPersisted) budgetReserved = false;
     });
-    h.session.queueMessage("owned automatic wake", options, {
-      acceptanceOrigin: "automatic",
-      synthetic: true,
-      onAccepted: accepted,
-      onAcceptedPreStreamFailure: failed,
-    });
-    h.session.queueMessage("manual successor", options);
-    h.session.sendQueuedMessages();
-    try {
-      await entered.promise;
-      expect(h.session.isBusy()).toBe(true);
-      expect(released).toBe(false);
-      expect(h.stream).not.toHaveBeenCalled();
-      expect(accepted).not.toHaveBeenCalled();
-      expect(await h.rows()).toEqual([]);
-      release.resolve();
-      await started.promise;
-      await h.session.waitForIdle();
-      expect(failed).toHaveBeenCalledTimes(1);
-      expect(released).toBe(true);
-      expect(h.session.queuedMessageEntryCount()).toBe(0);
-      expect(h.stream).toHaveBeenCalledTimes(1);
-      expect(await h.storage.read()).toBeNull();
-      expect(
-        (await h.rows()).map((row) =>
-          row.parts.map((part) => (part.type === "text" ? part.text : part.type))
-        )
-      ).toEqual([["manual successor"]]);
-    } finally {
-      release.resolve();
-      await h.session.waitForIdle();
+    await nodeAssert.rejects(
+      h.session.sendMessage("accepted automatic input", options, {
+        acceptanceOrigin: "automatic",
+        onAccepted: accepted,
+        onCanceled: canceled,
+        onAcceptedPreStreamFailure: failed,
+        preTurnMessages: [
+          createMuxMessage("peer-payload", "assistant", "reserved peer payload", {
+            synthetic: true,
+          }),
+        ],
+        onPreTurnRowsPersisted: () => {
+          rowsPersisted = true;
+        },
+      }),
+      /acceptance observer failed/
+    );
+    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(budgetReserved).toBe(true);
+    expect((await h.rows()).map((row) => row.id)).toContain("peer-payload");
+    expect(canceled).not.toHaveBeenCalled();
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(h.stream).not.toHaveBeenCalled();
+    expect((await h.rows()).at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await h.storage.read()).toBeNull();
+  });
+
+  test.each(["none", "unsettled", "settled"] as const)(
+    "automatic replacement preserves committed input but refuses superseding Stop before retirement (%s)",
+    async (foreignStop) => {
+      const h = await fixture();
+      expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+      const stopped = await h.storage.read();
+      assert(stopped?.version === 2);
+      const foreignHistory = new HistoryService(h.config);
+      const foreignStorage = foreignHistory.getCompactionCancellationStorage(workspaceId);
+      const foreign = new CompactionCancellation(foreignStorage);
+      let successor: Awaited<ReturnType<typeof foreignStorage.read>> = null;
+      let rowsPersisted = false;
+      let budgetReserved = true;
+      const accepted = mock(() => undefined);
+      const canceled = mock(() => undefined);
+      const failed = mock(() => {
+        if (!rowsPersisted) budgetReserved = false;
+      });
+      const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+      spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+        async (...args) => {
+          const result = await publish(...args);
+          assert(result.success && result.data.kind === "accepted");
+          if (foreignStop !== "none") {
+            await foreign.cancel(
+              foreignStop === "settled"
+                ? { settled: Promise.resolve(true) }
+                : { retainUntilReplacement: true }
+            );
+            successor = await foreignStorage.read();
+          }
+          return result;
+        }
+      );
+      const result = await h.session.sendMessage("accepted before foreign Stop", options, {
+        acceptanceOrigin: "automatic",
+        onAccepted: accepted,
+        onCanceled: canceled,
+        onAcceptedPreStreamFailure: failed,
+        preTurnMessages: [
+          createMuxMessage("retirement-peer-payload", "assistant", "reserved payload", {
+            synthetic: true,
+          }),
+        ],
+        onPreTurnRowsPersisted: () => {
+          rowsPersisted = true;
+        },
+      });
+      expect(result.success).toBe(foreignStop === "none");
+      expect(accepted).toHaveBeenCalledTimes(foreignStop === "none" ? 1 : 0);
+      expect(failed).toHaveBeenCalledTimes(foreignStop === "none" ? 0 : 1);
+      expect(canceled).not.toHaveBeenCalled();
+      expect(rowsPersisted).toBe(true);
+      expect(budgetReserved).toBe(true);
+      const rows = await h.rows();
+      expect(rows.map((row) => row.id)).toContain("retirement-peer-payload");
+      expect(rows.at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+      expect(rows.at(-1)?.parts).toMatchObject([
+        { type: "text", text: "accepted before foreign Stop" },
+      ]);
+      expect(h.stream).toHaveBeenCalledTimes(foreignStop === "none" ? 1 : 0);
+      expect(await foreignStorage.read()).toEqual(foreignStop === "none" ? null : successor);
     }
+  );
+
+  test("failed Stop retirement still delivers acceptance and retries its exact witness", async () => {
+    const h = await fixture();
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const stopped = await h.storage.read();
+    assert(stopped?.version === 2);
+    const remove = fs.rmSync;
+    const failure = spyOn(fs, "rmSync").mockImplementation((file, options) => {
+      if (file === h.storage.path) throw new Error("retirement unavailable");
+      return remove(file, options);
+    });
+    const cancel = new AbortController();
+    const accepted = mock(() => cancel.abort());
+    const canceled = mock(() => undefined);
+    const failed = mock(() => undefined);
+    expect(
+      await h.session.sendMessage("accepted automatic input", options, {
+        acceptanceOrigin: "automatic",
+        cancelSignal: cancel.signal,
+        withdrawAcceptedOnCancel: true,
+        onAccepted: accepted,
+        onCanceled: canceled,
+        onAcceptedPreStreamFailure: failed,
+      })
+    ).toEqual(Ok(undefined));
+    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(canceled).not.toHaveBeenCalled();
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(h.stream).not.toHaveBeenCalled();
+    expect((await h.rows()).at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await h.storage.read()).toEqual(stopped);
+    expect(h.state.compactionCancellation.needsPersistence).toBe(true);
+    failure.mockRestore();
+    expect(await h.session.isAutomaticSendBlocked()).toBe(false);
+    expect(await h.storage.read()).toBeNull();
+  });
+
+  test("post-receipt automatic cancellation keeps accepted row and callback ownership", async () => {
+    const h = await fixture();
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const stopped = await h.storage.read();
+    assert(stopped?.version === 2);
+    const cancel = new AbortController();
+    const accepted = mock(() => undefined);
+    const canceled = mock(() => undefined);
+    const failed = mock(() => undefined);
+    const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await publish(...args);
+        assert(result.success && result.data.kind === "accepted");
+        cancel.abort();
+        return result;
+      }
+    );
+    expect(
+      await h.session.sendMessage("accepted automatic input", options, {
+        acceptanceOrigin: "automatic",
+        cancelSignal: cancel.signal,
+        withdrawAcceptedOnCancel: true,
+        onAccepted: accepted,
+        onCanceled: canceled,
+        onAcceptedPreStreamFailure: failed,
+      })
+    ).toEqual(Ok(undefined));
+    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(canceled).not.toHaveBeenCalled();
+    expect(failed).toHaveBeenCalledTimes(1);
+    expect(h.stream).not.toHaveBeenCalled();
+    expect((await h.rows()).at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await h.storage.read()).toBeNull();
   });
 
   test.each([
@@ -518,7 +1344,12 @@ describe("compaction cancellation runtime", () => {
       expect(h.state.compactionCancellation.blocksRecovery).toBe(false);
       const repaired = await h.storage.read();
       assert(repaired);
-      if (cancellation) expect(repaired).toEqual(cancellation);
+      const settledGeneration = await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration();
+      expect(repaired).toMatchObject({ version: 2, settledGeneration });
+      if (cancellation)
+        expect(repaired).toEqual({ ...cancellation, version: 2, settledGeneration });
       expect(await h.session.sendMessage("accepted replacement", options)).toEqual(Ok(undefined));
       expect(h.stream).toHaveBeenCalledTimes(1);
       expect((await h.rows()).map((row) => row.id)).toContain("prior");
@@ -639,7 +1470,11 @@ describe("compaction cancellation runtime", () => {
       expect(await h.state.compactionCancellation.retry()).toBe("applied");
       const retried = await h.storage.read();
       assert(retried);
-      if (record) expect(retried).toEqual(record);
+      const settledGeneration = await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration();
+      expect(retried).toMatchObject({ version: 2, settledGeneration });
+      if (record) expect(retried).toEqual({ ...record, version: 2, settledGeneration });
     }
   );
 

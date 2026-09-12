@@ -11,6 +11,8 @@ import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCom
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { HistoryService } from "./historyService";
+import { MessageQueue } from "./messageQueue";
+import { Ok } from "@/common/types/result";
 import { CompactionHandler } from "./compactionHandler";
 import { HISTORY_APPEND_PROVENANCE_FILE } from "./historyAppendProvenance";
 import { createTestHistoryService } from "./testHistoryService";
@@ -128,7 +130,7 @@ describe("inactive real cancellation storage", () => {
       await state.cancel({ retainUntilReplacement: true });
       const captured = await h.historyService.captureCompactionReplacement(workspaceId);
       assert(captured.success && captured.data.nonce);
-      const expected = { nonce: captured.data.nonce, generation: captured.data.generation };
+      const expected = { ...captured.data };
       const accepted = await h.historyService.acceptCompactionReplacement(
         workspaceId,
         captured.data,
@@ -200,6 +202,7 @@ describe("inactive real cancellation storage", () => {
       if (phase === "mutated argument" || phase === "retry" || phase === "foreign retry") {
         captured.data.nonce = "not-the-original";
         captured.data.generation = "not-the-original";
+        captured.data.cancellationVersion = 2;
       }
       if (phase === "local newer Stop") {
         expect(await retiring).toBeUndefined();
@@ -262,8 +265,13 @@ describe("inactive real cancellation storage", () => {
         throw new Error("consumer notification failed");
       })
     ).toBe("applied");
+    // Retirement names the deleted frontier; it grants no settled-admission proof.
+    expect(captured.data.cancellationVersion).toBe(1);
     expect(notifications).toEqual([
-      [captured.data, { nonce: null, generation: captured.data.generation }],
+      [
+        { nonce: captured.data.nonce, generation: captured.data.generation },
+        { nonce: null, generation: captured.data.generation },
+      ],
     ]);
     if (process.platform !== "win32") expect(syncedAfterNotification).toBe(true);
     expect(await storage.read()).toBeNull();
@@ -356,8 +364,13 @@ describe("inactive real cancellation storage", () => {
       expect(state.needsPersistence).toBe(true);
       expect(await state.retry()).toBe("superseded");
     } else expect(await retiring).toBe("applied");
+    // The initial admission retains its version; the transition names only nonce/generation.
+    expect(captured.data.cancellationVersion).toBe(1);
     expect(receipts).toEqual([
-      [captured.data, { nonce: null, generation: captured.data.generation }],
+      [
+        { nonce: captured.data.nonce, generation: captured.data.generation },
+        { nonce: null, generation: captured.data.generation },
+      ],
     ]);
     if (phase === "later-foreign") {
       const other = new CompactionCancellation(
@@ -478,7 +491,52 @@ describe("inactive real cancellation storage", () => {
     }
   );
 
-  it("settlement still waits and cleans late recovery", async () => {
+  it.each(["joined", "unjoined", "failed", "retained", "scoped"] as const)(
+    "settled proof requires successful exact ordinary Stop (%s)",
+    async (kind) => {
+      const entered = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<boolean>();
+      const stopping = state.cancel({
+        retainUntilReplacement: kind === "retained",
+        onCaptured: () => entered.resolve(),
+        ...(kind === "unjoined" ? {} : { settled: settled.promise }),
+      });
+      try {
+        await entered.promise;
+        const initial = await storage.read();
+        assert(initial);
+        expect(initial.version).toBe(1);
+        if (kind === "scoped") {
+          const other = new CompactionCancellation(
+            new FileCompactionCancellationStorage(foreign, workspaceId)
+          );
+          await other.read();
+          await other.narrow(initial.nonce, summary);
+        }
+        settled.resolve(kind !== "failed");
+        expect(await stopping).toBe("applied");
+        const persisted = await new FileCompactionCancellationStorage(foreign, workspaceId).read();
+        expect(persisted?.nonce).toBe(initial.nonce);
+        expect(persisted?.version).toBe(kind === "joined" ? 2 : 1);
+        if (kind === "joined") {
+          expect(persisted?.settledGeneration).toBe(
+            await foreign.getContinuousCompactionJournal(workspaceId).captureGeneration()
+          );
+          expect(
+            await new CompactionCancellation(
+              new FileCompactionCancellationStorage(foreign, workspaceId)
+            ).read()
+          ).toEqual(persisted);
+        } else expect(persisted?.settledGeneration).toBeUndefined();
+        if (kind === "scoped") expect(persisted?.scope.kind).toBe("summary");
+      } finally {
+        settled.resolve(false);
+        await stopping;
+      }
+    }
+  );
+
+  it("a legacy void settlement still waits and cleans late recovery without granting proof", async () => {
     const entered = Promise.withResolvers<void>();
     const settled = Promise.withResolvers<void>();
     const neutralize = h.historyService.neutralizeCompactionRecoveryUnderHistoryLock.bind(
@@ -515,10 +573,59 @@ describe("inactive real cancellation storage", () => {
         type: "compaction-summary",
       });
       expect(await storage.read()).toMatchObject({ version: 1, scope: { kind: "unresolved" } });
+      expect((await storage.read())?.settledGeneration).toBeUndefined();
     } finally {
       settled.resolve();
       await stopping;
     }
+  });
+
+  it("a failed settled-proof write retains unresolved Stop debt until retry", async () => {
+    const rename = nodeFs.renameSync;
+    let publications = 0;
+    const failure = spyOn(nodeFs, "renameSync").mockImplementation((source, destination) => {
+      if (destination === storage.path && ++publications === 2) {
+        throw new Error("settled proof write failed");
+      }
+      return rename(source, destination);
+    });
+    await assert.rejects(
+      state.cancel({ settled: Promise.resolve(true) }),
+      /settled proof write failed/
+    );
+    expect(publications).toBe(2);
+    const stopped = await storage.read();
+    assert(stopped);
+    expect(stopped.version).toBe(1);
+    expect(state.blocksRecovery).toBe(true);
+    failure.mockRestore();
+    expect(await state.retry()).toBe("applied");
+    expect(await storage.read()).toEqual({
+      ...stopped,
+      version: 2,
+      settledGeneration: await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration(),
+    });
+    expect(state.blocksRecovery).toBe(false);
+  });
+
+  it("a displaced settled-proof write preserves a foreign Stop and generation", async () => {
+    const successor = { ...record("foreign-successor"), retainUntilReplacement: true };
+    const generationPath = path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE);
+    const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+    let stages = 0;
+    afterCompactionStaging(storage.path, () => {
+      if (++stages !== 2) return;
+      nodeFs.writeFileSync(lockPath, `${process.pid}:foreign-holder`);
+      nodeFs.writeFileSync(storage.path, JSON.stringify(successor));
+      nodeFs.writeFileSync(generationPath, "foreign-generation");
+    });
+    await assert.rejects(state.cancel({ settled: Promise.resolve(true) }), /no longer owned/);
+    expect(stages).toBe(2);
+    expect(state.blocksRecovery).toBe(true);
+    expect(await storage.read()).toEqual(successor);
+    expect(await fs.readFile(generationPath, "utf8")).toBe("foreign-generation");
   });
 
   it.each([
@@ -530,7 +637,7 @@ describe("inactive real cancellation storage", () => {
     "post-settlement cleanup cannot overwrite a newer %s (retained=%s)",
     async (successorKind, retainUntilReplacement) => {
       const firstCleanup = Promise.withResolvers<void>();
-      const settled = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<boolean>();
       const neutralize = h.historyService.neutralizeCompactionRecoveryUnderHistoryLock.bind(
         h.historyService
       );
@@ -563,12 +670,12 @@ describe("inactive real cancellation storage", () => {
         });
         expect((await foreign.writePartial(workspaceId, partial)).success).toBe(true);
         const before = await foreign.readPartial(workspaceId);
-        settled.resolve();
+        settled.resolve(true);
         expect(await stopping).toBe("superseded");
         expect(await foreign.readPartial(workspaceId)).toEqual(before);
         expect(await storage.read()).toEqual(successor);
       } finally {
-        settled.resolve();
+        settled.resolve(true);
         await stopping;
       }
     }
@@ -580,7 +687,7 @@ describe("inactive real cancellation storage", () => {
       if (phase === "first existing") await state.cancel();
       const predecessor = await storage.read();
       const initial = Promise.withResolvers<void>();
-      const settled = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<boolean>();
       const neutralize = h.historyService.neutralizeCompactionRecoveryUnderHistoryLock.bind(
         h.historyService
       );
@@ -616,7 +723,7 @@ describe("inactive real cancellation storage", () => {
             )
           ).success
         ).toBe(true);
-        settled.resolve();
+        settled.resolve(true);
         await failed;
         expect(state.needsPersistence).toBe(true);
         expect(state.blocksRecovery).toBe(true);
@@ -630,7 +737,7 @@ describe("inactive real cancellation storage", () => {
           type: "compaction-summary",
         });
       } finally {
-        settled.resolve();
+        settled.resolve(true);
         await failed;
       }
     }
@@ -1172,6 +1279,89 @@ describe("inactive real cancellation storage", () => {
     await state.cancel();
     expect((await storage.read())?.retainUntilReplacement).toBe(true);
   });
+
+  it.each([false, true])(
+    "narrowing cannot downgrade a peer-settled Stop (settled=%s)",
+    async (settled) => {
+      const peer = new CompactionCancellation(
+        foreign.getCompactionCancellationStorage(workspaceId)
+      );
+      const published = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<boolean>();
+      const stopping = peer.cancel({
+        settled: finish.promise,
+        onCaptured: () => published.resolve(),
+      });
+      await published.promise;
+      const captured = await state.read();
+      assert(captured?.version === 1);
+      if (settled) {
+        finish.resolve(true);
+        await stopping;
+      }
+      const before = await fs.readFile(storage.path);
+      try {
+        await state.narrow(captured.nonce, summary);
+        if (settled) expect(await fs.readFile(storage.path)).toEqual(before);
+        else expect((await storage.read())?.scope).toEqual({ kind: "summary", ...summary });
+      } finally {
+        finish.resolve(false);
+        await stopping;
+      }
+    }
+  );
+
+  it.each([false, true])(
+    "retirement advances only the original admission version (mixed=%s)",
+    async (mixed) => {
+      state = new CompactionCancellation(
+        h.historyService.getCompactionCancellationStorage(workspaceId)
+      );
+      const published = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<boolean>();
+      const stopping = state.cancel({
+        settled: finish.promise,
+        onCaptured: () => published.resolve(),
+      });
+      await published.promise;
+      const early = await h.historyService.captureCompactionReplacement(workspaceId);
+      assert(early.success);
+      finish.resolve(true);
+      await stopping;
+      const fresh = await foreign.captureCompactionReplacement(workspaceId);
+      assert(fresh.success);
+      const queue = new MessageQueue();
+      for (const captured of [mixed ? early.data : fresh.data, fresh.data])
+        queue.add("queued", undefined, {
+          acceptanceOrigin: "automatic",
+          readCompactionAdmission: () => Promise.resolve(Ok(captured)),
+        });
+      const accepted = await h.historyService.acceptCompactionReplacement(
+        workspaceId,
+        fresh.data,
+        {
+          kind: "append",
+          messages: [createMuxMessage("replacement", "user", "accepted fresh input")],
+        },
+        { isCurrent: () => true, onCommitted: () => undefined }
+      );
+      assert(accepted.success && accepted.data.kind === "accepted" && accepted.data.witness);
+      expect(
+        await state.retireReplacement(
+          accepted.data.witness,
+          (before, after) => {
+            queue.advanceCompactionAdmission(before, after);
+            return undefined;
+          },
+          fresh.data
+        )
+      ).toBe("applied");
+      expect(await storage.read()).toBeNull();
+      const captured = await queue.dequeueNext().internal?.readCompactionAdmission?.();
+      if (mixed) expect(captured?.success).toBe(false);
+      else expect(captured).toEqual(Ok({ nonce: null, generation: fresh.data.generation }));
+    }
+  );
 
   it("narrows and retires only the exact current nonce", async () => {
     await state.cancel();

@@ -1050,6 +1050,8 @@ export interface MuxMetadata {
   compactionBoundary?: boolean;
   /** Exact composed publication occurrence, shared with the pending file writeId. */
   compactionPublicationId?: string;
+  /** Captured generation of this publication; legacy rewrites must not inherit it. */
+  compactionPublicationGeneration?: string | null;
   /** Durable provider-context boundary kind. Existing compaction rows are also boundaries via compactionBoundary. */
   contextBoundaryKind?: PersistedContextBoundaryKind;
   toolPolicy?: ToolPolicy; // Tool policy active when this message was sent (user messages only)

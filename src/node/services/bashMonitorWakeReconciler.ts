@@ -172,6 +172,7 @@ interface ReconcileState {
   owedAcceptance?: readonly DerivedSignal[];
   /** Frontier a committed stop still has to retire; applied before any dispatch. */
   owedRetirement?: readonly BashMonitorProcessSnapshot[];
+  retirementCompletions?: Set<() => void>;
   /** Outstanding wake keys already looked up in the transcript (see deliveredSignals). */
   transcriptChecked?: ReadonlySet<string>;
 }
@@ -717,7 +718,11 @@ export class BashMonitorWakeReconciler {
    * given, the durable consumption waits for it under the lock and is skipped when it resolves
    * false, leaving the withdrawn signals owed to the next reconcile.
    */
-  async consumeCurrent(ownerWorkspaceId: string, commit?: () => Promise<boolean>): Promise<void> {
+  async consumeCurrent(
+    ownerWorkspaceId: string,
+    commit?: () => Promise<boolean>,
+    onSettled?: () => void
+  ): Promise<void> {
     // Withdraw before taking the lock: an acceptance in progress holds it across watermark,
     // registry, and process-acknowledgement I/O, and a hard Stop must cancel the admission
     // without waiting behind that. The lock slot is reserved synchronously too, ahead of any
@@ -729,13 +734,17 @@ export class BashMonitorWakeReconciler {
     const frontier = this.args.processManager.pullMonitorWakeSignals(ownerWorkspaceId);
     const committed = await this.locks.withLock(ownerWorkspaceId, async () => {
       this.abortDispatch(ownerWorkspaceId);
-      if (commit != null && !(await commit())) return false;
+      if (commit != null && !(await commit())) {
+        onSettled?.();
+        return false;
+      }
       const state = this.state(ownerWorkspaceId);
       const owed = new Map(
         (state.owedRetirement ?? []).map((s) => [signalKey(s.processId, s.createdAt), s] as const)
       );
       for (const s of frontier) owed.set(signalKey(s.processId, s.createdAt), s);
       state.owedRetirement = [...owed.values()];
+      if (onSettled) (state.retirementCompletions ??= new Set()).add(onSettled);
       await this.retireOwed(ownerWorkspaceId, state);
       return true;
     });
@@ -749,6 +758,10 @@ export class BashMonitorWakeReconciler {
     await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
     await this.cleanup(consumed);
     state.owedRetirement = undefined;
+    // Failed I/O retains the original obligation and its receipts for the existing retry.
+    const completions = state.retirementCompletions;
+    state.retirementCompletions = undefined;
+    for (const complete of completions ?? []) complete();
   }
 
   /**

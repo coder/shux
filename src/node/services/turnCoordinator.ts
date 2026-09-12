@@ -1159,9 +1159,9 @@ export class TurnCoordinator {
     return notify && !this.disposed;
   }
 
-  captureInterruptSettlement(soft?: boolean): Promise<void> | undefined {
+  captureInterruptSettlement(soft?: boolean, includeStartup = false): Promise<void> | undefined {
     const operation = this.state.turn.operation;
-    return !soft && operation?.stage === "started"
+    return !soft && operation && (includeStartup || operation.stage === "started")
       ? this.settlements.get(operation.id)?.promise
       : undefined;
   }
