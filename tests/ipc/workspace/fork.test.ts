@@ -169,7 +169,8 @@ describeIntegration("Workspace fork", () => {
               sourceWorkspaceId,
               newName: "forked-workspace",
             });
-            expect(forkResult.success).toBe(true);
+            // Keep the refusal reason visible when CI cannot map transformed stack lines.
+            expect(forkResult).toEqual(expect.objectContaining({ success: true }));
             if (!forkResult.success) return;
             const forkedWorkspaceId = forkResult.metadata.id;
 
@@ -183,7 +184,7 @@ describeIntegration("Workspace fork", () => {
               "What is 2+2? Answer with just the number.",
               modelString("anthropic", "claude-sonnet-4-5")
             );
-            expect(sendResult.success).toBe(true);
+            expect(sendResult).toEqual(expect.objectContaining({ success: true }));
 
             // Verify stream completes successfully
             await collector.waitForEvent("stream-end", 30000);
