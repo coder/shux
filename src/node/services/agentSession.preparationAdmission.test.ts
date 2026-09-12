@@ -186,7 +186,7 @@ describe("preparation admission", () => {
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const started = Promise.withResolvers<void>();
-      const append = spyOn(h.historyService, "appendToHistory");
+      const append = spyOn(h.historyService, "acceptCompactionReplacement");
       if (failure === "return") append.mockResolvedValueOnce(Err("disk failure"));
       else append.mockRejectedValueOnce(new Error("disk failure"));
       let cleanups = 0;
@@ -278,13 +278,15 @@ describe("preparation admission", () => {
     const releaseAppend = Promise.withResolvers<void>();
     const provider = Promise.withResolvers<void>();
     const releaseProvider = Promise.withResolvers<void>();
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
-      const result = await append(...args);
-      appended.resolve();
-      await releaseAppend.promise;
-      return result;
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await append(...args);
+        appended.resolve();
+        await releaseAppend.promise;
+        return result;
+      }
+    );
     const stream = spyOn(h.aiService, "streamMessage").mockImplementation(async () => {
       provider.resolve();
       await releaseProvider.promise;
@@ -333,12 +335,14 @@ describe("preparation admission", () => {
       maxTokens: 100000,
     });
     let stale = false;
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
-      const result = await append(...args);
-      stale = true;
-      return result;
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await append(...args);
+        stale = true;
+        return result;
+      }
+    );
     const stream = spyOn(h.aiService, "streamMessage");
     const result = await h.session.sendMessage("deferred question", options, {
       acceptanceOrigin: "automatic",

@@ -2042,12 +2042,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const h = await createActiveWakeHarness();
     const entered = createDeferred<void>();
     const release = createDeferred<void>();
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
-      entered.resolve();
-      await release.promise;
-      return append(...args);
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return append(...args);
+      }
+    );
     const controller = new AbortController();
     const accepted = mock(() => Promise.resolve());
     const deferred = mock(() => Promise.resolve());

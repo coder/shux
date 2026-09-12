@@ -463,12 +463,14 @@ describe("AgentSession token-budget lifecycle", () => {
     const before = await allRows(h);
     const controller = new AbortController();
     const cancelState = { canceledBeforeAcceptance: false };
-    const append = h.historyService.appendToHistory.bind(h.historyService);
-    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (id, row) => {
-      const result = await append(id, row);
-      controller.abort();
-      return result;
-    });
+    const append = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (...args) => {
+        const result = await append(...args);
+        controller.abort();
+        return result;
+      }
+    );
     expect(
       (
         await h.session.sendMessage("Cancel after persistence", options, {

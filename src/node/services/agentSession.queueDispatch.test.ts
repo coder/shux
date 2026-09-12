@@ -573,7 +573,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         workspaceId,
         aiServiceOverrides: { streamMessage },
       });
-      const append = spyOn(historyService, "appendToHistory");
+      const append = spyOn(historyService, "acceptCompactionReplacement");
       if (failureKind === "returned error") {
         append.mockResolvedValueOnce(Err("disk unavailable"));
       } else {
@@ -1365,7 +1365,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceId,
       captureEvents: true,
     });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
+    const originalAppend = historyService.acceptCompactionReplacement.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
       markAppendStarted = resolve;
@@ -1374,7 +1374,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const appendRelease = new Promise<void>((resolve) => {
       releaseAppend = resolve;
     });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
+    const appendSpy = spyOn(historyService, "acceptCompactionReplacement").mockImplementation(
       async (...args) => {
         markAppendStarted();
         await appendRelease;
@@ -1448,7 +1448,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceId,
       aiServiceOverrides: { streamMessage },
     });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
+    const originalAppend = historyService.acceptCompactionReplacement.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
       markAppendStarted = resolve;
@@ -1457,11 +1457,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const appendRelease = new Promise<void>((resolve) => {
       releaseAppend = resolve;
     });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
+    const appendSpy = spyOn(historyService, "acceptCompactionReplacement").mockImplementation(
       async (...args) => {
+        const result = await originalAppend(...args);
         markAppendStarted();
         await appendRelease;
-        return originalAppend(...args);
+        return result;
       }
     );
     const deleteMessagesSpy = spyOn(historyService, "deleteMessages").mockResolvedValue(
@@ -1529,7 +1530,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
   test("verifies a committed rollback when batch deletion reports a post-write failure", async () => {
     const workspaceId = "queue-dispatch-cancel-post-write-failure";
     const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
+    const originalAppend = historyService.acceptCompactionReplacement.bind(historyService);
     const originalDeleteMessages = historyService.deleteMessages.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
@@ -1539,11 +1540,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const appendRelease = new Promise<void>((resolve) => {
       releaseAppend = resolve;
     });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
+    const appendSpy = spyOn(historyService, "acceptCompactionReplacement").mockImplementation(
       async (...args) => {
+        const result = await originalAppend(...args);
         markAppendStarted();
         await appendRelease;
-        return originalAppend(...args);
+        return result;
       }
     );
     const deleteMessagesSpy = spyOn(historyService, "deleteMessages").mockImplementation(

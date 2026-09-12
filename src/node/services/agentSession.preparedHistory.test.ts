@@ -101,76 +101,104 @@ describe("prepared history publication", () => {
     }
   );
 
-  test.each(
-    (["skill", "prompt", "trigger"] as const).flatMap((failure) =>
-      (["result", "rejection"] as const).map((outcome) => ({ failure, outcome }))
-    )
-  )(
-    "a failed automatic $failure append ($outcome) rolls back only this attempt's previously published rows",
-    async ({ failure, outcome }) => {
-      const h = await fixture();
-      const foreign = createMuxMessage("foreign", "assistant", "concurrent input");
-      const earlier = ["file", "skill", "prompt"].slice(
-        0,
-        ["skill", "prompt", "trigger"].indexOf(failure) + 1
-      );
-      const append = h.historyService.appendToHistory.bind(h.historyService);
-      const appends = spyOn(h.historyService, "appendToHistory").mockImplementationOnce(
-        async (...args) => {
-          const result = await append(...args);
-          expect(result).toEqual(Ok(undefined));
-          // The real prefix released its lock; a foreign writer now lands before the failure.
-          expect(await append(workspaceId, foreign)).toEqual(Ok(undefined));
-          return result;
-        }
-      );
-      for (const _row of earlier.slice(1)) appends.mockImplementationOnce(append);
-      // Disk failures use Result Err; an unexpected service rejection must also retire
-      // already-published prefixes without deleting a concurrent writer's row.
-      if (outcome === "result") appends.mockResolvedValueOnce(Err("injected write failure"));
-      else appends.mockRejectedValueOnce(new Error("injected write failure"));
-      const start = spyOn(h.aiService, "streamMessage");
-      const result = await h.session
-        .sendMessage("inspect input", options, { acceptanceOrigin: "automatic" })
-        .catch((error: unknown) => error);
-      expect(appends.mock.calls.slice(0, -1).map(([, row]) => row.id)).toEqual(earlier);
-      expect(foreign.metadata?.historySequence).toBe(1);
-      expect(appends).toHaveBeenCalledTimes(earlier.length + 1);
-      expect((await h.rows()).map((row) => row.id)).toEqual([foreign.id]);
-      expect(result).toMatchObject({ success: false, error: { raw: "injected write failure" } });
-      expect(start).not.toHaveBeenCalled();
-    }
-  );
+  test("a failed automatic batch leaves foreign history and publishes no owned prefixes", async () => {
+    const h = await fixture();
+    const foreign = createMuxMessage("foreign", "assistant", "concurrent input");
+    const publish = spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      async (_id, _capture, operation) => {
+        expect(await h.rows()).toEqual([]);
+        assert(operation.kind === "append");
+        expect(operation.preserveCancellation).toBe(true);
+        expect(operation.messages.slice(0, -1).map((row) => row.id)).toEqual([
+          "file",
+          "skill",
+          "prompt",
+        ]);
+        expect(await h.historyService.appendToHistory(workspaceId, foreign)).toEqual(Ok(undefined));
+        // The batch API reports disk failures as Err; no per-prefix publication exists here.
+        return Err("injected batch write failure");
+      }
+    );
+    expect(
+      (await h.session.sendMessage("inspect input", options, { acceptanceOrigin: "automatic" }))
+        .success
+    ).toBe(false);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect((await h.rows()).map((row) => row.id)).toEqual([foreign.id]);
+    expect(h.stream).not.toHaveBeenCalled();
+  });
 
-  test.each(["file", "skill", "prompt", "trigger"])(
-    "automatic cancellation after %s publication still runs the existing rollback checkpoint",
-    async (after) => {
-      const h = await fixture();
-      const controller = new AbortController();
-      const canceled = mock(() => undefined);
-      const accepted = mock(() => undefined);
-      const append = h.historyService.appendToHistory.bind(h.historyService);
-      spyOn(h.historyService, "appendToHistory").mockImplementation(async (id, row) => {
-        const result = await append(id, row);
-        if (row.id === after || (after === "trigger" && row.metadata?.synthetic !== true))
+  test("a rejected automatic batch leaves foreign history and publishes no owned prefixes", async () => {
+    const h = await fixture();
+    const foreign = createMuxMessage("foreign", "assistant", "concurrent input");
+    expect(await h.historyService.appendToHistory(workspaceId, foreign)).toEqual(Ok(undefined));
+    const publish = spyOn(h.historyService, "acceptCompactionReplacement").mockRejectedValueOnce(
+      new Error("injected batch rejection")
+    );
+    const result = await h.session
+      .sendMessage("inspect input", options, {
+        acceptanceOrigin: "automatic",
+      })
+      .catch((error: unknown) => error);
+    expect(publish).toHaveBeenCalledTimes(1);
+    const operation = publish.mock.calls[0][2];
+    assert(operation.kind === "append");
+    expect(operation.preserveCancellation).toBe(true);
+    expect(operation.messages.slice(0, -1).map((row) => row.id)).toEqual([
+      "file",
+      "skill",
+      "prompt",
+    ]);
+    expect((await h.rows()).map((row) => row.id)).toEqual([foreign.id]);
+    expect(result).toMatchObject({ success: false, error: { raw: "injected batch rejection" } });
+    expect(h.stream).not.toHaveBeenCalled();
+  });
+
+  test("automatic cancellation after the batch receipt rolls back only its own rows", async () => {
+    const h = await fixture();
+    const foreign = createMuxMessage("foreign", "assistant", "concurrent input");
+    expect(await h.historyService.appendToHistory(workspaceId, foreign)).toEqual(Ok(undefined));
+    const controller = new AbortController();
+    const canceled = mock(() => undefined);
+    const accepted = mock(() => undefined);
+    const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    const publication = spyOn(
+      h.historyService,
+      "acceptCompactionReplacement"
+    ).mockImplementationOnce(async (id, capture, operation, observer) => {
+      assert(operation.kind === "append");
+      expect(operation.preserveCancellation).toBe(true);
+      const result = await publish(id, capture, operation, {
+        ...observer,
+        onCommitted: (receipt) => {
+          // Record the actual durable batch before cancellation exercises ordinary rollback.
+          observer.onCommitted(receipt);
           controller.abort();
-        return result;
+        },
       });
-      const start = spyOn(h.aiService, "streamMessage");
-      expect(
-        await h.session.sendMessage("inspect input", options, {
-          acceptanceOrigin: "automatic",
-          cancelSignal: controller.signal,
-          onCanceled: canceled,
-          onAccepted: accepted,
-        })
-      ).toEqual(Ok(undefined));
-      expect(await h.rows()).toEqual([]);
-      expect(canceled).toHaveBeenCalledTimes(1);
-      expect(accepted).not.toHaveBeenCalled();
-      expect(start).not.toHaveBeenCalled();
-    }
-  );
+      expect(result).toEqual(Ok({ kind: "accepted", witness: null }));
+      const rows = await h.rows();
+      expect(rows.map((row) => row.id)).toEqual([
+        foreign.id,
+        ...operation.messages.map((row) => row.id),
+      ]);
+      expect(rows.map((row) => row.metadata?.historySequence)).toEqual([0, 1, 2, 3, 4]);
+      return result;
+    });
+    expect(
+      await h.session.sendMessage("inspect input", options, {
+        acceptanceOrigin: "automatic",
+        cancelSignal: controller.signal,
+        onCanceled: canceled,
+        onAccepted: accepted,
+      })
+    ).toEqual(Ok(undefined));
+    expect(publication).toHaveBeenCalledTimes(1);
+    expect((await h.rows()).map((row) => row.id)).toEqual([foreign.id]);
+    expect(canceled).toHaveBeenCalledTimes(1);
+    expect(accepted).not.toHaveBeenCalled();
+    expect(h.stream).not.toHaveBeenCalled();
+  });
 
   test.each(["skill", "prompt"] as const)(
     "manual %s materialization failure leaves no orphaned prefixes or accepted Stop",

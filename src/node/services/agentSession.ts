@@ -3518,76 +3518,61 @@ export class AgentSession {
     const stagedPrefixes: MuxMessage[] = [];
     let replacementCapture: CompactionReplacementCapture | undefined;
     let replacementCommitted = false;
-    // Manual prefixes and their trigger form one accepted replacement. Optional context alone
-    // must never retire Stop, and cancellation after the receipt cannot erase the user's row.
+    // Prefixes and their trigger share the persisted Stop fence. A peer Stop or Clear
+    // must not land between automatic admission and its durable history append.
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
         | { kind: "trigger"; messages: MuxMessage[] }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
-      const resetBatch = [...stagedPrefixes, ...messages].some(
-        (row) => row.metadata?.contextBoundaryKind === "reset"
-      );
-      // Only reset prefixes wait for their actual trigger. Ordinary A prefixes retain their
-      // existing publication/rollback path; a reset alone cannot authorize replacement.
-      if (manualReplacement || resetBatch) {
-        if (publication.kind === "prefix") {
-          stagedPrefixes.push(...messages);
-          return Ok(undefined);
-        }
-        attempt.inputPublication = messages.at(-1);
-        const capture = replacementCapture ?? attempt.admissionCapture;
-        assert(capture, "Publication requires its original admission capture");
-        const batch = [...stagedPrefixes, ...messages];
-        const accepted = await this.historyService
-          .acceptCompactionReplacement(
-            this.workspaceId,
-            capture,
-            {
-              kind: "append",
-              messages: batch,
-              ...(!manualReplacement ? { preserveCancellation: true as const } : {}),
-            },
-            {
-              isCurrent: () =>
-                !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
-              onContextResetCommitted: (predecessor, successor) => {
-                this.advanceOwnedCompactionAdmission(predecessor, successor);
-                if (attempt.admissionCapture) Object.assign(attempt.admissionCapture, successor);
-              },
-              onCommitted: () => {
-                if (manualReplacement) {
-                  replacementCommitted = true;
-                  attempt.durability = "durable";
-                } else persistedCancelableMessageIds.push(...batch.map((row) => row.id));
-                return undefined;
-              },
-            }
-          )
-          .catch((error: unknown) => Err(getErrorMessage(error)));
-        if (!accepted.success) return accepted;
-        if (accepted.data.kind !== "accepted") {
-          if (await cancelBeforeAcceptance()) return Ok(undefined);
-          return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
-        }
-        // Retirement takes the same lock; join it only after publication releases that lock.
-        if (manualReplacement) {
-          await this.retireCompactionReplacement(accepted.data.witness, attempt.admissionCapture);
-          if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
-        }
+      if (!manualReplacement && (await this.isAutomaticSendBlocked()))
+        return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+      if (publication.kind === "prefix") {
+        stagedPrefixes.push(...messages);
         return Ok(undefined);
       }
-      if (await this.isAutomaticSendBlocked()) return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
-      // Preserve the same rollback checkpoints for unexpected service rejection as for
-      // ordinary Result failures; earlier prefixes may already be durable.
-      const result = await (
-        messages.length === 1
-          ? this.historyService.appendToHistory(this.workspaceId, messages[0])
-          : this.historyService.appendManyToHistory(this.workspaceId, messages)
-      ).catch((error: unknown) => Err(getErrorMessage(error)));
-      if (result.success) persistedCancelableMessageIds.push(...messages.map((row) => row.id));
-      return result;
+      attempt.inputPublication = messages.at(-1);
+      const capture = replacementCapture ?? attempt.admissionCapture;
+      assert(capture, "Publication requires its original admission capture");
+      const batch = [...stagedPrefixes, ...messages];
+      const accepted = await this.historyService
+        .acceptCompactionReplacement(
+          this.workspaceId,
+          capture,
+          {
+            kind: "append",
+            messages: batch,
+            ...(!manualReplacement ? { preserveCancellation: true as const } : {}),
+          },
+          {
+            isCurrent: () =>
+              !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+            onContextResetCommitted: (predecessor, successor) => {
+              this.advanceOwnedCompactionAdmission(predecessor, successor);
+              if (attempt.admissionCapture) Object.assign(attempt.admissionCapture, successor);
+            },
+            onCommitted: () => {
+              if (manualReplacement) {
+                replacementCommitted = true;
+                attempt.durability = "durable";
+              } else persistedCancelableMessageIds.push(...batch.map((row) => row.id));
+              return undefined;
+            },
+          }
+        )
+        .catch((error: unknown) => Err(getErrorMessage(error)));
+      if (!accepted.success) return accepted;
+      if (accepted.data.kind !== "accepted") {
+        if (await cancelBeforeAcceptance()) return Ok(undefined);
+        return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+      }
+      // Retirement takes the same lock; join it only after publication releases that lock.
+      if (manualReplacement) {
+        await this.retireCompactionReplacement(accepted.data.witness, attempt.admissionCapture);
+        if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
+      }
+      return Ok(undefined);
     };
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.

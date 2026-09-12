@@ -69,7 +69,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       timestamp: 1,
       synthetic: true,
     });
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const publication = spyOn(historyService, "acceptCompactionReplacement");
     const appendOne = spyOn(historyService, "appendToHistory");
 
     const result = await session.sendMessage(
@@ -86,8 +86,9 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
 
     // r32: payload + user row land in ONE durable write — separate appends
     // left a crash window that stranded the payload without its turn.
-    expect(appendMany).toHaveBeenCalledTimes(1);
-    expect(appendMany.mock.calls[0]?.[1]).toHaveLength(2);
+    expect(publication).toHaveBeenCalledTimes(1);
+    const operation = publication.mock.calls[0]?.[2];
+    expect(operation?.kind === "append" && operation.messages).toHaveLength(2);
     expect(appendOne.mock.calls.filter(([, message]) => message.role === "user")).toHaveLength(0);
 
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -111,7 +112,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       synthetic: true,
     });
 
-    spyOn(historyService, "appendManyToHistory").mockImplementation(() =>
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementation(() =>
       Promise.resolve(Err("simulated batch append failure"))
     );
 

@@ -7,7 +7,7 @@ import { historyWriteLockPath } from "./workspaceRemoval";
 import assert from "@/common/utils/assert";
 import nodeAssert from "node:assert/strict";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { FileChangeTracker } from "./utils/fileChangeTracker";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
@@ -738,12 +738,95 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
+  for (const peerAction of ["Stop", "Clear", "unchanged"] as const) {
+    test.each(["single", "batch"] as const)(
+      `peer ${peerAction} before automatic %s publication fences the persisted frontier`,
+      async (kind) => {
+        const h = await fixture();
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("prior", "user", "original context")
+        );
+        const peer = await createAgentSessionHarness({
+          workspaceId,
+          historyService: new HistoryService(h.config),
+          config: h.config,
+        });
+        fixtures.push(peer);
+        // Hold immediately before the real write lock, after automatic admission preflight.
+        // Both backends retain their own cancellation state but share the persisted transcript.
+        const writer = h.historyService as unknown as {
+          withRecoveredHistoryWriteResultLock<T>(
+            id: string,
+            error: string,
+            operation: (assertOwned: () => Promise<void>) => Promise<Result<T>>
+          ): Promise<Result<T>>;
+        };
+        const lock = writer.withRecoveredHistoryWriteResultLock.bind(writer);
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        let held = false;
+        spyOn(writer, "withRecoveredHistoryWriteResultLock").mockImplementation(async (...args) => {
+          if (
+            !held &&
+            ["Failed to append history", "Failed to accept compaction replacement"].includes(
+              args[1]
+            )
+          ) {
+            held = true;
+            entered.resolve();
+            await release.promise;
+          }
+          return lock(...args);
+        });
+        const sending = h.session.sendMessage("automatic input", options, {
+          acceptanceOrigin: "automatic",
+          ...(kind === "batch"
+            ? {
+                preTurnMessages: [
+                  createMuxMessage("payload", "assistant", "automatic payload", {
+                    synthetic: true,
+                  }),
+                ],
+              }
+            : {}),
+        });
+        try {
+          await entered.promise;
+          if (peerAction !== "unchanged") {
+            expect(
+              await peer.session.cancelCompaction(
+                true,
+                undefined,
+                peerAction === "Clear" ? { fullHistoryDeletion: { percentage: 1 } } : undefined
+              )
+            ).toEqual(Ok(undefined));
+          }
+          release.resolve();
+          const result = await sending;
+          const rows = await h.rows();
+          if (peerAction === "unchanged") {
+            expect(h.stream).toHaveBeenCalledTimes(1);
+            expect(rows.at(-1)?.role).toBe("user");
+            expect(rows).toHaveLength(kind === "batch" ? 3 : 2);
+          } else {
+            expect(rows.map((row) => row.id)).toEqual(peerAction === "Clear" ? [] : ["prior"]);
+            expect(h.stream).not.toHaveBeenCalled();
+          }
+          expect(result.success).toBe(peerAction === "unchanged");
+        } finally {
+          release.resolve();
+          await sending;
+        }
+      }
+    );
+  }
+
   for (const stale of ["Stop", "caller epoch"] as const) {
     test.each(["single", "batch"] as const)(
       `${stale} during automatic %s append removes only stale rows`,
       async (kind) => {
         const h = await fixture();
-        const chatPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
         let stopping: ReturnType<typeof h.session.cancelCompaction> | undefined;
         let foreign: ReturnType<typeof h.historyService.appendToHistory> | undefined;
         let epochStale = false;
@@ -756,26 +839,19 @@ describe("compaction cancellation runtime", () => {
             createMuxMessage("foreign", "assistant", "new unrelated row")
           );
         };
-        if (kind === "batch") {
-          const atomic = atomicWrite.default;
-          spyOn(atomicWrite, "default").mockImplementation(
-            new Proxy(atomic, {
-              async apply(target, receiver, args: Parameters<typeof atomic>) {
-                const result = await Reflect.apply(target, receiver, args);
-                if (args[0] === chatPath) supersede();
-                return result;
+        const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+        spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
+          (id, capture, operation, observer) =>
+            publish(id, capture, operation, {
+              ...observer,
+              onCommitted: (receipt) => {
+                observer.onCommitted(receipt);
+                // The actual journaled append committed; Stop/epoch loss still owns ordinary rollback.
+                supersede();
+                return undefined;
               },
             })
-          );
-        } else {
-          const append = fileIO.appendFile;
-          spyOn(fileIO, "appendFile").mockImplementation(
-            async (...args: Parameters<typeof append>) => {
-              await append(...args);
-              if (args[0] === chatPath) supersede();
-            }
-          );
-        }
+        );
         const result = await h.session.sendMessage("stale automatic input", options, {
           acceptanceOrigin: "automatic",
           admissionEpochStale: () => epochStale,

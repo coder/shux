@@ -131,7 +131,9 @@ describe("AgentSession scoped turn lifetimes", () => {
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
       const h = await createAgentSessionHarness({ workspaceId, appFiberScope });
-      spyOn(h.historyService, "appendToHistory").mockResolvedValueOnce(Err("disk unavailable"));
+      spyOn(h.historyService, "acceptCompactionReplacement").mockResolvedValueOnce(
+        Err("disk unavailable")
+      );
       let closing: Promise<void> | undefined;
       let closed = false;
       const close = (): void => {
