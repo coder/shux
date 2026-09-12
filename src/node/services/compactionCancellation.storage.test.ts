@@ -21,6 +21,7 @@ import {
   type CompactionCancellationMutation,
   type CompactionCancellationRecord,
   type CompactionCancellationStorage,
+  type CompactionReplacementCapture,
 } from "./compactionCancellation";
 
 type RejectsAsync<Observer> = (() => Promise<void>) extends Observer ? false : true;
@@ -101,6 +102,154 @@ describe("inactive real cancellation storage", () => {
   afterEach(async () => {
     mock.restore();
     await h.cleanup();
+  });
+
+  it("throwing retirement notification cannot skip unlink durability or recreate debt", async () => {
+    state = new CompactionCancellation(
+      h.historyService.getCompactionCancellationStorage(workspaceId)
+    );
+    await state.cancel();
+    const captured = await h.historyService.captureCompactionReplacement(workspaceId);
+    assert(captured.success && captured.data.nonce);
+    const accepted = await h.historyService.acceptCompactionReplacement(
+      workspaceId,
+      captured.data,
+      { kind: "append", messages: [createMuxMessage("replacement", "user", "Fresh input")] },
+      { isCurrent: () => true, onCommitted: () => undefined }
+    );
+    assert(accepted.success && accepted.data.kind === "accepted" && accepted.data.witness);
+    let notified = false;
+    let syncedAfterNotification = false;
+    const open = fs.open;
+    spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+      const handle = await open(...args);
+      if (args[0] === sessionDir) {
+        const sync = handle.sync.bind(handle);
+        spyOn(handle, "sync").mockImplementation(async () => {
+          await sync();
+          if (notified) syncedAfterNotification = true;
+        });
+      }
+      return handle;
+    });
+    const notifications: unknown[] = [];
+    expect(
+      await state.retireReplacement(accepted.data.witness, (before, after) => {
+        notifications.push([before, after]);
+        notified = true;
+        throw new Error("consumer notification failed");
+      })
+    ).toBe("applied");
+    expect(notifications).toEqual([
+      [captured.data, { nonce: null, generation: captured.data.generation }],
+    ]);
+    if (process.platform !== "win32") expect(syncedAfterNotification).toBe(true);
+    expect(await storage.read()).toBeNull();
+    expect(state.needsPersistence).toBe(false);
+    expect(await state.retry()).toBe("applied");
+    expect(notifications).toHaveLength(1);
+  });
+
+  it.each([
+    "commit",
+    "foreign-before",
+    "unlink-retry",
+    "generic-retry",
+    "foreign-retry",
+    "cleanup-failure",
+    "later-foreign",
+  ] as const)("replacement retirement reports its exact locked frontier (%s)", async (phase) => {
+    state = new CompactionCancellation(
+      h.historyService.getCompactionCancellationStorage(workspaceId)
+    );
+    await state.cancel();
+    const captured = await h.historyService.captureCompactionReplacement(workspaceId);
+    assert(captured.success);
+    assert(captured.data.nonce);
+    const accepted = await h.historyService.acceptCompactionReplacement(
+      workspaceId,
+      captured.data,
+      { kind: "append", messages: [createMuxMessage("replacement", "user", "Fresh input")] },
+      { isCurrent: () => true, onCommitted: () => undefined }
+    );
+    assert(accepted.success && accepted.data.kind === "accepted" && accepted.data.witness);
+    const receipts: Array<[CompactionReplacementCapture, CompactionReplacementCapture]> = [];
+    const notify = (before: CompactionReplacementCapture, after: CompactionReplacementCapture) => {
+      expect(nodeFs.existsSync(storage.path)).toBe(false);
+      expect(nodeFs.existsSync(historyWriteLockPath(h.config.rootDir, workspaceId))).toBe(true);
+      expect(state.blocksRecovery).toBe(false);
+      receipts.push([before, after]);
+      return undefined;
+    };
+    const remove = nodeFs.rmSync;
+    let failUnlink =
+      phase === "unlink-retry" || phase === "generic-retry" || phase === "foreign-retry";
+    spyOn(nodeFs, "rmSync").mockImplementation((file, options) => {
+      if (file === storage.path && failUnlink) throw new Error("unlink unavailable");
+      remove(file, options);
+    });
+    if (phase === "cleanup-failure") {
+      const lock = h.historyService.withCompactionStorageLock.bind(h.historyService);
+      spyOn(h.historyService, "withCompactionStorageLock").mockImplementationOnce(
+        async (...args) => {
+          await lock(...args);
+          throw new Error("post-commit cleanup unavailable");
+        }
+      );
+    }
+    if (phase === "foreign-before") {
+      const other = new CompactionCancellation(
+        foreign.getCompactionCancellationStorage(workspaceId)
+      );
+      await other.cancel({ retainUntilReplacement: true });
+    }
+    const retiring = state.retireReplacement(accepted.data.witness, notify);
+    if (phase === "foreign-before") {
+      expect(await retiring).toBe("superseded");
+      expect(receipts).toEqual([]);
+      expect((await storage.read())?.nonce).not.toBe(captured.data.nonce);
+      return;
+    }
+    if (failUnlink) {
+      await assert.rejects(retiring, /unlink unavailable/);
+      expect(receipts).toEqual([]);
+      expect((await storage.read())?.nonce).toBe(captured.data.nonce);
+      failUnlink = false;
+      if (phase === "foreign-retry") {
+        const other = new CompactionCancellation(
+          foreign.getCompactionCancellationStorage(workspaceId)
+        );
+        await other.cancel({ retainUntilReplacement: true });
+        const bytes = await fs.readFile(storage.path);
+        expect(await state.retry()).toBe("superseded");
+        expect(receipts).toEqual([]);
+        expect(await fs.readFile(storage.path)).toEqual(bytes);
+        return;
+      }
+      expect(
+        await (phase === "generic-retry" ? state.retire(captured.data.nonce) : state.retry())
+      ).toBe("applied");
+    } else if (phase === "cleanup-failure") {
+      await assert.rejects(retiring, /post-commit cleanup unavailable/);
+      expect(state.needsPersistence).toBe(true);
+      expect(await state.retry()).toBe("superseded");
+    } else expect(await retiring).toBe("applied");
+    expect(receipts).toEqual([
+      [captured.data, { nonce: null, generation: captured.data.generation }],
+    ]);
+    if (phase === "later-foreign") {
+      const other = new CompactionCancellation(
+        foreign.getCompactionCancellationStorage(workspaceId)
+      );
+      await other.cancel({ retainUntilReplacement: true });
+      const next = await h.historyService.acceptCompactionReplacement(
+        workspaceId,
+        receipts[0][1],
+        { kind: "append", messages: [createMuxMessage("queued", "user", "Queued input")] },
+        { isCurrent: () => true, onCommitted: () => undefined }
+      );
+      expect(next).toEqual({ success: true, data: { kind: "superseded" } });
+    }
   });
 
   it.each(["publish", "narrow", "confirm", "retire"] as const)(
@@ -631,7 +780,7 @@ describe("inactive real cancellation storage", () => {
       /not configured/
     );
     const refusing = new FileCompactionCancellationStorage(foreign, workspaceId, () =>
-      Promise.resolve(false)
+      Promise.resolve(() => Promise.resolve(false))
     );
     await assert.rejects(
       refusing.mutate(mutation, () => true, mutationCommitted),
@@ -639,18 +788,17 @@ describe("inactive real cancellation storage", () => {
     );
     expect(await storage.read()).toEqual(retained);
     let current = true;
-    const verifying = new FileCompactionCancellationStorage(
-      foreign,
-      workspaceId,
-      async (witness) => {
-        expect(witness.nonce).toBe(retained.nonce);
+    const verifying = new FileCompactionCancellationStorage(foreign, workspaceId, (witness) => {
+      expect(witness.nonce).toBe(retained.nonce);
+      expect(nodeFs.existsSync(historyWriteLockPath(h.config.rootDir, workspaceId))).toBe(false);
+      return Promise.resolve(async () => {
         expect(
           await fs.readFile(historyWriteLockPath(h.config.rootDir, workspaceId), "utf8")
         ).not.toBe("");
         current = false;
         return true;
-      }
-    );
+      });
+    });
     expect(await verifying.mutate(mutation, () => current, mutationCommitted)).toBe("superseded");
     expect(await storage.read()).toEqual(retained);
     // This injected authority exercises the seam only; real accepted-row proof belongs to H2b.
@@ -791,13 +939,26 @@ describe("inactive real cancellation storage", () => {
     expect(await storage.read()).toEqual(failed);
   });
 
+  it("overlapping Stop during generation staging returns superseded and preserves its successor", async () => {
+    let successor: ReturnType<typeof state.cancel> | undefined;
+    afterCompactionStaging(path.join(sessionDir, CONTINUOUS_COMPACTION_GENERATION_FILE), () => {
+      successor ??= state.cancel();
+    });
+    const first = await state.cancel().catch((error: unknown) => error);
+    expect(first).toBe("superseded");
+    expect(await successor).toBe("applied");
+    expect(await storage.read()).toEqual(await state.read());
+    expect((await storage.read())?.nonce).toBeDefined();
+  });
+
   it("a locally superseded publication cannot rename its staged cancellation", async () => {
     let current = true;
     const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
     const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
     spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async (...args) => {
-      await advance(...args);
+      const result = await advance(...args);
       current = false;
+      return result;
     });
     expect(await storage.mutate(publication("stale"), () => current, mutationCommitted)).toBe(
       "superseded"
@@ -1007,8 +1168,9 @@ describe("inactive real cancellation storage", () => {
     const journal = h.historyService.getContinuousCompactionJournal(workspaceId);
     const advance = journal.advanceGenerationUnderHistoryLock.bind(journal);
     spyOn(journal, "advanceGenerationUnderHistoryLock").mockImplementationOnce(async (...args) => {
-      await advance(...args);
+      const result = await advance(...args);
       current = false;
+      return result;
     });
     expect(await storage.repair(() => current, committed)).toBeNull();
     expect(await fs.readFile(storage.path, "utf8")).toBe("{bad again");

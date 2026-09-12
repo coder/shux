@@ -961,6 +961,8 @@ export interface ContextBudgetRejectedMessage {
 
 // Our custom metadata type
 export interface MuxMetadata {
+  /** Stop replaced by this durably accepted row; its enclosing id/sequence identify the receipt. */
+  compactionReplacementNonce?: string;
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)

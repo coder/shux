@@ -15,7 +15,7 @@ import { historyWriteLockPath } from "./workspaceRemoval";
 type PublicationObserver = NonNullable<
   Parameters<HistoryService["appendManyToHistoryUnderWriteLock"]>[2]
 >;
-// Compile-time assertion only; behavioral tests below check receipt timing at rename.
+// Compile-time assertion only; behavioral tests below check receipt timing at publication.
 expectTypeOf<() => Promise<undefined>>().not.toMatchTypeOf<PublicationObserver["onCommitted"]>();
 
 describe("HistoryService private publication seam", () => {
@@ -86,7 +86,26 @@ describe("HistoryService private publication seam", () => {
     return result.success ? result.data : [];
   }
 
-  function afterPublicationStaging(action: () => void | Promise<void>) {
+  function afterPublicationPreparation(
+    kind: "single" | "batch" | "update",
+    action: () => void | Promise<void>
+  ) {
+    // Single rows prepare an append handle; batches and updates stage a replacement file.
+    if (kind === "single") {
+      const open = fs.open;
+      return spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args);
+        if (args[0] === chatPath && args[1] === "a") {
+          try {
+            await action();
+          } catch (error) {
+            await handle.close();
+            throw error;
+          }
+        }
+        return handle;
+      });
+    }
     const atomic = atomicWrite.default;
     return spyOn(atomicWrite, "default").mockImplementation(
       new Proxy(atomic, {
@@ -117,8 +136,8 @@ describe("HistoryService private publication seam", () => {
         let successorReceiptBytes = Buffer.alloc(0);
         let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
         let commits = 0;
-        const staging = afterPublicationStaging(async () => {
-          // Model an expired birth-less lease while staging is held, then let
+        const staging = afterPublicationPreparation(kind, async () => {
+          // Model an expired birth-less lease while publication is prepared, then let
           // the real lock protocol reclaim it and a successor publish new bytes.
           const token = await fs.readFile(lockPath, "utf8");
           await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
@@ -170,7 +189,7 @@ describe("HistoryService private publication seam", () => {
       let staged = false;
       let current = true;
       let commits = 0;
-      const staging = afterPublicationStaging(() => {
+      const staging = afterPublicationPreparation(kind, () => {
         staged = true;
       });
       const readFile = fs.readFile;
@@ -251,34 +270,41 @@ describe("HistoryService private publication seam", () => {
       else expect(after?.epoch).toBe(before?.epoch);
     });
 
-    it(`${kind}: rejects ownership after staging without publishing or notifying`, async () => {
+    it(`${kind}: rejects ownership after preparation without publishing or notifying`, async () => {
       const before = await fs.readFile(chatPath);
-      let staged = false;
+      let prepared = false;
       let commits = 0;
-      const result = await publish(kind, {
-        isCurrent: () => {
-          staged = nodeFs
-            .readdirSync(path.dirname(chatPath))
-            .some((name) => name.startsWith("chat.jsonl.publication-"));
-          return false;
-        },
-        onCommitted: () => {
-          commits++;
-        },
+      const preparation = afterPublicationPreparation(kind, () => {
+        prepared = true;
       });
-      expect(result.success).toBe(false);
-      expect(staged).toBe(true);
-      expect(commits).toBe(0);
-      expect(await fs.readFile(chatPath)).toEqual(before);
-      expect(
-        (await fs.readdir(path.dirname(chatPath))).filter((name) => name.includes(".publication-"))
-      ).toEqual([]);
+      try {
+        const result = await publish(kind, {
+          isCurrent: () => !prepared,
+          onCommitted: () => {
+            commits++;
+          },
+        });
+        expect(result.success).toBe(false);
+        expect(prepared).toBe(true);
+        expect(commits).toBe(0);
+        expect(await fs.readFile(chatPath)).toEqual(before);
+        expect(
+          (await fs.readdir(path.dirname(chatPath))).filter((name) =>
+            name.includes(".publication-")
+          )
+        ).toEqual([]);
+      } finally {
+        preparation.mockRestore();
+      }
     });
 
-    it(`${kind}: a failed rename leaves the old history and no commit receipt`, async () => {
+    it(`${kind}: a failed publication leaves the old history and no commit receipt`, async () => {
       const before = await fs.readFile(chatPath);
       let commits = 0;
-      const rename = spyOn(nodeFs, "renameSync").mockImplementationOnce(() => {
+      const failure = spyOn(
+        nodeFs,
+        kind === "single" ? "writeSync" : "renameSync"
+      ).mockImplementationOnce(() => {
         throw new Error("publication unavailable");
       });
       try {
@@ -292,21 +318,36 @@ describe("HistoryService private publication seam", () => {
         expect(commits).toBe(0);
         expect(await fs.readFile(chatPath)).toEqual(before);
       } finally {
-        rename.mockRestore();
+        failure.mockRestore();
       }
     });
 
-    it(`${kind}: observer and staging-cleanup failures cannot turn a commit into a retry`, async () => {
+    it(`${kind}: observer and cleanup failures cannot turn a commit into a retry`, async () => {
       let commits = 0;
       let cleanupFailures = 0;
       const remove = fs.rm;
-      const failure = spyOn(fs, "rm").mockImplementation((target, options) => {
-        if (String(target).startsWith(`${chatPath}.publication-`)) {
-          cleanupFailures++;
-          return Promise.reject(new Error("cleanup unavailable"));
-        }
-        return remove(target, options);
-      });
+      const open = fs.open;
+      const failure =
+        kind === "single"
+          ? spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+              const handle = await open(...args);
+              if (args[0] === chatPath && args[1] === "a") {
+                const close = handle.close.bind(handle);
+                spyOn(handle, "close").mockImplementation(async () => {
+                  await close();
+                  cleanupFailures++;
+                  throw new Error("cleanup unavailable");
+                });
+              }
+              return handle;
+            })
+          : spyOn(fs, "rm").mockImplementation((target, options) => {
+              if (String(target).startsWith(`${chatPath}.publication-`)) {
+                cleanupFailures++;
+                return Promise.reject(new Error("cleanup unavailable"));
+              }
+              return remove(target, options);
+            });
       try {
         const result = await publish(kind, {
           isCurrent: () => true,

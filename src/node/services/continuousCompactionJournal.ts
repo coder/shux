@@ -159,22 +159,26 @@ export class ContinuousCompactionJournalStore {
   /** Caller already holds the history lock; never re-enter the journal queue here. */
   async advanceGenerationUnderHistoryLock(
     onCommitted?: (generation: string) => undefined,
-    assertStillOwned?: () => Promise<void>
-  ): Promise<void> {
+    assertStillOwned?: () => Promise<void>,
+    isCurrent: () => boolean = () => true
+  ): Promise<boolean> {
     const generation = randomUUID();
-    await publishCompactionFile(
+    const committed = await publishCompactionFile(
       path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
       generation,
-      () => true,
+      isCurrent,
       // The cancellation retry must learn its exact frontier at rename, before
       // cleanup or lock release can fail or admit a foreign generation.
       () => onCommitted?.(createHash("sha256").update(generation).digest("hex")),
       assertStillOwned
     );
+    return committed;
   }
 
   advanceGeneration(): Promise<void> {
-    return this.enqueue(() => this.advanceGenerationUnderHistoryLock());
+    return this.enqueue(async () => {
+      await this.advanceGenerationUnderHistoryLock();
+    });
   }
 
   private async readUnderHistoryLock(): Promise<ContinuousCompactionJournal | null> {

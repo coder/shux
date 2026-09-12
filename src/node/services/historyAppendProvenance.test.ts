@@ -94,6 +94,24 @@ afterEach(async () => {
 });
 
 describe("history append provenance", () => {
+  test("single replacement acceptance preserves the append cursor's fixed snapshot", async () => {
+    const cursor = await startCursor();
+    const capture = await fixture.historyService.captureCompactionReplacement(ws);
+    assert(capture.success);
+    const accepted = await fixture.historyService.acceptCompactionReplacement(
+      ws,
+      capture.data,
+      {
+        kind: "append",
+        messages: [createMuxMessage("accepted", "user", "new input")],
+      },
+      { isCurrent: () => true, onCommitted: () => undefined }
+    );
+    expect(accepted).toEqual({ success: true, data: { kind: "accepted", witness: null } });
+    expect((await resume(cursor)).map((row) => row.id)).toEqual(["row-1", "row-2"]);
+    expect((await store.read()).receipt?.epoch).toBe(cursor.provenanceEpoch);
+  });
+
   test("bootstraps privately without an existing receipt and uses exact bigint stamps", async () => {
     await fs.rm(store.receiptPath);
     const cursor = await startCursor();

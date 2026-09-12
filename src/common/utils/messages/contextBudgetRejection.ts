@@ -22,6 +22,8 @@ export function createContextBudgetRejectedMessage(message: MuxMessage): MuxMess
     parts: [],
     metadata: {
       historySequence: message.metadata?.historySequence,
+      // Quarantining this same occurrence must preserve its already-committed acceptance.
+      compactionReplacementNonce: message.metadata?.compactionReplacementNonce,
       timestamp: message.metadata?.timestamp,
       synthetic: true,
       uiVisible: false,
