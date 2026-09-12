@@ -139,6 +139,52 @@ describe("MessageQueue", () => {
       }
     );
 
+    it.each([1, 2] as const)(
+      "does not share settlement proof between mixed-version additions (first=%s)",
+      async (firstVersion) => {
+        for (const cancellationVersion of [firstVersion, firstVersion === 1 ? 2 : 1] as const)
+          queue.add("automatic addition", undefined, {
+            acceptanceOrigin: "automatic",
+            readCompactionAdmission: () => Promise.resolve(Ok({ ...newer, cancellationVersion })),
+          });
+        expect((await queue.dequeueNext().internal?.readCompactionAdmission?.())?.success).toBe(
+          false
+        );
+      }
+    );
+
+    it.each([1, 2] as const)(
+      "owned reset keeps mixed admission versions distinct (first=%s)",
+      async (firstVersion) => {
+        for (const cancellationVersion of [firstVersion, firstVersion === 1 ? 2 : 1] as const)
+          queue.add("automatic addition", undefined, {
+            acceptanceOrigin: "automatic",
+            readCompactionAdmission: () => Promise.resolve(Ok({ ...newer, cancellationVersion })),
+          });
+        const settled = { ...newer, cancellationVersion: 2 as const };
+        queue.advanceCompactionAdmission(settled, { ...settled, generation: "owned reset" });
+        expect((await queue.dequeueNext().internal?.readCompactionAdmission?.())?.success).toBe(
+          false
+        );
+      }
+    );
+
+    it.each([false, true])(
+      "matching settlement proof follows only its owned transition (retired=%s)",
+      async (retired) => {
+        const settled = { ...newer, cancellationVersion: 2 as const };
+        for (let index = 0; index < 2; index++)
+          queue.add("fresh addition", undefined, {
+            readCompactionAdmission: () => Promise.resolve(Ok(settled)),
+          });
+        const successor = { nonce: null, generation: settled.generation };
+        if (retired) queue.advanceCompactionAdmission(settled, successor);
+        expect(await queue.dequeueNext().internal?.readCompactionAdmission?.()).toEqual(
+          Ok(retired ? successor : settled)
+        );
+      }
+    );
+
     it("does not let a newer batched add authorize an older frontier", async () => {
       queue.add("old", undefined, { readCompactionAdmission: () => Promise.resolve(Ok(older)) });
       queue.add("fresh", undefined, { readCompactionAdmission: () => Promise.resolve(Ok(newer)) });

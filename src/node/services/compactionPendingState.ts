@@ -605,8 +605,12 @@ export class CompactionPendingState {
     // Caller metadata changes only with the synchronous history receipt, never while staging.
     const summaryMessage = structuredClone(input.summaryMessage);
     const writeId = randomUUID();
-    summaryMessage.metadata = { ...summaryMessage.metadata, compactionPublicationId: writeId };
     const publication = structuredClone(input.publication);
+    summaryMessage.metadata = {
+      ...summaryMessage.metadata,
+      compactionPublicationId: writeId,
+      compactionPublicationGeneration: publication.generation ?? null,
+    };
     const preparation = {
       attachments: structuredClone(input.attachments),
       boundaryMessageId: summaryMessage.id,

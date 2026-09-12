@@ -289,7 +289,8 @@ export class MessageQueue {
             const captured = await read();
             return captured.success &&
               captured.data.nonce === predecessor.nonce &&
-              captured.data.generation === predecessor.generation
+              captured.data.generation === predecessor.generation &&
+              captured.data.cancellationVersion === predecessor.cancellationVersion
               ? { success: true, data: { ...successor } }
               : captured;
           };
@@ -1115,7 +1116,8 @@ export class MessageQueue {
                 capture &&
                 (!capture.success ||
                   capture.data.nonce !== first.data.nonce ||
-                  capture.data.generation !== first.data.generation)
+                  capture.data.generation !== first.data.generation ||
+                  capture.data.cancellationVersion !== first.data.cancellationVersion)
             )
           )
             return Err("Queued admission spans different Stop frontiers.");

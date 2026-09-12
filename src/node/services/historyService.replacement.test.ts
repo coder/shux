@@ -688,7 +688,7 @@ describe("compaction replacement acceptance", () => {
       expect((await rows()).some((row) => row.id === "second-replacement")).toBe(false);
       expect(await stop.retireReplacement(first.data.witness)).toBe("applied");
       const successor = await capture();
-      expect(successor).toEqual({ ...expected, nonce: null });
+      expect(successor).toEqual({ nonce: null, generation: expected.generation });
       const later = await foreign.acceptCompactionReplacement(
         workspaceId,
         successor,

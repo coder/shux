@@ -920,6 +920,29 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test("fresh automatic rollover replaces fully settled Stop without scoped debt", async () => {
+    const h = await setup();
+    await seedHistory(h, 110_000);
+    expect(await h.session.interruptStream()).toEqual(Ok(undefined));
+    const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+    const stopped = await storage.read();
+    assert(stopped?.version === 2);
+    expect(stopped.scope.kind).toBe("unresolved");
+    expect(
+      await h.session.sendMessage("Fresh automatic input", options, {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+      })
+    ).toEqual(Ok(undefined));
+    const latest = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(latest.success);
+    expect(rolloverRows(latest.data)).toHaveLength(1);
+    expect(latest.data.some((row) => row.id === "old-answer")).toBe(false);
+    expect(latest.data.at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
+    expect(await storage.read()).toBeNull();
+    expect(h.requests).toHaveLength(1);
+  });
+
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
@@ -1971,6 +1994,33 @@ describe("AgentSession token-budget lifecycle", () => {
       await foreign.cancel({ retainUntilReplacement: true });
       for (const message of ["First after Stop", "Second after Stop"])
         h.session.queueMessage(message, options, { onAccepted: () => undefined });
+      h.session.sendQueuedMessages();
+      await h.waitForRequest(1);
+      h.settleStream(0, { finishReason: "stop" });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(
+        rows.filter((row) => ["First after Stop", "Second after Stop"].includes(text(row)))
+      ).toHaveLength(2);
+      expect(rolloverRows(rows)).toHaveLength(reset ? 1 : 0);
+    }
+  );
+
+  test.each([false, true])(
+    "separate automatic inputs survive settled Stop retirement (reset=%s)",
+    async (reset) => {
+      const h = await setup();
+      await seedHistory(h, reset ? 110_000 : 20_000);
+      const foreign = new CompactionCancellation(
+        new HistoryService(h.config).getCompactionCancellationStorage(workspaceId)
+      );
+      await foreign.cancel({ settled: Promise.resolve(true) });
+      for (const message of ["First after Stop", "Second after Stop"])
+        h.session.queueMessage(message, options, {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          onAccepted: () => undefined,
+        });
       h.session.sendQueuedMessages();
       await h.waitForRequest(1);
       h.settleStream(0, { finishReason: "stop" });

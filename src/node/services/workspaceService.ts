@@ -12165,6 +12165,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
+    let finalizeCompactionStop:
+      | ((cleanupSucceeded: boolean | Promise<boolean>) => Promise<Result<void>>)
+      | undefined;
     try {
       this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
@@ -12202,9 +12205,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         settleStop = resolve;
       });
       let retirementRecorded = true;
+      const retirementSettled = Promise.withResolvers<void>();
+      if (!retiring) retirementSettled.resolve();
       const retirement = retiring
         ? this.bashMonitorWakeReconciler
-            .consumeCurrent(workspaceId, () => stopSettled)
+            .consumeCurrent(
+              workspaceId,
+              () => stopSettled,
+              () => retirementSettled.resolve()
+            )
             .catch((error: unknown) => {
               retirementRecorded = false;
               log.warn("Failed to retire bash monitor attention before Stop", {
@@ -12230,6 +12239,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       try {
         const stopping = session.interruptStream({
           ...options,
+          onCompactionSettled: () => this.scheduleBashMonitorWakeReconcile(workspaceId),
+          deferCompactionSettlement: (finalize) => {
+            finalizeCompactionStop = finalize;
+          },
           onCompactionCanceled: (capture) => {
             stopCapture = capture;
           },
@@ -12251,10 +12264,92 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // unrecorded after the session retried the write fails the Stop below, on this and every later
       // Stop, so the obligation is not lost with the joined send.
       await withdrawnWakeSend?.catch(() => undefined);
-      const stopRecorded =
-        !(retiring || disabling) ||
-        ((await session.recordPendingAutoRetryState()) && retirementRecorded);
+      const retryStateRecorded =
+        !(retiring || disabling) || (await session.recordPendingAutoRetryState());
+      const stopRecorded = retryStateRecorded && retirementRecorded;
+      const cleanupQualification = () =>
+        retryStateRecorded
+          ? retirementRecorded
+            ? true
+            : retirementSettled.promise.then(() => true)
+          : false;
+      const finishOuterCleanup = async (allowQueueDispatch: boolean): Promise<boolean> => {
+        if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
+        // For hard interrupts, delete partial immediately. For soft interrupts,
+        // defer to stream-abort handler (stream is still running and may recreate partial).
+        if (options?.abandonPartial && !options?.soft) {
+          log.debug("Abandoning partial for workspace:", workspaceId);
+          await this.historyService.deletePartial(workspaceId);
+        }
+
+        let descendantsSettled = true;
+        // Rationale: user-initiated hard interrupts should stop the entire task tree so
+        // descendant sub-agents cannot finish later and auto-resume this workspace.
+        if (!options?.soft) {
+          try {
+            const interruptedTaskIds =
+              await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
+            if (interruptedTaskIds && interruptedTaskIds.length > 0) {
+              log.debug("Cascade-interrupted descendant tasks on interrupt", {
+                workspaceId,
+                interruptedTaskIds,
+              });
+            }
+          } catch (error: unknown) {
+            descendantsSettled = false;
+            log.error("Failed to cascade-interrupt descendant tasks on interrupt", {
+              workspaceId,
+              error,
+            });
+          }
+        }
+
+        if (!allowQueueDispatch && (stopAdmission() || session.closingSignal.aborted)) return false;
+
+        // Handle queued messages based on option
+        if (allowQueueDispatch && options?.sendQueuedImmediately) {
+          // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
+          // clear hard-interrupt suppression first (it won't flow through sendMessage()).
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
+          // The card represents only user-authored queue content. Prioritize that
+          // entry over hidden synthetic/background work before dispatching.
+          session.sendNextUserQueuedMessage(
+            options?.soft
+              ? undefined
+              : {
+                  isStale: stopAdmission,
+                  readCapture: () => stopCapture,
+                }
+          );
+        } else {
+          // Restore queued messages to input box for user-initiated interrupts
+          session.restoreQueueToInput();
+        }
+
+        return descendantsSettled;
+      };
+
       if (!stopResult.success && !stopResult.streamStopped) {
+        if (finalizeCompactionStop) {
+          // Preserve the physical error promptly. The existing workspace cleanup owner keeps the
+          // cascade/latch alive; V2 still needs both this receipt and the original producer exit.
+          const cleanup = Promise.withResolvers<boolean>();
+          const releaseCascade = releaseHardStopLatch;
+          releaseHardStopLatch = undefined;
+          this.deferWorkspaceCleanup(async () => {
+            try {
+              cleanup.resolve(await finishOuterCleanup(false));
+            } catch (error) {
+              cleanup.resolve(false);
+              log.error("Failed outer cleanup after physical Stop failure", { workspaceId, error });
+            } finally {
+              releaseCascade?.();
+            }
+          });
+          await finalizeCompactionStop(
+            cleanup.promise.then((completed) => (completed ? cleanupQualification() : false))
+          );
+        }
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
@@ -12263,54 +12358,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(stopResult.error);
       }
 
-      // For hard interrupts, delete partial immediately. For soft interrupts,
-      // defer to stream-abort handler (stream is still running and may recreate partial).
-      if (options?.abandonPartial && !options?.soft) {
-        log.debug("Abandoning partial for workspace:", workspaceId);
-        await this.historyService.deletePartial(workspaceId);
-      }
+      const descendantsSettled = await finishOuterCleanup(true);
 
-      // Rationale: user-initiated hard interrupts should stop the entire task tree so
-      // descendant sub-agents cannot finish later and auto-resume this workspace.
-      if (!options?.soft) {
-        try {
-          const interruptedTaskIds =
-            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
-          if (interruptedTaskIds && interruptedTaskIds.length > 0) {
-            log.debug("Cascade-interrupted descendant tasks on interrupt", {
-              workspaceId,
-              interruptedTaskIds,
-            });
-          }
-        } catch (error: unknown) {
-          log.error("Failed to cascade-interrupt descendant tasks on interrupt", {
-            workspaceId,
-            error,
-          });
-        }
-      }
-
-      // Handle queued messages based on option
-      if (options?.sendQueuedImmediately) {
-        // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
-        // clear hard-interrupt suppression first (it won't flow through sendMessage()).
-        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
-        // The card represents only user-authored queue content. Prioritize that
-        // entry over hidden synthetic/background work before dispatching.
-        session.sendNextUserQueuedMessage(
-          options?.soft
-            ? undefined
-            : {
-                isStale: stopAdmission,
-                readCapture: () => stopCapture,
-              }
-        );
-      } else {
-        // Restore queued messages to input box for user-initiated interrupts
-        session.restoreQueueToInput();
-      }
-
-      if (!stopRecorded || !stopResult.success) {
+      const finalized = await finalizeCompactionStop?.(
+        (stopResult.success || stopResult.streamStopped) && descendantsSettled
+          ? cleanupQualification()
+          : false
+      );
+      if (!stopRecorded || !stopResult.success || finalized?.success === false) {
         log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
         return Err(STOP_UNRECORDED_MESSAGE);
       }
@@ -12324,6 +12379,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       log.error("Unexpected error in interruptStream handler:", error);
       return Err(`Failed to interrupt stream: ${errorMessage}`);
     } finally {
+      // Every early return/throw abandons V2 qualification while still joining the exact Stop.
+      await finalizeCompactionStop?.(false);
       releaseHardStopLatch?.();
     }
   }

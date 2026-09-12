@@ -78,6 +78,7 @@ import {
   CompactionCancellation,
   matchesCompactionCancellation,
   type CompactionCancellationReplacementWitness,
+  type CompactionCancellationMutationOutcome,
   type CompactionCancellationSummary,
   type CompactionReplacementCapture,
 } from "./compactionCancellation";
@@ -790,6 +791,8 @@ interface CachedMemoryContext {
 
 interface SendMessageInternalOptions {
   readCompactionAdmission?: () => Promise<Result<CompactionReplacementCapture>>;
+  /** Recovery retains its original durable Stop frontier through final trigger publication. */
+  recoveryReplacement?: CompactionReplacementCapture;
   acceptanceOrigin?: TurnAcceptanceOrigin;
   preparation?: PreparationAttempt;
   /** A dequeued send keeps its admission owner through acceptance and startup failure. */
@@ -3376,10 +3379,12 @@ export class AgentSession {
     if (internal?.preparation)
       return this.prepareMessage(message, options, internal, internal.preparation);
     if (!internal?.readCompactionAdmission) {
-      const admission = this.historyService.captureCompactionReplacement(this.workspaceId, {
-        onRepaired: () => this.clearUsageState(),
-        replaceUnreadable: (internal?.acceptanceOrigin ?? "manual") === "manual",
-      });
+      const admission = internal?.recoveryReplacement
+        ? Promise.resolve(Ok(internal.recoveryReplacement))
+        : this.historyService.captureCompactionReplacement(this.workspaceId, {
+            onRepaired: () => this.clearUsageState(),
+            replaceUnreadable: (internal?.acceptanceOrigin ?? "manual") === "manual",
+          });
       internal = { ...internal, readCompactionAdmission: () => admission };
     }
     const attempt: PreparationAttempt = {
@@ -3517,60 +3522,74 @@ export class AgentSession {
     const persistedCancelableMessageIds: string[] = [];
     const stagedPrefixes: MuxMessage[] = [];
     let replacementCapture: CompactionReplacementCapture | undefined;
+    let automaticReplacement = false;
     let replacementCommitted = false;
-    // Prefixes and their trigger share the persisted Stop fence. A peer Stop or Clear
-    // must not land between automatic admission and its durable history append.
+    // Prefixes and their trigger publish together against the original Stop frontier. Optional
+    // context alone cannot replace Stop; only replacement receipts close the rollback horizon.
     const publishPreparedHistory = async (
       publication:
         | { kind: "prefix"; message: MuxMessage }
         | { kind: "trigger"; messages: MuxMessage[] }
     ): Promise<Result<void>> => {
       const messages = publication.kind === "prefix" ? [publication.message] : publication.messages;
-      if (!manualReplacement && (await this.isAutomaticSendBlocked()))
-        return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
       if (publication.kind === "prefix") {
         stagedPrefixes.push(...messages);
         return Ok(undefined);
       }
-      attempt.inputPublication = messages.at(-1);
-      const capture = replacementCapture ?? attempt.admissionCapture;
-      assert(capture, "Publication requires its original admission capture");
+      const replacesCancellation = manualReplacement || automaticReplacement;
       const batch = [...stagedPrefixes, ...messages];
-      const accepted = await this.historyService
-        .acceptCompactionReplacement(
-          this.workspaceId,
-          capture,
-          {
-            kind: "append",
-            messages: batch,
-            ...(!manualReplacement ? { preserveCancellation: true as const } : {}),
+      attempt.inputPublication = messages.at(-1);
+      assert(replacementCapture, "Publication requires its admission capture");
+      const publishing = this.historyService.acceptCompactionReplacement(
+        this.workspaceId,
+        replacementCapture,
+        {
+          kind: "append",
+          messages: batch,
+          ...(!replacesCancellation ? { preserveCancellation: true as const } : {}),
+        },
+        {
+          isCurrent: () =>
+            !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+          onContextResetCommitted: (predecessor, successor) => {
+            this.advanceOwnedCompactionAdmission(predecessor, successor, attempt.admissionCapture);
           },
-          {
-            isCurrent: () =>
-              !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
-            onContextResetCommitted: (predecessor, successor) => {
-              this.advanceOwnedCompactionAdmission(predecessor, successor);
-              if (attempt.admissionCapture) Object.assign(attempt.admissionCapture, successor);
-            },
-            onCommitted: () => {
-              if (manualReplacement) {
-                replacementCommitted = true;
-                attempt.durability = "durable";
-              } else persistedCancelableMessageIds.push(...batch.map((row) => row.id));
-              return undefined;
-            },
-          }
-        )
-        .catch((error: unknown) => Err(getErrorMessage(error)));
+          onCommitted: () => {
+            if (replacesCancellation) {
+              replacementCommitted = true;
+              attempt.durability = manualReplacement ? "durable" : "accepted";
+              // Replacement is irrevocable before retirement or fallible acceptance observers.
+              // Correlated senders must not refund an already accepted prefix.
+              if ((internal?.preTurnMessages?.length ?? 0) > 0)
+                internal?.onPreTurnRowsPersisted?.();
+            } else {
+              // Ordinary automatic publication only fences the Stop frontier; cancellation still
+              // owns rollback until the existing acceptance path closes that horizon.
+              persistedCancelableMessageIds.push(...batch.map((row) => row.id));
+            }
+            return undefined;
+          },
+        }
+      );
+      // Unexpected rejection follows Result Err's rollback path; the synchronous receipt
+      // still decides whether input is irrevocable. Retirement and observers remain outside.
+      const accepted = await publishing.catch((error: unknown) => Err(getErrorMessage(error)));
       if (!accepted.success) return accepted;
       if (accepted.data.kind !== "accepted") {
+        // A canceled ordinary append can now refuse under the publication lock before writing.
+        // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
       }
-      // Retirement takes the same lock; join it only after publication releases that lock.
-      if (manualReplacement) {
-        await this.retireCompactionReplacement(accepted.data.witness, attempt.admissionCapture);
-        if ((internal?.preTurnMessages?.length ?? 0) > 0) internal?.onPreTurnRowsPersisted?.();
+      if (replacesCancellation) {
+        // Retirement takes the same lock; join it only after publication releases that lock.
+        const retired = await this.retireCompactionReplacement(
+          accepted.data.witness,
+          attempt.admissionCapture
+        );
+        if (automaticReplacement && retired === "superseded")
+          return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+        if (!manualReplacement) await internal?.onAccepted?.();
       }
       return Ok(undefined);
     };
@@ -3658,6 +3677,13 @@ export class AgentSession {
       return Ok(undefined);
     }
 
+    // Capture before the first automatic gate: a foreign Stop discovered during preparation
+    // belongs to a later admission and cannot grant this attempt replacement authority.
+    const automaticCapture = manualReplacement
+      ? undefined
+      : internal?.recoveryReplacement
+        ? Ok(internal.recoveryReplacement)
+        : frontier;
     if (manualReplacement) {
       await this.readCompactionCancellation("manual");
       const stopAdmission = attempt.queuedStopAdmission;
@@ -3672,6 +3698,21 @@ export class AgentSession {
       attempt.admissionCapture = replacementCapture;
     } else if (await this.isAutomaticSendBlocked()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+    if (!manualReplacement) {
+      const record = await this.readCompactionCancellation();
+      if (!automaticCapture?.success)
+        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      replacementCapture = automaticCapture.data;
+      if (record?.version === 2) {
+        if (
+          replacementCapture.cancellationVersion !== 2 ||
+          replacementCapture.nonce !== record.nonce ||
+          replacementCapture.generation !== record.settledGeneration
+        )
+          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        automaticReplacement = true;
+      }
     }
     if (isAdmissionStale())
       return refuseBeforeAcceptance(
@@ -4238,7 +4279,7 @@ export class AgentSession {
       // An explicit replacement instead publishes its witness before compaction can hide debt.
       if (
         shouldCompactBeforeSend &&
-        (manualReplacement || !(await this.compactionRecoveryBlocked()))
+        (manualReplacement || automaticReplacement || !(await this.compactionRecoveryBlocked()))
       ) {
         this.continuousCompactor.reset("legacy-fallback");
         const followUpFileParts = effectiveFileParts?.map((part) => ({
@@ -5353,8 +5394,14 @@ export class AgentSession {
       this.activeStreamContext?.admissionCapture,
       this.activeCompactionRequest?.admissionCapture,
     ]) {
-      if (capture?.nonce === predecessor.nonce && capture.generation === predecessor.generation)
+      if (
+        capture?.nonce === predecessor.nonce &&
+        capture.generation === predecessor.generation &&
+        capture.cancellationVersion === predecessor.cancellationVersion
+      ) {
+        delete capture.cancellationVersion;
         Object.assign(capture, successor);
+      }
     }
   }
 
@@ -7130,6 +7177,13 @@ export class AgentSession {
         fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
         {
           acceptanceOrigin: "automatic",
+          // This continues the original stream and cannot acquire a newer Stop frontier.
+          readCompactionAdmission: () =>
+            Promise.resolve(
+              context.admissionCapture
+                ? Ok(context.admissionCapture)
+                : Err("Continuation has no original admission frontier.")
+            ),
           synthetic: true,
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
@@ -7219,6 +7273,13 @@ export class AgentSession {
         },
         {
           acceptanceOrigin: "automatic",
+          // This continues the original stream and cannot acquire a newer Stop frontier.
+          readCompactionAdmission: () =>
+            Promise.resolve(
+              streamContext.admissionCapture
+                ? Ok(streamContext.admissionCapture)
+                : Err("Continuation has no original admission frontier.")
+            ),
           admissionStale,
           synthetic: true,
           agentInitiated: autoCompactionRequest.agentInitiated,
@@ -7297,14 +7358,19 @@ export class AgentSession {
     };
   }
 
+  private pendingStopCompletion?: AbortController;
+
   async cancelCompaction(
     retainUntilReplacement = false,
-    settled?: Promise<void>,
+    settled?: Promise<boolean>,
     options?: {
       fullHistoryDeletion?: CompactionHistoryDeletion;
       onCaptured?: (capture: CompactionReplacementCapture) => void;
+      onInitialSettlement?: () => void;
+      onSettled?: (capture: CompactionReplacementCapture) => void;
     }
   ): Promise<Result<void>> {
+    this.pendingStopCompletion?.abort();
     this.compactionStopGeneration++;
     this.pendingResumeIntent?.abort();
     this.coordinator.abandonCompaction();
@@ -7316,6 +7382,8 @@ export class AgentSession {
         settled,
         fullHistoryDeletion: options?.fullHistoryDeletion,
         onCaptured: options?.onCaptured,
+        onInitialSettlement: options?.onInitialSettlement,
+        onSettled: options?.onSettled,
       });
       return Ok(undefined);
     } catch (error) {
@@ -7326,9 +7394,9 @@ export class AgentSession {
   private async retireCompactionReplacement(
     witness: CompactionCancellationReplacementWitness | null,
     preparing?: CompactionReplacementCapture
-  ): Promise<void> {
+  ): Promise<CompactionCancellationMutationOutcome | undefined> {
     if (!witness) return;
-    await this.compactionCancellation
+    return await this.compactionCancellation
       .retireReplacement(
         witness,
         (predecessor, successor) => {
@@ -7338,6 +7406,7 @@ export class AgentSession {
       )
       .catch((error: unknown) => {
         log.warn("Accepted replacement retains compaction cancellation cleanup debt", { error });
+        return undefined;
       });
   }
 
@@ -7368,18 +7437,26 @@ export class AgentSession {
   async isAutomaticSendBlocked(): Promise<boolean> {
     const record = await this.readCompactionCancellation();
     if (this.compactionCancellation.blocksRecovery || record?.retainUntilReplacement) return true;
-    // Scoped Stop can distinguish its canceled handoff from later automatic input.
-    // Keep that handoff identifiable before any fresh request can hide the summary.
-    if (record?.scope.kind === "unresolved") {
+    if (record?.version === 2) {
+      const captured = await this.historyService.captureCompactionReplacement(this.workspaceId);
+      // A reset can advance the journal before its replacement commits. Keep monitor attention
+      // deferred in that state instead of repeatedly retrying an admission that must refuse.
+      return (
+        !captured.success ||
+        captured.data.nonce !== record.nonce ||
+        captured.data.generation !== record.settledGeneration ||
+        this.compactionCancellation.blocksRecovery
+      );
+    }
+    // New monitor/family input remains automatic after ordinary Stop. Keep the canceled
+    // handoff identifiable when this fresh input hides its summary from tail-only recovery.
+    if (record?.version === 1 && record.scope.kind === "unresolved") {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);
       // A Stop admitted during the read can be waiting for this caller's terminal policy.
       if (this.compactionCancellation.blocksRecovery) return true;
       const summary = history.data.map(pendingCompactionSummary).findLast((entry) => entry != null);
       if (summary) await this.compactionCancellation.narrow(record.nonce, summary);
-      // An unresolved Stop has no durable settlement proof. Refuse fresh automatic input
-      // before acceptance so it cannot create a compaction continuation that recovery blocks.
-      // Explicit manual replacement remains the recovery path for this conservative layer.
       else return true;
     }
     return this.compactionCancellation.blocksRecovery;
@@ -7411,15 +7488,133 @@ export class AgentSession {
     abandonPartial?: boolean;
     preserveCompactionIntent?: boolean;
     onCompactionCanceled?: (capture: CompactionReplacementCapture) => void;
+    onCompactionSettled?: () => void;
+    deferCompactionSettlement?: (
+      finalize: (cleanupSucceeded: boolean | Promise<boolean>) => Promise<Result<void>>
+    ) => void;
   }): Promise<AgentSessionInterruptResult> {
     this.assertNotDisposed("interruptStream");
-    const settled = Promise.withResolvers<void>();
+    const settled = Promise.withResolvers<boolean>();
+    const initiallySettled = Promise.withResolvers<Result<void>>();
+    let physicallyStopped = false;
+    let settledCapture: CompactionReplacementCapture | undefined;
     const cancellation =
       options?.soft || options?.preserveCompactionIntent
         ? undefined
         : this.cancelCompaction(false, settled.promise, {
             onCaptured: options?.onCompactionCanceled,
+            onInitialSettlement: () => initiallySettled.resolve(Ok(undefined)),
+            onSettled: (capture) => {
+              settledCapture = capture;
+            },
           });
+    const completionController = new AbortController();
+    if (cancellation) {
+      this.pendingStopCompletion = completionController;
+      const abandon = () => {
+        completionController.abort();
+        settled.resolve(false);
+      };
+      completionController.signal.addEventListener("abort", () => settled.resolve(false), {
+        once: true,
+      });
+      this.closingSignal.addEventListener("abort", abandon, { once: true });
+      if (this.coordinator.closing) abandon();
+      const releaseCompletion = () => {
+        this.closingSignal.removeEventListener("abort", abandon);
+        if (this.pendingStopCompletion === completionController)
+          this.pendingStopCompletion = undefined;
+      };
+      cancellation.then(releaseCompletion, releaseCompletion);
+    }
+    const deferred = cancellation && options?.deferCompactionSettlement;
+    const generation = this.compactionStopGeneration;
+    // Physical Stop can acknowledge startup abort delivery before that original producer exits.
+    const producerCompletion = this.coordinator.captureInterruptSettlement(options?.soft, true);
+    let producerSettled = producerCompletion === undefined;
+    producerCompletion?.then(
+      () => {
+        producerSettled = true;
+      },
+      () => undefined
+    );
+    const isCurrent = () =>
+      !completionController.signal.aborted &&
+      !this.coordinator.closing &&
+      generation === this.compactionStopGeneration;
+    const notifySettlement = async (result: Result<void>, completed: boolean) => {
+      if (!completed || !result.success || !settledCapture || !isCurrent()) return;
+      try {
+        const current = await this.historyService.captureCompactionReplacement(this.workspaceId);
+        if (
+          current.success &&
+          current.data.nonce === settledCapture.nonce &&
+          current.data.generation === settledCapture.generation &&
+          isCurrent()
+        )
+          options?.onCompactionSettled?.();
+      } catch (error) {
+        // Notification is ancillary; observers cannot change the original physical Stop result.
+        log.warn("Stop settlement observer failed", { error });
+      }
+    };
+    let finalized: Promise<Result<void>> | undefined;
+    const finalize = (cleanupSucceeded: boolean | Promise<boolean>): Promise<Result<void>> => {
+      if (finalized) return finalized;
+      if (!cancellation) return Promise.resolve(Ok(undefined));
+      if (
+        (physicallyStopped && producerSettled && cleanupSucceeded === true) ||
+        cleanupSucceeded === false
+      ) {
+        const completed = physicallyStopped && producerSettled && cleanupSucceeded === true;
+        settled.resolve(completed);
+        return (finalized = cancellation.then(async (result) => {
+          await notifySettlement(result, completed);
+          return result;
+        }));
+      }
+      // Physical Stop can return before startup unwinds, or fail while its producer is live.
+      // Preserve that result promptly, but qualify only the captured producer's completion.
+      // The guardian joins this lease, and close/supersession abort it.
+      const controller = completionController;
+      const execution = this.coordinator.enterExecution();
+      const abandoned = Promise.withResolvers<boolean>();
+      const abandon = () => abandoned.resolve(false);
+      controller.signal.addEventListener("abort", abandon, { once: true });
+      this.closingSignal.addEventListener("abort", abandon, { once: true });
+      if (
+        controller.signal.aborted ||
+        this.coordinator.closing ||
+        generation !== this.compactionStopGeneration
+      )
+        abandon();
+      Promise.race([
+        Promise.all([producerCompletion, cleanupSucceeded]).then(([, complete]) => complete),
+        abandoned.promise,
+      ])
+        .then(async (completed) => {
+          const current =
+            completed && !this.coordinator.closing && generation === this.compactionStopGeneration;
+          settled.resolve(current);
+          const result = await cancellation;
+          await notifySettlement(result, current);
+        })
+        .catch((error: unknown) => {
+          settled.resolve(false);
+          log.warn("Deferred Stop completion failed", { error });
+        })
+        .finally(() => {
+          controller.signal.removeEventListener("abort", abandon);
+          this.closingSignal.removeEventListener("abort", abandon);
+          if (this.pendingStopCompletion === controller) this.pendingStopCompletion = undefined;
+          execution[Symbol.dispose]();
+        });
+      return (finalized = Promise.resolve(Ok(undefined)));
+    };
+    deferred?.(finalize);
+    cancellation?.then(initiallySettled.resolve, (error: unknown) =>
+      initiallySettled.resolve(Err(getErrorMessage(error)))
+    );
     // Send-now callers may replace the turn immediately after this returns. Capture
     // its settlement before any await so the old abort reaches accounting and the
     // renderer before replacement PREPARING invalidates its operation identity.
@@ -7447,10 +7642,19 @@ export class AgentSession {
       })
       .then(async (result) => {
         if (result.success) await interruptedPolicy;
+        physicallyStopped = result.success;
         return result;
       })
-      .finally(() => settled.resolve());
-    const canceled = await cancellation;
+      .catch((error: unknown) => {
+        settled.resolve(false);
+        throw error;
+      });
+    let canceled = cancellation ? await initiallySettled.promise : undefined;
+    if (!deferred) {
+      // Cancellation I/O debt owns its retry; it does not undo physical completion.
+      const finalResult = await finalize(true);
+      if (!finalResult.success) canceled = finalResult;
+    }
     if (!stopResult.success) {
       return Err(stopResult.error);
     }
@@ -10484,6 +10688,13 @@ export class AgentSession {
     const resumeCanceled = () =>
       stopGeneration !== this.compactionStopGeneration || cancelResume?.() === true;
 
+    const recoveryCapture = await this.historyService.captureCompactionReplacement(
+      this.workspaceId
+    );
+    // An unreadable frontier proves no handoff stale. Preserve durable work and let
+    // startup recovery retry instead of clearing a fresh heartbeat as canceled.
+    if (!recoveryCapture.success)
+      throw new Error(`Failed to capture follow-up recovery frontier: ${recoveryCapture.error}`);
     const canceled = await this.readCompactionCancellation();
     // Stop can be waiting for this policy to settle before its final cleanup.
     // Do not join that same mutation from automatic continuation dispatch.
@@ -10586,7 +10797,23 @@ export class AgentSession {
     }
 
     const summary = pendingCompactionSummary(lastMessage);
-    if (canceled && summary && matchesCompactionCancellation(canceled, summary)) {
+    // V2 cleanup removed every older handoff before settlement. Only an explicitly stamped
+    // heartbeat publication in that exact generation can be newer, including without a sidecar.
+    // Marker-preserving legacy rewrites omit this generation and gain no recovery authority.
+    const freshHeartbeat =
+      canceled?.version === 2 &&
+      !canceled.retainUntilReplacement &&
+      lastMessage.metadata?.compacted === "heartbeat" &&
+      lastMessage.metadata.compactionPublicationId !== undefined &&
+      lastMessage.metadata.compactionPublicationGeneration === canceled.settledGeneration &&
+      recoveryCapture.data.nonce === canceled.nonce &&
+      recoveryCapture.data.generation === canceled.settledGeneration;
+    if (
+      canceled &&
+      summary &&
+      !freshHeartbeat &&
+      matchesCompactionCancellation(canceled, summary)
+    ) {
       // The history read may have admitted a newer Stop that is waiting for this policy.
       if (this.compactionCancellation.blocksRecovery) return false;
       await this.compactionCancellation.narrow(canceled.nonce, summary);
@@ -10827,6 +11054,8 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       startStreamInBackground,
+      recoveryReplacement:
+        freshHeartbeat && recoveryCapture.success ? recoveryCapture.data : undefined,
       acceptanceOrigin: "automatic",
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
@@ -11694,6 +11923,9 @@ export class AgentSession {
     const captured = await this.historyService.captureCompactionReplacement(this.workspaceId);
     if (!captured.success) return Err(captured.error);
     if (
+      // A reset admitted during V1 cleanup cannot borrow that Stop's later V2 settlement.
+      // A newer Stop after captured absence changes the generation and fails publication CAS.
+      captured.data.cancellationVersion === 1 ||
       (await this.isAutomaticSendBlocked()) ||
       // Ordinary automatic input preserves scoped debt. A reset would archive its summary,
       // making the pending handoff unreachable to active-boundary recovery after restart.
