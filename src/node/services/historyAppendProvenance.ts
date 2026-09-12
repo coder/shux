@@ -280,7 +280,8 @@ export class HistoryAppendProvenance {
   async appendChat(
     bytes: Buffer,
     atomic = false,
-    publishAtomic?: (filePath: string, bytes: Buffer) => Promise<void>
+    publishAtomic?: (filePath: string, bytes: Buffer) => Promise<void>,
+    publishAppend?: (filePath: string, bytes: Buffer, createsFile: boolean) => Promise<void>
   ): Promise<void> {
     const transaction = transactions.getStore();
     assert(
@@ -330,7 +331,8 @@ export class HistoryAppendProvenance {
             await tailHandle.close();
           }
         }
-        await fs.appendFile(this.chatPath, bytes);
+        if (publishAppend) await publishAppend(this.chatPath, bytes, before.chat == null);
+        else await fs.appendFile(this.chatPath, bytes);
         published = true;
         const handle = await fs.open(this.chatPath, "r");
         try {

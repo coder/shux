@@ -34,8 +34,9 @@ describe("empty context reset transactions", () => {
         async (...args) => {
           entered.resolve();
           await release.promise;
-          await advance(...args);
+          const result = await advance(...args);
           order.push("fenced");
+          return result;
         }
       );
       const fencing = h.historyService.fenceEmptyContext(workspaceId);

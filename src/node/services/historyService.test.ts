@@ -2178,9 +2178,10 @@ describe("HistoryService", () => {
       const advancing = spyOn(store, "advanceGenerationUnderHistoryLock").mockImplementationOnce(
         async () => {
           await fs.access(historyWriteLockPath(config.rootDir, ws));
-          await advance();
+          const result = await advance();
           entered.resolve();
           await release.promise;
+          return result;
         }
       );
       const deleting =
