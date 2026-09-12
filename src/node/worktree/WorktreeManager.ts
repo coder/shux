@@ -65,6 +65,24 @@ export class WorktreeManager {
     return env || signal ? { ...(env ? { env } : {}), ...(signal ? { signal } : {}) } : undefined;
   }
 
+  private async supportsNativeHookRunner(signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
+    try {
+      using proc = execFileAsync("git", ["--version"], { signal });
+      const { stdout } = await proc.result;
+      signal?.throwIfAborted();
+      const version = /^git version (\d+)\.(\d+)/.exec(stdout.trim());
+      return (
+        version !== null &&
+        (Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 36))
+      );
+    } catch (error) {
+      // Unknown/older Git retains eager creation; cancellation must still stop creation.
+      if (signal?.aborted) throw error;
+      return false;
+    }
+  }
+
   private async pruneWorktreesBestEffort(
     projectPath: string,
     noHooksEnv: GitExecOptions
@@ -206,7 +224,12 @@ export class WorktreeManager {
       const pending: PendingMaterialization = {
         fastForwardFromOrigin: !skipRemoteSync && shouldUseOrigin && branchExists,
       };
-      if (params.deferMaterialization) {
+      // Older Git needs the legacy hook checkout, which briefly changes HEAD. Keep it
+      // before announcement so an immediate fork cannot observe its unborn placeholder.
+      const nativeHookRunner =
+        !gitHooksAllowed(params.trusted) ||
+        (await this.supportsNativeHookRunner(params.abortSignal));
+      if (params.deferMaterialization && nativeHookRunner) {
         await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
         return { success: true, workspacePath, pendingMaterialization: pending };
       }
@@ -222,7 +245,8 @@ export class WorktreeManager {
           env: params.env,
           trusted: params.trusted,
         },
-        pending
+        pending,
+        { legacyHookCheckout: !nativeHookRunner }
       );
 
       await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
@@ -283,7 +307,8 @@ export class WorktreeManager {
       env?: Record<string, string>;
       trusted?: boolean;
     },
-    pending: PendingMaterialization
+    pending: PendingMaterialization,
+    options?: { legacyHookCheckout?: boolean }
   ): Promise<void> {
     const { projectPath, workspacePath, branchName, trunkBranch, initLogger } = params;
     const noHooksEnv = await this.getGitExecOptions(
@@ -308,11 +333,10 @@ export class WorktreeManager {
       // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
       killTreeOnTermination: true,
     };
-    let headMoved = false;
+    let restoreHeadOnFailure = false;
     try {
       // Populate the files while HEAD still holds the branch, so no other worktree can claim it
-      // for as long as the checkout streams. Hooks stay off here: the switch below reruns the
-      // checkout for them.
+      // for as long as the checkout streams. Hooks stay off here and run separately below.
       // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
       // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
       // No --force: a deferred checkout runs in an announced workspace, so anything written
@@ -338,23 +362,55 @@ export class WorktreeManager {
         }
       );
       stdout.push((await populateProc.result).stdout);
-      // The files are in place; switch onto the branch from an unborn ref so trusted
-      // post-checkout hooks receive the same arguments as a plain `git worktree add` (null old
-      // commit, new-worktree flag). Nothing is written, so the branch is unclaimed only for the
-      // instant between these two commands.
-      using unbornProc = execFileAsync(
-        "git",
-        ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
-        noHooksEnv
-      );
-      await unbornProc.result;
-      headMoved = true;
-      using switchProc = execFileAsync(
-        "git",
-        ["-C", workspacePath, "checkout", "--no-recurse-submodules", branchName],
-        checkoutOptions
-      );
-      stdout.push((await switchProc.result).stdout);
+      if (gitHooksAllowed(params.trusted)) {
+        if (options?.legacyHookCheckout !== true) {
+          // Announced worktrees can be forked while hooks run. Invoke Git's hook runner
+          // with the new-worktree arguments without ever releasing or changing HEAD.
+          using tipProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "rev-parse", "HEAD"],
+            noHooksEnv
+          );
+          const tip = (await tipProc.result).stdout.trim();
+          // A failing hook may move HEAD; retain the legacy restoration guarantee.
+          restoreHeadOnFailure = true;
+          using hookProc = execFileAsync(
+            "git",
+            [
+              "-C",
+              workspacePath,
+              "hook",
+              "run",
+              "--ignore-missing",
+              "post-checkout",
+              "--",
+              "0".repeat(tip.length),
+              tip,
+              "1",
+            ],
+            checkoutOptions
+          );
+          stdout.push((await hookProc.result).stdout);
+        } else {
+          // The files are in place; switch onto the branch from an unborn ref so trusted
+          // post-checkout hooks receive the same arguments as a plain `git worktree add` (null old
+          // commit, new-worktree flag). Nothing is written, so the branch is unclaimed only for the
+          // instant between these two commands.
+          using unbornProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
+            noHooksEnv
+          );
+          await unbornProc.result;
+          restoreHeadOnFailure = true;
+          using switchProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "checkout", "--no-recurse-submodules", branchName],
+            checkoutOptions
+          );
+          stdout.push((await switchProc.result).stdout);
+        }
+      }
       progress.flush();
       for (const line of [...output, ...stdout.flatMap((text) => text.split(/[\r\n]/))]) {
         if (line) initLogger.logStdout(line);
@@ -368,7 +424,7 @@ export class WorktreeManager {
       // checkout needs the restore most.
       const restoreOptions = noHooksEnv?.env ? { env: noHooksEnv.env } : undefined;
       try {
-        if (headMoved) {
+        if (restoreHeadOnFailure) {
           // If another worktree claimed the branch during that instant, re-attaching would
           // leave two worktrees on it; detach at the tip instead and let the error report it.
           const claimedElsewhere = (await this.listWorktreeBlocks(projectPath, restoreOptions))
