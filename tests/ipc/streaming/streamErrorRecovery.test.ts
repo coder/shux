@@ -25,7 +25,7 @@ import {
   configureTestRetries,
   HAIKU_MODEL,
 } from "../helpers";
-import type { StreamCollector } from "../streamCollector";
+import { resumeAndWaitForSuccess, type StreamCollector } from "../streamCollector";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -86,51 +86,6 @@ function truncateToLastCompleteMarker(text: string, nonce: string): string {
   const lastMatch = matches[matches.length - 1];
   const endIndex = lastMatch.index! + lastMatch[0].length;
   return text.substring(0, endIndex);
-}
-
-import type { OrpcTestClient } from "../orpcTestClient";
-
-/**
- * Helper: Resume stream and wait for successful completion
- * Uses StreamCollector for ORPC-native event handling
- */
-async function resumeAndWaitForSuccess(
-  workspaceId: string,
-  client: OrpcTestClient,
-  model: string,
-  timeoutMs = 15000,
-  options?: {
-    toolPolicy?: Array<{ regex_match: string; action: "enable" | "disable" | "require" }>;
-  }
-): Promise<void> {
-  const collector = createStreamCollector(client, workspaceId);
-  collector.start();
-
-  try {
-    const resumeResult = await client.workspace.resumeStream({
-      workspaceId,
-      options: { model, agentId: "exec", toolPolicy: options?.toolPolicy },
-    });
-
-    if (!resumeResult.success) {
-      throw new Error(`Resume failed: ${resumeResult.error}`);
-    }
-
-    // Wait for stream-end event after resume
-    const streamEnd = await collector.waitForEvent("stream-end", timeoutMs);
-
-    if (!streamEnd) {
-      throw new Error("Stream did not complete after resume");
-    }
-
-    // Check for errors
-    const hasError = collector.hasError();
-    if (hasError) {
-      throw new Error("Resumed stream encountered an error");
-    }
-  } finally {
-    collector.stop();
-  }
 }
 
 /**

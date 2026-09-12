@@ -1,10 +1,14 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import assert from "node:assert/strict";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as atomicWrite from "write-file-atomic";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { historyWriteLockPath } from "./workspaceRemoval";
 
 const workspaceId = "truncation-compatibility";
 const hash = (contents: string | Buffer) => createHash("sha256").update(contents).digest("hex");
@@ -51,7 +55,190 @@ describe("HistoryService truncation marker compatibility", () => {
     ).toBe(true);
   });
   afterEach(async () => {
+    mock.restore();
     await h.cleanup();
+  });
+
+  async function publishOwnedArchive(
+    finalArchive: Buffer | null,
+    isCurrent: () => boolean,
+    onCommitted: () => undefined,
+    finalChat: Buffer | null = active
+  ) {
+    const history = h.historyService as unknown as {
+      rewriteHistoryFilesUnlocked(
+        workspace: string,
+        archive: Buffer | null,
+        chat: Buffer | null,
+        publication: {
+          assertStillOwned: () => Promise<void>;
+          isCurrent: () => boolean;
+          onCommitted: () => undefined;
+        }
+      ): Promise<void>;
+    };
+    return h.historyService.withCompactionStorageLock(workspaceId, (_dir, assertStillOwned) =>
+      history.rewriteHistoryFilesUnlocked(workspaceId, finalArchive, finalChat, {
+        assertStillOwned,
+        isCurrent,
+        onCommitted,
+      })
+    );
+  }
+
+  test.skipIf(process.platform === "win32").each([
+    ["retained archive", false],
+    ["retained archive", true],
+    ["removed archive", false],
+    ["removed archive", true],
+    ["removed chat", false],
+    ["removed chat", true],
+  ] as const)(
+    "owned %s receipt waits for directory durability (flush fails=%s)",
+    async (kind, fails) => {
+      if (kind !== "removed chat") await fs.writeFile(archivePath, backup);
+      const finalArchive = kind === "retained archive" ? reset : null;
+      const finalChat = kind === "removed chat" ? null : active;
+      let flushed = false;
+      let flushedAtReceipt = false;
+      const sync = nodeFs.fsyncSync;
+      spyOn(nodeFs, "fsyncSync").mockImplementation((fd) => {
+        if (nodeFs.fstatSync(fd).isDirectory()) {
+          if (fails) throw new Error("truncation directory unavailable");
+          flushed = true;
+        }
+        return sync(fd);
+      });
+      const committed = mock(() => {
+        flushedAtReceipt = flushed;
+        return undefined;
+      });
+      if (fails) {
+        await assert.rejects(
+          publishOwnedArchive(finalArchive, () => true, committed, finalChat),
+          /directory unavailable/
+        );
+        expect(committed).not.toHaveBeenCalled();
+      } else {
+        await publishOwnedArchive(finalArchive, () => true, committed, finalChat);
+        expect(committed).toHaveBeenCalledTimes(1);
+        expect(flushedAtReceipt).toBe(true);
+        if (finalChat) expect(await fs.readFile(chatPath)).toEqual(finalChat);
+        else expect(nodeFs.existsSync(chatPath)).toBe(false);
+        if (finalArchive) expect(await fs.readFile(archivePath)).toEqual(finalArchive);
+        else expect(nodeFs.existsSync(archivePath)).toBe(false);
+      }
+    }
+  );
+
+  test("owned archive publication commits retained raw bytes and chat before notification", async () => {
+    await fs.writeFile(archivePath, backup);
+    let current = true;
+    const committed = mock(() => {
+      expect(nodeFs.readFileSync(archivePath)).toEqual(reset);
+      expect(nodeFs.readFileSync(chatPath)).toEqual(active);
+      current = false;
+      return undefined;
+    });
+    await publishOwnedArchive(reset, () => current, committed);
+    expect(committed).toHaveBeenCalledTimes(1);
+    expect(nodeFs.existsSync(markerPath)).toBe(false);
+    expect(nodeFs.existsSync(tombstonePath)).toBe(false);
+  });
+
+  test.each(["archive", "chat"] as const)(
+    "Stop during owned %s staging leaves all history unchanged",
+    async (stage) => {
+      await fs.writeFile(archivePath, backup);
+      const beforeChat = await fs.readFile(chatPath);
+      let current = true;
+      const atomic = atomicWrite.default;
+      spyOn(atomicWrite, "default").mockImplementation(
+        new Proxy(atomic, {
+          async apply(target, receiver, args: Parameters<typeof atomic>) {
+            const result = await Reflect.apply(target, receiver, args);
+            if (
+              String(args[0]).startsWith(
+                `${stage === "archive" ? archivePath : chatPath}.publication-`
+              )
+            )
+              current = false;
+            return result;
+          },
+        })
+      );
+      const committed = mock(() => undefined);
+      await assert.rejects(
+        publishOwnedArchive(reset, () => current, committed),
+        /no longer owned/
+      );
+      expect(committed).not.toHaveBeenCalled();
+      expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+      expect(await fs.readFile(archivePath)).toEqual(backup);
+      expect(nodeFs.existsSync(markerPath)).toBe(false);
+      expect(nodeFs.existsSync(tombstonePath)).toBe(false);
+    }
+  );
+
+  test.each([false, true])(
+    "failed owned archive publication restores history only while its lease remains current (foreign=%s)",
+    async (foreign) => {
+      await fs.writeFile(archivePath, backup);
+      const beforeChat = await fs.readFile(chatPath);
+      const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
+      const successor = new Map([
+        [chatPath, "foreign chat"],
+        [archivePath, "foreign archive"],
+        [markerPath, "foreign marker"],
+        [tombstonePath, "foreign tombstone"],
+      ]);
+      const rename = nodeFs.renameSync;
+      spyOn(nodeFs, "renameSync").mockImplementation((source, destination) => {
+        if (destination === chatPath) {
+          if (foreign) {
+            nodeFs.writeFileSync(lockPath, "foreign-owner");
+            for (const [file, bytes] of successor) nodeFs.writeFileSync(file, bytes);
+          }
+          throw new Error("chat publication failed");
+        }
+        return rename(source, destination);
+      });
+      const committed = mock(() => undefined);
+      try {
+        await assert.rejects(publishOwnedArchive(reset, () => true, committed));
+        expect(committed).not.toHaveBeenCalled();
+        if (foreign) {
+          for (const [file, bytes] of successor)
+            expect(await fs.readFile(file, "utf8")).toBe(bytes);
+        } else {
+          expect(await fs.readFile(chatPath)).toEqual(beforeChat);
+          expect(await fs.readFile(archivePath)).toEqual(backup);
+          expect(nodeFs.existsSync(markerPath)).toBe(false);
+          expect(nodeFs.existsSync(tombstonePath)).toBe(false);
+        }
+      } finally {
+        if (foreign) await fs.rm(lockPath, { force: true });
+      }
+    }
+  );
+
+  test("owned archive cleanup failure preserves a committed transaction for restart", async () => {
+    await fs.writeFile(archivePath, backup);
+    const rm = fs.rm;
+    spyOn(fs, "rm").mockImplementation((file, options) =>
+      file === tombstonePath ? Promise.reject(new Error("cleanup failed")) : rm(file, options)
+    );
+    const committed = mock(() => undefined);
+    await publishOwnedArchive(reset, () => true, committed);
+    expect(committed).toHaveBeenCalledTimes(1);
+    expect(await fs.readFile(chatPath)).toEqual(active);
+    expect(await fs.readFile(archivePath)).toEqual(reset);
+    mock.restore();
+    await new HistoryService(h.config).getLastMessages(workspaceId, 1);
+    expect(await fs.readFile(chatPath)).toEqual(active);
+    expect(await fs.readFile(archivePath)).toEqual(reset);
+    expect(nodeFs.existsSync(markerPath)).toBe(false);
+    expect(nodeFs.existsSync(tombstonePath)).toBe(false);
   });
 
   async function seedTransaction(marker: unknown, archive = reset): Promise<void> {

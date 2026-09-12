@@ -1,3 +1,4 @@
+import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
@@ -2676,6 +2677,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (hasAiServiceStream) {
         return "deferred";
       }
+      // Retained Stop waits for manual replacement; an already-idle retry would spin.
+      if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
       const sendOptions =
         (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
         (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
@@ -2730,6 +2733,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       }
       if (!sendResult.success && !accepted) {
+        if (await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked()) return "deferred";
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
       }
@@ -11235,7 +11239,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
       let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let compactionAdmissionStale = () => false;
       const admissionEpochStale = () =>
+        compactionAdmissionStale() ||
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
@@ -11313,6 +11319,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const session = this.getOrCreateSession(workspaceId);
 
       // Skip recency update for idle compaction - preserve original "last used" time
+      compactionAdmissionStale = session.captureCompactionAdmission(
+        internal?.acceptanceOrigin ?? "manual"
+      );
+      // Storage acquisition is admission's cross-backend linearization point. Complete it
+      // before pricing/settings can suspend; dispatch must never adopt a later Stop.
+      const admission = await this.historyService.captureCompactionReplacement(workspaceId, {
+        onRepaired: () => session.clearUsageState(),
+        replaceUnreadable: (internal?.acceptanceOrigin ?? "manual") === "manual",
+      });
+      if (!admission.success) return Err({ type: "unknown", raw: admission.error });
+      const readCompactionAdmission = () => Promise.resolve(admission);
+
       const muxMeta = options?.muxMetadata as { type?: string; source?: string } | undefined;
       const isIdleCompaction =
         muxMeta?.type === "compaction-request" && muxMeta?.source === "idle-compaction";
@@ -11396,6 +11414,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // rejected row and applies goal safety.
           return await session.sendMessage(message, normalizedOptions, {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
@@ -11577,6 +11596,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           continuationSendState.options,
           {
             acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+            readCompactionAdmission,
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             authoredAtMs,
@@ -11595,6 +11615,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
             admissionStale: internal?.admissionStale,
+            compactionAdmissionStale: () => compactionAdmissionStale(),
+            refreshCompactionAdmission:
+              (internal?.acceptanceOrigin ?? "manual") === "manual"
+                ? (isStale) => {
+                    compactionAdmissionStale = isStale;
+                  }
+                : undefined,
           }
         );
 
@@ -11695,6 +11722,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+        readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
           this.advanceContextMutationEpoch(workspaceId);
@@ -11942,6 +11970,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Reject before persistence/dispatch when the chosen model would silently
       // bypass budget enforcement on a budgeted resumable goal.
+      const resumeStale = session.captureCompactionAdmission(
+        internal?.acceptanceOrigin ?? "manual"
+      );
+      using resumeIntent =
+        (internal?.acceptanceOrigin ?? "manual") === "manual"
+          ? session.beginResumeIntent()
+          : undefined;
+      const admission = await this.historyService.captureCompactionReplacement(workspaceId, {
+        onRepaired: () => session.clearUsageState(),
+        replaceUnreadable: (internal?.acceptanceOrigin ?? "manual") === "manual",
+      });
+      if (!admission.success) return Err({ type: "unknown", raw: admission.error });
       const pricingGate = await this.assertPricedModelForBudgetedGoal(
         workspaceId,
         normalizedOptions
@@ -11949,6 +11989,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
+      if (resumeStale() || resumeIntent?.signal.aborted) return Ok({ started: false });
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
@@ -11975,6 +12016,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // resumed turn itself can observe the reservation and self-veto.
       const result = await session.resumeStream(normalizedOptions, {
         acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+        preparationSignal: resumeIntent?.signal,
+        readCompactionAdmission: () => Promise.resolve(admission),
         agentInitiated: internal?.agentInitiated,
       });
       sessionInvisiblePreflight.release();
@@ -12181,11 +12224,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             log.warn("Failed to disable auto-retry during Stop", { workspaceId, error });
           })
         : undefined;
-      let stopResult: Result<void> | undefined;
+      let stopResult: Awaited<ReturnType<AgentSession["interruptStream"]>> | undefined;
+      let stopCapture: CompactionReplacementCapture | undefined;
+      let stopAdmission: ReturnType<AgentSession["captureCompactionAdmission"]> = () => true;
       try {
-        stopResult = await session.interruptStream(options);
+        const stopping = session.interruptStream({
+          ...options,
+          onCompactionCanceled: (capture) => {
+            stopCapture = capture;
+          },
+        });
+        // cancelCompaction advances synchronously; later local or foreign Stops cannot be adopted.
+        stopAdmission = session.captureCompactionAdmission("automatic");
+        stopResult = await stopping;
       } finally {
-        settleStop(stopResult?.success === true);
+        settleStop(stopResult?.success === true || stopResult?.streamStopped === true);
       }
       await retirement;
       await optOut;
@@ -12201,7 +12254,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const stopRecorded =
         !(retiring || disabling) ||
         ((await session.recordPendingAutoRetryState()) && retirementRecorded);
-      if (!stopResult.success) {
+      if (!stopResult.success && !stopResult.streamStopped) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
@@ -12244,13 +12297,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         // The card represents only user-authored queue content. Prioritize that
         // entry over hidden synthetic/background work before dispatching.
-        session.sendNextUserQueuedMessage();
+        session.sendNextUserQueuedMessage(
+          options?.soft
+            ? undefined
+            : {
+                isStale: stopAdmission,
+                readCapture: () => stopCapture,
+              }
+        );
       } else {
         // Restore queued messages to input box for user-initiated interrupts
         session.restoreQueueToInput();
       }
 
-      if (!stopRecorded) {
+      if (!stopRecorded || !stopResult.success) {
         log.error("Stop left stopped work eligible to resume on restart", { workspaceId });
         return Err(STOP_UNRECORDED_MESSAGE);
       }
@@ -12754,6 +12814,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     ]);
   }
 
+  private async clearHistoryThroughCompactionCancellation(
+    workspaceId: string,
+    percentage: number,
+    onCancellationFailure: (error: string) => void
+  ): Promise<Result<number[]>> {
+    let deleted: number[] | undefined;
+    const canceled = await this.getOrCreateSession(workspaceId).cancelCompaction(true, undefined, {
+      fullHistoryDeletion: {
+        percentage,
+        onCommitted: (sequences) => {
+          deleted = sequences;
+          return undefined;
+        },
+      },
+    });
+    if (deleted === undefined)
+      return canceled.success ? Err("History deletion was superseded; retry the clear.") : canceled;
+    // The transcript is already gone even if publishing Stop failed. Finish monitor and
+    // deletion accounting, then report that failure without appending replacement input.
+    if (!canceled.success) onCancellationFailure(canceled.error);
+    return Ok(deleted);
+  }
+
   private clearHistoryWithRetiredBashMonitorWakes<T>(
     workspaceId: string,
     clear: () => Promise<Result<T>>,
@@ -12916,13 +12999,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // direction (a partial cut becoming a full delete skips the full-clear guards; a no-op
     // becoming a real cut skips reference retirement; a full clear leaving survivors would
     // apply full-clear-only discards while rows remain).
+    let cancellationError: string | undefined;
     const truncate = () =>
-      this.historyService.truncateHistory(workspaceId, effectivePercentage, {
-        refuseFullDelete: truncationScope === "partial",
-        refuseRowRemoval: truncationScope === "none",
-        requireFullDelete: truncationScope === "all",
-        fenceEmptyHistory: isFullClear,
-      });
+      isFullClear
+        ? this.clearHistoryThroughCompactionCancellation(
+            workspaceId,
+            effectivePercentage,
+            (error) => {
+              cancellationError = error;
+            }
+          )
+        : this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+            refuseFullDelete: truncationScope === "partial",
+            refuseRowRemoval: truncationScope === "none",
+          });
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -13019,7 +13109,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
 
-    return Ok(undefined);
+    return cancellationError ? Err(cancellationError) : Ok(undefined);
   }
 
   async resetContext(workspaceId: string): Promise<Result<"reset" | "noop">> {
@@ -13331,9 +13421,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         }
         this.sessions.get(workspaceId)?.clearUsageState();
+        let cancellationError: string | undefined;
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
-          () => this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: !isCompaction }),
+          () =>
+            isCompaction
+              ? this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false })
+              : this.clearHistoryThroughCompactionCancellation(workspaceId, 1, (error) => {
+                  cancellationError = error;
+                }),
           { discardUnacceptedOnSuccess: true }
         );
         if (!clearResult.success) {
@@ -13392,6 +13488,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           status: "completed",
         });
         deletedSequences = clearResult.data;
+        if (cancellationError) {
+          if (deletedSequences.length > 0) {
+            const deleted: DeleteMessage = { type: "delete", historySequences: deletedSequences };
+            const session = this.sessions.get(workspaceId);
+            if (session) session.emitChatEvent(deleted);
+            else this.emit("chat", { workspaceId, message: deleted });
+          }
+          return Err(cancellationError);
+        }
       }
 
       const appendResult = await this.historyService.appendToHistory(workspaceId, messageToAppend);

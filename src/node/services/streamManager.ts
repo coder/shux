@@ -311,6 +311,8 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   providedRuntimeTempDir?: string;
   modelFallback?: ModelFallbackOptions;
   onStreamConstructed?: () => Promise<void>;
+  assertAdmissionCurrent?: () => Promise<void>;
+  withAdmissionCurrent?: (construct: () => void) => Promise<void>;
 }
 
 type StreamRequestInput = StreamRequestOptions & {
@@ -5360,6 +5362,10 @@ export class StreamManager {
       const resourceScope = Scope.makeUnsafe();
       let processingStarted = false;
       const cleanupStartup = async (): Promise<void> => {
+        // streamText may already have invoked the provider while the envelope awaited I/O.
+        // A refused startup must cancel that request before releasing its owned resources.
+        if (!streamAbortController.signal.aborted)
+          streamAbortController.abort(new Error("Stream startup did not complete"));
         if (registeredStream) return this.closeStreamResources(registeredStream);
         runLanguageModelCleanup(model);
         unlinkAbortSignal();
@@ -5422,17 +5428,29 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
-        // Step 4: Atomic stream creation and registration
-        const streamInfo = this.createStreamAtomically(options, {
-          streamToken,
-          runtimeTempDir,
-          resourceScope,
-          abortController: streamAbortController,
-          completionController,
-        });
+        // Construction invokes the provider: validate after every startup resource await.
+        await options.assertAdmissionCurrent?.();
+        if (streamAbortController.signal.aborted) return settleStartupAbort();
 
-        registeredStream = streamInfo;
-        streamInfo.unlinkAbortSignal = unlinkAbortSignal;
+        // The persisted comparison and synchronous provider registration share one lock.
+        // Record cleanup ownership inside the callback, even if releasing the lock fails.
+        const construct = () => {
+          if (streamAbortController.signal.aborted) return;
+          registeredStream = this.createStreamAtomically(options, {
+            streamToken,
+            runtimeTempDir,
+            resourceScope,
+            abortController: streamAbortController,
+            completionController,
+          });
+          registeredStream.unlinkAbortSignal = unlinkAbortSignal;
+          // Scope close must own STARTING streams before the fence's release can await.
+          this.superviseEngine(typedWorkspaceId, registeredStream);
+        };
+        if (options.withAdmissionCurrent) await options.withAdmissionCurrent(construct);
+        else construct();
+        const streamInfo = registeredStream;
+        if (!streamInfo) return settleStartupAbort();
 
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.
@@ -5446,15 +5464,16 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
-        // Supervise from registration on: a shutdown landing during the envelope
-        // write below must find this STARTING stream and cancel it inside the
-        // scope close (the hard-interrupt path documented after the await),
-        // not after teardown has moved past the bridges.
-        this.superviseEngine(typedWorkspaceId, streamInfo);
-
         // Stream constructed + registered: durable request-describing side
         // effects (turn envelope) may be recorded now.
         await onStreamConstructed?.();
+        // The envelope may wait on storage after construction; do not begin processing a
+        // superseded request. Existing failure cleanup owns its registered stream and handle.
+        if (
+          !streamAbortController.signal.aborted &&
+          this.workspaceStreams.get(typedWorkspaceId) === streamInfo
+        )
+          await options.assertAdmissionCurrent?.();
 
         // A hard interrupt during the awaited envelope write finds the
         // registered STARTING stream, aborts it, awaits its placeholder

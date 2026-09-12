@@ -276,7 +276,7 @@ describe("AgentSession startup auto-retry recovery", () => {
   });
 
   test.each(["materialize", "append"] as const)(
-    "beginShutdown inside the %s await rolls the unaccepted turn back instead of leaving a row",
+    "beginShutdown inside the %s await preserves only accepted user input",
     async (window) => {
       const workspaceId = `startup-retry-shutdown-mid-${window}`;
       const streamMessage = mock(() =>
@@ -307,9 +307,9 @@ describe("AgentSession startup auto-retry recovery", () => {
           return snapshots;
         };
       } else {
-        const append = historyService.appendToHistory.bind(historyService);
-        spyOn(historyService, "appendToHistory").mockImplementation(async (id, message) => {
-          const result = await append(id, message);
+        const append = historyService.acceptCompactionReplacement.bind(historyService);
+        spyOn(historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+          const result = await append(...args);
           session.beginShutdown();
           return result;
         });
@@ -322,9 +322,14 @@ describe("AgentSession startup auto-retry recovery", () => {
       expect(sendResult.success).toBe(false);
       expect(streamMessage).not.toHaveBeenCalled();
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success ? history.data.map((row) => row.id) : ["unexpected"]).toEqual(
-        seeded.map((row) => row.id)
+      expect(history.success ? history.data.slice(0, seeded.length) : ["unexpected"]).toMatchObject(
+        seeded
       );
+      expect(history.success && history.data.length).toBe(
+        seeded.length + (window === "append" ? 1 : 0)
+      );
+      if (window === "append" && history.success)
+        expect(history.data.at(-1)?.parts).toMatchObject([{ type: "text", text: "hello" }]);
 
       await session.dispose();
     }
@@ -364,9 +369,9 @@ describe("AgentSession startup auto-retry recovery", () => {
           return snapshots;
         };
       } else {
-        const append = historyService.appendToHistory.bind(historyService);
-        spyOn(historyService, "appendToHistory").mockImplementation(async (id, message) => {
-          const result = await append(id, message);
+        const append = historyService.acceptCompactionReplacement.bind(historyService);
+        spyOn(historyService, "acceptCompactionReplacement").mockImplementation(async (...args) => {
+          const result = await append(...args);
           session.beginShutdown();
           return result;
         });

@@ -49,6 +49,81 @@ describe("conditional compaction follow-up cleanup", () => {
     await store.cleanup();
   });
 
+  test.each([
+    "cleared",
+    "missing",
+    "sequence",
+    "duplicate",
+    "role",
+    "metadata",
+    "request",
+    "null request",
+    "malformed",
+    "retired owner",
+  ] as const)("confirmation requires an exact cleared summary (%s)", async (kind) => {
+    const expected = summary();
+    await store.historyService.appendToHistory(workspaceId, expected);
+    const sequence = expected.metadata?.historySequence;
+    assert(sequence != null, "Expected persisted identity");
+    const cleared = {
+      ...expected,
+      workspaceId,
+      role: kind === "role" ? "user" : expected.role,
+      metadata: {
+        ...expected.metadata,
+        historySequence: kind === "sequence" ? sequence + 1 : sequence,
+        muxMetadata:
+          kind === "metadata"
+            ? { type: "unrelated" }
+            : {
+                type: "compaction-summary",
+                pendingFollowUp:
+                  kind === "request"
+                    ? { ...request, text: "new work" }
+                    : kind === "null request"
+                      ? null
+                      : undefined,
+              },
+      },
+    };
+    const row = JSON.stringify(cleared) + "\n";
+    const bytes =
+      kind === "missing"
+        ? ""
+        : kind === "malformed"
+          ? "{broken\n"
+          : row.repeat(kind === "duplicate" ? 2 : 1);
+    const historyPath = path.join(store.config.sessionsDir, workspaceId, "chat.jsonl");
+    await fs.writeFile(historyPath, bytes);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(
+        await store.historyService.cleanupCompactionFollowUp(
+          workspaceId,
+          expected,
+          "confirm-cleared",
+          () => kind !== "retired owner"
+        )
+      ).toEqual(Ok(kind === "cleared" ? "applied" : "skipped"));
+      expect(await fs.readFile(historyPath, "utf8")).toBe(bytes);
+    }
+  });
+
+  test("unreadable history cannot confirm a cleared handoff", async () => {
+    const expected = summary();
+    await store.historyService.appendToHistory(workspaceId, expected);
+    const historyPath = path.join(store.config.sessionsDir, workspaceId, "chat.jsonl");
+    await fs.rm(historyPath);
+    await fs.mkdir(historyPath);
+    const result = await store.historyService.cleanupCompactionFollowUp(
+      workspaceId,
+      expected,
+      "confirm-cleared",
+      () => true
+    );
+    expect(result.success).toBe(false);
+    expect((await fs.stat(historyPath)).isDirectory()).toBe(true);
+  });
+
   test("clearing a handoff preserves late summary finalization and unrelated rows", async () => {
     const expected = summary();
     expect(await store.historyService.appendToHistory(workspaceId, expected)).toEqual(

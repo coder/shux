@@ -179,6 +179,104 @@ describe("inactive cancellation state core", () => {
     expect(state.needsPersistence).toBe(false);
   });
 
+  it.each([false, true])(
+    "explicit recovery fences an oversized narrow debt (joined in flight=%s)",
+    async (inFlight) => {
+      const { state, storage } = harness();
+      await state.cancel();
+      const original = (await state.read())!;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      storage.mutate.mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        throw new CompactionCancellationReadRefusedError("oversized narrow");
+      });
+      const narrowing = state.narrow(original.nonce, summary);
+      const failed = assert.rejects(narrowing, CompactionCancellationReadRefusedError);
+      await entered.promise;
+      if (!inFlight) {
+        release.resolve();
+        await failed;
+      }
+      expect(state.blocksRecovery).toBe(true);
+      expect(await state.read()).toEqual(original);
+      const replacement = state.readForReplacement();
+      release.resolve();
+      await failed;
+      const retained = await replacement;
+      expect(retained).toMatchObject({
+        retainUntilReplacement: true,
+        scope: { kind: "unresolved" },
+      });
+      expect(retained?.nonce).not.toBe(original.nonce);
+      expect(state.needsPersistence).toBe(false);
+      expect(storage.mutate.mock.calls.map(([mutation]) => mutation.kind)).toEqual([
+        "publish",
+        "narrow",
+        "publish",
+      ]);
+    }
+  );
+
+  it("manual recovery cannot replace a newer Stop while oversized narrowing fails", async () => {
+    const { state, storage } = harness();
+    await state.cancel();
+    const original = (await state.read())!;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    storage.mutate.mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      throw new CompactionCancellationReadRefusedError("oversized narrow");
+    });
+    const failed = assert.rejects(state.narrow(original.nonce, summary));
+    await entered.promise;
+    const replacement = state.readForReplacement();
+    const stopping = state.cancel();
+    const successor = await state.read();
+    release.resolve();
+    await failed;
+    await stopping;
+    expect(await replacement).toEqual(successor);
+    expect(storage.mutate.mock.calls.map(([mutation]) => mutation.kind)).toEqual([
+      "publish",
+      "narrow",
+      "publish",
+    ]);
+  });
+
+  it("manual recovery joins a newer retry of the same narrow mutation", async () => {
+    const { state, storage } = harness();
+    await state.cancel();
+    const original = (await state.read())!;
+    storage.mutate.mockRejectedValueOnce(
+      new CompactionCancellationReadRefusedError("oversized narrow")
+    );
+    await assert.rejects(state.narrow(original.nonce, summary));
+    const replacement = state.readForReplacement();
+    await state.retry();
+    expect(await replacement).toMatchObject({ nonce: original.nonce, scope: { kind: "summary" } });
+    expect(storage.mutate.mock.calls.map(([mutation]) => mutation.kind)).toEqual([
+      "publish",
+      "narrow",
+      "narrow",
+    ]);
+  });
+
+  it("ordinary failed narrowing keeps its exact debt during explicit recovery", async () => {
+    const { state, storage } = harness();
+    await state.cancel();
+    const original = (await state.read())!;
+    storage.mutate
+      .mockRejectedValueOnce(new Error("disk unavailable"))
+      .mockRejectedValueOnce(new Error("disk unavailable"));
+    await assert.rejects(state.narrow(original.nonce, summary));
+    await assert.rejects(state.readForReplacement(), /disk unavailable/);
+    expect(await state.read()).toEqual(original);
+    expect(state.blocksRecovery).toBe(true);
+  });
+
   it("failed narrowing retains unresolved exclusion until the exact retry commits", async () => {
     const { state, storage } = harness();
     await state.cancel();
@@ -775,13 +873,17 @@ describe("inactive cancellation state core", () => {
     expect(state.repairRevision).toBe(0);
   });
 
-  it("replacement propagates a read refusal without repair or fallback publication", async () => {
+  it("automatic refusal preserves bytes while explicit replacement installs a retained fence", async () => {
     const { state, storage } = harness();
     const refusal = new CompactionCancellationReadRefusedError("Read refused");
     storage.read.mockRejectedValueOnce(refusal);
-    await assert.rejects(state.readForReplacement(), (error) => error === refusal);
+    await assert.rejects(state.read(), (error) => error === refusal);
     expect(storage.repair).not.toHaveBeenCalled();
     expect(storage.mutate).not.toHaveBeenCalled();
+    storage.read.mockRejectedValueOnce(refusal);
+    expect(await state.readForReplacement()).toMatchObject({ retainUntilReplacement: true });
+    expect(storage.repair).not.toHaveBeenCalled();
+    expect(storage.mutate).toHaveBeenCalledTimes(1);
     expect(state.needsPersistence).toBe(false);
   });
 

@@ -291,6 +291,9 @@ export interface StreamMessageOptions {
   onPreStartError?: (event: ErrorEvent) => void;
   /** Synchronous registration of the facade's handleless startup notification identity. */
   onStreamStarting?: (messageId: string) => void;
+  /** Revalidate recorded admission after asynchronous startup, without acquiring new authority. */
+  assertAdmissionCurrent?: () => Promise<void>;
+  withAdmissionCurrent?: (construct: () => void) => Promise<void>;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;

@@ -32,7 +32,7 @@ import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
-import { fsyncSync, renameSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
+import { fsyncSync, renameSync, rmdirSync, rmSync, unlinkSync, writeSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import * as fs from "fs/promises";
 import type {
@@ -115,6 +115,12 @@ interface HistoryTruncateHashes {
 
 interface HistoryTruncateTransaction extends HistoryTruncateHashes {
   rawHashes?: HistoryTruncateHashes & { version: 1 };
+}
+
+interface CompactionReplacementEdit {
+  capture: CompactionReplacementCapture;
+  isCurrent: () => boolean;
+  onGenerationAdvanced: (generation: string) => undefined;
 }
 
 interface HistoryPublicationObserver {
@@ -668,7 +674,7 @@ export class HistoryService {
       : path.join(this.config.sessionsDir, workspaceId);
   }
 
-  /** Inactive sidecar seam: Stop must remain publishable when transcript recovery fails. */
+  /** Stop must remain publishable even when transcript recovery fails. */
   withCompactionStorageLock<T>(
     workspaceId: string,
     operation: (sessionDir: string, assertStillOwned: () => Promise<void>) => Promise<T>
@@ -720,30 +726,34 @@ export class HistoryService {
       const partialBytes = await this.readExistingFileBytes(partialPath);
       if (partialBytes !== null) {
         const text = partialBytes.toString("utf8");
-        let partial: MuxMessage | null;
+        let partial: MuxMessage | null = null;
         try {
           partial = this.normalizeTranscriptMessage(JSON.parse(text));
         } catch {
-          throw new Error("Cannot safely neutralize malformed partial summary");
+          // A torn partial cannot be recovered; Stop must not leave every manual send retrying it.
         }
-        if (
-          !isReadableHistoryMessage(partial) ||
-          !Buffer.from(text).equals(partialBytes) ||
-          (hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
-        )
+        if (hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
           throw new Error("Cannot safely neutralize malformed partial summary");
-        const cleared = clearFollowUp(partial);
-        if (
-          cleared !== partial &&
-          !(await publishCompactionFile(
-            partialPath,
-            JSON.stringify(cleared),
-            isCurrent,
-            undefined,
-            assertStillOwned
-          ))
-        )
-          return false;
+        if (!isReadableHistoryMessage(partial) || !Buffer.from(text).equals(partialBytes)) {
+          // Match guarded cancellation cleanup: no await between the final ownership check and
+          // deletion, so a displaced Stop cannot erase a valid successor's partial.
+          await assertStillOwned();
+          if (!isCurrent()) return false;
+          rmSync(partialPath, { force: true });
+        } else {
+          const cleared = clearFollowUp(partial);
+          if (
+            cleared !== partial &&
+            !(await publishCompactionFile(
+              partialPath,
+              JSON.stringify(cleared),
+              isCurrent,
+              undefined,
+              assertStillOwned
+            ))
+          )
+            return false;
+        }
       }
       // Repair every recoverable epoch, including summaries restored by truncate
       // recovery. Raw rewrite helpers retain malformed/ambiguous privacy floors.
@@ -779,6 +789,49 @@ export class HistoryService {
         )
           return false;
       }
+      return isCurrent();
+    }, assertStillOwned);
+  }
+
+  /** Full Clear has already retired external wakes and fenced the journal under these locks. */
+  async clearCompactionHistoryUnderHistoryLock(
+    workspaceId: string,
+    percentage: number,
+    isCurrent: () => boolean,
+    assertStillOwned: () => Promise<void>,
+    onCommitted: (deletedSequences: number[]) => undefined
+  ): Promise<boolean> {
+    return this.getAppendProvenance(workspaceId).runMutation(async () => {
+      if (!isCurrent()) return false;
+      await this.recoverTruncateTransactionUnlocked(workspaceId, assertStillOwned);
+      const archive = await this.readHistoryForRewrite(this.getChatArchivePath(workspaceId));
+      const chat = await this.readHistoryForRewrite(this.getChatHistoryPath(workspaceId));
+      const messages = [...archive.messages, ...chat.messages];
+      if (
+        percentage < 1 &&
+        messages.length > 0 &&
+        (await this.computeTruncationRemoveCount(messages, percentage)) < messages.length
+      )
+        throw new Error(
+          "Truncation classified as a full clear would leave messages; retry to re-run it."
+        );
+      const sequences = messages
+        .map((row) => row.metadata?.historySequence)
+        .filter((sequence): sequence is number => isNonNegativeInteger(sequence));
+      await assertStillOwned();
+      if (!isCurrent()) return false;
+      // A foreign partial may arrive after workspace preflight; it must not restore the
+      // deleted transcript on downgrade. Full deletion also authorizes malformed bytes.
+      rmSync(this.getPartialPath(workspaceId), { force: true });
+      await this.rewriteHistoryFilesUnlocked(workspaceId, null, null, {
+        isCurrent,
+        assertStillOwned,
+        onCommitted: () => {
+          this.sequenceCounters.set(workspaceId, 0);
+          onCommitted(sequences);
+          return undefined;
+        },
+      });
       return isCurrent();
     }, assertStillOwned);
   }
@@ -1291,7 +1344,8 @@ export class HistoryService {
   private async rewriteHistoryFilesUnlocked(
     workspaceId: string,
     finalArchiveContents: Buffer | null,
-    finalChatContents: Buffer | null
+    finalChatContents: Buffer | null,
+    publication?: HistoryPublicationObserver
   ): Promise<void> {
     invalidateHistoryAppendProvenance();
     const archivePath = this.getChatArchivePath(workspaceId);
@@ -1309,35 +1363,57 @@ export class HistoryService {
     if (!archiveExists) {
       assert(finalArchiveContents === null, "cannot replace a missing history archive");
       if (finalChatContents === null) {
+        if (publication) {
+          await using directory = await this.openHistoryPublicationDirectory(
+            this.getChatHistoryPath(workspaceId)
+          );
+          await publication.assertStillOwned();
+          if (!publication.isCurrent()) throw new Error("History publication no longer owned");
+          rmSync(this.getChatHistoryPath(workspaceId), { force: true });
+          if (directory) fsyncSync(directory.fd);
+          publication.onCommitted();
+          return;
+        }
         await fs.rm(this.getChatHistoryPath(workspaceId), { force: true });
       } else {
-        await writeFileAtomic(this.getChatHistoryPath(workspaceId), finalChatContents);
+        await this.publishHistoryUnderWriteLock(
+          this.getChatHistoryPath(workspaceId),
+          finalChatContents,
+          publication
+        );
       }
       return;
     }
 
-    await writeFileAtomic(
-      markerPath,
-      JSON.stringify({
-        // Older builds hash decoded UTF-8. Keep these fields compatible so a
-        // downgrade cannot roll back a committed byte-preserving truncation.
+    const markerContents = JSON.stringify({
+      // Older builds hash decoded UTF-8. Keep these fields compatible so a
+      // downgrade cannot roll back a committed byte-preserving truncation.
+      finalArchiveHash:
+        finalArchiveContents === null
+          ? null
+          : this.historyContentsHash(finalArchiveContents.toString("utf8")),
+      finalChatHash:
+        finalChatContents === null
+          ? null
+          : this.historyContentsHash(finalChatContents.toString("utf8")),
+      rawHashes: {
+        version: 1,
         finalArchiveHash:
-          finalArchiveContents === null
-            ? null
-            : this.historyContentsHash(finalArchiveContents.toString("utf8")),
+          finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
         finalChatHash:
-          finalChatContents === null
-            ? null
-            : this.historyContentsHash(finalChatContents.toString("utf8")),
-        rawHashes: {
-          version: 1,
-          finalArchiveHash:
-            finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
-          finalChatHash:
-            finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
-        },
-      })
-    );
+          finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
+      },
+    });
+    if (publication) {
+      return this.publishTruncationUnderWriteLock(
+        workspaceId,
+        finalArchiveContents,
+        finalChatContents,
+        markerContents,
+        publication
+      );
+    }
+    await writeFileAtomic(markerPath, markerContents);
     try {
       await fs.rename(archivePath, archiveTombstonePath);
     } catch (error) {
@@ -1379,6 +1455,71 @@ export class HistoryService {
         workspaceId,
         error,
       });
+    }
+  }
+
+  private async publishTruncationUnderWriteLock(
+    workspaceId: string,
+    archive: Buffer | null,
+    chat: Buffer | null,
+    marker: string,
+    publication: HistoryPublicationObserver
+  ): Promise<void> {
+    const archivePath = this.getChatArchivePath(workspaceId);
+    const chatPath = this.getChatHistoryPath(workspaceId);
+    const markerPath = this.getTruncateTransactionPath(workspaceId);
+    const outputs: Array<[string, Buffer | null]> = [
+      [markerPath, Buffer.from(marker)],
+      [archivePath, archive],
+      [chatPath, chat],
+    ];
+    const staged = new Map<string, string>();
+    let committed = false;
+    try {
+      // Stop may win throughout staging. No live marker, archive, or chat changes yet.
+      for (const [target, bytes] of outputs) {
+        if (bytes === null) continue;
+        const stagedPath = `${target}.publication-${randomUUID()}`;
+        staged.set(target, stagedPath);
+        await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
+      }
+      await using directory = await this.openHistoryPublicationDirectory(chatPath);
+      await publication.assertStillOwned();
+      if (!publication.isCurrent()) throw new Error("History publication no longer owned");
+      try {
+        // Preserve the existing recovery hashes and tombstone protocol, but leave no await
+        // between the final ownership check and the complete destructive transaction.
+        renameSync(staged.get(markerPath)!, markerPath);
+        renameSync(archivePath, `${archivePath}.truncate`);
+        if (archive !== null) renameSync(staged.get(archivePath)!, archivePath);
+        if (chat === null) rmSync(chatPath, { force: true });
+        else renameSync(staged.get(chatPath)!, chatPath);
+        committed = true;
+      } catch (error) {
+        // Lease loss forbids recovery over a successor. The next owner can reconcile
+        // an interrupted transaction using the same marker format as earlier builds.
+        committed = await this.recoverTruncateTransactionUnlocked(
+          workspaceId,
+          publication.assertStillOwned
+        );
+        if (!committed) throw error;
+      }
+      // Rename/remove durability is part of the edit receipt. A recovered transaction must
+      // pass the same barrier; observing its new contents alone cannot accept the edit.
+      if (directory) fsyncSync(directory.fd);
+      publication.onCommitted();
+      try {
+        await this.recoverTruncateTransactionUnlocked(workspaceId, publication.assertStillOwned);
+      } catch (error) {
+        log.warn("History truncation cleanup deferred to the next owner", { workspaceId, error });
+      }
+    } finally {
+      for (const stagedPath of staged.values()) {
+        await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+          if (!committed) throw error;
+          log.warn("History truncated but staging cleanup failed", { error });
+        });
+      }
     }
   }
 
@@ -3282,7 +3423,7 @@ export class HistoryService {
     );
   }
 
-  /** Inactive until all Stop/send/resume/recovery consumers adopt the same authority. */
+  /** Shared history-lock authority for Stop, replacement acceptance, and recovery. */
   getCompactionCancellationStorage(workspaceId: string): FileCompactionCancellationStorage {
     return new FileCompactionCancellationStorage(this, workspaceId, async (witness, signal) => {
       const evidence = await this.prepareCompactionReplacementWitness(
@@ -3327,6 +3468,28 @@ export class HistoryService {
       workspaceId,
       "Failed to capture replacement",
       async () => Ok(await this.captureCompactionReplacementUnderHistoryLock(workspaceId))
+    );
+  }
+
+  /** Keep the persisted frontier stable through synchronous provider construction/registration. */
+  runWithCompactionAdmission(
+    workspaceId: string,
+    captured: CompactionReplacementCapture,
+    construct: () => void
+  ): Promise<Result<void>> {
+    const expected = { ...captured };
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to validate stream admission",
+      async (assertStillOwned) => {
+        const current = await this.captureCompactionReplacementUnderHistoryLock(workspaceId);
+        if (current.nonce !== expected.nonce || current.generation !== expected.generation)
+          return Err("Compaction admission was superseded");
+        await assertStillOwned();
+        // Do not await playback, envelopes, or cleanup here: they may acquire this lock.
+        construct();
+        return Ok(undefined);
+      }
     );
   }
 
@@ -3445,6 +3608,15 @@ export class HistoryService {
         if (prepared.kind === "append") {
           messages = prepared.messages;
           if (messages.length === 0) return Ok({ kind: "skipped" });
+          // Automatic rollover must leave a canceled summary reachable to active-boundary
+          // recovery. Recheck under this lock: a peer can narrow Stop without changing its nonce.
+          if (
+            prepared.preserveCancellation &&
+            messages.some((message) => message.metadata?.contextBoundaryKind === "reset") &&
+            (await this.getCompactionCancellationStorage(workspaceId).read())?.scope.kind ===
+              "summary"
+          )
+            return Ok({ kind: "skipped" });
           const trigger = messages.at(-1)!;
           if (
             new Set(messages.map((message) => message.id)).size !== messages.length ||
@@ -3899,7 +4071,7 @@ export class HistoryService {
   async cleanupCompactionFollowUp(
     workspaceId: string,
     summary: MuxMessage,
-    action: "clear" | "rollback-heartbeat",
+    action: "clear" | "rollback-heartbeat" | "confirm-cleared",
     isCurrent: () => boolean,
     // Unlike void, undefined rejects async observers that would outlive the held locks.
     onCommitted?: () => undefined,
@@ -3924,7 +4096,8 @@ export class HistoryService {
       workspaceId,
       "Failed to clean up compaction follow-up",
       async (assertStillOwned) => {
-        if (!isCurrent() || !expected.pendingFollowUp) return Ok("skipped");
+        if (!isCurrent() || (!expected.pendingFollowUp && action !== "confirm-cleared"))
+          return Ok("skipped");
         const historyPath = this.getChatHistoryPath(workspaceId);
         const { rows, messages } = await this.readHistoryForRewrite(historyPath);
         // Archived summaries no longer own an active continuation or reset rollback.
@@ -3941,11 +4114,17 @@ export class HistoryService {
           // Reused IDs/sequences do not transfer a handoff to a different publication.
           current.metadata?.compactionPublicationId !== summary.metadata?.compactionPublicationId ||
           !isCompactionSummaryMetadata(metadata) ||
-          !isDeepStrictEqual(metadata.pendingFollowUp, expected.pendingFollowUp) ||
+          (action !== "confirm-cleared" &&
+            !isDeepStrictEqual(metadata.pendingFollowUp, expected.pendingFollowUp)) ||
           (action === "rollback-heartbeat" && current.metadata?.compacted !== "heartbeat") ||
           !isCurrent()
         )
           return Ok("skipped");
+
+        // A crash can leave cancellation debt after the clear committed. Only this exact,
+        // valid active summary proves absence; missing rows and changed handoffs do not.
+        if (action === "confirm-cleared")
+          return Ok(metadata.pendingFollowUp === undefined ? "applied" : "skipped");
 
         const { pendingFollowUp: _pending, ...remainingMetadata } = metadata;
         const replacement =
@@ -4693,14 +4872,29 @@ export class HistoryService {
   async truncateAfterMessage(
     workspaceId: string,
     messageId: string,
-    options?: { keepTargetMessage?: boolean }
+    options?: { keepTargetMessage?: boolean; replacement?: CompactionReplacementEdit }
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
-      async () => {
+      async (assertStillOwned) => {
         invalidateHistoryAppendProvenance();
         try {
+          const replacement = options?.replacement;
+          const publication: HistoryPublicationObserver | undefined = replacement && {
+            assertStillOwned,
+            isCurrent: replacement.isCurrent,
+            onCommitted: () => undefined,
+          };
+          if (
+            replacement &&
+            (!replacement.isCurrent() ||
+              !isDeepStrictEqual(
+                await this.captureCompactionReplacementUnderHistoryLock(workspaceId),
+                replacement.capture
+              ))
+          )
+            return Err("Compaction replacement changed before edit truncation");
           // Structural rewrite requires full file content
           const { rows, messages } = await this.readHistoryForRewrite(
             this.getChatHistoryPath(workspaceId)
@@ -4725,7 +4919,9 @@ export class HistoryService {
               messageId,
               keepTargetMessage,
               messages,
-              rows
+              rows,
+              replacement,
+              publication
             );
           }
 
@@ -4750,10 +4946,13 @@ export class HistoryService {
           if (tailCutChangesProviderContext(removedMessages)) {
             await this.getContinuousCompactionJournal(
               workspaceId
-            ).advanceGenerationUnderHistoryLock();
+            ).advanceGenerationUnderHistoryLock(
+              replacement?.onGenerationAdvanced,
+              assertStillOwned,
+              replacement?.isCurrent
+            );
           }
-          // Atomic write prevents corruption if app crashes mid-write
-          await writeFileAtomic(historyPath, historyEntries);
+          await this.publishHistoryUnderWriteLock(historyPath, historyEntries, publication);
 
           // Update sequence counter to continue from where we truncated.
           // Self-healing read path: skip malformed persisted historySequence values.
@@ -4809,7 +5008,9 @@ export class HistoryService {
     keepTargetMessage: boolean,
     /** Active-epoch messages already read by the caller; all of them are discarded on this branch. */
     activeEpochMessages: MuxMessage[],
-    activeEpochRows: HistoryRewriteRow[]
+    activeEpochRows: HistoryRewriteRow[],
+    replacement?: CompactionReplacementEdit,
+    publication?: HistoryPublicationObserver
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
     try {
       const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
@@ -4833,7 +5034,11 @@ export class HistoryService {
         archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
       }
       if (tailCutChangesProviderContext(removedMessages)) {
-        await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock();
+        await this.getContinuousCompactionJournal(workspaceId).advanceGenerationUnderHistoryLock(
+          replacement?.onGenerationAdvanced,
+          publication?.assertStillOwned,
+          replacement?.isCurrent
+        );
       }
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
@@ -4842,7 +5047,8 @@ export class HistoryService {
           [...archiveRows, ...activeEpochRows],
           workspaceId,
           truncatedMessages
-        )
+        ),
+        publication
       );
       // chat.jsonl may contain sealed epochs again — allow the lazy check to re-run.
       this.sealedRotationChecked.delete(workspaceId);

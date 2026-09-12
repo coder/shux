@@ -1,3 +1,4 @@
+import { Err, Ok } from "@/common/types/result";
 import { describe, it, expect, beforeEach } from "bun:test";
 import { MessageQueue } from "./messageQueue";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
@@ -11,6 +12,74 @@ describe("MessageQueue", () => {
   });
 
   describe("acceptance origin", () => {
+    it.each([0, 1])("keeps every compaction probe on a batch (stale add=%s)", (staleAdd) => {
+      const stale = [false, false];
+      for (const index of [0, 1]) {
+        queue.add(`addition ${index}`, undefined, {
+          compactionAdmissionStale: () => stale[index],
+          refreshCompactionAdmission: () => {
+            stale[index] = false;
+          },
+        });
+      }
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.message).toBe("addition 0\naddition 1");
+      expect(queue.isEmpty()).toBe(true);
+      expect(dispatched.internal?.admissionStale?.()).toBe(false);
+      stale[staleAdd] = true;
+      expect(dispatched.internal?.admissionStale?.()).toBe(true);
+      stale.fill(true);
+      dispatched.internal?.refreshCompactionAdmission?.(() => false);
+      expect(dispatched.internal?.admissionStale?.()).toBe(false);
+      stale[staleAdd] = true;
+      expect(dispatched.internal?.admissionStale?.()).toBe(true);
+    });
+
+    it("does not refresh automatic authority in a mixed batch", () => {
+      let manualStale = true;
+      let automaticStale = true;
+      queue.add("automatic", undefined, {
+        acceptanceOrigin: "automatic",
+        compactionAdmissionStale: () => automaticStale,
+        refreshCompactionAdmission: () => {
+          automaticStale = false;
+        },
+      });
+      queue.add("manual", undefined, {
+        compactionAdmissionStale: () => manualStale,
+        refreshCompactionAdmission: () => {
+          manualStale = false;
+        },
+      });
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.message).toBe("automatic\nmanual");
+      dispatched.internal?.refreshCompactionAdmission?.(() => false);
+      expect(manualStale).toBe(false);
+      expect(automaticStale).toBe(true);
+      expect(dispatched.internal?.admissionStale?.()).toBe(true);
+    });
+
+    it("removes only a withdrawn add's compaction authority", () => {
+      queue.addOnce("automatic", undefined, "auto:1", {
+        acceptanceOrigin: "automatic",
+        compactionAdmissionStale: () => false,
+      });
+      let refreshed = false;
+      queue.addOnce("manual", undefined, "manual:1", {
+        compactionAdmissionStale: () => true,
+        refreshCompactionAdmission: () => {
+          refreshed = true;
+        },
+      });
+      expect(queue.removeByDedupeKeyPrefix("manual:").removedCount).toBe(1);
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.message).toBe("automatic");
+      expect(dispatched.internal?.acceptanceOrigin).toBe("automatic");
+      expect(dispatched.internal?.admissionStale?.()).toBe(false);
+      dispatched.internal?.refreshCompactionAdmission?.(() => false);
+      expect(refreshed).toBe(false);
+    });
+
     it("preserves automatic origin across batching without changing visibility or billing", () => {
       const internal = { acceptanceOrigin: "automatic" as const };
       queue.add("first", undefined, internal);
@@ -43,6 +112,67 @@ describe("MessageQueue", () => {
         internal: automatic,
       });
     });
+  });
+
+  describe("durable admission frontier", () => {
+    const older = { nonce: null, generation: undefined };
+    const newer = { nonce: "new-stop", generation: "new-generation" };
+
+    it.each(["match", "nonce", "generation", "error"] as const)(
+      "owned reset receipts preserve %s queued authority through consecutive resets",
+      async (kind) => {
+        const source =
+          kind === "nonce"
+            ? { ...older, nonce: "foreign" }
+            : kind === "generation"
+              ? { ...older, generation: "foreign" }
+              : older;
+        const result = kind === "error" ? Err("capture failed") : Ok(source);
+        queue.add("queued", undefined, { readCompactionAdmission: () => Promise.resolve(result) });
+        const first = { ...older, generation: "first-reset" };
+        const second = { ...older, generation: "second-reset" };
+        queue.advanceCompactionAdmission(older, first);
+        queue.advanceCompactionAdmission(first, second);
+        expect(await queue.dequeueNext().internal?.readCompactionAdmission?.()).toEqual(
+          kind === "match" ? Ok(second) : result
+        );
+      }
+    );
+
+    it("does not let a newer batched add authorize an older frontier", async () => {
+      queue.add("old", undefined, { readCompactionAdmission: () => Promise.resolve(Ok(older)) });
+      queue.add("fresh", undefined, { readCompactionAdmission: () => Promise.resolve(Ok(newer)) });
+      expect((await queue.dequeueNext().internal?.readCompactionAdmission?.())?.success).toBe(
+        false
+      );
+    });
+
+    it("removes only the withdrawn add's durable frontier", async () => {
+      queue.addOnce("old", undefined, "withdraw:old", {
+        readCompactionAdmission: () => Promise.resolve(Ok(older)),
+      });
+      queue.add("fresh", undefined, { readCompactionAdmission: () => Promise.resolve(Ok(newer)) });
+      expect(queue.removeByDedupeKeyPrefix("withdraw:").removedCount).toBe(1);
+      expect(await queue.dequeueNext().internal?.readCompactionAdmission?.()).toEqual(Ok(newer));
+    });
+
+    it.each(["manual", "automatic"] as const)(
+      "Send Now refreshes manual additions without reauthorizing %s siblings",
+      async (origin) => {
+        queue.add("manual", undefined, {
+          readCompactionAdmission: () => Promise.resolve(Ok(older)),
+        });
+        queue.add("sibling", undefined, {
+          acceptanceOrigin: origin,
+          readCompactionAdmission: () => Promise.resolve(Ok(older)),
+        });
+        const { internal } = queue.dequeueNext();
+        internal?.refreshCompactionAdmission?.(() => false, newer);
+        const acquired = await internal?.readCompactionAdmission?.();
+        if (origin === "manual") expect(acquired).toEqual(Ok(newer));
+        else expect(acquired?.success).toBe(false);
+      }
+    );
   });
 
   describe("authoredAtMs", () => {

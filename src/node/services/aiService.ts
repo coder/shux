@@ -949,6 +949,9 @@ export class AIService extends EventEmitter {
         if (combinedAbortSignal.aborted) {
           return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         }
+        if (!combinedAbortSignal.aborted) await opts.assertAdmissionCurrent?.();
+        if (combinedAbortSignal.aborted)
+          return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
@@ -999,6 +1002,9 @@ export class AIService extends EventEmitter {
         return buildOutcome.result;
       }
 
+      // Prepared candidates must use the final caller's admission, not their earlier preview.
+      buildOutcome.turnExecutionOptions.assertAdmissionCurrent = opts.assertAdmissionCurrent;
+      buildOutcome.turnExecutionOptions.withAdmissionCurrent = opts.withAdmissionCurrent;
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);

@@ -5,6 +5,7 @@ import { Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
 import { log } from "./log";
 import { EventEmitter } from "events";
+import { promises as fileIO } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
@@ -65,7 +66,130 @@ function observePolicy(session: AgentSession) {
 }
 
 describe("AgentSession turn completion", () => {
-  test("ordinary completion drains queued input despite an unreadable compaction generation", async () => {
+  test("startup retries a pending continuation after a transient cancellation read failure", async () => {
+    const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+    const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+    const stream = spyOn(h.aiService, "streamMessage");
+    await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "pending continuation", model, agentId: "exec" },
+        },
+      })
+    );
+    const open = fileIO.open;
+    let failed = false;
+    const reading = spyOn(fileIO, "open").mockImplementation(
+      async (...args: Parameters<typeof open>) => {
+        if (args[0] === storage.path && !failed) {
+          failed = true;
+          throw Object.assign(new Error("temporary cancellation read failure"), { code: "EIO" });
+        }
+        return open(...args);
+      }
+    );
+    try {
+      await h.session.runStartupRecovery();
+      expect(failed).toBe(true);
+      expect(stream).not.toHaveBeenCalled();
+      // The failed startup step must remain retryable; the later run dispatches real pending input.
+      await h.session.runStartupRecovery();
+      expect(stream).toHaveBeenCalledTimes(1);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data.at(-1)?.parts).toMatchObject([
+        { type: "text", text: "pending continuation" },
+      ]);
+    } finally {
+      reading.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test.each(["EACCES", "EIO"])(
+    "terminal error settles while cancellation storage fails with %s",
+    async (code) => {
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const emitter = new EventEmitter();
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter: emitter,
+        captureEvents: true,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            start(emitter);
+            return Promise.resolve(
+              Ok({ messageId: "assistant-1", completion: completion.promise })
+            );
+          }),
+        },
+      });
+      const consumer = observePolicy(h.session);
+      const stream = spyOn(h.aiService, "streamMessage");
+      const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
+      const failure = Object.assign(new Error(`${code}: cancellation read unavailable`), { code });
+      const open = fileIO.open;
+      let reading: ReturnType<typeof spyOn<typeof fileIO, "open">> | undefined;
+      const warning = spyOn(log, "warn");
+      try {
+        expect(await h.session.sendMessage("original", sendOptions)).toEqual(Ok(undefined));
+        expect(await h.session.cancelCompaction(true)).toEqual(Ok(undefined));
+        const cancellationBytes = await fileIO.readFile(storage.path);
+        reading = spyOn(fileIO, "open").mockImplementation(
+          async (...args: Parameters<typeof open>) => {
+            if (args[0] === storage.path) {
+              entered.resolve();
+              await release.promise;
+              throw failure;
+            }
+            return open(...args);
+          }
+        );
+        const streamError = {
+          messageId: "assistant-1",
+          error: "provider failed",
+          errorType: "api" as const,
+        };
+        emitter.emit("error", { ...streamError, workspaceId });
+        completion.resolve({ status: "failed", streamError });
+        await entered.promise;
+        expect(internal(h.session).coordinator.phase).toBe("completing");
+        release.resolve();
+        await policyPromise(consumer);
+        expect(internal(h.session).coordinator.phase).toBe("idle");
+        expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-1")).toBe(
+          "terminal"
+        );
+        expect(h.events.filter((event) => event.type === "stream-error")).toMatchObject([
+          { messageId: "assistant-1", error: "provider failed" },
+        ]);
+        expect(stream).toHaveBeenCalledTimes(1);
+        expect(await fileIO.readFile(storage.path)).toEqual(cancellationBytes);
+        expect(
+          warning.mock.calls.some((args) =>
+            args.some(
+              (arg) =>
+                typeof arg === "object" && arg != null && "error" in arg && arg.error === failure
+            )
+          )
+        ).toBe(true);
+      } finally {
+        release.resolve();
+        reading?.mockRestore();
+        warning.mockRestore();
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("ordinary completion drains queued input despite a transient compaction generation read failure", async () => {
     const completion = Promise.withResolvers<TurnCompletion>();
     const nextStarted = Promise.withResolvers<void>();
     const emitter = new EventEmitter();
@@ -94,23 +218,43 @@ describe("AgentSession turn completion", () => {
     const consumer = observePolicy(h.session);
     const observation = spyOn(internal(h.session), "observeContinuousCompactionAtStreamEnd");
     const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
+    let reading: ReturnType<typeof spyOn<typeof fileIO, "readFile">> | undefined;
+    let failed = false;
     try {
-      expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
-      const firstPolicy = policyPromise(consumer);
-      h.session.queueMessage("queued follow-up", sendOptions);
-      // A compaction-only sidecar must not strand ordinary completion policy or its queue.
+      // Keep admission's real frontier stable: only the ordinary completion read fails.
       const generationPath = path.join(
         h.config.sessionsDir,
         workspaceId,
         CONTINUOUS_COMPACTION_GENERATION_FILE
       );
-      await fs.mkdir(generationPath);
+      const generation = "existing-generation";
+      await fs.mkdir(path.dirname(generationPath), { recursive: true });
+      await fs.writeFile(generationPath, generation);
+      expect((await h.session.sendMessage("original", sendOptions)).success).toBe(true);
+      const firstPolicy = policyPromise(consumer);
+      const admission = await h.historyService.captureCompactionReplacement(workspaceId);
+      expect(admission.success).toBe(true);
+      h.session.queueMessage("queued follow-up", sendOptions, {
+        readCompactionAdmission: () => Promise.resolve(admission),
+      });
+      // Install the transient fault only after the queue's recorded acquisition completes.
+      const read = fileIO.readFile;
+      reading = spyOn(fileIO, "readFile").mockImplementation((async (
+        ...args: Parameters<typeof read>
+      ) => {
+        if (args[0] === generationPath && !failed) {
+          failed = true;
+          throw Object.assign(new Error("temporary generation read failure"), { code: "EIO" });
+        }
+        return read(...args);
+      }) as typeof read);
       completion.resolve({ status: "completed", streamEnd: end() });
       await firstPolicy;
       expect(h.session.hasQueuedMessages()).toBe(false);
       expect(observation).toHaveBeenCalledTimes(1);
       expect(accounting).toHaveBeenCalledTimes(1);
       await nextStarted.promise;
+      expect(failed).toBe(true);
       expect(calls).toBe(2);
       expect(h.session.isBusy()).toBe(true);
       expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(1);
@@ -119,8 +263,9 @@ describe("AgentSession turn completion", () => {
       expect(history.data.at(-1)?.parts).toMatchObject([
         { type: "text", text: "queued follow-up" },
       ]);
-      expect((await fs.stat(generationPath)).isDirectory()).toBe(true);
+      expect(await fs.readFile(generationPath, "utf8")).toBe(generation);
     } finally {
+      reading?.mockRestore();
       completion.resolve({ status: "completed", streamEnd: end() });
       observation.mockRestore();
       accounting.mockRestore();

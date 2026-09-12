@@ -67,13 +67,14 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   it("refuses at the pre-persist gate before any row lands when the epoch is stale", async () => {
     const workspaceId = "ws-epoch-prepersist";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const publication = spyOn(historyService, "acceptCompactionReplacement");
     let acceptedCalls = 0;
 
     const result = await session.sendMessage(
       "family trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("family-payload-stale", "assistant", "untrusted payload", {
@@ -94,7 +95,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     });
     // Pre-acceptance refusal: nothing persisted, nothing accepted, no stream.
     expect(acceptedCalls).toBe(0);
-    expect(appendMany).not.toHaveBeenCalled();
+    expect(publication).not.toHaveBeenCalled();
     expect(streamMessage).not.toHaveBeenCalled();
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
@@ -103,13 +104,25 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   it("invokes the cancellation hook when the caller probe goes stale before acceptance", async () => {
     const workspaceId = "ws-caller-stale-cancel";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    let published = false;
+    const publish = historyService.acceptCompactionReplacement.bind(historyService);
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      (id, capture, operation, observer) =>
+        publish(id, capture, operation, {
+          ...observer,
+          onCommitted: (receipt) => {
+            observer.onCommitted(receipt);
+            published = true;
+          },
+        })
+    );
     const canceled: string[] = [];
 
     const result = await session.sendMessage(
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stale", "assistant", "untrusted payload", {
@@ -121,7 +134,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
         // which must roll the rows back AND surface the refusal through the cancellation hook —
         // a queued peer send's caller already returned success and this hook carries its budget
         // refund; without it the reservation would leak.
-        admissionStale: () => appendMany.mock.calls.length > 0,
+        admissionStale: () => published,
         onCanceled: (reason: string) => {
           canceled.push(reason);
         },
@@ -138,7 +151,18 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   it("keeps the charge when a stale send's rollback did not commit", async () => {
     const workspaceId = "ws-caller-stale-rollback-failed";
     const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
-    const appendMany = spyOn(historyService, "appendManyToHistory");
+    let published = false;
+    const publish = historyService.acceptCompactionReplacement.bind(historyService);
+    spyOn(historyService, "acceptCompactionReplacement").mockImplementationOnce(
+      (id, capture, operation, observer) =>
+        publish(id, capture, operation, {
+          ...observer,
+          onCommitted: (receipt) => {
+            observer.onCommitted(receipt);
+            published = true;
+          },
+        })
+    );
     // Rollback deletion fails and the rows verifiably REMAIN: the cancellation hook must not
     // fire — a refunded reservation with durable rows would let the payload enter provider
     // context after a resume while no longer counting against the sender's budget.
@@ -152,6 +176,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "peer trigger",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         preTurnMessages: [
           createMuxMessage("peer-payload-stuck", "assistant", "untrusted payload", {
@@ -159,7 +184,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
             synthetic: true,
           }),
         ],
-        admissionStale: () => appendMany.mock.calls.length > 0,
+        admissionStale: () => published,
         onCanceled: (reason: string) => {
           canceled.push(reason);
         },
@@ -196,6 +221,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       "hello",
       { model: TEST_MODEL, agentId: "exec" },
       {
+        acceptanceOrigin: "automatic",
         synthetic: true,
         onAccepted: () => {
           acceptedCalls += 1;
