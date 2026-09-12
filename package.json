@@ -140,6 +140,7 @@
     "ssh-config": "^5.0.4",
     "ssh2": "^1.17.0",
     "sshpk": "^1.18.0",
+    "stream-json": "3.6.0",
     "streamdown": "2.0.0-canary.2",
     "trpc-cli": "^0.12.1",
     "turndown": "^7.2.2",
