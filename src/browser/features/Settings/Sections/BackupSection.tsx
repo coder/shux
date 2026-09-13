@@ -269,6 +269,7 @@ export function BackupSection() {
           setProjectImports([]);
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
+          setUnsupportedSettings([]);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -385,6 +386,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setUnsupportedSettings([]);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -452,6 +454,7 @@ export function BackupSection() {
     // change.
     setProjectImports([]);
     setProjectBundleSkipped(false);
+    setUnsupportedSettings([]);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -527,6 +530,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setUnsupportedSettings([]);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${getCredentialLabel(result.data.credential)}.`
       );

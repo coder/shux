@@ -1,4 +1,4 @@
-import type { z } from "zod";
+import { z } from "zod";
 import { AppConfigOnDiskSchema, GoalDefaultsSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -120,11 +120,21 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
 };
 
 /**
+ * The on-disk schema leaves layoutPresets unknown and its normalizer reads a version it does not
+ * know as an empty config, which a restore would turn into deleting the target's presets. Pin
+ * the versions this build migrates so a newer document is reported as unsupported instead.
+ */
+const LAYOUT_PRESETS_SCHEMA = z
+  .object({ version: z.union([z.literal(1), z.literal(2)]) })
+  .passthrough();
+
+/**
  * Per-key schemas rather than one picked object: the on-disk schema is passthrough, which would
  * carry any key of a repository-controlled document into the config, and each key accepts null.
  */
 function fieldSchema(key: BackedUpSettingsKey): z.ZodType {
-  return AppConfigOnDiskSchema.shape[key].nullable();
+  const schema = key === "layoutPresets" ? LAYOUT_PRESETS_SCHEMA : AppConfigOnDiskSchema.shape[key];
+  return schema.nullable();
 }
 
 function setSetting<K extends BackedUpSettingsKey>(

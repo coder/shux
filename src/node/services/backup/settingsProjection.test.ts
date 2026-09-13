@@ -241,20 +241,32 @@ describe("settingsProjection", () => {
       settings: {
         agentAiDefaults: { exec: { thinkingLevel: "bogus" } },
         heartbeatDefaultIntervalMs: 1,
+        // The on-disk schema leaves this key unknown; a version this build cannot migrate would
+        // otherwise normalize to empty and delete the target's presets.
+        layoutPresets: { version: 3, slots: [{ slot: 1 }] },
         defaultModel: "anthropic:claude-plan",
       },
     });
-    expect(read.unsupported).toEqual(["agentAiDefaults", "heartbeatDefaultIntervalMs"]);
+    expect(read.unsupported).toEqual([
+      "agentAiDefaults",
+      "heartbeatDefaultIntervalMs",
+      "layoutPresets",
+    ]);
     expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
+    expect(readBackupSettings({ settings: { layoutPresets: "garbage" } }).unsupported).toEqual([
+      "layoutPresets",
+    ]);
 
     const current: ProjectsConfig = {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
       heartbeatDefaultIntervalMs: 900_000,
+      layoutPresets: { version: 2, slots: [{ slot: 1 }] },
     };
     const merged = mergeBackupSettings(current, read.settings!);
     expect(merged.agentAiDefaults).toEqual(current.agentAiDefaults);
     expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
+    expect(merged.layoutPresets).toEqual(current.layoutPresets);
     expect(merged.defaultModel).toBe("anthropic:claude-plan");
 
     expect(readBackupSettings({ settings: null })).toEqual({

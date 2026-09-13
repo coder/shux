@@ -150,7 +150,8 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         iterator = subscribedIterator;
         for await (const _ of subscribedIterator) {
           if (signal.aborted) break;
-          void refresh();
+          // Awaited so two changes in quick succession cannot let the older response land last.
+          await refresh();
         }
       } catch {
         // Config subscriptions are cancelled during unmounts and API reconnects.
