@@ -1,46 +1,43 @@
-import { Shimmer } from "@/browser/features/AIElements/Shimmer";
-import { LoadingAnimation } from "@/browser/components/LoadingAnimation/LoadingAnimation";
+import { InitMessage } from "@/browser/features/Messages/InitMessage";
+import { UserMessage } from "@/browser/features/Messages/UserMessage";
+import {
+  createPendingCreationInitMessage,
+  createPendingUserDisplayedMessage,
+  type PendingInitialUserMessage,
+} from "@/browser/utils/messages/pendingInitialUserMessage";
 
 interface CreationCenterContentProps {
-  projectName: string;
   isSending: boolean;
+  /** The first message being sent (null for sends that create no user turn, e.g. /goal) */
+  pendingUserMessage: PendingInitialUserMessage | null;
   /** The confirmed workspace name (null while generation is in progress) */
   workspaceName?: string | null;
-  /** The confirmed workspace title (null while generation is in progress) */
-  workspaceTitle?: string | null;
+  kind?: "scratch";
+  projectPath: string;
 }
 
 /**
- * Loading overlay displayed during workspace creation.
- * Shown as an overlay when isSending is true.
+ * Transcript-first creation progress: the message being sent followed by the same creation
+ * card the new workspace will show, so the view already looks like the transcript it becomes.
  */
 export function CreationCenterContent(props: CreationCenterContentProps) {
+  if (!props.isSending) {
+    return null;
+  }
+  const timestamp = props.pendingUserMessage?.timestamp ?? Date.now();
   return (
-    <>
-      {props.isSending && (
-        <div
-          className={
-            "bg-surface-primary absolute inset-0 z-10 flex flex-col items-center justify-center pb-[30vh]"
-          }
-        >
-          <LoadingAnimation />
-          <div className="mt-8 max-w-xl px-8 text-center">
-            <h2 className="text-foreground mb-2 text-2xl font-medium">Creating workspace</h2>
-            <p className="text-muted text-sm leading-relaxed">
-              {props.workspaceName ? (
-                <>
-                  <code className="bg-separator rounded px-1">{props.workspaceName}</code>
-                  {props.workspaceTitle && (
-                    <span className="text-muted-foreground ml-1">— {props.workspaceTitle}</span>
-                  )}
-                </>
-              ) : (
-                <Shimmer>Generating name…</Shimmer>
-              )}
-            </p>
-          </div>
-        </div>
+    <div className="w-full" data-testid="creation-pending-transcript">
+      {props.pendingUserMessage && (
+        <UserMessage message={createPendingUserDisplayedMessage(props.pendingUserMessage)} />
       )}
-    </>
+      <InitMessage
+        message={createPendingCreationInitMessage({
+          workspaceName: props.workspaceName ?? null,
+          kind: props.kind,
+          hookPath: props.projectPath,
+          timestamp,
+        })}
+      />
+    </div>
   );
 }

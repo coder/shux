@@ -4,6 +4,7 @@ import type { Review } from "@/common/types/review";
 import type { EditingMessageState, PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { QueuedMessage } from "@/common/types/message";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 
 export type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
@@ -24,6 +25,8 @@ export interface WorkspaceCreatedOptions {
   pendingStreamModel?: string | null;
   /** Set false when creation does not immediately enqueue an initial user send. */
   markPendingInitialSend?: boolean;
+  /** First message shown as a transcript row until the backend persists it. */
+  pendingUserMessage?: PendingInitialUserMessage;
 }
 
 // Workspace variant: full functionality for existing workspaces

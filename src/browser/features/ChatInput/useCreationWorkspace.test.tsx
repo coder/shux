@@ -1116,7 +1116,11 @@ describe("useCreationWorkspace", () => {
     // Navigation happens optimistically before staging; the pending-send
     // barrier is cleared once staging fails.
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
-    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({ markPendingInitialSend: true });
+    // The pending transcript row shows the typed command, not the rewritten skill text.
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      markPendingInitialSend: true,
+      pendingUserMessage: { content: "/review my files" },
+    });
     expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
     clearPendingInitialSendSpy.mockRestore();
 
@@ -1314,14 +1318,10 @@ describe("useCreationWorkspace", () => {
     const { workspaceApi } = setupWindow({ setGoal: setGoalMock, sendMessage: sendMessageMock });
 
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
@@ -1735,14 +1735,7 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "different-draft";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
         metadata,
         options,
       })
@@ -1768,6 +1761,12 @@ describe("useCreationWorkspace", () => {
       autoNavigate: false,
       pendingStreamModel: null,
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 
@@ -1810,14 +1809,10 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "draft-being-created";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
 
     const getHook = renderUseCreationWorkspace({
@@ -1840,6 +1835,12 @@ describe("useCreationWorkspace", () => {
       autoNavigate: true,
       pendingStreamModel: "anthropic:claude-opus-5",
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 

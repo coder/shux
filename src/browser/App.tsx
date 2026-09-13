@@ -318,7 +318,11 @@ function AppInner() {
       });
 
       if (createdSelection && options?.markPendingInitialSend !== false) {
-        workspaceStore.markPendingInitialSend(metadata.id, options?.pendingStreamModel ?? null);
+        workspaceStore.markPendingInitialSend(
+          metadata.id,
+          options?.pendingStreamModel ?? null,
+          options?.pendingUserMessage
+        );
       }
     }
 

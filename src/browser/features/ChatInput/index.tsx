@@ -2441,17 +2441,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   return (
     <Wrapper {...wrapperProps}>
       {creationState.trustDialog}
-      {/* Loading overlay during workspace creation */}
+      {/* Pending transcript (first message + creation progress) during workspace creation */}
       {variant === "creation" && (
         <CreationCenterContent
-          projectName={props.projectName}
-          isSending={isSendInFlight}
-          workspaceName={
-            isSendInFlight && props.kind !== "scratch"
-              ? creationState.creatingWithIdentity?.name
-              : undefined
-          }
-          workspaceTitle={isSendInFlight ? creationState.creatingWithIdentity?.title : undefined}
+          isSending={creationState.isSending}
+          pendingUserMessage={creationState.pendingUserMessage}
+          workspaceName={props.kind !== "scratch" ? creationState.creatingWithIdentity?.name : null}
+          kind={props.kind}
+          projectPath={props.projectPath}
         />
       )}
 

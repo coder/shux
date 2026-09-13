@@ -22,6 +22,7 @@ import {
   type LoadedSkill,
   type SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import {
   createCompactionCompletion,
   type ResponseCompleteEvent,
@@ -2740,7 +2741,7 @@ export class WorkspaceStore {
     const messages = aggregator.getDisplayedMessages();
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
-      if (message.type !== "user" || message.isSynthetic === true) {
+      if (message.type !== "user" || message.isSynthetic === true || message.isPendingSend) {
         continue;
       }
       // Generated attachment markup is provider context, not part of the user's prompt.
@@ -4001,13 +4002,17 @@ export class WorkspaceStore {
     }
   }
 
-  markPendingInitialSend(workspaceId: string, pendingStreamModel: string | null): void {
+  markPendingInitialSend(
+    workspaceId: string,
+    pendingStreamModel: string | null,
+    pendingUserMessage?: PendingInitialUserMessage
+  ): void {
     const aggregator = this.aggregators.get(workspaceId);
     if (!aggregator) {
       return;
     }
 
-    aggregator.markOptimisticPendingStreamStart(pendingStreamModel);
+    aggregator.markOptimisticPendingStreamStart(pendingStreamModel, pendingUserMessage);
     this.states.bump(workspaceId);
   }
 
@@ -4832,8 +4837,12 @@ export const workspaceStore = {
    * Mark a newly-created workspace as having its first send in flight.
    * Used by creation mode so the transcript can show the starting barrier immediately.
    */
-  markPendingInitialSend: (workspaceId: string, pendingStreamModel: string | null) =>
-    getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel),
+  markPendingInitialSend: (
+    workspaceId: string,
+    pendingStreamModel: string | null,
+    pendingUserMessage?: PendingInitialUserMessage
+  ) =>
+    getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel, pendingUserMessage),
   clearPendingInitialSendState: (workspaceId: string) =>
     getStoreInstance().clearPendingInitialSendState(workspaceId),
   /**

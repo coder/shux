@@ -757,6 +757,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       // Machine wakes and budget warnings should not interrupt navigation between human prompts.
       if (
         message.type === "user" &&
+        message.isPendingSend == null &&
         message.bashMonitorWake == null &&
         message.agentPeerMessageTrigger == null &&
         message.contextBudgetWarning == null

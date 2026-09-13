@@ -20,6 +20,7 @@ import {
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 import { ChatHarness } from "../harness";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { PENDING_INITIAL_USER_MESSAGE_ID } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { getDraftScopeId } from "@/common/constants/storage";
 import type { TestEnvironment } from "../../ipc/setup";
 
@@ -81,6 +82,7 @@ async function createCreationHarness(options?: {
 }
 
 type WorkspaceSendMessageFn = TestEnvironment["orpc"]["workspace"]["sendMessage"];
+type WorkspaceCreateFn = TestEnvironment["orpc"]["workspace"]["create"];
 
 function overrideWorkspaceSendMessage(
   env: TestEnvironment,
@@ -94,6 +96,25 @@ function overrideWorkspaceSendMessage(
   return () => {
     workspaceApi.sendMessage = originalSendMessage;
   };
+}
+
+function overrideWorkspaceCreate(env: TestEnvironment, override: WorkspaceCreateFn): () => void {
+  const workspaceApi = env.orpc.workspace as typeof env.orpc.workspace & {
+    create: WorkspaceCreateFn;
+  };
+  const originalCreate = workspaceApi.create;
+  workspaceApi.create = override;
+  return () => {
+    workspaceApi.create = originalCreate;
+  };
+}
+
+function gate(): { release: () => void; wait: Promise<void> } {
+  let release: () => void = () => {};
+  const wait = new Promise<void>((resolve) => {
+    release = () => resolve();
+  });
+  return { release, wait };
 }
 
 async function waitForCreatedWorkspaceId(
@@ -210,6 +231,109 @@ describe("New chat streaming flash regression", () => {
       observer.disconnect();
       restoreSendMessage();
       releaseSend();
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("shows the first message as a transcript row from the creation view through the new workspace", async () => {
+    const typed = "Show my first message before the workspace exists";
+    const createGate = gate();
+    const sendGate = gate();
+    const restores: Array<() => void> = [];
+    const app = await createCreationHarness({
+      beforeRender: (env) => {
+        const originalCreate = env.orpc.workspace.create.bind(
+          env.orpc.workspace
+        ) as WorkspaceCreateFn;
+        restores.push(
+          overrideWorkspaceCreate(env, (async (input) => {
+            await createGate.wait;
+            return originalCreate(input);
+          }) as WorkspaceCreateFn)
+        );
+        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
+          env.orpc.workspace
+        ) as WorkspaceSendMessageFn;
+        restores.push(
+          overrideWorkspaceSendMessage(env, (async (input) => {
+            await sendGate.wait;
+            return originalSendMessage(input);
+          }) as WorkspaceSendMessageFn)
+        );
+      },
+    });
+    const container = app.view.container;
+    const chatRows = () =>
+      Array.from(container.querySelectorAll<HTMLElement>('[data-testid="chat-message"]'));
+
+    try {
+      await app.chat.send(typed);
+
+      // Creation view, before the workspace exists: the transcript-shaped pending rows replace
+      // the old full-page overlay, and the composer stays mounted underneath them.
+      await waitFor(
+        () => {
+          const pending = container.querySelector('[data-testid="creation-pending-transcript"]');
+          if (!pending) {
+            throw new Error("Pending creation transcript not rendered yet");
+          }
+          expect(pending.textContent).toContain(typed);
+          const initHeader = pending.querySelector("button[aria-expanded]");
+          expect(initHeader?.textContent).toContain("Creating workspace");
+          expect(pending.textContent).toContain("Generating name");
+        },
+        { timeout: 10_000 }
+      );
+      expect(container.querySelector('[data-testid="message-window"]')).toBeNull();
+      expect(container.querySelector("textarea")).not.toBeNull();
+
+      createGate.release();
+      const workspaceId = await waitForCreatedWorkspaceId(app.env, app.projectPath);
+
+      // Workspace view, before the backend persists the message: the pending user row leads the
+      // transcript and the creation card sits directly below it.
+      await waitFor(
+        () => {
+          if (!container.querySelector('[data-testid="message-window"]')) {
+            throw new Error("Workspace chat view not rendered yet");
+          }
+          const rows = chatRows();
+          const pendingIndex = rows.findIndex(
+            (row) => row.getAttribute("data-message-id") === PENDING_INITIAL_USER_MESSAGE_ID
+          );
+          const initIndex = rows.findIndex((row) =>
+            /Creating workspace|Workspace created/.test(row.textContent ?? "")
+          );
+          expect(pendingIndex).toBe(0);
+          expect(rows[pendingIndex].textContent).toContain(typed);
+          expect(initIndex).toBe(1);
+        },
+        { timeout: 10_000 }
+      );
+
+      sendGate.release();
+      const workspaceChat = new ChatHarness(container, workspaceId);
+      await workspaceChat.expectTranscriptContains(`Mock response: ${typed}`);
+      await workspaceChat.expectStreamComplete();
+
+      // The durable message replaced the pending row: exactly one user row carries the text.
+      await waitFor(() => {
+        const rows = chatRows();
+        expect(
+          rows.some(
+            (row) => row.getAttribute("data-message-id") === PENDING_INITIAL_USER_MESSAGE_ID
+          )
+        ).toBe(false);
+        const userRows = rows.filter((row) => {
+          const text = row.textContent ?? "";
+          return text.includes(typed) && !text.includes("Mock response");
+        });
+        expect(userRows).toHaveLength(1);
+      });
+    } finally {
+      createGate.release();
+      sendGate.release();
+      for (const restore of restores) restore();
       await app.dispose();
     }
   }, 60_000);

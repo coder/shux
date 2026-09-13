@@ -1207,6 +1207,11 @@ export type DisplayedMessage =
       fileParts?: FilePart[]; // Optional attachments
       historySequence: number; // Global ordering across all messages
       isSynthetic?: boolean;
+      /**
+       * Presentation-only row for a first send that is not persisted yet (workspace creation).
+       * Never backed by history, so it cannot be edited, forked, or navigated to.
+       */
+      isPendingSend?: true;
       /** True only for synthetic messages intentionally rendered in the normal transcript. */
       isUiVisible?: boolean;
       /** Durable terminal rejection: keep visible, but never retry this or an older turn. */

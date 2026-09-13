@@ -85,6 +85,10 @@ import { z } from "zod";
 import { createDeltaStorage, type DeltaRecordStorage } from "./StreamingTPSCalculator";
 import { buildTranscriptTruncationPlan } from "./transcriptTruncationPlan";
 import { computeRecencyTimestamp } from "./recency";
+import {
+  createPendingUserDisplayedMessage,
+  type PendingInitialUserMessage,
+} from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
 import { getStatusStateKey } from "@/common/constants/storage";
 import {
@@ -652,6 +656,9 @@ export class StreamingMessageAggregator {
   // either the real user message or a terminal stream event.
   private optimisticPendingStreamStart = false;
   private optimisticPendingStreamStartIdleCaughtUpCount = 0;
+  // The first message of a created workspace, shown as a transcript row until the durable user
+  // message lands. Presentation only: never part of this.messages or any history bookkeeping.
+  private pendingInitialUserMessage: PendingInitialUserMessage | null = null;
 
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
@@ -1227,6 +1234,7 @@ export class StreamingMessageAggregator {
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
+          this.clearPendingInitialUserMessage();
           continue;
         }
 
@@ -1596,12 +1604,17 @@ export class StreamingMessageAggregator {
     return this.pendingStreamModel;
   }
 
-  markOptimisticPendingStreamStart(model: string | null): void {
+  markOptimisticPendingStreamStart(
+    model: string | null,
+    pendingUserMessage?: PendingInitialUserMessage
+  ): void {
     this.optimisticPendingStreamStart = true;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     this.pendingCompactionRequest = null;
     this.pendingStreamModel = model;
+    this.pendingInitialUserMessage = pendingUserMessage ?? null;
     this.setPendingStreamStartTime(Date.now());
+    this.invalidateCache();
   }
 
   clearPendingStreamStartIfNotOptimistic(): void {
@@ -1693,7 +1706,16 @@ export class StreamingMessageAggregator {
       this.pendingStreamModel = null;
       this.optimisticPendingStreamStart = false;
       this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
+      this.clearPendingInitialUserMessage();
     }
+  }
+
+  private clearPendingInitialUserMessage(): void {
+    if (this.pendingInitialUserMessage === null) {
+      return;
+    }
+    this.pendingInitialUserMessage = null;
+    this.invalidateCache();
   }
 
   private getActiveStreamEntry(): [string, StreamingContext] | undefined {
@@ -2026,6 +2048,7 @@ export class StreamingMessageAggregator {
             optimisticPendingStreamStart: this.optimisticPendingStreamStart,
             optimisticPendingStreamStartIdleCaughtUpCount:
               this.optimisticPendingStreamStartIdleCaughtUpCount,
+            pendingInitialUserMessage: this.pendingInitialUserMessage,
           };
 
     this.clear();
@@ -2040,6 +2063,7 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStart = pendingStreamSnapshot.optimisticPendingStreamStart;
     this.optimisticPendingStreamStartIdleCaughtUpCount =
       pendingStreamSnapshot.optimisticPendingStreamStartIdleCaughtUpCount;
+    this.pendingInitialUserMessage = pendingStreamSnapshot.pendingInitialUserMessage;
   }
 
   clear(): void {
@@ -3190,6 +3214,9 @@ export class StreamingMessageAggregator {
 
     this.optimisticPendingStreamStart = false;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
+    // The durable first message replaces the presentation-only row for good, so a later
+    // history truncation can never resurrect it.
+    this.clearPendingInitialUserMessage();
     this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
 
     if (muxMeta?.displayStatus) {
@@ -3855,6 +3882,16 @@ export class StreamingMessageAggregator {
       }
 
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);
+
+      if (
+        this.pendingInitialUserMessage &&
+        !resultMessages.some((message) => message.type === "user")
+      ) {
+        resultMessages = [
+          createPendingUserDisplayedMessage(this.pendingInitialUserMessage),
+          ...resultMessages,
+        ];
+      }
 
       if (this.initState) {
         const durationMs =

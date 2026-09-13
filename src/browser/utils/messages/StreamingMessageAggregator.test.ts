@@ -3493,6 +3493,90 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.getPendingStreamModel()).toBe("openai:gpt-4o-mini");
     });
 
+    const pendingFirstMessage = { content: "Build the thing", timestamp: 1_700_000_000_000 };
+    const displayedTypes = (aggregator: StreamingMessageAggregator) =>
+      aggregator.getDisplayedMessages().map((message) => message.type);
+    const displayedUserRows = (aggregator: StreamingMessageAggregator) =>
+      aggregator
+        .getDisplayedMessages()
+        .filter((message): message is Extract<DisplayedMessage, { type: "user" }> => {
+          return message.type === "user";
+        });
+
+    test("shows the pending first message as a user row ahead of the creation card", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0]).toMatchObject({
+        content: "Build the thing",
+        isPendingSend: true,
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      // The row is presentation only: history bookkeeping never sees it.
+      expect(aggregator.getAllMessages()).toHaveLength(0);
+      expect(aggregator.hasMessages()).toBe(false);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+    });
+
+    test("replaces the pending row with the durable first message and never resurrects it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      const [durableRow] = displayedUserRows(aggregator);
+      expect(durableRow.historyId).toBe("user-1");
+      expect(durableRow.isPendingSend).toBeUndefined();
+
+      // Truncating history back to empty must not bring the presentation row back.
+      aggregator.loadHistoricalMessages([], false);
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+    });
+
+    test("drops the pending row when the durable first message arrives via bulk history", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("user-1", "user", "Build the thing", { historySequence: 1 })],
+        true
+      );
+      expect(displayedUserRows(aggregator)).toHaveLength(1);
+      aggregator.loadHistoricalMessages([], true);
+      expect(displayedUserRows(aggregator)).toHaveLength(0);
+    });
+
+    test("clearing the pending stream start removes the pending row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.resetForReplay();
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+
+      aggregator.clearPendingStreamStart();
+      expect(displayedTypes(aggregator)).toEqual([]);
+    });
+
     test("clears stale pending state when authoritative history now ends with assistant", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       seedPendingStreamState(aggregator);
