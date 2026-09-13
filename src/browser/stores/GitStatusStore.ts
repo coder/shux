@@ -48,6 +48,13 @@ const MAX_CONCURRENT_GIT_OPS = 5;
 // Fetch configuration - aggressive intervals for fresh data
 const FETCH_BASE_INTERVAL_MS = 3 * 1000; // 3 seconds
 const FETCH_MAX_INTERVAL_MS = 60 * 1000; // 60 seconds
+// Background fetches are unfiltered (see GIT_FETCH_SCRIPT) and may run a
+// one-time full --refetch to heal repos poisoned into promisor/partial
+// clones, so transfers can be much larger than the old blob-filtered ones.
+// Killing a slow-but-progressing fetch wastes the entire transfer and leaves
+// ahead/behind state permanently stale behind retry backoff, so budget for a
+// full-object transfer instead.
+const FETCH_TIMEOUT_SECS = 300; // 5 minutes
 
 interface FetchState {
   lastFetch: number;
@@ -925,7 +932,7 @@ export class GitStatusStore {
       // Passive fetches use the runtime path because git fetch / git ls-remote
       // may need remote credentials that only exist inside the runtime. These
       // background fetches are only scheduled when that runtime is already running.
-      options: repoRootBashOptions(30, repoRootProjectPath),
+      options: repoRootBashOptions(FETCH_TIMEOUT_SECS, repoRootProjectPath),
     });
 
     if (!result.success) {

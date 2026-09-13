@@ -2206,6 +2206,12 @@ describeIntegration("Runtime integration tests", () => {
             `git --git-dir="${baseRepoPath}" config --local core.bare true`,
             `git --git-dir="${baseRepoPath}" config --local core.worktree "${bogusWorktreePath}"`,
             `git --git-dir="${baseRepoPath}" symbolic-ref HEAD refs/heads/main`,
+            // Simulate what a background `git fetch --filter=blob:none` from a
+            // sibling worktree registers in the shared gitdir. A promisor base
+            // repo lazy-fetches missing blobs over the network mid-checkout, so
+            // the warm path must strip these before `git worktree add`.
+            `git --git-dir="${baseRepoPath}" config --local remote.origin.promisor true`,
+            `git --git-dir="${baseRepoPath}" config --local remote.origin.partialclonefilter blob:none`,
           ].join(" && ")
         );
         expect(poisonResult.exitCode).toBe(0);
@@ -2242,6 +2248,20 @@ describeIntegration("Runtime integration tests", () => {
           `git --git-dir="${baseRepoPath}" config --get core.worktree`
         );
         expect(baseRepoCoreWorktreeCheck.exitCode).toBe(1);
+
+        // Promisor/partial-clone registration must be stripped so worktree
+        // materialization never lazy-fetches blobs over the network.
+        const baseRepoPromisorCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get remote.origin.promisor`
+        );
+        expect(baseRepoPromisorCheck.exitCode).toBe(1);
+
+        const baseRepoFilterCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get remote.origin.partialclonefilter`
+        );
+        expect(baseRepoFilterCheck.exitCode).toBe(1);
 
         const baseHeadSymbolicCheck = await execSSH(
           runtime,

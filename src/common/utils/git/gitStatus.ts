@@ -183,6 +183,19 @@ export function parseGitStatusScriptOutput(output: string): ParsedGitStatusOutpu
 }
 
 /**
+ * Git config keys that mark a repo as a promisor/partial clone. Previous
+ * versions of GIT_FETCH_SCRIPT fetched with --filter=blob:none, which made
+ * git persist this state (poisoning the repo: every later fetch stayed
+ * filtered and checkouts lazy-fetched blobs from the network). The fetch
+ * script's heal block and SSHRuntime's base-repo hygiene both unset these.
+ */
+export const PROMISOR_CONFIG_KEYS = [
+  "remote.origin.promisor",
+  "remote.origin.partialclonefilter",
+  "extensions.partialclone",
+] as const;
+
+/**
  * Smart git fetch script that minimizes lock contention.
  *
  * Uses ls-remote to check if remote has new commits before fetching.
@@ -201,6 +214,123 @@ export GIT_TERMINAL_PROMPT=0
 export GIT_ASKPASS=echo
 export SSH_ASKPASS=echo
 export GIT_SSH_COMMAND="\${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+
+# One-time heal for repos that previous versions of this script converted
+# into promisor/partial clones. --no-filter (used below) stops the damage but
+# does not remove the persisted promisor config, nor backfill the blobs that
+# earlier filtered fetches omitted. Left unhealed, "git worktree add"
+# (workspace creation) lazy-fetches those old blobs mid-checkout and fails on
+# transient network errors. Only repos whose filter is exactly the
+# "blob:none" this script used to write are healed. This block runs before
+# any ls-remote/primary-branch gating on purpose: a stale origin/HEAD (e.g.
+# default branch renamed upstream) makes the checks below exit early, which
+# must not leave the repo poisoned forever.
+if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
+  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  NOW=$(date +%s)
+  # A backfill can succeed while objects stay missing (see the completeness
+  # check below); that outcome may never improve, so retry it at most daily
+  # instead of hammering the network with a full refetch every poll.
+  LAST_INCOMPLETE=$(git config --local --get xum.promisorHealIncompleteAt 2>/dev/null || echo 0)
+  [ -n "$LAST_INCOMPLETE" ] || LAST_INCOMPLETE=0
+  if [ -n "$COMMON_DIR" ] && [ $((NOW - LAST_INCOMPLETE)) -ge 86400 ]; then
+    # mkdir is the atomic claim: sibling worktrees share repo config, so this
+    # keeps them from starting concurrent full refetches. Staleness comes
+    # from a timestamp file inside the lock (portable, unlike find/stat
+    # mtime probing): a lock left behind by a killed heal expires after an
+    # hour, which also rate-limits retries after a failed refetch (the
+    # failure path below keeps the lock in place for that reason).
+    HEAL_LOCK="$COMMON_DIR/xum-promisor-heal.lock"
+    LOCK_TS=$(cat "$HEAL_LOCK/started" 2>/dev/null || echo 0)
+    [ -n "$LOCK_TS" ] || LOCK_TS=0
+    if [ -d "$HEAL_LOCK" ] && [ $((NOW - LOCK_TS)) -gt 3600 ]; then
+      rm -rf "$HEAL_LOCK"
+    fi
+    if mkdir "$HEAL_LOCK" 2>/dev/null; then
+      echo "$NOW" > "$HEAL_LOCK/started"
+      echo "HEAL: backfilling promisor partial clone"
+      # Enumerate locally reachable objects the repo does not have (one OID
+      # per line). --reflog matters: an upstream force-push strands the
+      # displaced commit in the remote-tracking reflog, and recovery (e.g.
+      # git reset --hard origin/main@{1}) must keep lazy-fetching after an
+      # unsafe unset would have broken it, so reflog-only gaps count too.
+      # When rev-list itself fails (e.g. a local ref names a commit object
+      # the repo does not have at all, which exits 128 before reporting
+      # anything) a sentinel is printed instead: enumeration failure must
+      # read as "not proven complete", never as "nothing missing", or the
+      # unset below would strip the lazy-fetch fallback from a repo that
+      # still needs it.
+      xum_missing_objects() {
+        if xum_rl_out=$(git rev-list --objects --missing=print --all --reflog 2>/dev/null); then
+          printf '%s\\n' "$xum_rl_out" | sed -n 's/^?//p'
+        else
+          echo "enumeration-failed"
+        fi
+      }
+      HEAL_FETCHED=""
+      MISSING=$(xum_missing_objects)
+      # Stage 1: batch-fetch exactly the missing objects by OID. Downloads
+      # only the gaps (a --refetch re-sends the whole repo) and works on
+      # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
+      # OID wants ride the same protocol-v2 server capability the repo's
+      # lazy fetch already depends on (this is a batched lazy fetch), and
+      # explicit wants bypass the persisted partial-clone filter. Skipped on
+      # enumeration failure (no OID list to fetch); stage 2 still runs then,
+      # since a full refetch can restore a missing commit object itself.
+      if [ -n "$MISSING" ] && [ "$MISSING" != "enumeration-failed" ]; then
+        if printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
+            fetch origin \\
+            --stdin \\
+            --no-tags \\
+            --no-recurse-submodules \\
+            --no-write-fetch-head \\
+            2>&1; then
+          HEAL_FETCHED=1
+        fi
+        MISSING=$(xum_missing_objects)
+      fi
+      # Stage 2: full --refetch (git >= 2.36, hence feature-detected) for
+      # servers that refuse OID wants: it negotiates as if the repo had
+      # nothing, so the server re-sends every object reachable from its
+      # current refs, including previously filtered-out blobs.
+      if [ -n "$MISSING" ] && git fetch -h 2>&1 | grep -q refetch; then
+        if git -c protocol.version=2 \\
+            fetch origin \\
+            --refetch \\
+            --no-filter \\
+            --prune \\
+            --no-tags \\
+            --no-recurse-submodules \\
+            --no-write-fetch-head \\
+            2>&1; then
+          HEAL_FETCHED=1
+        fi
+        MISSING=$(xum_missing_objects)
+      fi
+      if [ -z "$MISSING" ]; then
+        # Every locally reachable object is present, so dropping the promisor
+        # config is safe. Doing it with objects still missing would turn a
+        # recoverable partial clone into a repo whose checkouts hard-fail
+        # ("unable to read sha1 file") with no lazy-fetch fallback.
+${PROMISOR_CONFIG_KEYS.map((key) => `        git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
+        git config --local --unset-all xum.promisorHealIncompleteAt 2>/dev/null
+        echo "HEAL: promisor config removed"
+        rm -rf "$HEAL_LOCK"
+      elif [ -n "$HEAL_FETCHED" ]; then
+        # The server was reachable yet objects are still missing (e.g. blobs
+        # only ever fetched bloblessly whose refs were deleted and GC'd
+        # upstream). That may never improve, so keep the lazy-fetch fallback
+        # and record the attempt; the marker throttles retries to daily.
+        echo "HEAL: objects still missing after backfill; keeping promisor config"
+        git config --local xum.promisorHealIncompleteAt "$NOW" 2>/dev/null
+        rm -rf "$HEAL_LOCK"
+      fi
+      # When every fetch attempt failed (offline, auth): transient, so the
+      # lock (with its timestamp) stays in place and the 1h staleness window
+      # paces the retries.
+    fi
+  fi
+fi
 
 # Get primary branch name
 PRIMARY_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
@@ -228,6 +358,18 @@ if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
 fi
 
 # Remote has new commits or ref moved - fetch updates
+#
+# --no-filter (NOT --filter=blob:none): a filtered fetch permanently converts
+# the repo into a promisor/partial clone (git writes remote.origin.promisor +
+# remote.origin.partialclonefilter on the first filtered fetch, and the
+# configured filter then applies to every subsequent plain fetch). That leaves
+# every commit fetched by this background loop without its blobs, so a later
+# "git worktree add" (workspace creation) must lazy-fetch blobs from the
+# remote mid-checkout and any transient network failure aborts it with
+# "fatal: could not fetch <oid> from promisor remote". --no-filter avoids
+# poisoning healthy repos and keeps this fetch unfiltered even in a repo that
+# is still poisoned (already-converted repos are backfilled and cleaned up by
+# the one-time heal block above).
 git -c protocol.version=2 \\
     -c fetch.negotiationAlgorithm=skipping \\
     fetch origin \\
@@ -235,6 +377,6 @@ git -c protocol.version=2 \\
     --no-tags \\
     --no-recurse-submodules \\
     --no-write-fetch-head \\
-    --filter=blob:none \\
+    --no-filter \\
     2>&1
 `;
