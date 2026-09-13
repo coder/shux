@@ -401,7 +401,7 @@ const AUTH_FAILURE_PATTERN =
 const ACCESS_DENIED_PATTERN =
   /write access to repository not granted|permission to [^\n]*denied|repository not found|marked as read.?only|returned error: 403/i;
 
-const REMOTE_REASON_LINE = /^(?:remote|ERROR):[ \t]*(.+)$/m;
+const REMOTE_REASON_LINES = /^(?:remote|ERROR):[ \t]*(.+)$/gm;
 const FATAL_LINE = /^fatal:[ \t]*(.+)$/m;
 const REMOTE_REASON_MAX_LENGTH = 200;
 
@@ -435,8 +435,12 @@ function remoteReason(error: unknown): string {
   const stderr =
     error instanceof Error ? (error as Error & { stderr?: unknown }).stderr : undefined;
   const text = typeof stderr === "string" ? stderr : errorText(error);
+  // Server progress arrives as `remote:` lines too, so the denial is the line that matched the
+  // classifier, not whichever line the server sent first.
+  const remoteLines = Array.from(text.matchAll(REMOTE_REASON_LINES), (match) => match[1]);
   const line =
-    REMOTE_REASON_LINE.exec(text)?.[1] ??
+    remoteLines.find((candidate) => ACCESS_DENIED_PATTERN.test(candidate)) ??
+    remoteLines[0] ??
     FATAL_LINE.exec(text)?.[1] ??
     text.split("\n").find((candidate) => candidate.trim() !== "") ??
     "";

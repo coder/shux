@@ -319,6 +319,40 @@ exit 128
     expect(attempts).toHaveLength(2);
   });
 
+  it("quotes the denial line, not server progress that preceded it", async () => {
+    if (process.platform === "win32") return;
+    await writeExecutable(path.join(binDir, "gh"), "#!/bin/sh\nexit 1\n");
+    await writeExecutable(
+      path.join(binDir, "git"),
+      `#!/bin/sh
+case "$*" in
+  *core.sshCommand*) exit 1 ;;
+esac
+echo 'remote: Enumerating objects: 5, done.' >&2
+echo 'remote: Permission to owner/repo.git denied to someone.' >&2
+echo "fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 403" >&2
+exit 128
+`
+    );
+
+    let caught: unknown;
+    try {
+      await withPath(binDir, () =>
+        runGitWithCredentialLadder(["push", "origin", "HEAD:refs/heads/main"], {
+          repoUrl: "https://github.com/owner/repo.git",
+          env: { GIT_LOG: logPath },
+        })
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackupAuthFailedError);
+    const message = (caught as Error).message;
+    expect(message).toContain("Permission to owner/repo.git denied to someone");
+    expect(message).not.toContain("Enumerating objects");
+  });
+
   it("prefers the rung the remote recognised over one that had no credential", async () => {
     if (process.platform === "win32") return;
     await writeExecutable(path.join(binDir, "gh"), "#!/bin/sh\nexit 0\n");
