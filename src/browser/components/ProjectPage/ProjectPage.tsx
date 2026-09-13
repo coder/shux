@@ -305,7 +305,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                     {/* ChatInput for workspace creation. */}
                     <ChatInput
                       // Key by project + draft so project navigation and draft switches both remount
-                      // creation-local state (including any in-flight creation overlays).
+                      // creation-local state (including any in-flight creation send).
                       key={`${projectPath}:${pendingDraftId ?? "__pending__"}`}
                       variant="creation"
                       projectPath={projectPath}

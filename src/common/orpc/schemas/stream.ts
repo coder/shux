@@ -586,6 +586,14 @@ export const InitStartEventSchema = z.object({
     .boolean()
     .optional()
     .meta({ description: "True when this event is emitted during init replay" }),
+  // Replay of an already finished init carries its terminal result up front so the
+  // client never has to publish a "running" snapshot before the replayed init-end lands.
+  completed: z
+    .object({
+      exitCode: z.number(),
+      endTime: z.number(),
+    })
+    .optional(),
 });
 
 export const InitOutputEventSchema = z.object({

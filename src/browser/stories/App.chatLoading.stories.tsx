@@ -5,8 +5,10 @@ import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
+import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
 import {
+  clearWorkspaceSelection,
   collapseLeftSidebar,
   collapseRightSidebar,
   expandLeftSidebar,
@@ -113,6 +115,20 @@ async function finishReplayWithoutLayoutShift(
   await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
 }
 
+// Client swaps between stories must release the previous activity snapshot subscription.
+const keepActivitySubscriptionOpen: ReturnType<
+  typeof createMockORPCClient
+>["workspace"]["activity"]["subscribe"] = (_input, options) => {
+  async function* iterate() {
+    yield* [];
+    await new Promise<void>((resolve) => {
+      if (options?.signal?.aborted) resolve();
+      else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+  return Promise.resolve(wrapAsyncIterator(iterate(), {}));
+};
+
 function createHydrationStory(workspaceId: string): AppStory {
   const workspace = createWorkspace({
     id: workspaceId,
@@ -197,17 +213,7 @@ function createHydrationStory(workspaceId: string): AppStory {
         }
       },
     });
-    // Client swaps between stories must release the previous activity snapshot subscription.
-    client.workspace.activity.subscribe = (_input, options) => {
-      async function* iterate() {
-        yield* [];
-        await new Promise<void>((resolve) => {
-          if (options?.signal?.aborted) resolve();
-          else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-      }
-      return Promise.resolve(wrapAsyncIterator(iterate(), {}));
-    };
+    client.workspace.activity.subscribe = keepActivitySubscriptionOpen;
     return client;
   }
   const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
@@ -445,4 +451,156 @@ export const InitialLoadingPhone: AppStory = {
     // A fixed-height phone canvas can autofocus-scroll the initial shimmer out of view.
     await expect(skeleton.getBoundingClientRect().top).toBeGreaterThanOrEqual(0);
   },
+};
+
+// Sending the first message shows nothing on the project page beyond a locked composer; the new
+// workspace opens with the message and the creation card and keeps both until the backend
+// persists them.
+function createCreationPendingStory(): AppStory {
+  const projectPath = "/home/user/projects/xum";
+  const typed = "Add a dark mode toggle";
+  const workspaceName = "dark-mode-toggle";
+  let releaseName: () => void = () => undefined;
+  let releaseCreate: () => void = () => undefined;
+
+  function setup() {
+    clearWorkspaceSelection();
+    collapseLeftSidebar();
+    collapseRightSidebar();
+    expandProjects([projectPath]);
+    const nameGate = new Promise<void>((resolve) => {
+      releaseName = resolve;
+    });
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const client = createMockORPCClient({
+      projects: new Map<string, ProjectConfig>([[projectPath, { workspaces: [], trusted: true }]]),
+      workspaces: [],
+      onChat: (workspaceId, emit) => {
+        if (!workspaceId.startsWith("ws-created-")) {
+          return;
+        }
+        // Live init for the just-created workspace; the first message is never persisted here,
+        // so the pending row stays in place for the snapshot.
+        emit({
+          type: "init-start",
+          hookPath: projectPath + "/.xum/init",
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({
+          type: "init-output",
+          line: "Preparing checkout",
+          step: true,
+          isError: false,
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({
+          type: "init-output",
+          line: "Running .xum/init",
+          step: true,
+          isError: false,
+          timestamp: STABLE_TIMESTAMP,
+        });
+        emit({ type: "caught-up", replay: "full", hasOlderHistory: false });
+      },
+    });
+    client.nameGeneration.generate = async () => {
+      await nameGate;
+      return {
+        success: true as const,
+        data: { name: workspaceName, title: "Dark mode toggle", modelUsed: "mock" },
+      };
+    };
+    const originalCreate = client.workspace.create;
+    client.workspace.create = async (input) => {
+      await createGate;
+      return originalCreate(input);
+    };
+    client.workspace.activity.subscribe = keepActivitySubscriptionOpen;
+    return client;
+  }
+
+  const play: AppStory["play"] = async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    const textarea = () => canvasElement.querySelector<HTMLTextAreaElement>("textarea");
+
+    await step("Open the project creation view", async () => {
+      expandLeftSidebar();
+      const projectRow = await waitFor(async () => {
+        const element = canvasElement.querySelector<HTMLElement>(
+          '[data-project-path="' + projectPath + '"][aria-controls]'
+        );
+        await expect(element).not.toBeNull();
+        return element!;
+      });
+      await userEvent.click(projectRow);
+      collapseLeftSidebar();
+      await waitFor(async () => {
+        await expect(textarea()).not.toBeNull();
+        await expect(textarea()).toBeEnabled();
+      });
+    });
+
+    await step(
+      "Sending only locks the composer; the project page shows no transcript",
+      async () => {
+        await userEvent.click(textarea()!);
+        await userEvent.type(textarea()!, typed);
+        await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
+        await waitFor(async () => {
+          await expect(textarea()).toBeDisabled();
+        });
+        releaseName();
+        // Name generation is done and creation is still pending: no rows, no creation card.
+        await expect(canvasElement.querySelector('[data-testid="chat-message"]')).toBeNull();
+        await expect(canvas.queryByText(/Creating workspace/)).toBeNull();
+        await expect(canvas.queryByTestId("message-window")).toBeNull();
+      }
+    );
+
+    await step(
+      "The new workspace opens with the message above the live creation card",
+      async () => {
+        releaseCreate();
+        const messageWindow = await canvas.findByTestId("message-window", {}, { timeout: 5000 });
+        await waitFor(async () => {
+          const rows = Array.from(messageWindow.querySelectorAll('[data-testid="chat-message"]'));
+          await expect(rows.length).toBeGreaterThanOrEqual(2);
+          await expect(rows[0].textContent).toContain(typed);
+          await expect(rows[1].textContent).toContain("Creating workspace");
+        });
+        await expect(await canvas.findByText("Running .xum/init")).toBeVisible();
+      }
+    );
+  };
+
+  return { render: () => <AppWithMocks setup={setup} />, play };
+}
+
+export const CreationPending: AppStory = {
+  ...createCreationPendingStory(),
+  parameters: { pixel: { matrix: { viewports: ["laptop"] } } },
+};
+
+const creationPendingPhone = createCreationPendingStory();
+
+export const CreationPendingPhone: AppStory = {
+  ...creationPendingPhone,
+  play: async (context) => {
+    await checkPhoneViewport(context);
+    await creationPendingPhone.play!(context);
+  },
+  decorators: [
+    (Story) => (
+      <div
+        data-testid="chat-loading-phone"
+        style={{ width: 390, maxWidth: "100%", height: "100vh", overflow: "hidden" }}
+      >
+        <Story />
+      </div>
+    ),
+  ],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
 };

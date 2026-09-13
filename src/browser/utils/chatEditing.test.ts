@@ -40,6 +40,10 @@ describe("canEditDisplayedUserMessage", () => {
     expect(canEditDisplayedUserMessage(userMessage({ isBudgetLimitWrapup: true }))).toBe(false);
   });
 
+  test("excludes the not-yet-persisted first message of a new workspace", () => {
+    expect(canEditDisplayedUserMessage(userMessage({ isPendingSend: true }))).toBe(false);
+  });
+
   test("excludes local command output messages", () => {
     expect(
       canEditDisplayedUserMessage(

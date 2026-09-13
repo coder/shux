@@ -65,6 +65,7 @@ import {
   MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
 } from "@/browser/features/ChatInput/draftAttachmentsStorage";
 import type { MuxMessageMetadata } from "@/common/types/message";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import {
   processSlashCommand,
@@ -72,11 +73,7 @@ import {
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import {
-  useWorkspaceName,
-  type WorkspaceNameState,
-  type WorkspaceIdentity,
-} from "@/browser/hooks/useWorkspaceName";
+import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -232,12 +229,11 @@ interface UseCreationWorkspaceReturn {
     fileParts?: FilePart[],
     optionsOverride?: Partial<SendMessageOptions>,
     initialSlashCommand?: CreationInitialSlashCommand,
-    pendingFiles?: PendingFileChatAttachment[]
+    pendingFiles?: PendingFileChatAttachment[],
+    pendingUserMessageDraft?: PendingInitialUserMessage
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** The confirmed identity being used for creation (null until generation resolves) */
-  creatingWithIdentity: WorkspaceIdentity | null;
   /** Reload branches (e.g., after git init) */
   reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
@@ -253,6 +249,16 @@ export type RuntimeAvailabilityState =
   | { status: "loading" }
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
+
+function isWorkspaceDraftEmpty(workspaceId: string): boolean {
+  return (
+    readPersistedState<string>(getInputKey(workspaceId), "").trim().length === 0 &&
+    (readPersistedState<ChatAttachment[] | undefined>(
+      getInputAttachmentsKey(workspaceId),
+      undefined
+    )?.length ?? 0) === 0
+  );
+}
 
 // Persist a failed creation send's draft under the new workspace's keys so the
 // retry happens there instead of creating a duplicate workspace.
@@ -336,8 +342,6 @@ export function useCreationWorkspace({
      * so onConfirm trusts the correct project even if the user navigates. */
     projectPath: string;
   } | null>(null);
-  // The confirmed identity being used for workspace creation (set after waitForGeneration resolves)
-  const [creatingWithIdentity, setCreatingWithIdentity] = useState<WorkspaceIdentity | null>(null);
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
@@ -447,7 +451,8 @@ export function useCreationWorkspace({
       fileParts?: FilePart[],
       optionsOverride?: Partial<SendMessageOptions>,
       initialSlashCommand?: CreationInitialSlashCommand,
-      pendingFiles?: PendingFileChatAttachment[]
+      pendingFiles?: PendingFileChatAttachment[],
+      pendingUserMessageDraft?: PendingInitialUserMessage
     ): Promise<CreationSendResult> => {
       const pendingFilesToStage = pendingFiles ?? [];
       // File-only sends are valid; the attached-files notice or provider file
@@ -491,16 +496,31 @@ export function useCreationWorkspace({
 
       const runtimeConfig: RuntimeConfig | undefined = buildRuntimeConfig(runtimeSelection);
 
+      // SendMessageOptions.muxMetadata is a black box (z.any); the creation
+      // caller only ever passes XumMessageMetadata built in ChatInput.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
+      const overrideRawCommand =
+        overrideMuxMetadata &&
+        "rawCommand" in overrideMuxMetadata &&
+        typeof overrideMuxMetadata.rawCommand === "string"
+          ? overrideMuxMetadata.rawCommand
+          : null;
+      // Transcript row the new workspace shows from the moment it opens until the backend
+      // persists the first message. ChatInput passes the row it captured at Send (typed command
+      // for skill sends, attached-files summary for attachment-only sends); the fallback covers
+      // callers that do not.
+      const pendingUserMessage: PendingInitialUserMessage | null =
+        initialSlashCommand == null
+          ? (pendingUserMessageDraft ?? {
+              content: overrideRawCommand ?? (messageText.trim() ? messageText : message),
+              fileParts,
+              timestamp: Date.now(),
+            })
+          : null;
+
       setIsSending(true);
       setToast(null);
-      // If user provided a manual name, show it immediately in the overlay
-      // instead of "Generating name…". Auto-generated names still show the
-      // loading text until generation resolves.
-      setCreatingWithIdentity(
-        !workspaceNameState.autoGenerate && workspaceNameState.name.trim()
-          ? { name: workspaceNameState.name.trim(), title: workspaceNameState.name.trim() }
-          : null
-      );
 
       let createdWorkspaceId: string | null = null;
 
@@ -512,9 +532,6 @@ export function useCreationWorkspace({
           setIsSending(false);
           return { success: false };
         }
-
-        // Set the confirmed identity for splash UI display
-        setCreatingWithIdentity(identity);
 
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
@@ -688,6 +705,18 @@ export function useCreationWorkspace({
           autoNavigate: shouldAutoNavigate,
           pendingStreamModel: shouldAutoNavigate ? baseModel : null,
           markPendingInitialSend: initialSlashCommand == null,
+          pendingUserMessage: pendingUserMessage ?? undefined,
+          // Scratch chats never run init, so nothing would replace a stand-in card there.
+          pendingCreationInit:
+            kind === "scratch"
+              ? undefined
+              : {
+                  workspaceName: metadata.name,
+                  nameGenerated: workspaceNameState.autoGenerate,
+                  kind,
+                  hookPath: projectPath,
+                  timestamp: pendingUserMessage?.timestamp ?? Date.now(),
+                },
         });
 
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {
@@ -706,17 +735,6 @@ export function useCreationWorkspace({
             ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
-
-        // SendMessageOptions.muxMetadata is a black box (z.any); the creation
-        // caller only ever passes XumMessageMetadata built in ChatInput.
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        const overrideMuxMetadata: MuxMessageMetadata | undefined = optionsOverride?.muxMetadata;
-        const overrideRawCommand =
-          overrideMuxMetadata &&
-          "rawCommand" in overrideMuxMetadata &&
-          typeof overrideMuxMetadata.rawCommand === "string"
-            ? overrideMuxMetadata.rawCommand
-            : null;
 
         if (stagingFailed) {
           workspaceStore.clearPendingInitialSendState(metadata.id);
@@ -838,10 +856,12 @@ export function useCreationWorkspace({
           if (createdWorkspaceId) {
             workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
           }
-          if (stagingOutcome.staged.length > 0) {
-            // The creation draft was already cleared; without a transferred
-            // draft the staged files would sit in the workspace with no
-            // chips/notice to retry the send with.
+          // The workspace exists but holds no message, and the creation draft was already
+          // cleared: hand the draft to the workspace composer (with any staged files) so the
+          // user can fix the model or provider and resend from the chat they landed in. The
+          // composer is only locked while files stage, so a text-only send that waited on init
+          // may already hold something the user typed there; never overwrite that.
+          if (isWorkspaceDraftEmpty(metadata.id)) {
             transferDraftToWorkspace(
               metadata.id,
               overrideRawCommand ?? messageText,
@@ -897,7 +917,7 @@ export function useCreationWorkspace({
       settings.trunkBranch,
       waitForGeneration,
       workspaceNameState.autoGenerate,
-      workspaceNameState.name,
+      message,
       subProjectPath,
       dynamicWorkflowsEnabled,
       draftId,
@@ -966,8 +986,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // The confirmed identity being used for creation (null until generation resolves)
-    creatingWithIdentity,
     // Reload branches (e.g., after git init)
     reloadBranches: loadBranches,
     // Runtime availability state for each mode

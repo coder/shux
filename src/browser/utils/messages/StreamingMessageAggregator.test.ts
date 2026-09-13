@@ -3493,6 +3493,295 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.getPendingStreamModel()).toBe("openai:gpt-4o-mini");
     });
 
+    const pendingFirstMessage = { content: "Build the thing", timestamp: 1_700_000_000_000 };
+    const displayedTypes = (aggregator: StreamingMessageAggregator) =>
+      aggregator.getDisplayedMessages().map((message) => message.type);
+    const displayedUserRows = (aggregator: StreamingMessageAggregator) =>
+      aggregator
+        .getDisplayedMessages()
+        .filter((message): message is Extract<DisplayedMessage, { type: "user" }> => {
+          return message.type === "user";
+        });
+
+    test("shows the pending first message as a user row ahead of the creation card", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0]).toMatchObject({
+        content: "Build the thing",
+        isPendingSend: true,
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      // The row is presentation only: history bookkeeping never sees it.
+      expect(aggregator.getAllMessages()).toHaveLength(0);
+      expect(aggregator.hasMessages()).toBe(false);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+    });
+
+    test("replaces the pending row with the durable first message and never resurrects it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1,
+        replay: true,
+      });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      const [durableRow] = displayedUserRows(aggregator);
+      expect(durableRow.historyId).toBe("user-1");
+      expect(durableRow.isPendingSend).toBeUndefined();
+
+      // Truncating history back to empty must not bring the presentation row back.
+      aggregator.loadHistoricalMessages([], false);
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+    });
+
+    test("keeps the pending row through hidden snapshot rows until the visible first message", () => {
+      // Skill, MCP prompt, and @file sends persist synthetic snapshot rows ahead of the user
+      // row; they never render, so they cannot stand in for the durable first message.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage(
+          "skill-snapshot-1",
+          "user",
+          '<agent-skill name="x">\nbody\n</agent-skill>',
+          {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }
+        ),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0].isPendingSend).toBe(true);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 2,
+          timestamp: Date.now(),
+        }),
+      });
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
+    test("drops the pending row when the durable first message arrives via bulk history", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("user-1", "user", "Build the thing", { historySequence: 1 })],
+        true
+      );
+      expect(displayedUserRows(aggregator)).toHaveLength(1);
+      aggregator.loadHistoricalMessages([], true);
+      expect(displayedUserRows(aggregator)).toHaveLength(0);
+    });
+
+    test("keeps the pending row when bulk history holds only hidden snapshot rows", () => {
+      // Catching up between the persisted snapshot rows and the durable user row must not
+      // leave the transcript without a prompt.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      const skillSnapshot = createMuxMessage(
+        "skill-snapshot-1",
+        "user",
+        '<agent-skill name="x">\nbody\n</agent-skill>',
+        {
+          historySequence: 1,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+        }
+      );
+      aggregator.loadHistoricalMessages([skillSnapshot], true);
+      const pendingRows = displayedUserRows(aggregator);
+      expect(pendingRows).toHaveLength(1);
+      expect(pendingRows[0].isPendingSend).toBe(true);
+
+      aggregator.loadHistoricalMessages(
+        [
+          skillSnapshot,
+          createMuxMessage("user-1", "user", "Build the thing", { historySequence: 2 }),
+        ],
+        true
+      );
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
+    test("shows a stand-in creation card until the backend init replaces it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: "dark-mode",
+        nameGenerated: false,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      const initRow = () =>
+        aggregator
+          .getDisplayedMessages()
+          .find(
+            (message): message is Extract<DisplayedMessage, { type: "workspace-init" }> =>
+              message.type === "workspace-init"
+          );
+
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      // A typed name was never generated, so the card only lists the creation step.
+      expect(initRow()).toMatchObject({
+        status: "running",
+        lines: [{ line: "Creating workspace dark-mode", step: true }],
+      });
+
+      // The durable first message does not disturb the stand-in card.
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+      });
+      aggregator.handleMessage({
+        type: "init-output",
+        line: "Preparing checkout",
+        step: true,
+        timestamp: 6,
+        replay: true,
+      });
+      aggregator.flushPendingInitOutput();
+      expect(initRow()).toMatchObject({
+        hookPath: "/project/.xum/init",
+        lines: [{ line: "Preparing checkout", step: true }],
+      });
+    });
+
+    test("an explicit creation failure removes the pending row and a stand-in card no init replaced", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: null,
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.clearPendingStreamStart();
+      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
+      expect(displayedTypes(aggregator)).toEqual([]);
+      expect(aggregator.clearPendingCreationPresentation()).toBe(false);
+    });
+
+    test("a failed initial /goal can drop its stand-in card without a pending stream", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markPendingCreationInit({
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: Date.now(),
+      });
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
+      expect(displayedTypes(aggregator)).toEqual([]);
+    });
+
+    test("carries a stand-in creation card without a pending stream until init-start", () => {
+      // Initial /goal sends create no user turn, so no pending stream is marked.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markPendingCreationInit({
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: Date.now(),
+      });
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      // The subscription's replay reset must not drop the card before init-start arrives.
+      aggregator.resetForReplay();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+        completed: { exitCode: 0, endTime: 9 },
+      });
+      const initRows = aggregator
+        .getDisplayedMessages()
+        .filter((message) => message.type === "workspace-init");
+      expect(initRows).toHaveLength(1);
+      expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
+    });
+
+    test("the stale startup barrier clears on repeated idle catch-ups but the pending row stays", () => {
+      // The first send can wait minutes on init (deferred runtimes, file staging). Two idle
+      // caught-up cycles across reconnects retire the optimistic barrier, which must not take
+      // the only visible prompt with it; the durable first message is what replaces the row.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+      aggregator.resetForReplay();
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+
+      aggregator.resetForReplay();
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0]).toMatchObject({ isPendingSend: true });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", pendingFirstMessage.content, {
+          historySequence: 1,
+          timestamp: pendingFirstMessage.timestamp + 5,
+        }),
+      });
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0].historyId).toBe("user-1");
+    });
+
     test("clears stale pending state when authoritative history now ends with assistant", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       seedPendingStreamState(aggregator);

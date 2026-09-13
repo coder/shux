@@ -1646,6 +1646,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             projectName: input.projectPath.split("/").pop() ?? "project",
             namedWorkspacePath: `/mock/workspace/${input.branchName}`,
             runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+            // The frontend rejects created workspaces without createdAt as a contract violation.
+            createdAt: new Date(Date.now()).toISOString(),
           },
         });
       },

@@ -85,6 +85,12 @@ import { z } from "zod";
 import { createDeltaStorage, type DeltaRecordStorage } from "./StreamingTPSCalculator";
 import { buildTranscriptTruncationPlan } from "./transcriptTruncationPlan";
 import { computeRecencyTimestamp } from "./recency";
+import {
+  createPendingCreationInitMessage,
+  createPendingUserDisplayedMessage,
+  type PendingCreationInit,
+  type PendingInitialUserMessage,
+} from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
 import { getStatusStateKey } from "@/common/constants/storage";
 import {
@@ -92,6 +98,13 @@ import {
   getContextBoundaryKind,
 } from "@/common/utils/messages/compactionBoundary";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
+
+// Hidden synthetic snapshot rows (skill, MCP prompt, and @file materializations) precede the
+// durable first message and never render, so they must not drop the presentation-only pending
+// row; only a transcript-visible user row replaces it.
+function isTranscriptVisibleUserRow(message: MuxMessage): boolean {
+  return message.metadata?.synthetic !== true || message.metadata.uiVisible === true;
+}
 
 function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
   if (
@@ -652,6 +665,12 @@ export class StreamingMessageAggregator {
   // either the real user message or a terminal stream event.
   private optimisticPendingStreamStart = false;
   private optimisticPendingStreamStartIdleCaughtUpCount = 0;
+  // The first message of a created workspace, shown as a transcript row until the durable user
+  // message lands. Presentation only: never part of this.messages or any history bookkeeping.
+  private pendingInitialUserMessage: PendingInitialUserMessage | null = null;
+  // Stand-in creation card until the backend's init-start replay arrives on subscription, so
+  // the card the creation view already showed does not vanish for a frame after navigation.
+  private pendingCreationInit: PendingCreationInit | null = null;
 
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
@@ -1227,6 +1246,9 @@ export class StreamingMessageAggregator {
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
+          if (isTranscriptVisibleUserRow(message)) {
+            this.clearPendingInitialUserMessage();
+          }
           continue;
         }
 
@@ -1596,12 +1618,28 @@ export class StreamingMessageAggregator {
     return this.pendingStreamModel;
   }
 
-  markOptimisticPendingStreamStart(model: string | null): void {
+  markOptimisticPendingStreamStart(
+    model: string | null,
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
+  ): void {
     this.optimisticPendingStreamStart = true;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     this.pendingCompactionRequest = null;
     this.pendingStreamModel = model;
+    this.pendingInitialUserMessage = pendingUserMessage ?? null;
+    this.pendingCreationInit = pendingCreationInit ?? null;
     this.setPendingStreamStartTime(Date.now());
+    this.invalidateCache();
+  }
+
+  /**
+   * Carry the creation card without a pending stream. An initial /goal sets a goal instead of
+   * sending a user turn, so nothing marks a pending send, yet the workspace still runs init.
+   */
+  markPendingCreationInit(pendingCreationInit: PendingCreationInit): void {
+    this.pendingCreationInit = pendingCreationInit;
+    this.invalidateCache();
   }
 
   clearPendingStreamStartIfNotOptimistic(): void {
@@ -1694,6 +1732,37 @@ export class StreamingMessageAggregator {
       this.optimisticPendingStreamStart = false;
       this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     }
+  }
+
+  /**
+   * Drop the presentation-only creation rows (pending first message and stand-in card). They
+   * are deliberately independent of the pending-stream marker: the stale-barrier heuristic in
+   * clearPendingStreamStartIfNotOptimistic fires on a reconnect while the first send is still
+   * waiting on init, and an initial /goal never marks a pending stream at all. Only a visible
+   * user row, a real init-start, or an explicit creation failure may remove them.
+   */
+  clearPendingCreationPresentation(): boolean {
+    const hadPresentation =
+      this.pendingInitialUserMessage !== null || this.pendingCreationInit !== null;
+    this.clearPendingInitialUserMessage();
+    this.clearPendingCreationInit();
+    return hadPresentation;
+  }
+
+  private clearPendingCreationInit(): void {
+    if (this.pendingCreationInit === null) {
+      return;
+    }
+    this.pendingCreationInit = null;
+    this.invalidateCache();
+  }
+
+  private clearPendingInitialUserMessage(): void {
+    if (this.pendingInitialUserMessage === null) {
+      return;
+    }
+    this.pendingInitialUserMessage = null;
+    this.invalidateCache();
   }
 
   private getActiveStreamEntry(): [string, StreamingContext] | undefined {
@@ -2027,8 +2096,14 @@ export class StreamingMessageAggregator {
             optimisticPendingStreamStartIdleCaughtUpCount:
               this.optimisticPendingStreamStartIdleCaughtUpCount,
           };
+    // The creation rows outlive the replay reset: the replayed visible first message and
+    // init-start are what replace them (see clearPendingCreationPresentation).
+    const pendingInitialUserMessage = this.pendingInitialUserMessage;
+    const pendingCreationInit = this.pendingCreationInit;
 
     this.clear();
+    this.pendingInitialUserMessage = pendingInitialUserMessage;
+    this.pendingCreationInit = pendingCreationInit;
 
     if (!pendingStreamSnapshot) {
       return;
@@ -2048,6 +2123,8 @@ export class StreamingMessageAggregator {
     this.displayedMessageCache.clear();
     this.messageVersions.clear();
     this.clearPendingStreamLifecycleState();
+    this.pendingInitialUserMessage = null;
+    this.pendingCreationInit = null;
     this.interruptingMessageId = null;
     this.streamLifecycle = null;
     this.lastAbortReason = null;
@@ -3031,18 +3108,31 @@ export class StreamingMessageAggregator {
         // as a no-op so switching back never clears the visible SSH/setup output mid-replay.
         this.replayInitVisiblePrefix = [...this.initState.lines];
         this.replayInitVisiblePrefixIndex = 0;
+        // The init may have finished while disconnected; adopt the terminal snapshot now instead
+        // of staying "running" until the replayed init-end lands.
+        if (data.completed) {
+          this.initState.status = data.completed.exitCode === 0 ? "success" : "error";
+          this.initState.exitCode = data.completed.exitCode;
+          this.initState.endTime = data.completed.endTime;
+          this.initState.progress = null;
+          this.invalidateCache();
+        }
         return true;
       }
 
       this.clearReplayInitVisiblePrefix();
+      this.pendingCreationInit = null;
+      // A replayed finished init lands as terminal from its first snapshot so the row never
+      // flashes "Creating workspace" between the replayed init-start and init-end.
+      const completed = data.completed;
       this.initState = {
-        status: "running",
+        status: completed ? (completed.exitCode === 0 ? "success" : "error") : "running",
         hookPath: data.hookPath,
         lines: [],
         progress: null,
-        exitCode: null,
+        exitCode: completed?.exitCode ?? null,
         startTime: data.timestamp,
-        endTime: null,
+        endTime: completed?.endTime ?? null,
       };
       this.invalidateCache();
       return true;
@@ -3187,6 +3277,11 @@ export class StreamingMessageAggregator {
 
     this.optimisticPendingStreamStart = false;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
+    // The durable first message replaces the presentation-only row for good, so a later
+    // history truncation can never resurrect it.
+    if (isTranscriptVisibleUserRow(incomingMessage)) {
+      this.clearPendingInitialUserMessage();
+    }
     this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
 
     if (muxMeta?.displayStatus) {
@@ -3853,24 +3948,37 @@ export class StreamingMessageAggregator {
 
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);
 
-      if (this.initState) {
-        const durationMs =
-          this.initState.endTime !== null
-            ? this.initState.endTime - this.initState.startTime
-            : null;
-        const initMessage: DisplayedMessage = {
-          type: "workspace-init",
-          id: "workspace-init",
-          historySequence: -1,
-          status: this.initState.status,
-          hookPath: this.initState.hookPath,
-          lines: [...this.initState.lines],
-          progress: this.initState.progress,
-          exitCode: this.initState.exitCode,
-          timestamp: this.initState.startTime,
-          durationMs,
-          truncatedLines: this.initState.truncatedLines,
-        };
+      if (
+        this.pendingInitialUserMessage &&
+        !resultMessages.some((message) => message.type === "user")
+      ) {
+        resultMessages = [
+          createPendingUserDisplayedMessage(this.pendingInitialUserMessage),
+          ...resultMessages,
+        ];
+      }
+
+      const initMessage: DisplayedMessage | null = this.initState
+        ? {
+            type: "workspace-init",
+            id: "workspace-init",
+            historySequence: -1,
+            status: this.initState.status,
+            hookPath: this.initState.hookPath,
+            lines: [...this.initState.lines],
+            progress: this.initState.progress,
+            exitCode: this.initState.exitCode,
+            timestamp: this.initState.startTime,
+            durationMs:
+              this.initState.endTime !== null
+                ? this.initState.endTime - this.initState.startTime
+                : null,
+            truncatedLines: this.initState.truncatedLines,
+          }
+        : this.pendingCreationInit
+          ? createPendingCreationInitMessage(this.pendingCreationInit)
+          : null;
+      if (initMessage) {
         // Creation belongs to the first user turn, even though init starts before it is persisted.
         const insertionIndex = resultMessages.findIndex((message) => message.type === "user") + 1;
         resultMessages = resultMessages.slice();

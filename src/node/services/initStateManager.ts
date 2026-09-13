@@ -118,6 +118,9 @@ export class InitStateManager extends EventEmitter {
       hookPath: state.hookPath,
       timestamp: state.startTime,
       replay: true,
+      ...(state.exitCode !== null
+        ? { completed: { exitCode: state.exitCode, endTime: state.endTime ?? state.startTime } }
+        : {}),
     });
 
     // Emit init-output for each accumulated line with original timestamps

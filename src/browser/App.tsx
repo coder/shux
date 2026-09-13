@@ -317,8 +317,19 @@ function AppInner() {
         return createdSelection;
       });
 
-      if (createdSelection && options?.markPendingInitialSend !== false) {
-        workspaceStore.markPendingInitialSend(metadata.id, options?.pendingStreamModel ?? null);
+      if (createdSelection) {
+        if (options?.markPendingInitialSend !== false) {
+          workspaceStore.markPendingInitialSend(
+            metadata.id,
+            options?.pendingStreamModel ?? null,
+            options?.pendingUserMessage,
+            options?.pendingCreationInit
+          );
+        } else if (options?.pendingCreationInit) {
+          // Sends without a user turn (initial /goal) still run init: keep the creation card
+          // on screen until the workspace's own init-start replaces it.
+          workspaceStore.markPendingCreationInit(metadata.id, options.pendingCreationInit);
+        }
       }
     }
 

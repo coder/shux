@@ -1572,6 +1572,102 @@ describe("WorkspaceStore", () => {
       mockChatScript([], { keepOpen: true });
     });
 
+    it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
+      // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
+      // durable message; each live event bumps state, so the row must survive that bump.
+      const workspaceId = "workspace-pending-row-hidden-snapshots";
+      let releaseUserRow!: () => void;
+      const userRowReady = new Promise<void>((resolve) => {
+        releaseUserRow = resolve;
+      });
+
+      mockChatStreamFor(workspaceId, async function* () {
+        yield { type: "caught-up", replay: "full" };
+        yield {
+          type: "message",
+          ...createMuxMessage("skill-snapshot-1", "user", "<agent-skill>body</agent-skill>", {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }),
+        };
+        await userRowReady;
+        yield {
+          type: "message",
+          ...createMuxMessage("user-1", "user", "Build the thing", {
+            historySequence: 2,
+            timestamp: Date.now(),
+          }),
+        };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingInitialSend(workspaceId, "openai:gpt-4o-mini", {
+        content: "Build the thing",
+        timestamp: Date.now(),
+      });
+
+      const userRows = () =>
+        store.getWorkspaceState(workspaceId).messages.filter((message) => message.type === "user");
+      // The hidden snapshot row is filtered from display, so observe its arrival through the
+      // pending-stream model it resets; the pending row must still be the only visible user row.
+      const sawSnapshot = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).pendingStreamModel === null
+      );
+      expect(sawSnapshot).toBe(true);
+      expect(userRows()).toHaveLength(1);
+      expect(userRows()[0]).toMatchObject({ isPendingSend: true });
+
+      releaseUserRow();
+      const replaced = await waitUntil(() => {
+        const rows = userRows();
+        return rows.length === 1 && rows[0].historyId === "user-1";
+      });
+      expect(replaced).toBe(true);
+    });
+
+    it("carries a creation card without marking a pending stream", () => {
+      const workspaceId = "workspace-goal-creation-card";
+      const internalStore = getInternal<{
+        resetChatStateForReplay: (workspaceId: string) => void;
+      }>(store);
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingCreationInit(workspaceId, {
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: 1,
+      });
+      internalStore.resetChatStateForReplay(workspaceId);
+
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isStreamStarting).toBe(false);
+      expect(state.messages.map((message) => message.type)).toEqual(["workspace-init"]);
+    });
+
+    it("clears a card-only creation state when the initial /goal fails", () => {
+      const workspaceId = "workspace-goal-creation-failed";
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingCreationInit(workspaceId, {
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: 1,
+      });
+      expect(store.getWorkspaceState(workspaceId).messages.map((m) => m.type)).toEqual([
+        "workspace-init",
+      ]);
+
+      // No pending stream was ever marked; the failure path must still remove the card.
+      store.clearPendingInitialSendState(workspaceId);
+      expect(store.getWorkspaceState(workspaceId).messages).toEqual([]);
+    });
+
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
@@ -3273,6 +3369,88 @@ describe("WorkspaceStore", () => {
       });
       expect(sawPendingModel).toBe(true);
     });
+  });
+
+  describe("completed init replay", () => {
+    it.each([
+      { exitCode: 0, status: "success" },
+      { exitCode: 1, status: "error" },
+    ])(
+      "never publishes a running init row while replaying a finished init (exit $exitCode)",
+      async ({ exitCode, status }) => {
+        const workspaceId = `completed-init-replay-${exitCode}`;
+        let releaseCaughtUp!: () => void;
+        const caughtUpReady = new Promise<void>((resolve) => {
+          releaseCaughtUp = resolve;
+        });
+        const replayedInit: WorkspaceChatMessage[] = [
+          {
+            type: "init-start",
+            hookPath: "/project",
+            timestamp: 1_000,
+            replay: true,
+            completed: { exitCode, endTime: 4_500 },
+          },
+          {
+            type: "init-output",
+            line: "Preparing checkout",
+            step: true,
+            isError: false,
+            timestamp: 2_000,
+            lineNumber: 0,
+            replay: true,
+          },
+          {
+            type: "init-output",
+            line: "Running hook",
+            step: true,
+            isError: false,
+            timestamp: 2_001,
+            lineNumber: 1,
+            replay: true,
+          },
+          { type: "init-end", exitCode, timestamp: 4_500, replay: true },
+        ];
+        mockChatStreamFor(workspaceId, async function* () {
+          for (const event of replayedInit) {
+            yield event;
+            await tick();
+          }
+          await caughtUpReady;
+          yield { type: "caught-up", replay: "full" };
+        });
+
+        const findInitRow = () =>
+          store
+            .getWorkspaceState(workspaceId)
+            .messages.find((message) => message.type === "workspace-init");
+
+        createAndAddWorkspace(store, workspaceId);
+        const publishedStatuses: string[] = [];
+        const unsubscribe = store.subscribeKey(workspaceId, () => {
+          const init = findInitRow();
+          if (init) publishedStatuses.push(init.status);
+        });
+
+        expect(
+          await waitUntil(() => {
+            const init = findInitRow();
+            return init?.exitCode === exitCode && init.lines.length === 2;
+          })
+        ).toBe(true);
+        expect(store.getWorkspaceState(workspaceId).isTranscriptCaughtUp).toBe(false);
+
+        releaseCaughtUp();
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+        ).toBe(true);
+        unsubscribe();
+
+        expect(publishedStatuses.length).toBeGreaterThan(0);
+        expect(publishedStatuses.every((published) => published === status)).toBe(true);
+        expect(findInitRow()).toMatchObject({ status, exitCode, durationMs: 3_500 });
+      }
+    );
   });
 
   describe("history pagination", () => {
