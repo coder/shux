@@ -250,6 +250,16 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
+function isWorkspaceDraftEmpty(workspaceId: string): boolean {
+  return (
+    readPersistedState<string>(getInputKey(workspaceId), "").trim().length === 0 &&
+    (readPersistedState<ChatAttachment[] | undefined>(
+      getInputAttachmentsKey(workspaceId),
+      undefined
+    )?.length ?? 0) === 0
+  );
+}
+
 // Persist a failed creation send's draft under the new workspace's keys so the
 // retry happens there instead of creating a duplicate workspace.
 function transferDraftToWorkspace(
@@ -848,16 +858,20 @@ export function useCreationWorkspace({
           }
           // The workspace exists but holds no message, and the creation draft was already
           // cleared: hand the draft to the workspace composer (with any staged files) so the
-          // user can fix the model or provider and resend from the chat they landed in.
-          transferDraftToWorkspace(
-            metadata.id,
-            overrideRawCommand ?? messageText,
-            [
-              ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
-              ...stagingOutcome.staged,
-            ],
-            optionsOverride?.disableWorkspaceAgents === true
-          );
+          // user can fix the model or provider and resend from the chat they landed in. The
+          // composer is only locked while files stage, so a text-only send that waited on init
+          // may already hold something the user typed there; never overwrite that.
+          if (isWorkspaceDraftEmpty(metadata.id)) {
+            transferDraftToWorkspace(
+              metadata.id,
+              overrideRawCommand ?? messageText,
+              [
+                ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
+                ...stagingOutcome.staged,
+              ],
+              optionsOverride?.disableWorkspaceAgents === true
+            );
+          }
           if (sendResult.error) {
             // Persist the failure so the workspace view can surface a toast after navigation.
             updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), sendResult.error);

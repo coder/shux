@@ -1731,9 +1731,22 @@ export class StreamingMessageAggregator {
       this.pendingStreamModel = null;
       this.optimisticPendingStreamStart = false;
       this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
-      this.clearPendingInitialUserMessage();
-      this.clearPendingCreationInit();
     }
+  }
+
+  /**
+   * Drop the presentation-only creation rows (pending first message and stand-in card). They
+   * are deliberately independent of the pending-stream marker: the stale-barrier heuristic in
+   * clearPendingStreamStartIfNotOptimistic fires on a reconnect while the first send is still
+   * waiting on init, and an initial /goal never marks a pending stream at all. Only a visible
+   * user row, a real init-start, or an explicit creation failure may remove them.
+   */
+  clearPendingCreationPresentation(): boolean {
+    const hadPresentation =
+      this.pendingInitialUserMessage !== null || this.pendingCreationInit !== null;
+    this.clearPendingInitialUserMessage();
+    this.clearPendingCreationInit();
+    return hadPresentation;
   }
 
   private clearPendingCreationInit(): void {
@@ -2082,13 +2095,14 @@ export class StreamingMessageAggregator {
             optimisticPendingStreamStart: this.optimisticPendingStreamStart,
             optimisticPendingStreamStartIdleCaughtUpCount:
               this.optimisticPendingStreamStartIdleCaughtUpCount,
-            pendingInitialUserMessage: this.pendingInitialUserMessage,
           };
-    // The stand-in creation card outlives the pending-stream marker (an initial /goal never sets
-    // one); the replayed init-start is what replaces it.
+    // The creation rows outlive the replay reset: the replayed visible first message and
+    // init-start are what replace them (see clearPendingCreationPresentation).
+    const pendingInitialUserMessage = this.pendingInitialUserMessage;
     const pendingCreationInit = this.pendingCreationInit;
 
     this.clear();
+    this.pendingInitialUserMessage = pendingInitialUserMessage;
     this.pendingCreationInit = pendingCreationInit;
 
     if (!pendingStreamSnapshot) {
@@ -2101,7 +2115,6 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStart = pendingStreamSnapshot.optimisticPendingStreamStart;
     this.optimisticPendingStreamStartIdleCaughtUpCount =
       pendingStreamSnapshot.optimisticPendingStreamStartIdleCaughtUpCount;
-    this.pendingInitialUserMessage = pendingStreamSnapshot.pendingInitialUserMessage;
   }
 
   clear(): void {
@@ -2110,6 +2123,8 @@ export class StreamingMessageAggregator {
     this.displayedMessageCache.clear();
     this.messageVersions.clear();
     this.clearPendingStreamLifecycleState();
+    this.pendingInitialUserMessage = null;
+    this.pendingCreationInit = null;
     this.interruptingMessageId = null;
     this.streamLifecycle = null;
     this.lastAbortReason = null;

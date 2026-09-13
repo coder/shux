@@ -1292,6 +1292,43 @@ describe("useCreationWorkspace", () => {
     });
   });
 
+  test("handleSend leaves a draft typed in the new workspace alone when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+    // Text-only sends leave the new workspace composer unlocked while sendMessage waits on
+    // init, so the user may already have typed a follow-up there.
+    window.localStorage.setItem(getInputKey(TEST_WORKSPACE_ID), JSON.stringify("also check CI"));
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("fix the login bug");
+    });
+
+    expect(updatePersistedStateCalls.some(([key]) => key === getInputKey(TEST_WORKSPACE_ID))).toBe(
+      false
+    );
+    expect(window.localStorage.getItem(getInputKey(TEST_WORKSPACE_ID))).toBe(
+      JSON.stringify("also check CI")
+    );
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+  });
+
   test("handleSend keeps small retryable files when trimming an over-cap transfer", async () => {
     const stageAttachmentMock = mock(
       (_args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> =>

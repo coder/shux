@@ -3689,7 +3689,7 @@ describe("StreamingMessageAggregator", () => {
       });
     });
 
-    test("clearing the pending stream start removes a stand-in card that no init replaced", () => {
+    test("an explicit creation failure removes the pending row and a stand-in card no init replaced", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
         workspaceName: null,
@@ -3701,6 +3701,24 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
 
       aggregator.clearPendingStreamStart();
+      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
+      expect(displayedTypes(aggregator)).toEqual([]);
+      expect(aggregator.clearPendingCreationPresentation()).toBe(false);
+    });
+
+    test("a failed initial /goal can drop its stand-in card without a pending stream", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markPendingCreationInit({
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: Date.now(),
+      });
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      expect(aggregator.clearPendingCreationPresentation()).toBe(true);
       expect(displayedTypes(aggregator)).toEqual([]);
     });
 
@@ -3736,14 +3754,32 @@ describe("StreamingMessageAggregator", () => {
       expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
     });
 
-    test("clearing the pending stream start removes the pending row", () => {
+    test("the stale startup barrier clears on repeated idle catch-ups but the pending row stays", () => {
+      // The first send can wait minutes on init (deferred runtimes, file staging). Two idle
+      // caught-up cycles across reconnects retire the optimistic barrier, which must not take
+      // the only visible prompt with it; the durable first message is what replaces the row.
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
       aggregator.resetForReplay();
-      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
 
-      aggregator.clearPendingStreamStart();
-      expect(displayedTypes(aggregator)).toEqual([]);
+      aggregator.resetForReplay();
+      aggregator.clearPendingStreamStartIfNotOptimistic();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0]).toMatchObject({ isPendingSend: true });
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", pendingFirstMessage.content, {
+          historySequence: 1,
+          timestamp: pendingFirstMessage.timestamp + 5,
+        }),
+      });
+      const userRows = displayedUserRows(aggregator);
+      expect(userRows).toHaveLength(1);
+      expect(userRows[0].historyId).toBe("user-1");
     });
 
     test("clears stale pending state when authoritative history now ends with assistant", () => {

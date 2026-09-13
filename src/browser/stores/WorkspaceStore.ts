@@ -4024,14 +4024,25 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
+  /**
+   * A creation send failed or was abandoned: drop the optimistic startup barrier and the
+   * presentation-only creation rows. The rows are cleared even without a pending stream so an
+   * initial /goal that fails before init-start arrives does not leave its stand-in card behind.
+   */
   clearPendingInitialSendState(workspaceId: string): void {
     const aggregator = this.aggregators.get(workspaceId);
-    if (aggregator?.getPendingStreamStartTime() == null) {
+    if (!aggregator) {
       return;
     }
 
-    aggregator.clearPendingStreamStart();
-    this.states.bump(workspaceId);
+    const hadPendingStream = aggregator.getPendingStreamStartTime() != null;
+    if (hadPendingStream) {
+      aggregator.clearPendingStreamStart();
+    }
+    const clearedPresentation = aggregator.clearPendingCreationPresentation();
+    if (hadPendingStream || clearedPresentation) {
+      this.states.bump(workspaceId);
+    }
   }
 
   markPendingCreationInit(workspaceId: string, pendingCreationInit: PendingCreationInit): void {

@@ -1648,6 +1648,26 @@ describe("WorkspaceStore", () => {
       expect(state.messages.map((message) => message.type)).toEqual(["workspace-init"]);
     });
 
+    it("clears a card-only creation state when the initial /goal fails", () => {
+      const workspaceId = "workspace-goal-creation-failed";
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingCreationInit(workspaceId, {
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: 1,
+      });
+      expect(store.getWorkspaceState(workspaceId).messages.map((m) => m.type)).toEqual([
+        "workspace-init",
+      ]);
+
+      // No pending stream was ever marked; the failure path must still remove the card.
+      store.clearPendingInitialSendState(workspaceId);
+      expect(store.getWorkspaceState(workspaceId).messages).toEqual([]);
+    });
+
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
