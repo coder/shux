@@ -5,6 +5,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { seedConfigMirrors } from "@/browser/utils/configMirrors";
 import {
   formatKeybind,
   isDialogOpen,
@@ -600,6 +601,12 @@ export function BackupSection() {
         mergeImportResults(previous, result.data.projectImportResults)
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      // The restore rewrote config behind the renderer's localStorage mirrors.
+      try {
+        seedConfigMirrors(await api.config.getConfig());
+      } catch {
+        // Best-effort: the mirrors re-seed on the next startup.
+      }
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0

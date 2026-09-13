@@ -91,7 +91,14 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
  */
 export function readBackupSettings(document: unknown): BackupSettings | undefined {
   if (!isPlainObject(document) || document.settings === undefined) return undefined;
-  return BackupSettingsSchema.parse(document.settings);
+  const parsed = BackupSettingsSchema.safeParse(document.settings);
+  if (parsed.success) return parsed.data;
+  // The message reaches the Backup screen, so name the offending fields instead of dumping
+  // the raw issue list.
+  const issues = parsed.error.issues
+    .slice(0, 3)
+    .map((issue) => `${issue.path.map(String).join(".") || "settings"}: ${issue.message}`);
+  throw new Error(`Backup preferences.json has an invalid settings block (${issues.join("; ")})`);
 }
 
 /**

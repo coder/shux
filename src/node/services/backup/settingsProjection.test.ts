@@ -140,10 +140,13 @@ describe("settingsProjection", () => {
       })
     ).toEqual({ defaultModel: "anthropic:claude-plan" });
 
+    // The error names the field so the Backup screen can say what is wrong with the document.
     expect(() =>
       readBackupSettings({ settings: { agentAiDefaults: { exec: { thinkingLevel: "bogus" } } } })
-    ).toThrow();
-    expect(() => readBackupSettings({ settings: { heartbeatDefaultIntervalMs: 1 } })).toThrow();
+    ).toThrow(/settings block \(agentAiDefaults\.exec\.thinkingLevel: /);
+    expect(() => readBackupSettings({ settings: { heartbeatDefaultIntervalMs: 1 } })).toThrow(
+      /heartbeatDefaultIntervalMs/
+    );
     expect(() => readBackupSettings({ settings: null })).toThrow();
   });
 });
