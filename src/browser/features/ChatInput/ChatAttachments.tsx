@@ -1,5 +1,6 @@
 import React from "react";
 import { FileText, X } from "lucide-react";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 
 import { formatBytes } from "./stagedAttachments";
 
@@ -67,30 +68,32 @@ export const ChatAttachments: React.FC<ChatAttachmentsProps> = (props) => {
         const isImage = attachment.kind === "provider" && baseMediaType.startsWith("image/");
 
         if (isImage) {
+          const resizeTooltip = attachment.resizeInfo
+            ? `Resized from ${attachment.resizeInfo.originalWidth}×${attachment.resizeInfo.originalHeight} to ${attachment.resizeInfo.newWidth}×${attachment.resizeInfo.newHeight}`
+            : undefined;
+
           return (
             <div
               key={attachment.id}
               className="border-border-light bg-dark group grid h-20 w-20 overflow-hidden rounded border"
             >
-              <img
-                src={attachment.url}
-                alt="Attached image"
-                title={
-                  attachment.resizeInfo
-                    ? `Resized from ${attachment.resizeInfo.originalWidth}×${attachment.resizeInfo.originalHeight} to ${attachment.resizeInfo.newWidth}×${attachment.resizeInfo.newHeight}`
-                    : undefined
-                }
-                className="pointer-events-none col-start-1 row-start-1 h-full w-full object-cover"
-              />
+              <TooltipIfPresent tooltip={resizeTooltip}>
+                <img
+                  src={attachment.url}
+                  alt="Attached image"
+                  className="col-start-1 row-start-1 h-full w-full object-cover"
+                />
+              </TooltipIfPresent>
               {handleRemove && (
-                <button
-                  onClick={() => handleRemove(attachment.id)}
-                  title="Remove attachment"
-                  className="col-start-1 row-start-1 m-0.5 flex h-5 w-5 cursor-pointer items-center justify-center self-start justify-self-end rounded-full border-0 bg-black/70 p-0 text-sm leading-none text-white hover:bg-black/90"
-                  aria-label="Remove attachment"
-                >
-                  <X className="h-3 w-3" />
-                </button>
+                <TooltipIfPresent tooltip="Remove attachment">
+                  <button
+                    onClick={() => handleRemove(attachment.id)}
+                    className="col-start-1 row-start-1 m-0.5 flex h-5 w-5 cursor-pointer items-center justify-center self-start justify-self-end rounded-full border-0 bg-black/70 p-0 text-sm leading-none text-white hover:bg-black/90"
+                    aria-label="Remove attachment"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </TooltipIfPresent>
               )}
             </div>
           );
@@ -116,14 +119,15 @@ export const ChatAttachments: React.FC<ChatAttachmentsProps> = (props) => {
               ) : null}
             </span>
             {handleRemove && (
-              <button
-                onClick={() => handleRemove(attachment.id)}
-                title="Remove attachment"
-                className="ml-auto flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-[var(--color-subtle)] hover:bg-black/40"
-                aria-label="Remove attachment"
-              >
-                <X className="h-3 w-3" />
-              </button>
+              <TooltipIfPresent tooltip="Remove attachment">
+                <button
+                  onClick={() => handleRemove(attachment.id)}
+                  className="ml-auto flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-full border-0 bg-transparent p-0 text-[var(--color-subtle)] hover:bg-black/40"
+                  aria-label="Remove attachment"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </TooltipIfPresent>
             )}
           </div>
         );
