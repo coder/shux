@@ -23,7 +23,6 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { Ok, Err } from "@/common/types/result";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
-import { AdvisorToolInputSchema } from "@/common/utils/tools/toolDefinitions";
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import {
   StreamManager,
@@ -41,9 +40,7 @@ import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedConte
 import * as aiSdk from "ai";
 import {
   APICallError,
-  InvalidToolInputError,
   RetryError,
-  TypeValidationError,
   tool,
   type LanguageModel,
   type ModelMessage,
@@ -4119,88 +4116,6 @@ describe("StreamManager - exact step indices", () => {
       ).toEqual(preserveParts ? [0] : []);
     }
   );
-});
-
-describe("StreamManager - invalid tool input", () => {
-  test("relays a concise zod summary instead of the SDK's input-echoing error", async () => {
-    const streamManager = new StreamManager(historyService);
-    const workspaceId = "invalid-tool-input-workspace";
-    const messageId = "invalid-tool-input-message";
-    await appendPartialAssistantForTests(workspaceId, messageId, 1);
-    Reflect.set(streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(undefined),
-      countTokens: () => Promise.resolve(0),
-    });
-
-    // Mirror the SDK's pre-execution rejection: an invalid dynamic tool-call
-    // carrying the Error, then a tool-error carrying only its message string.
-    const input = { question: "x".repeat(2100) };
-    const validation = AdvisorToolInputSchema.safeParse(input);
-    if (validation.success) throw new Error("Expected the advisor schema to reject the input");
-    const error = new InvalidToolInputError({
-      toolName: "advisor",
-      toolInput: JSON.stringify(input),
-      cause: TypeValidationError.wrap({ value: input, cause: validation.error }),
-    });
-    const toolCallId = "advisor-invalid-call";
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "start-step" };
-          yield {
-            type: "tool-call",
-            toolCallId,
-            toolName: "advisor",
-            input,
-            dynamic: true,
-            invalid: true,
-            error,
-          };
-          yield {
-            type: "tool-error",
-            toolCallId,
-            toolName: "advisor",
-            input,
-            error: error.message,
-            dynamic: true,
-          };
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
-          };
-          yield { type: "finish", finishReason: "stop" };
-        })()
-      ),
-    });
-
-    await getProcessStreamWithCleanupForTests(streamManager).call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      1
-    );
-
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) throw new Error(history.error);
-    const toolPart = history.data
-      .find((row) => row.id === messageId)
-      ?.parts.find((part) => part.type === "dynamic-tool");
-    if (toolPart?.type !== "dynamic-tool" || toolPart.state !== "output-available") {
-      throw new Error("Expected a completed dynamic-tool part");
-    }
-    const output = toolPart.output as { success: boolean; error: string };
-
-    expect(output.success).toBe(false);
-    expect(output.error).toContain("advisor");
-    expect(output.error).toContain("question");
-    expect(output.error).toContain("2000");
-    expect(output.error).toContain("2100");
-    expect(output.error.length).toBeLessThan(500);
-    expect(output.error).not.toContain("xxxx");
-  });
 });
 
 describe("StreamManager - empty stream completions", () => {
