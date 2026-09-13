@@ -243,7 +243,7 @@ const LOGIN_FAILED_MESSAGE =
   "Could not authenticate to the backup repository. Check your SSH key or `gh auth login`.";
 
 function accessDeniedMessage(credential: BackupCredential, error: unknown): string {
-  return `Access to the backup repository was denied (credential: ${BACKUP_CREDENTIAL_LABELS[credential]}): ${remoteReason(error)} The credential was accepted, so signing in again will not help. Check that the URL names the right repository and that the account behind this credential, or the integration that issues its token, has write access to it.`;
+  return `Access to the backup repository was denied (credential: ${BACKUP_CREDENTIAL_LABELS[credential]}): ${remoteReason(error)} Check that the URL names the right repository and that the account behind this credential, or the integration that issues its token, has write access to it.`;
 }
 
 export interface GitCredentialOptions extends Omit<ExecFileAsyncOptions, "killTreeOnTermination"> {
@@ -436,12 +436,15 @@ function remoteReason(error: unknown): string {
     error instanceof Error ? (error as Error & { stderr?: unknown }).stderr : undefined;
   const text = typeof stderr === "string" ? stderr : errorText(error);
   // Server progress arrives as `remote:` lines too, so the denial is the line that matched the
-  // classifier, not whichever line the server sent first.
+  // classifier, wherever it sits, not whichever line the server sent first.
   const remoteLines = Array.from(text.matchAll(REMOTE_REASON_LINES), (match) => match[1]);
+  const fatalLine = FATAL_LINE.exec(text)?.[1];
   const line =
-    remoteLines.find((candidate) => ACCESS_DENIED_PATTERN.test(candidate)) ??
+    [...remoteLines, ...(fatalLine === undefined ? [] : [fatalLine])].find((candidate) =>
+      ACCESS_DENIED_PATTERN.test(candidate)
+    ) ??
     remoteLines[0] ??
-    FATAL_LINE.exec(text)?.[1] ??
+    fatalLine ??
     text.split("\n").find((candidate) => candidate.trim() !== "") ??
     "";
   const reason = line.trim().slice(0, REMOTE_REASON_MAX_LENGTH);
