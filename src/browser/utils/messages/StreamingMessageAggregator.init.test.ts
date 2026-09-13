@@ -265,6 +265,57 @@ describe("Init display after cleanup changes", () => {
     ]);
   });
 
+  it("adopts terminal metadata when the same running init is replayed as completed", () => {
+    const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+    const initRow = () =>
+      aggregator.getDisplayedMessages().find((message) => message.type === "workspace-init");
+
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+    });
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+    });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({ status: "running" });
+
+    // Reconnect after the init finished server-side: the replayed init-start already knows
+    // the outcome, so the retained row must not stay "running" until init-end is replayed.
+    aggregator.resetForReplay();
+    aggregator.handleMessage({
+      type: "init-start",
+      hookPath: "/project/.xum/init",
+      timestamp: 1_000,
+      replay: true,
+      completed: { exitCode: 0, endTime: 4_000 },
+    });
+    expect(initRow()).toMatchObject({
+      status: "success",
+      exitCode: 0,
+      durationMs: 3_000,
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
+
+    aggregator.handleMessage({
+      type: "init-output",
+      line: "Installing dependencies...",
+      timestamp: 1_001,
+      isError: false,
+      replay: true,
+    });
+    aggregator.handleMessage({ type: "init-end", exitCode: 0, timestamp: 4_000, replay: true });
+    aggregator.flushPendingInitOutput();
+    expect(initRow()).toMatchObject({
+      status: "success",
+      lines: [{ line: "Installing dependencies...", isError: false }],
+    });
+  });
+
   it("should preserve duplicate replayed init lines that share a timestamp", () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 

@@ -4034,6 +4034,16 @@ export class WorkspaceStore {
     this.states.bump(workspaceId);
   }
 
+  markPendingCreationInit(workspaceId: string, pendingCreationInit: PendingCreationInit): void {
+    const aggregator = this.aggregators.get(workspaceId);
+    if (!aggregator) {
+      return;
+    }
+
+    aggregator.markPendingCreationInit(pendingCreationInit);
+    this.states.bump(workspaceId);
+  }
+
   /**
    * Remove a workspace and clean up subscriptions.
    */
@@ -4859,6 +4869,8 @@ export const workspaceStore = {
     ),
   clearPendingInitialSendState: (workspaceId: string) =>
     getStoreInstance().clearPendingInitialSendState(workspaceId),
+  markPendingCreationInit: (workspaceId: string, pendingCreationInit: PendingCreationInit) =>
+    getStoreInstance().markPendingCreationInit(workspaceId, pendingCreationInit),
   /**
    * Set the active workspace for onChat subscription management.
    * Exposed for test helpers that bypass React routing effects.

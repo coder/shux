@@ -233,7 +233,8 @@ interface UseCreationWorkspaceReturn {
     fileParts?: FilePart[],
     optionsOverride?: Partial<SendMessageOptions>,
     initialSlashCommand?: CreationInitialSlashCommand,
-    pendingFiles?: PendingFileChatAttachment[]
+    pendingFiles?: PendingFileChatAttachment[],
+    pendingUserMessageDraft?: PendingInitialUserMessage
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
@@ -454,7 +455,8 @@ export function useCreationWorkspace({
       fileParts?: FilePart[],
       optionsOverride?: Partial<SendMessageOptions>,
       initialSlashCommand?: CreationInitialSlashCommand,
-      pendingFiles?: PendingFileChatAttachment[]
+      pendingFiles?: PendingFileChatAttachment[],
+      pendingUserMessageDraft?: PendingInitialUserMessage
     ): Promise<CreationSendResult> => {
       const pendingFilesToStage = pendingFiles ?? [];
       // File-only sends are valid; the attached-files notice or provider file
@@ -509,16 +511,17 @@ export function useCreationWorkspace({
           ? overrideMuxMetadata.rawCommand
           : null;
       // Transcript row shown by the creation view and, after navigation, by the new workspace
-      // until the backend persists the first message. Skill sends show the typed command
-      // (rawCommand) rather than the rewritten skill text; attachment-only sends reuse the
-      // attached-files summary already built for naming.
+      // until the backend persists the first message. ChatInput passes the row it already shows
+      // while resolving commands so the handoff keeps one timestamp; otherwise skill sends show
+      // the typed command (rawCommand) rather than the rewritten skill text and attachment-only
+      // sends reuse the attached-files summary already built for naming.
       const pendingUserMessage: PendingInitialUserMessage | null =
         initialSlashCommand == null
-          ? {
+          ? (pendingUserMessageDraft ?? {
               content: overrideRawCommand ?? (messageText.trim() ? messageText : message),
               fileParts,
               timestamp: Date.now(),
-            }
+            })
           : null;
 
       setIsSending(true);
@@ -722,7 +725,7 @@ export function useCreationWorkspace({
           pendingUserMessage: pendingUserMessage ?? undefined,
           // Scratch chats never run init, so nothing would replace a stand-in card there.
           pendingCreationInit:
-            pendingUserMessage == null || kind === "scratch"
+            kind === "scratch"
               ? undefined
               : {
                   workspaceName: metadata.name,

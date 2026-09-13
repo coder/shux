@@ -152,6 +152,7 @@ import { trackCommandUsed } from "@/common/telemetry";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 
 import { CreationCenterContent } from "./CreationCenterContent";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { cn } from "@/common/lib/utils";
 import type {
   ChatInputProps,
@@ -336,6 +337,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
   const isSending = sendingCount > 0;
+  // Creation sends resolve commands and skill references (which can wait on cold MCP servers)
+  // before useCreationWorkspace takes over, so the transcript row shown during that phase is
+  // captured here and handed to the hook to keep the same row across the handoff.
+  const [creationSendDraft, setCreationSendDraft] = useState<PendingInitialUserMessage | null>(
+    null
+  );
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
@@ -1744,6 +1751,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 transferredDraftProjectDiscovery,
             }
           : null;
+    // Same routing as the creation branch below: an initial /goal without attachments sets a
+    // goal instead of sending a user turn, so only the creation card is previewed for it.
+    const creationFileParts = variant === "creation" ? chatAttachmentsToFileParts(attachments) : [];
+    const creationPendingUserMessage: PendingInitialUserMessage | null =
+      variant === "creation" &&
+      !(parseCommand(messageText)?.type === "goal-set" && attachments.length === 0)
+        ? {
+            content: messageText.length > 0 ? messageText : creationNameMessage,
+            fileParts: creationFileParts.length > 0 ? creationFileParts : undefined,
+            timestamp: Date.now(),
+          }
+        : null;
+    setCreationSendDraft(creationPendingUserMessage);
     // Resolving commands/references can include cold MCP server startup and
     // prompt discovery; mark the send in flight so a second Enter cannot start
     // a duplicate send against the same captured draft.
@@ -1873,14 +1893,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
 
       // Creation variant: simple message send + workspace creation
-      const creationFileParts = chatAttachmentsToFileParts(attachments);
       const creationPendingFiles = getPendingFileAttachments(attachments);
       const creationResult = await creationState.handleSend(
         creationMessageTextForSend,
         creationFileParts.length > 0 ? creationFileParts : undefined,
         creationOptionsOverride,
         initialSlashCommand,
-        creationPendingFiles.length > 0 ? creationPendingFiles : undefined
+        creationPendingFiles.length > 0 ? creationPendingFiles : undefined,
+        creationPendingUserMessage ?? undefined
       );
 
       if (creationResult.success) {
@@ -2444,9 +2464,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       {/* Pending transcript (first message + creation progress) during workspace creation */}
       {variant === "creation" && (
         <CreationCenterContent
-          isSending={creationState.isSending}
-          pendingUserMessage={creationState.pendingUserMessage}
-          workspaceName={props.kind !== "scratch" ? creationState.creatingWithIdentity?.name : null}
+          isSending={isSendInFlight}
+          pendingUserMessage={
+            creationState.isSending ? creationState.pendingUserMessage : creationSendDraft
+          }
+          workspaceName={
+            props.kind !== "scratch" && creationState.isSending
+              ? creationState.creatingWithIdentity?.name
+              : null
+          }
           nameGenerated={creationState.nameState.autoGenerate}
           kind={props.kind}
           projectPath={props.projectPath}

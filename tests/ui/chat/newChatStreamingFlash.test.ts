@@ -83,6 +83,18 @@ async function createCreationHarness(options?: {
 
 type WorkspaceSendMessageFn = TestEnvironment["orpc"]["workspace"]["sendMessage"];
 type WorkspaceCreateFn = TestEnvironment["orpc"]["workspace"]["create"];
+type AgentSkillsGetFn = TestEnvironment["orpc"]["agentSkills"]["get"];
+
+function overrideAgentSkillsGet(env: TestEnvironment, override: AgentSkillsGetFn): () => void {
+  const agentSkillsApi = env.orpc.agentSkills as typeof env.orpc.agentSkills & {
+    get: AgentSkillsGetFn;
+  };
+  const originalGet = agentSkillsApi.get;
+  agentSkillsApi.get = override;
+  return () => {
+    agentSkillsApi.get = originalGet;
+  };
+}
 
 function overrideWorkspaceSendMessage(
   env: TestEnvironment,
@@ -334,6 +346,60 @@ describe("New chat streaming flash regression", () => {
       createGate.release();
       sendGate.release();
       for (const restore of restores) restore();
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("shows the pending transcript while the send is still resolving a slash skill", async () => {
+    // Typed /skill commands are looked up on the backend before creation starts; that lookup
+    // can wait on cold servers, so the transcript must already reflect the send during it.
+    const typed = "/slow-skill do the thing";
+    const lookupGate = gate();
+    let restoreAgentSkillsGet: () => void = () => {};
+    const app = await createCreationHarness({
+      beforeRender: (env) => {
+        const originalGet = env.orpc.agentSkills.get.bind(env.orpc.agentSkills) as AgentSkillsGetFn;
+        restoreAgentSkillsGet = overrideAgentSkillsGet(env, (async (input) => {
+          await lookupGate.wait;
+          return originalGet(input);
+        }) as AgentSkillsGetFn);
+      },
+    });
+    const container = app.view.container;
+    const pendingTranscript = () =>
+      container.querySelector('[data-testid="creation-pending-transcript"]');
+
+    try {
+      await app.chat.send(typed);
+
+      await waitFor(
+        () => {
+          const pending = pendingTranscript();
+          if (!pending) {
+            throw new Error("Pending creation transcript not rendered yet");
+          }
+          expect(pending.textContent).toContain(typed);
+          expect(pending.querySelector("button[aria-expanded]")?.textContent).toContain(
+            "Creating workspace"
+          );
+        },
+        { timeout: 10_000 }
+      );
+      const workspacesDuringLookup = await app.env.orpc.workspace.list({ archived: false });
+      expect(workspacesDuringLookup.some((w) => w.projectPath === app.projectPath)).toBe(false);
+
+      // The skill does not exist, so the resolved send is rejected and the preview is withdrawn.
+      lookupGate.release();
+      await waitFor(
+        () => {
+          expect(container.textContent).toContain("Unknown command");
+          expect(pendingTranscript()).toBeNull();
+        },
+        { timeout: 10_000 }
+      );
+    } finally {
+      lookupGate.release();
+      restoreAgentSkillsGet();
       await app.dispose();
     }
   }, 60_000);

@@ -3636,6 +3636,38 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedTypes(aggregator)).toEqual([]);
     });
 
+    test("carries a stand-in creation card without a pending stream until init-start", () => {
+      // Initial /goal sends create no user turn, so no pending stream is marked.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markPendingCreationInit({
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: Date.now(),
+      });
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      // The subscription's replay reset must not drop the card before init-start arrives.
+      aggregator.resetForReplay();
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+        completed: { exitCode: 0, endTime: 9 },
+      });
+      const initRows = aggregator
+        .getDisplayedMessages()
+        .filter((message) => message.type === "workspace-init");
+      expect(initRows).toHaveLength(1);
+      expect(initRows[0]).toMatchObject({ hookPath: "/project/.xum/init", status: "success" });
+    });
+
     test("clearing the pending stream start removes the pending row", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);

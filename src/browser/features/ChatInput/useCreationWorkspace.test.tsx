@@ -1358,10 +1358,20 @@ describe("useCreationWorkspace", () => {
       turnCap: null,
       expectedGoalId: null,
     });
+    // No user turn is queued, but the workspace still runs init, so the creation card is carried.
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
       pendingStreamModel: "anthropic:claude-opus-5",
       markPendingInitialSend: false,
+      pendingUserMessage: undefined,
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 
@@ -1775,6 +1785,35 @@ describe("useCreationWorkspace", () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         timestamp: expect.any(Number),
       },
+    });
+  });
+
+  test("handleSend reuses the pending row ChatInput showed while resolving the send", async () => {
+    const onWorkspaceCreated = mock(
+      (_metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => undefined
+    );
+    setupWindow({
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+    });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "test message",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const draft = { content: "test message", fileParts: undefined, timestamp: 1_234 };
+    await act(async () => {
+      await getHook().handleSend("test message", undefined, undefined, undefined, undefined, draft);
+    });
+
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      pendingUserMessage: draft,
+      pendingCreationInit: { timestamp: 1_234 },
     });
   });
 

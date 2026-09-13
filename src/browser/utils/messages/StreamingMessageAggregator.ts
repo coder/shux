@@ -1624,6 +1624,15 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
+  /**
+   * Carry the creation card without a pending stream. An initial /goal sets a goal instead of
+   * sending a user turn, so nothing marks a pending send, yet the workspace still runs init.
+   */
+  markPendingCreationInit(pendingCreationInit: PendingCreationInit): void {
+    this.pendingCreationInit = pendingCreationInit;
+    this.invalidateCache();
+  }
+
   clearPendingStreamStartIfNotOptimistic(): void {
     if (!this.optimisticPendingStreamStart) {
       this.clearPendingStreamStart();
@@ -2065,10 +2074,13 @@ export class StreamingMessageAggregator {
             optimisticPendingStreamStartIdleCaughtUpCount:
               this.optimisticPendingStreamStartIdleCaughtUpCount,
             pendingInitialUserMessage: this.pendingInitialUserMessage,
-            pendingCreationInit: this.pendingCreationInit,
           };
+    // The stand-in creation card outlives the pending-stream marker (an initial /goal never sets
+    // one); the replayed init-start is what replaces it.
+    const pendingCreationInit = this.pendingCreationInit;
 
     this.clear();
+    this.pendingCreationInit = pendingCreationInit;
 
     if (!pendingStreamSnapshot) {
       return;
@@ -2081,7 +2093,6 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStartIdleCaughtUpCount =
       pendingStreamSnapshot.optimisticPendingStreamStartIdleCaughtUpCount;
     this.pendingInitialUserMessage = pendingStreamSnapshot.pendingInitialUserMessage;
-    this.pendingCreationInit = pendingStreamSnapshot.pendingCreationInit;
   }
 
   clear(): void {
@@ -3073,6 +3084,15 @@ export class StreamingMessageAggregator {
         // as a no-op so switching back never clears the visible SSH/setup output mid-replay.
         this.replayInitVisiblePrefix = [...this.initState.lines];
         this.replayInitVisiblePrefixIndex = 0;
+        // The init may have finished while disconnected; adopt the terminal snapshot now instead
+        // of staying "running" until the replayed init-end lands.
+        if (data.completed) {
+          this.initState.status = data.completed.exitCode === 0 ? "success" : "error";
+          this.initState.exitCode = data.completed.exitCode;
+          this.initState.endTime = data.completed.endTime;
+          this.initState.progress = null;
+          this.invalidateCache();
+        }
         return true;
       }
 

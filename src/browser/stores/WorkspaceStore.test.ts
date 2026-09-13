@@ -1572,6 +1572,27 @@ describe("WorkspaceStore", () => {
       mockChatScript([], { keepOpen: true });
     });
 
+    it("carries a creation card without marking a pending stream", () => {
+      const workspaceId = "workspace-goal-creation-card";
+      const internalStore = getInternal<{
+        resetChatStateForReplay: (workspaceId: string) => void;
+      }>(store);
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingCreationInit(workspaceId, {
+        workspaceName: "dark-mode",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: 1,
+      });
+      internalStore.resetChatStateForReplay(workspaceId);
+
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.isStreamStarting).toBe(false);
+      expect(state.messages.map((message) => message.type)).toEqual(["workspace-init"]);
+    });
+
     it("preserves optimistic startup across full replay resets", () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
