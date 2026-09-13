@@ -3567,6 +3567,75 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedUserRows(aggregator)).toHaveLength(0);
     });
 
+    test("shows a stand-in creation card until the backend init replaces it", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: "dark-mode",
+        nameGenerated: false,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      const initRow = () =>
+        aggregator
+          .getDisplayedMessages()
+          .find(
+            (message): message is Extract<DisplayedMessage, { type: "workspace-init" }> =>
+              message.type === "workspace-init"
+          );
+
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+      // A typed name was never generated, so the card only lists the creation step.
+      expect(initRow()).toMatchObject({
+        status: "running",
+        lines: [{ line: "Creating workspace dark-mode", step: true }],
+      });
+
+      // The durable first message does not disturb the stand-in card.
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 1,
+          timestamp: Date.now(),
+        }),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: 5,
+        replay: true,
+      });
+      aggregator.handleMessage({
+        type: "init-output",
+        line: "Preparing checkout",
+        step: true,
+        timestamp: 6,
+        replay: true,
+      });
+      aggregator.flushPendingInitOutput();
+      expect(initRow()).toMatchObject({
+        hookPath: "/project/.xum/init",
+        lines: [{ line: "Preparing checkout", step: true }],
+      });
+    });
+
+    test("clearing the pending stream start removes a stand-in card that no init replaced", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {
+        workspaceName: null,
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: "/project",
+        timestamp: pendingFirstMessage.timestamp,
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user", "workspace-init"]);
+
+      aggregator.clearPendingStreamStart();
+      expect(displayedTypes(aggregator)).toEqual([]);
+    });
+
     test("clearing the pending stream start removes the pending row", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);

@@ -321,7 +321,8 @@ function AppInner() {
         workspaceStore.markPendingInitialSend(
           metadata.id,
           options?.pendingStreamModel ?? null,
-          options?.pendingUserMessage
+          options?.pendingUserMessage,
+          options?.pendingCreationInit
         );
       }
     }

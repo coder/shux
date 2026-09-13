@@ -12,6 +12,8 @@ interface CreationCenterContentProps {
   pendingUserMessage: PendingInitialUserMessage | null;
   /** The confirmed workspace name (null while generation is in progress) */
   workspaceName?: string | null;
+  /** False when the user typed the name, so no "Generating name" step is listed */
+  nameGenerated: boolean;
   kind?: "scratch";
   projectPath: string;
 }
@@ -33,6 +35,7 @@ export function CreationCenterContent(props: CreationCenterContentProps) {
       <InitMessage
         message={createPendingCreationInitMessage({
           workspaceName: props.workspaceName ?? null,
+          nameGenerated: props.nameGenerated,
           kind: props.kind,
           hookPath: props.projectPath,
           timestamp,

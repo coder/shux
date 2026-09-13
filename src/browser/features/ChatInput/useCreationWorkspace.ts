@@ -720,6 +720,17 @@ export function useCreationWorkspace({
           pendingStreamModel: shouldAutoNavigate ? baseModel : null,
           markPendingInitialSend: initialSlashCommand == null,
           pendingUserMessage: pendingUserMessage ?? undefined,
+          // Scratch chats never run init, so nothing would replace a stand-in card there.
+          pendingCreationInit:
+            pendingUserMessage == null || kind === "scratch"
+              ? undefined
+              : {
+                  workspaceName: metadata.name,
+                  nameGenerated: workspaceNameState.autoGenerate,
+                  kind,
+                  hookPath: projectPath,
+                  timestamp: pendingUserMessage?.timestamp ?? Date.now(),
+                },
         });
 
         if (typeof draftId === "string" && draftId.trim().length > 0 && promoteWorkspaceDraft) {

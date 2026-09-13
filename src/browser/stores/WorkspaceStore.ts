@@ -22,7 +22,10 @@ import {
   type LoadedSkill,
   type SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
-import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
+import type {
+  PendingCreationInit,
+  PendingInitialUserMessage,
+} from "@/browser/utils/messages/pendingInitialUserMessage";
 import {
   createCompactionCompletion,
   type ResponseCompleteEvent,
@@ -4005,14 +4008,19 @@ export class WorkspaceStore {
   markPendingInitialSend(
     workspaceId: string,
     pendingStreamModel: string | null,
-    pendingUserMessage?: PendingInitialUserMessage
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
   ): void {
     const aggregator = this.aggregators.get(workspaceId);
     if (!aggregator) {
       return;
     }
 
-    aggregator.markOptimisticPendingStreamStart(pendingStreamModel, pendingUserMessage);
+    aggregator.markOptimisticPendingStreamStart(
+      pendingStreamModel,
+      pendingUserMessage,
+      pendingCreationInit
+    );
     this.states.bump(workspaceId);
   }
 
@@ -4840,9 +4848,15 @@ export const workspaceStore = {
   markPendingInitialSend: (
     workspaceId: string,
     pendingStreamModel: string | null,
-    pendingUserMessage?: PendingInitialUserMessage
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
   ) =>
-    getStoreInstance().markPendingInitialSend(workspaceId, pendingStreamModel, pendingUserMessage),
+    getStoreInstance().markPendingInitialSend(
+      workspaceId,
+      pendingStreamModel,
+      pendingUserMessage,
+      pendingCreationInit
+    ),
   clearPendingInitialSendState: (workspaceId: string) =>
     getStoreInstance().clearPendingInitialSendState(workspaceId),
   /**

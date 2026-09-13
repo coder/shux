@@ -1767,6 +1767,14 @@ describe("useCreationWorkspace", () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         timestamp: expect.any(Number),
       },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 
@@ -1838,6 +1846,14 @@ describe("useCreationWorkspace", () => {
       pendingUserMessage: {
         content: "test message",
         fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         timestamp: expect.any(Number),
       },

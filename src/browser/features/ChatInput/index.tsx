@@ -2447,6 +2447,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           isSending={creationState.isSending}
           pendingUserMessage={creationState.pendingUserMessage}
           workspaceName={props.kind !== "scratch" ? creationState.creatingWithIdentity?.name : null}
+          nameGenerated={creationState.nameState.autoGenerate}
           kind={props.kind}
           projectPath={props.projectPath}
         />

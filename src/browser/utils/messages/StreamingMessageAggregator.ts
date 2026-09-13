@@ -86,7 +86,9 @@ import { createDeltaStorage, type DeltaRecordStorage } from "./StreamingTPSCalcu
 import { buildTranscriptTruncationPlan } from "./transcriptTruncationPlan";
 import { computeRecencyTimestamp } from "./recency";
 import {
+  createPendingCreationInitMessage,
   createPendingUserDisplayedMessage,
+  type PendingCreationInit,
   type PendingInitialUserMessage,
 } from "./pendingInitialUserMessage";
 import { assert } from "@/common/utils/assert";
@@ -659,6 +661,9 @@ export class StreamingMessageAggregator {
   // The first message of a created workspace, shown as a transcript row until the durable user
   // message lands. Presentation only: never part of this.messages or any history bookkeeping.
   private pendingInitialUserMessage: PendingInitialUserMessage | null = null;
+  // Stand-in creation card until the backend's init-start replay arrives on subscription, so
+  // the card the creation view already showed does not vanish for a frame after navigation.
+  private pendingCreationInit: PendingCreationInit | null = null;
 
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
@@ -1606,13 +1611,15 @@ export class StreamingMessageAggregator {
 
   markOptimisticPendingStreamStart(
     model: string | null,
-    pendingUserMessage?: PendingInitialUserMessage
+    pendingUserMessage?: PendingInitialUserMessage,
+    pendingCreationInit?: PendingCreationInit
   ): void {
     this.optimisticPendingStreamStart = true;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     this.pendingCompactionRequest = null;
     this.pendingStreamModel = model;
     this.pendingInitialUserMessage = pendingUserMessage ?? null;
+    this.pendingCreationInit = pendingCreationInit ?? null;
     this.setPendingStreamStartTime(Date.now());
     this.invalidateCache();
   }
@@ -1707,7 +1714,16 @@ export class StreamingMessageAggregator {
       this.optimisticPendingStreamStart = false;
       this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
       this.clearPendingInitialUserMessage();
+      this.clearPendingCreationInit();
     }
+  }
+
+  private clearPendingCreationInit(): void {
+    if (this.pendingCreationInit === null) {
+      return;
+    }
+    this.pendingCreationInit = null;
+    this.invalidateCache();
   }
 
   private clearPendingInitialUserMessage(): void {
@@ -2049,6 +2065,7 @@ export class StreamingMessageAggregator {
             optimisticPendingStreamStartIdleCaughtUpCount:
               this.optimisticPendingStreamStartIdleCaughtUpCount,
             pendingInitialUserMessage: this.pendingInitialUserMessage,
+            pendingCreationInit: this.pendingCreationInit,
           };
 
     this.clear();
@@ -2064,6 +2081,7 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStartIdleCaughtUpCount =
       pendingStreamSnapshot.optimisticPendingStreamStartIdleCaughtUpCount;
     this.pendingInitialUserMessage = pendingStreamSnapshot.pendingInitialUserMessage;
+    this.pendingCreationInit = pendingStreamSnapshot.pendingCreationInit;
   }
 
   clear(): void {
@@ -3059,6 +3077,7 @@ export class StreamingMessageAggregator {
       }
 
       this.clearReplayInitVisiblePrefix();
+      this.pendingCreationInit = null;
       // A replayed finished init lands as terminal from its first snapshot so the row never
       // flashes "Creating workspace" between the replayed init-start and init-end.
       const completed = data.completed;
@@ -3893,24 +3912,27 @@ export class StreamingMessageAggregator {
         ];
       }
 
-      if (this.initState) {
-        const durationMs =
-          this.initState.endTime !== null
-            ? this.initState.endTime - this.initState.startTime
-            : null;
-        const initMessage: DisplayedMessage = {
-          type: "workspace-init",
-          id: "workspace-init",
-          historySequence: -1,
-          status: this.initState.status,
-          hookPath: this.initState.hookPath,
-          lines: [...this.initState.lines],
-          progress: this.initState.progress,
-          exitCode: this.initState.exitCode,
-          timestamp: this.initState.startTime,
-          durationMs,
-          truncatedLines: this.initState.truncatedLines,
-        };
+      const initMessage: DisplayedMessage | null = this.initState
+        ? {
+            type: "workspace-init",
+            id: "workspace-init",
+            historySequence: -1,
+            status: this.initState.status,
+            hookPath: this.initState.hookPath,
+            lines: [...this.initState.lines],
+            progress: this.initState.progress,
+            exitCode: this.initState.exitCode,
+            timestamp: this.initState.startTime,
+            durationMs:
+              this.initState.endTime !== null
+                ? this.initState.endTime - this.initState.startTime
+                : null,
+            truncatedLines: this.initState.truncatedLines,
+          }
+        : this.pendingCreationInit
+          ? createPendingCreationInitMessage(this.pendingCreationInit)
+          : null;
+      if (initMessage) {
         // Creation belongs to the first user turn, even though init starts before it is persisted.
         const insertionIndex = resultMessages.findIndex((message) => message.type === "user") + 1;
         resultMessages = resultMessages.slice();

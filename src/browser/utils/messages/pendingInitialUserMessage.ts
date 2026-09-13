@@ -29,24 +29,32 @@ export function createPendingUserDisplayedMessage(
   };
 }
 
+export interface PendingCreationInit {
+  /** null while the name is still being generated */
+  workspaceName: string | null;
+  /** Typed names never list a "Generating name" step. */
+  nameGenerated: boolean;
+  kind: "scratch" | undefined;
+  hookPath: string;
+  timestamp: number;
+}
+
 /**
  * Creation progress shown before the backend init stream exists. Scratch chats skip name
  * generation, so their only step is the creation itself.
  */
-export function createPendingCreationInitMessage(input: {
-  workspaceName: string | null;
-  kind: "scratch" | undefined;
-  hookPath: string;
-  timestamp: number;
-}): Extract<DisplayedMessage, { type: "workspace-init" }> {
+export function createPendingCreationInitMessage(
+  input: PendingCreationInit
+): Extract<DisplayedMessage, { type: "workspace-init" }> {
   const step = (line: string) => ({ line, isError: false, step: true });
-  const lines =
+  const steps =
     input.kind === "scratch"
       ? [step("Creating workspace")]
       : [
-          step("Generating name"),
+          ...(input.nameGenerated ? [step("Generating name")] : []),
           ...(input.workspaceName ? [step(`Creating workspace ${input.workspaceName}`)] : []),
         ];
+  const lines = steps.length > 0 ? steps : [step("Creating workspace")];
   return {
     type: "workspace-init",
     id: "workspace-init",
