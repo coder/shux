@@ -26,6 +26,7 @@ import {
   type ToolSet,
   LoadAPIKeyError,
   APICallError,
+  InvalidToolInputError,
   RetryError,
 } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -86,6 +87,10 @@ import {
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
+import {
+  formatToolInputIssues,
+  isToolInputIssueArray,
+} from "@/common/utils/tools/formatToolInputIssues";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   computeActiveToolNames,
@@ -190,9 +195,31 @@ interface ToolCallState {
   toolName: string;
   input: unknown;
   output?: unknown;
+  /** Concise message for a call the SDK rejected before execution; replaces the raw tool-error string. */
+  invalidInputError?: string;
 }
 
 type ToolCallMap = Map<string, ToolCallState>;
+
+/**
+ * The SDK's InvalidToolInputError message echoes the entire submitted input
+ * and buries the zod issue at the end, so the model retries blind. Render only
+ * the issues (with received string lengths) when the cause chain
+ * (InvalidToolInputError -> TypeValidationError -> ZodError) exposes them.
+ */
+function describeInvalidToolInput(toolName: string, input: unknown, error: unknown): string {
+  if (InvalidToolInputError.isInstance(error)) {
+    let cause: unknown = error.cause;
+    for (let depth = 0; depth < 3 && typeof cause === "object" && cause !== null; depth += 1) {
+      const issues: unknown = (cause as { issues?: unknown }).issues;
+      if (isToolInputIssueArray(issues)) {
+        return `Invalid input for tool ${toolName}: ${formatToolInputIssues(issues, input)}`;
+      }
+      cause = (cause as { cause?: unknown }).cause;
+    }
+  }
+  return clampErrorMessage(getErrorMessage(error));
+}
 
 type WorkspaceId = string & { __brand: "WorkspaceId" };
 type StreamToken = string & { __brand: "StreamToken" };
@@ -4080,10 +4107,15 @@ export class StreamManager {
 
               case "tool-call": {
                 // Tool call started - store in map for later lookup
+                const invalidInputError =
+                  part.dynamic === true && part.invalid === true && part.error != null
+                    ? describeInvalidToolInput(part.toolName, part.input, part.error)
+                    : undefined;
                 toolCalls.set(part.toolCallId, {
                   toolCallId: part.toolCallId,
                   toolName: part.toolName,
                   input: part.input,
+                  ...(invalidInputError != null ? { invalidInputError } : {}),
                 });
 
                 // Note: Tool availability is handled by the SDK, which emits tool-error events
@@ -4186,11 +4218,12 @@ export class StreamManager {
                 const errorOutput = {
                   success: false,
                   error:
-                    typeof toolErrorPart.error === "string"
+                    toolCalls.get(toolErrorPart.toolCallId)?.invalidInputError ??
+                    (typeof toolErrorPart.error === "string"
                       ? toolErrorPart.error
                       : toolErrorPart.error instanceof Error
                         ? toolErrorPart.error.message
-                        : getErrorMessage(toolErrorPart.error),
+                        : getErrorMessage(toolErrorPart.error)),
                 };
 
                 // Use shared completion logic (await to ensure partial is flushed before event)

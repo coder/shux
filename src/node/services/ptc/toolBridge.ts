@@ -21,6 +21,7 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import { formatToolInputIssues } from "@/common/utils/tools/formatToolInputIssues";
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
@@ -592,10 +593,9 @@ export class ToolBridge {
     if (typeof schema === "object" && "_def" in schema) {
       const result = (schema as z.ZodType).safeParse(args);
       if (!result.success) {
-        const issues = result.error.issues
-          .map((i) => `${i.path.join(".")}: ${i.message}`)
-          .join("; ");
-        throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+        throw new Error(
+          `Invalid arguments for ${toolName}: ${formatToolInputIssues(result.error.issues, args)}`
+        );
       }
       return result.data;
     }
