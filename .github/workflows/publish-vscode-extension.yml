@@ -1,0 +1,61 @@
+name: Publish VS Code Extension
+
+on:
+  push:
+    tags:
+      - 'vscode-v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.1.42
+
+      - name: Install dependencies
+        working-directory: vscode
+        run: bun install
+
+      - name: Compile extension
+        working-directory: vscode
+        run: bun run compile
+
+      - name: Publish to Marketplace
+        working-directory: vscode
+        run: npx @vscode/vsce publish -p $VSCE_PAT
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Package extension
+        working-directory: vscode
+        run: bun run package
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/vscode-v}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "🤖 VS Code Extension v${{ steps.version.outputs.version }}"
+          body: |
+            _Generated with `cmux`_
+            
+            ## Installation
+            
+            **From VS Code Marketplace:**
+            ```bash
+            code --install-extension coder.cmux
+            ```
+            
+            **From .vsix file:**
+            ```bash
+            code --install-extension cmux-${{ steps.version.outputs.version }}.vsix
+            ```
+          files: vscode/cmux-*.vsix
