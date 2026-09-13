@@ -121,6 +121,171 @@ describe("git diff parser (real repository)", () => {
     expect(nonPhantomLines.every((l) => l.startsWith("+"))).toBe(true);
   });
 
+  it("should parse diff headers with non-literal path prefixes", () => {
+    const diffOutput = [
+      "diff --git c/foo.ts w/foo.ts",
+      "index 1111111..2222222 100644",
+      "--- c/foo.ts",
+      "+++ w/foo.ts",
+      "@@ -1 +1 @@",
+      "-old line",
+      "+new line",
+    ].join("\n");
+
+    const fileDiffs = parseDiff(diffOutput);
+    const allHunks = extractAllHunks(fileDiffs);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].filePath).toBe("foo.ts");
+    expect(fileDiffs[0].oldPath).toBeUndefined();
+    expect(allHunks).toHaveLength(1);
+    expect(allHunks[0].content).toContain("+new line");
+  });
+
+  it("should parse real diffs for paths with spaces", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+
+    const spacedFileName = "file with space.txt";
+    writeFileSync(join(testRepoPath, spacedFileName), "before\n");
+    execSync("git add . && git commit -m 'Add spaced file'", { cwd: testRepoPath });
+
+    writeFileSync(join(testRepoPath, spacedFileName), "after\n");
+
+    const diff = execSync("git diff HEAD", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].filePath).toBe(spacedFileName);
+    expect(fileDiffs[0].oldPath).toBeUndefined();
+    expect(fileDiffs[0].hunks).toHaveLength(1);
+    expect(fileDiffs[0].hunks[0].filePath).toBe(spacedFileName);
+    expect(fileDiffs[0].hunks[0].content).toContain("+after");
+  });
+
+  it("should preserve literal trailing spaces in diff path labels", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+
+    const trailingSpaceFileName = "trailing-space.txt ";
+    writeFileSync(join(testRepoPath, trailingSpaceFileName), "before\n");
+    execSync("git add . && git commit -m 'Add trailing space file'", { cwd: testRepoPath });
+
+    rmSync(join(testRepoPath, trailingSpaceFileName));
+
+    const diff = execSync("git diff HEAD", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].changeType).toBe("deleted");
+    expect(fileDiffs[0].filePath).toBe(trailingSpaceFileName);
+    expect(fileDiffs[0].oldPath).toBe(trailingSpaceFileName);
+    expect(fileDiffs[0].hunks).toHaveLength(1);
+    expect(fileDiffs[0].hunks[0].filePath).toBe(trailingSpaceFileName);
+    expect(fileDiffs[0].hunks[0].oldPath).toBe(trailingSpaceFileName);
+    expect(fileDiffs[0].hunks[0].content).toContain("-before");
+  });
+
+  it("should normalize quoted patch labels for escaped file names", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+
+    const escapedFileName = 'tab\tquote"file.txt';
+    writeFileSync(join(testRepoPath, escapedFileName), "before\n");
+    execSync("git add . && git commit -m 'Add escaped path file'", { cwd: testRepoPath });
+
+    rmSync(join(testRepoPath, escapedFileName));
+
+    const diff = execSync("git diff HEAD", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].changeType).toBe("deleted");
+    expect(fileDiffs[0].filePath).toBe(escapedFileName);
+    expect(fileDiffs[0].oldPath).toBe(escapedFileName);
+    expect(fileDiffs[0].hunks).toHaveLength(1);
+    expect(fileDiffs[0].hunks[0].oldPath).toBe(escapedFileName);
+    expect(fileDiffs[0].hunks[0].content).toContain("-before");
+  });
+
+  it("should preserve nested paths in --no-prefix diffs", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+    execSync("mkdir -p src/common", { cwd: testRepoPath });
+    writeFileSync(join(testRepoPath, "src", "common", "no-prefix.ts"), "old line\n");
+    execSync("git add src/common/no-prefix.ts && git commit -m 'Add nested no-prefix file'", {
+      cwd: testRepoPath,
+    });
+
+    writeFileSync(join(testRepoPath, "src", "common", "no-prefix.ts"), "new line\n");
+
+    const diff = execSync("git diff --no-prefix HEAD", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].filePath).toBe("src/common/no-prefix.ts");
+    expect(fileDiffs[0].oldPath).toBeUndefined();
+    expect(fileDiffs[0].hunks).toHaveLength(1);
+    expect(fileDiffs[0].hunks[0].content).toContain("+new line");
+  });
+
+  it("should parse real mnemonic-prefix diffs", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+    execSync("mkdir -p src/mnemonic", { cwd: testRepoPath });
+    writeFileSync(join(testRepoPath, "src", "mnemonic", "real.ts"), "before\n");
+    execSync("git add src/mnemonic/real.ts && git commit -m 'Add mnemonic test file'", {
+      cwd: testRepoPath,
+    });
+
+    writeFileSync(join(testRepoPath, "src", "mnemonic", "real.ts"), "after\n");
+
+    const diff = execSync("git -c diff.mnemonicPrefix=true diff HEAD", {
+      cwd: testRepoPath,
+      encoding: "utf-8",
+    });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].filePath).toBe("src/mnemonic/real.ts");
+    expect(fileDiffs[0].oldPath).toBeUndefined();
+    expect(fileDiffs[0].hunks[0].content).toContain("+after");
+  });
+
+  it("should parse --no-prefix additions that use /dev/null", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+    execSync("mkdir -p nested/dir", { cwd: testRepoPath });
+    writeFileSync(join(testRepoPath, "nested", "dir", "added-no-prefix.ts"), "added\n");
+    execSync("git add nested/dir/added-no-prefix.ts", { cwd: testRepoPath });
+
+    const diff = execSync("git diff --cached --no-prefix", {
+      cwd: testRepoPath,
+      encoding: "utf-8",
+    });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].changeType).toBe("added");
+    expect(fileDiffs[0].filePath).toBe("nested/dir/added-no-prefix.ts");
+    expect(fileDiffs[0].oldPath).toBeUndefined();
+    expect(fileDiffs[0].hunks[0].header).toMatch(/^@@ -0,0 \+1(?:,1)? @@/);
+  });
+
+  it("should parse --no-prefix deletions that use /dev/null", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+    execSync("mkdir -p deleted/nested", { cwd: testRepoPath });
+    writeFileSync(join(testRepoPath, "deleted", "nested", "gone.ts"), "gone\n");
+    execSync("git add deleted/nested/gone.ts && git commit -m 'Add nested deleted file'", {
+      cwd: testRepoPath,
+    });
+
+    execSync("rm deleted/nested/gone.ts", { cwd: testRepoPath });
+
+    const diff = execSync("git diff --no-prefix HEAD", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].changeType).toBe("deleted");
+    expect(fileDiffs[0].filePath).toBe("deleted/nested/gone.ts");
+    expect(fileDiffs[0].oldPath).toBe("deleted/nested/gone.ts");
+    expect(fileDiffs[0].hunks[0].content).toContain("-gone");
+  });
+
   it("should normalize CRLF diff output (no \\r in hunk content)", () => {
     const diffOutput =
       [
@@ -154,10 +319,10 @@ describe("git diff parser (real repository)", () => {
   });
 
   it("should parse file deletion", () => {
-    // Reset and commit newfile
-    execSync("git add . && git commit -m 'Add newfile'", { cwd: testRepoPath });
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+    writeFileSync(join(testRepoPath, "newfile.md"), "# New File\n\nContent here\n");
+    execSync("git add newfile.md && git commit -m 'Add newfile'", { cwd: testRepoPath });
 
-    // Delete file
     execSync("rm newfile.md", { cwd: testRepoPath });
 
     const diff = execSync("git diff HEAD", { cwd: testRepoPath, encoding: "utf-8" });
@@ -272,6 +437,28 @@ describe("git diff parser (real repository)", () => {
 
     // All hunks should have valid IDs
     expect(allHunks.every((h) => h.id && h.id.length > 0)).toBe(true);
+  });
+
+  it("should normalize quoted rename metadata paths", () => {
+    execSync("git reset --hard HEAD && git clean -fd", { cwd: testRepoPath });
+
+    const originalFileName = 'tab\tquote"name.txt';
+    const renamedFileName = 'tab\tquote"renamed.txt';
+    writeFileSync(join(testRepoPath, originalFileName), "before\n");
+    execSync("git add . && git commit -m 'Add quoted rename source file'", { cwd: testRepoPath });
+
+    execSync(`git mv '${originalFileName}' '${renamedFileName}'`, {
+      cwd: testRepoPath,
+    });
+
+    const diff = execSync("git diff --cached -M", { cwd: testRepoPath, encoding: "utf-8" });
+    const fileDiffs = parseDiff(diff);
+
+    expect(fileDiffs).toHaveLength(1);
+    expect(fileDiffs[0].changeType).toBe("renamed");
+    expect(fileDiffs[0].filePath).toBe(renamedFileName);
+    expect(fileDiffs[0].oldPath).toBe(originalFileName);
+    expect(fileDiffs[0].hunks).toHaveLength(0);
   });
 
   it("should handle pure file rename (no content changes)", () => {
