@@ -17,13 +17,14 @@
  * documented limitation.
  */
 import { EventEmitter } from "events";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
 import { CONTEXT_NOTES_MEMORY_PATH } from "@/common/constants/contextBudget";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
   MEMORY_INDEX_DESCRIPTION_MAX_CHARS,
@@ -47,6 +48,13 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
+import {
+  adoptionTargetStamp,
+  legacyAdoptionManifestPath,
+  LegacyAdoptionManifestMalformedError,
+  readLegacyAdoptionManifest,
+  type LegacyAdoptionRecord,
+} from "@/node/services/memoryLegacyAdoption";
 import {
   resolveWorkspaceMemoryOwnerId,
   workspaceMemoryOwnerResolver,
@@ -378,8 +386,23 @@ interface MemoryStore {
   /** assertRootSafe + create the root if missing (write paths only). */
   ensureRoot(): Promise<void>;
   /** Relative paths of all non-dotfile files under the root, sorted. */
-  listFiles(): Promise<string[]>;
-  kind(relPath: string): Promise<MemoryEntryKind>;
+  /**
+   * Files under the root. Tolerant and bounded by default (self-healing: an
+   * unreadable directory lists as empty; the walk stops past the per-scope
+   * cap); `strict` throws on any traversal failure and is unbounded, for
+   * callers whose decision must not rest on a possibly partial listing.
+   * Dot-entries are omitted unless `includeDotfiles`: listings and the index
+   * hide them, but the path grammar admits them, so a note such as `.note`
+   * is addressable — the legacy adoption pass must see it or removal would
+   * delete the only copy.
+   */
+  listFiles(options?: { strict?: boolean; includeDotfiles?: boolean }): Promise<string[]>;
+  /**
+   * Kind of an entry, null when absent. Tolerant by default (any stat failure
+   * reads as absent); `strict` throws unless the absence is proven (ENOENT /
+   * ENOTDIR), for callers about to overwrite whatever is there.
+   */
+  kind(relPath: string, options?: { strict?: boolean }): Promise<MemoryEntryKind>;
   /**
    * Read at most `maxBytes` from the head of the file. Index/hot-set builds
    * use this so files edited outside MemoryService cannot force unbounded reads
@@ -387,6 +410,8 @@ interface MemoryStore {
    * the result as a best-effort prefix.
    */
   readFilePrefix(relPath: string, maxBytes: number): Promise<string>;
+  /** The same bounded prefix as raw bytes, for callers that must validate the encoding themselves. */
+  readFilePrefixBytes(relPath: string, maxBytes: number): Promise<Buffer>;
   /** Atomic write; creates parent directories. */
   writeFile(relPath: string, content: string): Promise<void>;
   /** Recursive delete of a file or directory. */
@@ -398,6 +423,92 @@ interface MemoryStore {
    * target and require it to stay inside the (realpathed) root. Throws on escape.
    */
   assertContained(relPath: string): Promise<void>;
+}
+
+const LEGACY_IMPORT_DIR = "imported";
+/**
+ * Directory beside the owner's memory root (in its session dir, OUTSIDE the
+ * model-writable memory namespace — a legacy note may legitimately live under
+ * any in-namespace path, dot-entries included) where the adoption pass stages
+ * a copy's bytes before installing them by rename
+ * (adoptLegacyPrivateStoreOrThrow); emptied at the start of every pass.
+ */
+const LEGACY_ADOPTION_STAGING_DIR_NAME = "memory-adoption-staging";
+
+function legacyAdoptionStagingDir(store: MemoryStore): string {
+  return path.join(path.dirname(store.physicalRoot), LEGACY_ADOPTION_STAGING_DIR_NAME);
+}
+
+/**
+ * Pin bit of a manifest record's child sidecar fingerprint. No child entry at
+ * that adoption is the default, unpinned state (a usage entry a downgraded
+ * build creates by merely viewing the note is not a pin transition); null
+ * only for an unparsable fingerprint.
+ */
+function legacySidecarPinned(sidecar: string): boolean | null {
+  if (sidecar === "") return false;
+  try {
+    const parsed: unknown = JSON.parse(sidecar);
+    return typeof parsed === "object" && parsed !== null
+      ? ((parsed as { pinned?: unknown }).pinned ?? false) === true
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Change stamp of a sub-agent's legacy private store: the root directory's
+ * mtime and every listed file's size + mtime — a DOWNGRADED build editing an
+ * existing nested note moves the root mtime no more than a foreign backend's
+ * self-fallback write does. Bounded by the per-scope file cap and paid only
+ * while a legacy directory exists: an over-cap legacy store fingerprints
+ * only the capped prefix of its listing (an edit to a note sorted past it is
+ * picked up by a restart or removal's forced pass); the throttled
+ * full-store fingerprint lands with the multi-backend layer. Missing pieces
+ * read as fixed tokens.
+ */
+async function legacyStoreStamp(legacyRoot: string): Promise<string> {
+  const rootMtime = await fsPromises
+    .stat(legacyRoot)
+    .then((stat) => String(stat.mtimeMs))
+    .catch(() => "missing");
+  const files = await new LocalMemoryStore(legacyRoot)
+    .listFiles({ includeDotfiles: true })
+    .catch(() => []);
+  const fileStamps = await Promise.all(
+    files.map(async (relPath) => {
+      const stamp = await fsPromises
+        .lstat(path.join(legacyRoot, relPath), { bigint: true })
+        .then((stat) => `${stat.size}:${stat.mtimeNs}`)
+        .catch(() => "missing");
+      return `${relPath}=${stamp}`;
+    })
+  );
+  return `${rootMtime}:${fileStamps.join("\u0001")}`;
+}
+
+/** A stat failure that proves the path is absent (vs. one that says nothing about it). */
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * Link-aware kind of a path: symlinks are reported as such, never followed.
+ * "missing" only when proven (ENOENT/ENOTDIR); any other failure (EACCES,
+ * EIO) is "unreadable" — a legacy notebook whose root cannot be inspected
+ * must not read as "nothing to adopt" to a removal about to delete it.
+ */
+async function lstatKind(
+  absPath: string
+): Promise<"dir" | "symlink" | "other" | "missing" | "unreadable"> {
+  try {
+    const stat = await fsPromises.lstat(absPath);
+    return stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "dir" : "other";
+  } catch (error) {
+    return isMissingPathError(error) ? "missing" : "unreadable";
+  }
 }
 
 function isPathWithinRoot(
@@ -442,16 +553,24 @@ class LocalMemoryStore implements MemoryStore {
     await fsPromises.mkdir(this.physicalRoot, { recursive: true });
   }
 
-  async listFiles(): Promise<string[]> {
+  async listFiles(options?: { strict?: boolean; includeDotfiles?: boolean }): Promise<string[]> {
     const results: string[] = [];
     const walk = async (dirRel: string): Promise<void> => {
       // Bounded walk: files may have been edited outside MemoryService. +1 lets
-      // callers detect overflow (e.g. the index logs its truncation).
-      if (results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
+      // callers detect overflow (e.g. the index logs its truncation). Strict
+      // callers need the COMPLETE set (an omitted file would silently count
+      // as "nothing to adopt" and could lose its only copy), so the bound
+      // does not apply to them.
+      if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
       let entries;
       try {
         entries = await fsPromises.readdir(this.abs(dirRel), { withFileTypes: true });
-      } catch {
+      } catch (error) {
+        // Strict callers (removal's legacy handover) must not take a partial
+        // listing for the whole; a missing ROOT is the genuine empty case.
+        if (options?.strict === true && !(dirRel === "" && hasErrorCode(error, "ENOENT"))) {
+          throw error;
+        }
         return; // Self-healing: missing/unreadable dirs list as empty.
       }
       // Iterate in path-string order — directories key as "name/" so the DFS
@@ -466,8 +585,8 @@ class LocalMemoryStore implements MemoryStore {
       });
       for (const entry of entries) {
         // Per-entry cap: a single flat directory can exceed the cap on its own.
-        if (results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
-        if (entry.name.startsWith(".")) continue;
+        if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
+        if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
         if (entry.isDirectory()) {
           await walk(childRel);
@@ -480,21 +599,26 @@ class LocalMemoryStore implements MemoryStore {
     return results.sort();
   }
 
-  async kind(relPath: string): Promise<MemoryEntryKind> {
+  async kind(relPath: string, options?: { strict?: boolean }): Promise<MemoryEntryKind> {
     try {
       const stat = await fsPromises.stat(this.abs(relPath));
       return stat.isDirectory() ? "dir" : "file";
-    } catch {
+    } catch (error) {
+      if (options?.strict === true && !isMissingPathError(error)) throw error;
       return null;
     }
   }
 
   async readFilePrefix(relPath: string, maxBytes: number): Promise<string> {
+    return (await this.readFilePrefixBytes(relPath, maxBytes)).toString("utf-8");
+  }
+
+  async readFilePrefixBytes(relPath: string, maxBytes: number): Promise<Buffer> {
     const handle = await fsPromises.open(this.abs(relPath), "r");
     try {
       const buffer = Buffer.alloc(maxBytes);
       const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
-      return buffer.subarray(0, bytesRead).toString("utf-8");
+      return buffer.subarray(0, bytesRead);
     } finally {
       await handle.close();
     }
@@ -753,6 +877,13 @@ export class MemoryService extends EventEmitter {
   private readonly ownerByContext = new WeakMap<MemoryScopeContext, string>();
 
   /**
+   * Sub-agents whose pre-sharing private notebook was found absent or already
+   * adopted during this process lifetime, keyed to the owner and legacy-store
+   * state observed at the time (see adoptLegacyPrivateStore).
+   */
+  private readonly legacyStoreCheckedAgainst = new Map<string, string>();
+
+  /**
    * Owner of the workspace scope for this context ("" when there is no
    * workspace). Public so callers that key sidecar metadata for the same
    * context (memoryOperations) bind to the exact owner the store resolved to.
@@ -787,7 +918,8 @@ export class MemoryService extends EventEmitter {
    * file about to be removed. A guard run before the command against a
    * separately resolved owner (the private-store fallback while config.json
    * was unreadable) would check the wrong sidecar entries and let an
-   * owner-pinned note go.
+   * owner-pinned note go. Strict sidecar read: an unreadable pin file must
+   * refuse, not read as "nothing pinned".
    */
   private async assertNotPinnedForRemoval(
     ctx: MemoryScopeContext,
@@ -798,7 +930,7 @@ export class MemoryService extends EventEmitter {
     const key = this.logicalKeyFor(ctx, scope, relPath);
     if (key === null) return;
     const subtreePrefix = `${key}/`;
-    for (const [entryKey, entry] of await this.metaService.getEntries()) {
+    for (const [entryKey, entry] of await this.metaService.getEntriesOrThrow()) {
       if (entry.pinned !== true) continue;
       if (entryKey === key || entryKey.startsWith(subtreePrefix)) {
         throw new MemoryCommandError(
@@ -964,10 +1096,767 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Every workspace-scope entry point (commands, root listing, index build)
-   * goes through here: refuse revoked access.
+   * goes through here: refuse revoked access, then fold a sub-agent's
+   * pre-sharing private notebook into the shared store it now resolves to.
    */
   private async openWorkspaceStore(ctx: MemoryScopeContext, store: MemoryStore): Promise<void> {
     await this.assertWorkspaceStoreReadable(ctx, store);
+    await this.adoptLegacyPrivateStore(ctx, store);
+    // The adoption pass waits for and holds the owner-store lock, a window in
+    // which another backend's removal can publish the acting workspace's (or
+    // the owner's) tombstone. The pass itself refuses on its commit guard
+    // and swallows that as a retryable adoption failure, so re-check here:
+    // the caller is about to read the owner's still-live notebook on behalf
+    // of a workspace that no longer exists.
+    await this.assertWorkspaceStoreReadable(ctx, store);
+  }
+
+  /**
+   * Upgrade compatibility for the shared task-tree notebook. Sub-agents
+   * created by builds before sharing kept `/memories/workspace` in their OWN
+   * session dir (<sessionsDir>/<child>/memory). getStore now redirects them to
+   * the owner's root, which would make those notes invisible — and removal
+   * later deletes the child's session dir, discarding them for good. On the
+   * child's first shared-store access per process, copy every legacy file
+   * into the owner store (same relPath when free or identical; otherwise
+   * under imported/<child>/) and copy pins/stats to the owner key.
+   *
+   * The legacy directory is left in place, untouched: it is exactly where a
+   * DOWNGRADED build reads (and writes) this child's notebook, so the notes
+   * stay visible across upgrade↔downgrade (the child-keyed sidecar entries
+   * stay for the same reason) and files the import cannot carry
+   * (binary/oversize, doubly conflicting) are never moved anywhere.
+   * The copy is idempotent — identical files are skipped, differing ones land
+   * under imported/<child>/ — so notes edited during a downgrade are folded in
+   * again on the next upgrade. Writes made through the shared store meanwhile
+   * live in the owner's notebook, which the downgraded build shows there.
+   *
+   * Security: the legacy root must be a real directory (a symlinked root
+   * would let an index build copy arbitrary host text into the shared
+   * notebook and the model's context), and every file passes the store's
+   * containment check before it is read. Runs under the owner store's
+   * mutation lock with the same commit guard as file mutations, and never
+   * throws: a failure (lock timeout, disk) is retried on the next access,
+   * while the caller proceeds with the shared store. Not journaled: this is
+   * a mechanical copy, not an agent edit; pre-upgrade child journal rows keep
+   * targeting the legacy physical paths.
+   */
+  private async adoptLegacyPrivateStore(
+    ctx: MemoryScopeContext,
+    store: MemoryStore
+  ): Promise<void> {
+    const childId = ctx.workspaceId;
+    if (childId === "") return;
+    const owner = this.storeOwnerWorkspaceId(store);
+    assert(owner !== null, "workspace-scope stores live under sessionsDir");
+    if (owner === childId) {
+      // Not redirected: the private store IS the store. Recorded so a later
+      // redirect (config recovered) is seen as a change of the key below.
+      this.legacyStoreCheckedAgainst.set(childId, owner);
+      // The OWNER's access adopts its descendants' legacy notebooks too: a
+      // sub-agent that finished before the upgrade never touches memory
+      // again, and without this its notes would stay invisible to the owner
+      // until the child's removal hands them over.
+      await this.adoptDescendantLegacyStores(ctx, store, owner);
+      return;
+    }
+    try {
+      await this.adoptLegacyPrivateStoreOrThrow(ctx, store, owner);
+    } catch (error) {
+      log.warn(
+        "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook; retrying on next access",
+        {
+          childId,
+          owner,
+          error,
+        }
+      );
+    }
+  }
+
+  /**
+   * Access-time adoption on behalf of every registered workspace resolving
+   * to `owner` (one config snapshot per pass). Each child costs one lstat of
+   * its legacy root when there is nothing to adopt — an absent root is
+   * skipped outright, an unchanged one is answered by the per-child memo —
+   * and a failing child never fails the owner's access (logged, retried on
+   * the next access like the child's own pass).
+   */
+  private async adoptDescendantLegacyStores(
+    ctx: MemoryScopeContext,
+    store: MemoryStore,
+    owner: string
+  ): Promise<void> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    for (const project of cfg.projects.values()) {
+      for (const workspace of project.workspaces) {
+        const childId = workspace.id;
+        if (childId === undefined || childId === owner || resolve(childId) !== owner) continue;
+        const legacyRoot = path.join(this.config.sessionsDir, childId, "memory");
+        if ((await lstatKind(legacyRoot)) === "missing") continue;
+        const childCtx: MemoryScopeContext = {
+          runtime: null,
+          checkoutCwd: "",
+          workspaceId: childId,
+          projectPath: ctx.projectPath,
+        };
+        try {
+          await this.adoptLegacyPrivateStoreOrThrow(childCtx, store, owner);
+        } catch (error) {
+          log.warn(
+            "[MemoryService] failed to adopt a sub-agent's legacy workspace notebook on the owner's behalf; retrying on next access",
+            { childId, owner, error }
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Removal handover: before a sub-agent's session directory is deleted,
+   * fold its legacy private notebook (if any) into the owner store. The
+   * access-time adoption above only runs when some workspace-memory entry
+   * point serves the child; a child removed right after an upgrade (an
+   * inactive-descendant deletion cascade, say) may never have had one, and
+   * the deletion would discard its notes for good. Runs BEFORE any teardown
+   * step (removal reuses the owner it verified), so a failure aborts the
+   * removal with the workspace intact: this variant THROWS instead of
+   * deferring to a next access that will never come — also when a listed
+   * note could not be represented in the owner store (shared notebook at its
+   * file cap, both destinations taken by different content, unreadable as
+   * text): the pass would count it as skipped and the deletion would take
+   * the only copy. Removal runs it twice: pre-teardown, and again inside the
+   * removal locks (`locksHeld`, the owner-store lock among them) right before
+   * the tombstone, catching a note a self-fallback backend committed into the
+   * legacy directory in between — the child's own store lock is held there
+   * too, so nothing can land after that pass.
+   */
+  async adoptLegacyPrivateStoreForRemoval(
+    childWorkspaceId: string,
+    ownerWorkspaceId: string,
+    options?: { locksHeld: boolean }
+  ): Promise<void> {
+    assert(childWorkspaceId.length > 0, "adoptLegacyPrivateStoreForRemoval requires a child id");
+    assert(
+      ownerWorkspaceId.length > 0 && ownerWorkspaceId !== childWorkspaceId,
+      "adoptLegacyPrivateStoreForRemoval requires a distinct owner id"
+    );
+    // Workspace-scope keys and roots embed only the workspace id (see
+    // logicalKeyFor / getStore), so no project identity is needed here.
+    const ctx: MemoryScopeContext = {
+      runtime: null,
+      checkoutCwd: "",
+      workspaceId: childWorkspaceId,
+      projectPath: "",
+    };
+    const store = this.getStore(ctx, "workspace");
+    // The store resolved from current config must be the owner removal
+    // verified; a disagreement means the topology changed under removal's
+    // feet, and adopting into the wrong notebook would be worse than aborting.
+    const resolvedOwner = this.storeOwnerWorkspaceId(store);
+    if (resolvedOwner !== ownerWorkspaceId) {
+      throw new Error(
+        `shared memory owner of ${childWorkspaceId} resolved to ${String(resolvedOwner)} while removal verified ${ownerWorkspaceId}`
+      );
+    }
+    const { skipped } = await this.adoptLegacyPrivateStoreOrThrow(ctx, store, ownerWorkspaceId, {
+      force: true,
+      locksHeld: options?.locksHeld === true,
+    });
+    if (skipped > 0) {
+      throw new Error(
+        `${skipped} legacy workspace memory note(s) of ${childWorkspaceId} could not be folded into ${ownerWorkspaceId}'s shared notebook (full, conflicting, or not text); removing the session directory would discard them`
+      );
+    }
+  }
+
+  /**
+   * Fingerprint of a sub-agent's legacy private notebook as seen by the
+   * adoption pass: owner, legacy root kind, the legacy store's stamp (root
+   * entry, listed files' size/mtime) and the child-keyed sidecar entries.
+   * Cheap when no legacy root exists (one lstat).
+   */
+  private async legacyAdoptionCheckKey(
+    childId: string,
+    owner: string
+  ): Promise<{ legacyRootKind: Awaited<ReturnType<typeof lstatKind>>; checkKey: string }> {
+    const childSessionDir = path.join(this.config.sessionsDir, childId);
+    const legacyRoot = path.join(childSessionDir, "memory");
+    const legacyRootKind = await lstatKind(legacyRoot);
+    // Workspace-scope keys embed only the workspace id (see logicalKeyFor).
+    const childKeyPrefix = memoryLogicalKey("workspace", "", {
+      projectPath: "",
+      workspaceId: childId,
+    });
+    const childSidecarFingerprint =
+      legacyRootKind === "dir"
+        ? JSON.stringify(
+            [...(await this.metaService.getEntries())]
+              .filter(([key]) => key.startsWith(childKeyPrefix))
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          )
+        : "";
+    const legacyStamp = legacyRootKind !== "dir" ? "" : await legacyStoreStamp(legacyRoot);
+    const checkKey = `${owner}\u0000${legacyRootKind}\u0000${legacyStamp}\u0000${childSidecarFingerprint}`;
+    return { legacyRootKind, checkKey };
+  }
+
+  /**
+   * The adoption pass (see adoptLegacyPrivateStore). `force` skips the
+   * per-process "already checked" memo: removal wants the pass to run against
+   * the current legacy directory regardless of what an earlier access saw.
+   * `locksHeld`: the caller already holds the owner store's mutation lock
+   * (removal's in-lock delta pass), so it is not re-acquired. Returns how many
+   * listed legacy notes could NOT be represented in the owner store this pass.
+   */
+  private async adoptLegacyPrivateStoreOrThrow(
+    ctx: MemoryScopeContext,
+    store: MemoryStore,
+    owner: string,
+    options?: { force: boolean; locksHeld?: boolean }
+  ): Promise<{ skipped: number }> {
+    const childId = ctx.workspaceId;
+    // Checked once per (child, owner, legacy-store state) per process. The
+    // owner is part of the key because ownership can move: a command served
+    // while config.json was missing/malformed resolves the child to itself
+    // and writes into the legacy dir. The legacy store's own state is part of
+    // it because ANOTHER backend can do the same while this process's
+    // resolution never changes: its self-fallback write replaces a root entry
+    // and moves the listed files' size/mtime, so either signal re-runs the
+    // pass. The child-keyed sidecar entries are the fourth input: a
+    // downgraded build can change only a pin or usage counter, which the
+    // manifest reconciles (sidecar fingerprint) but no file stat shows. The
+    // pass itself is idempotent.
+    const childSessionDir = path.join(this.config.sessionsDir, childId);
+    const legacyRoot = path.join(childSessionDir, "memory");
+    const { legacyRootKind, checkKey } = await this.legacyAdoptionCheckKey(childId, owner);
+    if (options?.force !== true && this.legacyStoreCheckedAgainst.get(childId) === checkKey) {
+      return { skipped: 0 };
+    }
+    // Not "nothing to adopt": a root that could not be inspected may hold the
+    // only copy of downgrade-era notes. Access-time callers log and retry;
+    // removal aborts with the session intact.
+    const unreadableRoot = (): Error =>
+      new Error(`the legacy workspace memory root of ${childId} could not be inspected`);
+    if (legacyRootKind === "unreadable") throw unreadableRoot();
+    if (legacyRootKind !== "dir") {
+      if (legacyRootKind === "symlink") {
+        log.warn("[MemoryService] ignoring a symlinked legacy workspace memory root", {
+          childId,
+          legacyRoot,
+        });
+      }
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
+      return { skipped: 0 };
+    }
+    // Files adopted this pass (bytes written OR only their sidecar entries
+    // folded in): either changes what the shared store's readers derive from it.
+    let adoptedCount = 0;
+    // Notes left unrepresented, split by what a retry against the SAME legacy
+    // store could change: permanent skips (over the cap, doubly conflicting,
+    // not text, escaping destination) need the legacy or owner store to
+    // change first; transient ones (an fs error on a read, stage, install or
+    // sidecar write) may clear on their own, so they keep the pass unmemoized.
+    let skipped = 0;
+    let transientSkips = 0;
+    const pass = async (): Promise<void> => {
+      await this.assertMutationCommittable(ctx, store, undefined, toVirtualPath("workspace", ""));
+      const rootKindUnderLock = await lstatKind(legacyRoot);
+      if (rootKindUnderLock === "unreadable") throw unreadableRoot();
+      if (rootKindUnderLock !== "dir") return; // swapped while waiting for the lock
+      const legacy = new LocalMemoryStore(legacyRoot);
+      // Strict: a note omitted by a partial listing would count as "nothing
+      // to adopt" (skipped stays 0) and removal would then delete its only
+      // copy. A traversal failure fails the pass instead (access-time:
+      // retried on the next access; removal: aborted, session intact).
+      // Dot-entries included: no listing shows them, but the path grammar
+      // admits them, so `.note` may be a real note of the downgraded child.
+      const files = await legacy.listFiles({ strict: true, includeDotfiles: true });
+      // What was already folded in, kept in the child's session dir OUTSIDE
+      // the legacy root (which is a downgraded build's model-writable
+      // namespace; see legacyAdoptionManifestPath): per relPath the content
+      // hash, the fingerprint of the child-keyed sidecar entry, and where the
+      // copy landed. Content: without it, a note later edited through the shared
+      // store would be re-imported as a stale duplicate on every backend
+      // start. Sidecar: a downgraded build can change only a pin or usage
+      // stats, which must reach the owner key without the bytes changing.
+      // Strict reads throughout: this pass decides what the handover may
+      // consider done (and removal then deletes the child session on that
+      // basis), so a transiently unreadable manifest, sidecar or owner
+      // listing must fail the pass rather than stand in as "empty".
+      const manifestPath = legacyAdoptionManifestPath(childSessionDir);
+      const adopted = await this.readOrQuarantineAdoptionManifest(manifestPath, childId);
+      const sidecarEntries = await this.metaService.getEntriesOrThrow();
+      // The per-scope file cap is a store invariant (create/rename enforce
+      // it): the copy stops at the owner store's remaining capacity so a
+      // combined notebook cannot exceed it — an over-full scope is silently
+      // truncated by the index and refuses every later create. Files left
+      // behind stay unrecorded and are retried once space frees up. Complete
+      // owner listing: an undercount would let the copy push the store past
+      // the cap and hide an adopted note's only copy once readable again.
+      let remainingCapacity =
+        MEMORY_MAX_FILES_PER_SCOPE - (await store.listFiles({ strict: true })).length;
+      // Staged bytes a crashed pass never installed: their records claim
+      // nothing (no file carries the receipt), so they are simply dropped.
+      const stagingDir = legacyAdoptionStagingDir(store);
+      await fsPromises.rm(stagingDir, { recursive: true, force: true });
+      let capacityExhausted = false;
+      let manifestDirty = false;
+      let imported = 0;
+      const writeManifest = () =>
+        writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
+          encoding: "utf-8",
+        });
+      for (const relPath of files) {
+        // Same gates as a memory command. Name first: a legacy file whose
+        // name the path grammar rejects (traversal-looking segments, control
+        // characters, XML metacharacters) can never be addressed through the
+        // shared store, so it is never copied there — a permanent skip that
+        // removal reports like any other unrepresentable note.
+        try {
+          parseMemoryPath(toVirtualPath("workspace", relPath));
+        } catch {
+          skipped++;
+          continue;
+        }
+        // Then containment (no symlink escape), size cap, and text-only.
+        // Dot-entries too (r73): `.note` is addressable, so a real note
+        // there may hold text `create` permitted or be transiently
+        // unreadable — exempting dot-entries would report a complete
+        // handover and let removal take the only copy. A stray `.DS_Store`
+        // costs a forced removal, never a note.
+        let bytes: Buffer;
+        try {
+          await legacy.assertContained(relPath);
+          bytes = await legacy.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
+        } catch (error) {
+          skipped++;
+          // An escaping path is permanent; a read failure (EACCES, EIO) may clear.
+          if (!(error instanceof MemoryCommandError)) transientSkips++;
+          continue;
+        }
+        if (bytes.length > MEMORY_MAX_FILE_BYTES) {
+          skipped++;
+          continue;
+        }
+        // Strict decode: invalid UTF-8 cannot be carried by a text write, but a
+        // note that legitimately contains U+FFFD must not be mistaken for one
+        // (a lossy decode would make the two indistinguishable).
+        let content: string;
+        try {
+          content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch {
+          skipped++;
+          continue;
+        }
+        const childKey = memoryLogicalKey("workspace", relPath, {
+          projectPath: ctx.projectPath,
+          workspaceId: childId,
+        });
+        const childEntry = sidecarEntries.get(childKey);
+        const record: LegacyAdoptionRecord = {
+          content: sha256Hex(content),
+          sidecar: childEntry === undefined ? "" : JSON.stringify(childEntry),
+          target: "",
+          created: false,
+        };
+        const previous = adopted.get(relPath);
+        if (
+          previous?.content === record.content &&
+          previous.sidecar === record.sidecar &&
+          previous.pending !== true
+        ) {
+          continue; // folded in earlier, nothing changed since
+        }
+        let target: { relPath: string; write: boolean } | null = null;
+        // A child's pin toggle folds into the copy only while the copy is
+        // this adoption's generation (see below) or the owner's identical
+        // note it was folded into at first adoption; a copy the owner
+        // replaced since keeps the owner's pin.
+        let foldChildPin = true;
+        if (previous !== undefined) {
+          // The recorded target is reused only while it still holds bytes
+          // this adoption put there — the owner may have edited, replaced or
+          // deleted it since, and the child's note must not land on unrelated
+          // content or a missing file. Unchanged legacy bytes (only the
+          // sidecar moved): reuse without a write. Otherwise the note is
+          // placed anew (legacyImportTarget: a legacy note edited on the
+          // downgraded build lands under imported/<child>/ beside the copy of
+          // its earlier bytes). Inspected strictly: a prior target that
+          // merely cannot be stat'ed or read right now is not "replaced" —
+          // retry on the next access instead (the pass stays incomplete).
+          let priorContent: string | null;
+          try {
+            priorContent = await this.inspectAdoptedCopy(store, previous.target);
+          } catch (error) {
+            log.warn(
+              "[MemoryService] cannot inspect an adopted note's prior copy; retrying later",
+              { childId, owner, relPath, target: previous.target, error }
+            );
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          if (priorContent === content) {
+            // Ours only while the copy is the generation this adoption
+            // installed (LegacyAdoptionRecord.targetStamp — a receipt taken
+            // on the staged bytes BEFORE they appear at the target, so even a
+            // pass interrupted between manifest and install left one).
+            // Identical bytes in another generation are the owner's: the
+            // owner may have deleted and recreated the note with the very
+            // same bytes, or — a pass interrupted before its install —
+            // another backend may have created it at the planned target.
+            // `pending` alone is never provenance: a stamp-less pending
+            // record (an older build's) is ambiguous and claims nothing.
+            const currentStamp =
+              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+            const ours =
+              previous.created === true &&
+              currentStamp !== undefined &&
+              currentStamp === previous.targetStamp;
+            target = { relPath: previous.target, write: false };
+            record.created = ours;
+            record.targetStamp = ours ? currentStamp : undefined;
+            foldChildPin = !(previous.created === true && !ours);
+          }
+        }
+        if (target === null) {
+          // A destination that cannot be inspected right now (EACCES, EIO on
+          // its lstat or read) is neither free nor different: the note waits
+          // for the next pass with no copy made and no record written.
+          try {
+            target = await this.legacyImportTarget(store, childId, relPath, content);
+          } catch (error) {
+            log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
+              childId,
+              owner,
+              relPath,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          if (target === null) {
+            skipped++;
+            continue;
+          }
+        }
+        if (target.write) {
+          if (remainingCapacity <= 0) {
+            capacityExhausted = true;
+            skipped++;
+            continue;
+          }
+          // Destination containment immediately before the write (the
+          // same check a memory create runs): a symlinked component under
+          // the owner root — e.g. imported/<child> pointing elsewhere —
+          // must never let the copy land outside the shared notebook.
+          try {
+            await store.assertContained(target.relPath);
+          } catch (error) {
+            log.warn("[MemoryService] legacy note destination escapes the shared store; skipped", {
+              childId,
+              relPath,
+              target: target.relPath,
+              error,
+            });
+            skipped++;
+            continue;
+          }
+          // Staged install: the bytes are written to a hidden staging entry
+          // of the owner store first and their identity taken there (a
+          // rename keeps ino, size and mtime), so the manifest can record the
+          // receipt of the copy BEFORE the copy appears at the target. A pass
+          // interrupted at any point then leaves a record that either names
+          // a file not yet there (nothing claimed) or names the installed
+          // generation by stamp; a plain byte match never has to stand in
+          // for provenance. Without the record, an installed copy would read
+          // as the owner's own note.
+          const stagingPath = path.join(stagingDir, randomUUID());
+          try {
+            await fsPromises.mkdir(stagingDir, { recursive: true });
+            await writeFileAtomic(stagingPath, content, { encoding: "utf-8" });
+          } catch (error) {
+            log.warn("[MemoryService] cannot stage a legacy note for adoption; retrying later", {
+              childId,
+              relPath,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          const stagedStamp = await adoptionTargetStamp(stagingPath);
+          if (stagedStamp === null) {
+            await fsPromises.rm(stagingPath, { force: true });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          adopted.set(relPath, {
+            ...record,
+            target: target.relPath,
+            created: true,
+            pending: true,
+            targetStamp: stagedStamp,
+          });
+          await writeManifest();
+          // The destination as decided above, re-checked under the lock right
+          // before the install: a fresh placement must still be free.
+          // Anything else is owner state the rename must not clobber — the
+          // staged bytes are dropped, the record restored, and the note is
+          // placed on the next pass.
+          const installable = (await store.kind(target.relPath, { strict: true })) === null;
+          const restoreRecord = async () => {
+            await fsPromises.rm(stagingPath, { force: true });
+            if (previous === undefined) adopted.delete(relPath);
+            else adopted.set(relPath, previous);
+            await writeManifest();
+          };
+          if (!installable) {
+            await restoreRecord();
+            log.warn(
+              "[MemoryService] adoption destination changed before install; retrying later",
+              {
+                childId,
+                relPath,
+                target: target.relPath,
+              }
+            );
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          // The install: same session dir, so a plain rename (an EXDEV — the
+          // memory root mounted apart from its session dir — fails this note,
+          // not the pass).
+          try {
+            const destination = store.physicalPath(target.relPath);
+            await fsPromises.mkdir(path.dirname(destination), { recursive: true });
+            await fsPromises.rename(stagingPath, destination);
+          } catch (error) {
+            await restoreRecord();
+            log.warn("[MemoryService] cannot install a staged legacy note; retrying later", {
+              childId,
+              relPath,
+              target: target.relPath,
+              error,
+            });
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          remainingCapacity--;
+          imported++;
+          record.created = true;
+          // The generation of the file just installed (see targetStamp): the
+          // staged receipt, unless the filesystem re-stamped the rename.
+          record.targetStamp =
+            (await adoptionTargetStamp(store.physicalPath(target.relPath))) ?? undefined;
+        }
+        record.target = target.relPath;
+        // Pins/stats were keyed by the child: fold them into the owner key.
+        // The child-keyed entry stays — like the legacy file, it is what a
+        // downgraded build reads. Recorded in the manifest only once this
+        // succeeded, so an adoption interrupted after its writeFile (or a
+        // failing sidecar write) retries this step on the next access. A
+        // first adoption keeps the owner's own pin (a note the owner tracked
+        // independently); a PIN the CHILD toggled since its last adoption
+        // (downgrade-time pin/unpin) is the newer intent and wins. Only the
+        // pin bit counts for that: a downgraded build merely viewing the note
+        // changes its usage counters, which must not drag the owner's pin
+        // back to the child's unchanged value.
+        if (childEntry !== undefined) {
+          // A pending record still carries the sidecar state it was recorded
+          // with: a fresh adoption's is the child's current state (no
+          // transition → first-adoption semantics).
+          const priorPinned = previous === undefined ? null : legacySidecarPinned(previous.sidecar);
+          // Only an actual boolean transition of the child's pin overrides
+          // the owner's; an unknown prior state never does.
+          const childPinChanged = priorPinned !== null && priorPinned !== childEntry.pinned;
+          try {
+            await this.metaService.mergeKeys(
+              childKey,
+              memoryLogicalKey("workspace", target.relPath, {
+                projectPath: ctx.projectPath,
+                workspaceId: owner,
+              }),
+              { pinned: childPinChanged && foldChildPin ? "source" : "target" }
+            );
+          } catch (error) {
+            log.warn(
+              "[MemoryService] failed to fold legacy memory stats into the shared store; retrying on next access",
+              { relPath, error }
+            );
+            // Counts as skipped: the note's pin/usage metadata is still
+            // stranded under the child key, and removal must not delete the
+            // child session (the only trigger for a retry) on that basis.
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+        }
+        adopted.set(relPath, record);
+        manifestDirty = true;
+        adoptedCount++;
+      }
+      if (manifestDirty) await writeManifest();
+      await fsPromises.rm(stagingDir, { recursive: true, force: true });
+      if (capacityExhausted) {
+        log.warn(
+          "[MemoryService] shared workspace notebook is full; legacy notes left in the sub-agent's private directory until space frees up",
+          { childId, owner, cap: MEMORY_MAX_FILES_PER_SCOPE }
+        );
+      }
+      if (adoptedCount > 0) {
+        log.info(
+          "[MemoryService] adopted a sub-agent's legacy workspace notebook into the shared store",
+          { childId, owner, imported, skipped }
+        );
+      }
+    };
+    if (options?.locksHeld === true) {
+      await pass();
+    } else {
+      await withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), pass);
+    }
+    // Recorded against the state observed BEFORE the pass: a foreign write
+    // landing during it changes the stamp and re-runs the (idempotent) pass.
+    // Memoized even when notes were left PERMANENTLY unrepresented (owner
+    // store full, both destinations taken, not text): an unchanged legacy
+    // store cannot adopt more on a retry, and re-walking it on every access
+    // would make a stuck note a per-access tax — owner-side state the key
+    // does not observe (freed capacity) is picked up by the next
+    // legacy-store change, a process restart, or removal's forced pass. A
+    // TRANSIENT failure (permission interval, ENOSPC, a sidecar write) may
+    // clear by itself, so the pass stays unmemoized and the next access
+    // retries it.
+    if (transientSkips === 0) {
+      this.legacyStoreCheckedAgainst.set(childId, checkKey);
+    } else {
+      this.legacyStoreCheckedAgainst.delete(childId);
+    }
+    if (adoptedCount > 0) this.emitChange(ctx, "workspace", "", "agent");
+    return { skipped };
+  }
+
+  /**
+   * Strict manifest read that self-heals a MALFORMED file: its bytes are the
+   * file's state, and refusing forever would block every access-time pass
+   * and non-forced removal of the child. The file is quarantined beside
+   * itself (`<name>.malformed-<ts>`) and the pass continues from an empty
+   * record map — safe because adoption is idempotent: identical files are
+   * skipped and differing ones land under imported/<child>/. Only the
+   * provenance of copies this adoption created is lost (they read as the
+   * owner's own from now on). An UNREADABLE manifest (EACCES, EIO) still
+   * fails the pass, as does a quarantine rename that fails.
+   */
+  private async readOrQuarantineAdoptionManifest(
+    manifestPath: string,
+    childId: string
+  ): Promise<Map<string, LegacyAdoptionRecord>> {
+    try {
+      return await readLegacyAdoptionManifest(manifestPath, { strict: true });
+    } catch (error) {
+      if (!(error instanceof LegacyAdoptionManifestMalformedError)) throw error;
+      const quarantined = `${manifestPath}.malformed-${Date.now()}`;
+      try {
+        await fsPromises.rename(manifestPath, quarantined);
+      } catch (renameError) {
+        log.warn("[MemoryService] cannot quarantine a malformed legacy adoption manifest", {
+          childId,
+          manifestPath,
+          error: renameError,
+        });
+        throw error;
+      }
+      log.warn(
+        "[MemoryService] quarantined a malformed legacy adoption manifest; re-adopting from scratch",
+        { childId, manifestPath, quarantined, error: getErrorMessage(error) }
+      );
+      return new Map();
+    }
+  }
+
+  /**
+   * Where a legacy file lands in the owner store: its own relPath when free
+   * (write) or already identical (no write); the per-child import directory
+   * when the owner has different content there; null when even that slot is
+   * taken by different content (the file stays only in the legacy directory).
+   */
+  private async legacyImportTarget(
+    store: MemoryStore,
+    childId: string,
+    relPath: string,
+    content: string
+  ): Promise<{ relPath: string; write: boolean } | null> {
+    for (const candidate of [relPath, `${LEGACY_IMPORT_DIR}/${childId}/${relPath}`]) {
+      // Never even compare through an escaping path (the write site re-checks).
+      const contained = await store.assertContained(candidate).then(
+        () => true,
+        () => false
+      );
+      if (!contained) continue;
+      const destination = await this.inspectAdoptionDestination(store, candidate);
+      if (destination === "free") return { relPath: candidate, write: true };
+      if (destination.content === content) return { relPath: candidate, write: false };
+    }
+    return null;
+  }
+
+  /**
+   * Content of an adopted note's copy in the owner store, or null when no
+   * regular listed file is there (absent, a directory, a symlink, or grown
+   * past the cap — each a change the owner made). Throws when the copy
+   * cannot be inspected at all (EACCES, EIO): callers retry later.
+   */
+  private async inspectAdoptedCopy(store: MemoryStore, relPath: string): Promise<string | null> {
+    const contained = await store.assertContained(relPath).then(
+      () => true,
+      () => false
+    );
+    if (!contained) return null;
+    const destination = await this.inspectAdoptionDestination(store, relPath);
+    return destination === "free" ? null : destination.content;
+  }
+
+  /**
+   * What an adoption destination in the owner store holds: "free" when
+   * nothing is there, else the text of a regular, in-cap, valid-UTF-8 file —
+   * or `content: null` for anything a legacy note can never equal (a
+   * directory, a symlink, a FIFO/socket/device, a file over the cap or not
+   * UTF-8), which is owner state the caller must neither read nor clobber.
+   * The type is settled by lstat BEFORE anything opens the entry: open() on a
+   * FIFO blocks until a peer shows up and would hang the pass. Destination
+   * bytes are decoded strictly for the same reason legacy bytes are: a lossy
+   * decode reads invalid UTF-8 as U+FFFD and would settle a legacy note that
+   * literally contains U+FFFD as "already present", leaving its only copy in
+   * the legacy directory. Throws when the entry cannot be inspected at all
+   * (EACCES, EIO): a transient failure the callers retry later, never a
+   * mismatch — declaring it free would clobber the owner's note, declaring it
+   * different would duplicate the child's under imported/<child>/.
+   */
+  private async inspectAdoptionDestination(
+    store: MemoryStore,
+    relPath: string
+  ): Promise<"free" | { content: string | null }> {
+    let isRegularFile: boolean;
+    try {
+      isRegularFile = (await fsPromises.lstat(store.physicalPath(relPath))).isFile();
+    } catch (error) {
+      if (isMissingPathError(error)) return "free";
+      throw error;
+    }
+    if (!isRegularFile) return { content: null };
+    const bytes = await store.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
+    if (bytes.length > MEMORY_MAX_FILE_BYTES) return { content: null };
+    try {
+      return { content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+    } catch {
+      return { content: null };
+    }
   }
 
   /**

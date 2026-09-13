@@ -1,10 +1,11 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
+import { MemoryMetaService, MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 import { TestTempDir } from "./tools/testHelpers";
+import { getErrorMessage } from "@/common/utils/errors";
 
 describe("memoryLogicalKey", () => {
   it("keys each scope by its stable identity, never the physical path", () => {
@@ -248,5 +249,103 @@ describe("MemoryMetaService", () => {
         expect(cachedEntries).toEqual(diskEntries);
       }
     });
+  });
+  it("does not cache an empty view taken while the sidecar was unreadable", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    await service.setPinned("global:prefs.md", true);
+    // Transient read failure (EACCES interval): this read heals to empty, but
+    // the next one must retry the file — not serve the empty view and then
+    // write it back over the real pins.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const reloaded = new MemoryMetaService(tempDir.path);
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set());
+    reader.mockRestore();
+    expect(await reloaded.getPinnedKeys()).toEqual(new Set(["global:prefs.md"]));
+    await reloaded.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+  });
+
+  it("refuses a mutation whose read of the sidecar failed instead of overwriting it", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    await new MemoryMetaService(tempDir.path).setPinned("global:prefs.md", true);
+    // The mutating call itself hits the transient failure: its healed empty
+    // view must not become the file, or every existing pin is erased.
+    const reader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    const fresh = new MemoryMetaService(tempDir.path);
+    try {
+      const failure = await fresh.setPinned("workspace:ws-1:scratch.md", true).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(MemoryMetaWriteError);
+      expect((failure as MemoryMetaWriteError).reason).toContain("could not be read");
+    } finally {
+      reader.mockRestore();
+    }
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md"])
+    );
+    // Once readable again the same instance mutates normally.
+    await fresh.setPinned("workspace:ws-1:scratch.md", true);
+    expect(await new MemoryMetaService(tempDir.path).getPinnedKeys()).toEqual(
+      new Set(["global:prefs.md", "workspace:ws-1:scratch.md"])
+    );
+    // getEntriesOrThrow refuses the healed substitute a plain read serves.
+    const strict = new MemoryMetaService(tempDir.path);
+    const strictReader = spyOn(fsPromises, "readFile").mockImplementationOnce((() =>
+      Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))) as never);
+    try {
+      const failure = await strict.getEntriesOrThrow().then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(getErrorMessage(failure)).toContain("could not be read");
+    } finally {
+      strictReader.mockRestore();
+    }
+    expect((await strict.getEntriesOrThrow()).has("global:prefs.md")).toBe(true);
+  });
+
+  it("mergeKeys folds a subtree into a second key, keeping the source", async () => {
+    using tempDir = new TestTempDir("test-memory-meta");
+    const service = new MemoryMetaService(tempDir.path);
+    // Child-keyed entries under one directory: one with no owner counterpart,
+    // one whose owner entry already has larger counters and its own pin.
+    await service.setPinned("workspace:ws-child:dir/only.md", true);
+    await service.recordAccess("workspace:ws-child:dir/both.md", { write: true });
+    await service.setPinned("workspace:ws-child:dir/both.md", true);
+    for (let i = 0; i < 3; i++) {
+      await service.recordAccess("workspace:ws-owner:dir/both.md", { write: false });
+    }
+    // A sibling whose key merely starts with the same characters is not in
+    // the subtree (segment-aware matching).
+    await service.setPinned("workspace:ws-child:dir-2/x.md", true);
+    await service.mergeKeys("workspace:ws-child:dir", "workspace:ws-owner:dir", {
+      pinned: "target",
+    });
+    let entries = await service.getEntries();
+    // Missing target: copied. Existing target: larger counters, its own pin.
+    expect(entries.get("workspace:ws-owner:dir/only.md")?.pinned).toBe(true);
+    expect(entries.get("workspace:ws-owner:dir/both.md")?.pinned).toBe(false);
+    expect(entries.get("workspace:ws-owner:dir/both.md")?.accessCount).toBe(3);
+    expect(entries.get("workspace:ws-owner:dir/both.md")?.lastWriteAt).not.toBeNull();
+    expect(entries.has("workspace:ws-owner:dir-2/x.md")).toBe(false);
+    // The source stays for a downgraded build, and the fold is idempotent.
+    expect(entries.get("workspace:ws-child:dir/only.md")?.pinned).toBe(true);
+    await service.mergeKeys("workspace:ws-child:dir", "workspace:ws-owner:dir", {
+      pinned: "target",
+    });
+    expect(await service.getEntries()).toEqual(entries);
+    // `pinned: "source"`: the child's pin overrides the owner's.
+    await service.mergeKeys("workspace:ws-child:dir/both.md", "workspace:ws-owner:dir/both.md", {
+      pinned: "source",
+    });
+    entries = await service.getEntries();
+    expect(entries.get("workspace:ws-owner:dir/both.md")?.pinned).toBe(true);
   });
 });

@@ -135,9 +135,17 @@ import {
   pinDescendantWorkspaceMemoryOwners,
   resolveWorkspaceMemoryOwnerId,
 } from "@/node/services/memoryWorkspaceOwner";
+import type { MemoryService } from "@/node/services/memoryService";
+/** Narrow MemoryService surface removal needs for the shared-memory handover. */
+type SharedWorkspaceMemoryStoreForRemoval = Pick<
+  MemoryService,
+  "adoptLegacyPrivateStoreForRemoval"
+>;
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  sealSubAgentForRemovalUnderMemoryLocks,
+  SharedMemoryRemovalAbortedError,
   refineApplyLockPath,
   rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
@@ -2761,6 +2769,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     releaseRemovalCancellation(workspaceId: string): void;
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
+  /** Narrow MemoryService surface for removal's shared-memory handover; wired by coreServices. */
+  private sharedWorkspaceMemoryStore?: SharedWorkspaceMemoryStoreForRemoval;
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
@@ -3246,6 +3256,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
+  }
+
+  setSharedWorkspaceMemoryStore(store: SharedWorkspaceMemoryStoreForRemoval): void {
+    this.sharedWorkspaceMemoryStore = store;
   }
 
   setWorkspaceLifecycleHooks(hooks: WorkspaceLifecycleHooks): void {
@@ -4378,6 +4392,33 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       for (const [workspaceId, session] of registry) {
         if (isAffected(workspaceId)) session.invalidateMemoryContext();
       }
+    }
+  }
+
+  /**
+   * Removal's in-lock shared-memory handover (see removeSessionDirUnderMemoryLocks
+   * `beforeTombstone`): the legacy-notebook adoption delta pass, run while
+   * the owner-store lock is held so nothing can land after it. Throws to
+   * abort the removal unless `force` accepts the loss.
+   */
+  private async lockedSharedMemoryHandover(
+    workspaceId: string,
+    ownerWorkspaceId: string,
+    force: boolean
+  ): Promise<void> {
+    try {
+      await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+        workspaceId,
+        ownerWorkspaceId,
+        { locksHeld: true }
+      );
+    } catch (error) {
+      if (!force) throw error;
+      log.warn("Forced removal: locked shared-memory handover to the owner failed", {
+        workspaceId,
+        ownerWorkspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -5961,11 +6002,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
-    // Set once removal passes its point of no return (session teardown and
-    // tombstone follow unconditionally); an abort before that leaves the
-    // workspace registered and intact, so the finally lifts the consolidation
-    // teardown gate the drains below installed.
-    let removalCommitted = false;
+    // Set once this attempt published the durable removal tombstone (sealed
+    // sub-agent handover, or the session-dir teardown). If the removal then
+    // ends with the workspace STILL REGISTERED — a refused checkout deletion,
+    // a later teardown step throwing, deregistration failing — the marker is
+    // rolled back in the finally (ownership-checked, r66): left in place it
+    // would refuse every later memory access and removal retry of a
+    // workspace that still exists. Only a completed deregistration keeps it.
+    let tombstonePublished = false;
+    // r66: identifies THIS removal attempt in the durable tombstone so the
+    // compensating rollback below cannot delete a concurrent backend
+    // attempt's marker.
+    const removalAttemptId = crypto.randomUUID();
+    // Sub-agents: the tombstone was published (with the final shared-memory
+    // handover) BEFORE the checkout deletion; an abort between the two rolls
+    // it back so the intact workspace stays usable.
+    let sealedForRemoval = false;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6003,6 +6055,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      // r65: keep renewing the removal tombstone's mtime until this removal
+      // settles so a foreign backend's startup self-heal cannot mistake a
+      // merely SLOW removal (a hung runtime deletion or MCP server close) for
+      // crash residue and delete the marker while removal is live — a healed
+      // marker would readmit child writes after the final shared-memory
+      // handover (sealSubAgentForRemovalUnderMemoryLocks). Held from before the
+      // earliest publish point: ticks against a not-yet-published marker are
+      // swallowed ENOENTs, as are ticks after a rollback deleted it, and
+      // disposal at scope exit (after deregistration or its rollback) is safe
+      // since a late renewal of a retained terminal marker is meaningless.
+      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
       // Forced removals too (routine task cleanup uses force): proceeding
       // while a stalled writer still owns the lock would let it resume after
       // the deletion and recreate the removed path. The acquisition is
@@ -6040,6 +6103,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Raw terminal listeners may enqueue timing writes; join those before rollup/removal.
       await this.sessionTimingService?.waitForIdle(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
 
       let parentWorkspaceId: string | null = null;
       // Memory owner resolved while the workspace was still fully registered
@@ -6116,10 +6180,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         // Shared workspace memory (sub-agents write into their task-tree
         // owner's store). BEFORE any destructive step — so a failure leaves a
-        // fully intact, retryable workspace: pin the owner on surviving
-        // descendants (their parent chain is about to lose this node),
-        // verified by reading the config back because Config swallows write
-        // failures.
+        // fully intact, retryable workspace:
+        //  - pin the owner on surviving descendants (their parent chain is
+        //    about to lose this node), verified by reading the config back
+        //    because Config swallows write failures;
+        //  - fold this workspace's pre-sharing private notebook into the
+        //    owner's store. A second, delta pass runs under the removal locks
+        //    below so a note that lands in between is captured too; that late
+        //    pass only has the few notes written since this one, keeping the
+        //    fallible work at the point of no return minimal.
         const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
           this.config.loadConfigOrDefault(),
           workspaceId
@@ -6139,6 +6208,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                 throw new Error(`memory owner pin for descendant ${id} did not persist`);
               }
             }
+            // A pre-sharing build kept this child's notebook in its OWN
+            // session dir (<sessionsDir>/<child>/memory); access-time adoption
+            // may never have run for a child removed right after the upgrade,
+            // and the deletion below would take those notes with it.
+            await this.sharedWorkspaceMemoryStore?.adoptLegacyPrivateStoreForRemoval(
+              workspaceId,
+              sharedMemoryOwnerId
+            );
           } catch (error) {
             if (!force) {
               return Err(
@@ -6151,6 +6228,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               error: getErrorMessage(error),
             });
           }
+          // Final handover + tombstone under the removal locks, BEFORE the
+          // checkout is deleted (sealSubAgentForRemovalUnderMemoryLocks): a
+          // late legacy note the owner store cannot take must abort while the
+          // checkout still exists, and once sealed no backend can add
+          // another (they honor the tombstone at their commit points), so the
+          // session-dir deletion after runtime deletion has nothing fallible
+          // left. `force` accepts the loss of notes the handover cannot place.
+          await sealSubAgentForRemovalUnderMemoryLocks({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            sharedWorkspaceMemorySessionDir: path.join(
+              this.config.sessionsDir,
+              sharedMemoryOwnerId
+            ),
+            beforeTombstone: () =>
+              this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+          });
+          sealedForRemoval = true;
+          tombstonePublished = true;
         }
 
         if (isMultiProject(metadata)) {
@@ -6448,7 +6546,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       //
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
-      removalCommitted = true;
       this.initStateManager.clearInMemoryState(workspaceId);
 
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
@@ -6499,11 +6596,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
 
       // Remove session data
-      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      // r66: identifies THIS removal attempt in the durable tombstone so the
-      // compensating rollback below cannot delete a concurrent backend
-      // attempt's marker.
-      const removalAttemptId = crypto.randomUUID();
       try {
         if (parentWorkspaceId) {
           try {
@@ -6540,45 +6632,48 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         const memoryOwnerId =
           verifiedSharedMemoryOwnerId ??
           resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
+        const ownerSessionDir =
+          memoryOwnerId === workspaceId
+            ? undefined
+            : path.join(this.config.sessionsDir, memoryOwnerId);
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
           attemptId: removalAttemptId,
-          sharedWorkspaceMemorySessionDir:
-            memoryOwnerId === workspaceId
+          sharedWorkspaceMemorySessionDir: ownerSessionDir,
+          tombstoneSealed: sealedForRemoval,
+          // Sealed above (metadata path): handover done and tombstone
+          // published under these locks already. Otherwise (phantom,
+          // metadata-less path) the handover runs here, inside the locks
+          // and right before the tombstone. Throws → removal aborts,
+          // session intact.
+          beforeTombstone:
+            ownerSessionDir === undefined || sealedForRemoval
               ? undefined
-              : path.join(this.config.sessionsDir, memoryOwnerId),
+              : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
         });
-        // Only once the session (and with it the transcript) is gone are the
-        // retryable harvest records truly unrecoverable; an aborted removal
-        // above must leave them retryable.
-        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+        tombstonePublished = true;
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the
         // workspace stays registered and retryable) instead of proceeding
         // to deregistration below.
-        if (error instanceof TombstoneNotDurableError) {
-          // No durable tombstone was published: the workspace stays
-          // registered with its session directory intact, so the
-          // consolidation teardown gate is lifted again in the finally like
-          // any pre-commit abort.
-          removalCommitted = false;
+        if (
+          error instanceof TombstoneNotDurableError ||
+          error instanceof SharedMemoryRemovalAbortedError
+        ) {
+          // No durable tombstone was published (the locked handover or the
+          // tombstone write itself failed): the workspace stays registered
+          // with its session directory intact, so the consolidation teardown
+          // gate is lifted again in the finally like any pre-commit abort.
           throw error;
         }
+        // Orphan path (r62): the directory was retained but the tombstone
+        // is durable, and deregistration proceeds below.
+        tombstonePublished = true;
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
-      // r65: the tombstone is durable here (both the locked path and the
-      // orphan fallback published it). Keep renewing its mtime until this
-      // removal settles so a foreign backend's startup self-heal cannot
-      // mistake a merely SLOW removal (e.g. a hung MCP server close below)
-      // for crash residue and delete the marker while removal is live.
-      // Disposal at scope exit (after deregistration or its rollback) is
-      // safe: a late renewal of a retained terminal marker is meaningless,
-      // and utimes on a rolled-back (deleted) marker is a swallowed ENOENT.
-      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
-
       // The on-disk devtools.jsonl died with the session directory above; also drop any
       // in-memory DevTools state so stale runs cannot outlive the workspace.
       try {
@@ -6658,6 +6753,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+      // Only once the workspace is deregistered (and its session, with the
+      // transcript, gone) are the retryable harvest records truly
+      // unrecoverable; an aborted removal must leave them retryable.
+      // Best-effort: the removal is committed, so a sidecar failure here
+      // must not turn it into an error (the metadata event below still fires).
+      try {
+        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
+      } catch (error) {
+        log.warn("Failed to finalize harvest records after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
 
       // Deregistration succeeded: drop the workspace's activity/status entry
       // so extensionMetadata.json stays bounded (stale entries were
@@ -6690,7 +6798,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
-      if (!removalCommitted) {
+      if (!removedFromConfig) {
+        // The workspace is still registered (a refused checkout deletion, a
+        // teardown step that threw, deregistration that failed): lift this
+        // attempt's tombstone again (ownership-checked, r66) so it stays
+        // usable, and the consolidation teardown gate with it.
+        if (tombstonePublished) {
+          try {
+            await rollbackRemovalTombstoneIfOwned({
+              rootDir: this.config.rootDir,
+              sessionDir: path.join(this.config.sessionsDir, workspaceId),
+              workspaceId,
+              attemptId: removalAttemptId,
+              workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            });
+          } catch (rollbackError) {
+            log.error(
+              "Failed to roll back the removal tombstone after an aborted removal; " +
+                "the startup self-heal will reclaim it",
+              { workspaceId, rollbackError }
+            );
+          }
+        }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
       }
       if (releaseOverridesLock !== undefined) {
