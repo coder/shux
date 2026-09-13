@@ -2129,6 +2129,299 @@ describe("ProviderModelFactory routing", () => {
     });
   });
 
+  describe("OpenRouter session_id", () => {
+    type OpenRouterModule = Awaited<ReturnType<(typeof PROVIDER_REGISTRY)["openrouter"]>>;
+    type CreateOpenRouterOptions = Parameters<OpenRouterModule["createOpenRouter"]>[0];
+
+    async function withCapturedOpenRouterOptions(
+      run: (captured: CreateOpenRouterOptions[]) => Promise<void>,
+      // Lets wire-level tests swap the fetch handed to the real factory while
+      // still capturing the options mux built (captured pre-wrap).
+      wrapOptions?: (options: CreateOpenRouterOptions) => CreateOpenRouterOptions
+    ): Promise<void> {
+      const originalRegistry = PROVIDER_REGISTRY.openrouter;
+      const module = await originalRegistry();
+      const captured: CreateOpenRouterOptions[] = [];
+      PROVIDER_REGISTRY.openrouter = () =>
+        Promise.resolve({
+          ...module,
+          createOpenRouter: (options: CreateOpenRouterOptions) => {
+            captured.push(options);
+            return module.createOpenRouter(wrapOptions ? wrapOptions(options) : options);
+          },
+        });
+      try {
+        await run(captured);
+      } finally {
+        PROVIDER_REGISTRY.openrouter = originalRegistry;
+      }
+    }
+
+    it("stamps a per-workspace session_id into extraBody", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test" },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured).toHaveLength(1);
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
+        });
+      });
+    });
+
+    it("stamps through the resolveAndCreateModel seam production callers use", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test" },
+          });
+
+          const result = await factory.resolveAndCreateModel(
+            "openrouter:openai/gpt-5",
+            "off",
+            undefined,
+            { workspaceId: "ws1234abcd" }
+          );
+          expect(result.success).toBe(true);
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
+        });
+      });
+    });
+
+    it("lets an explicit config session_id win over the workspace default", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", session_id: "static-session" },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured[0]?.extraBody).toEqual({ session_id: "static-session" });
+        });
+      });
+    });
+
+    it("treats config session_id: null as a full opt-out (nothing sent)", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", session_id: null },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured).toHaveLength(1);
+          expect(captured[0]?.extraBody).toBeUndefined();
+        });
+      });
+    });
+
+    it("does not stamp over a configured x-session-id header", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", headers: { "X-Session-Id": "my-static" } },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured[0]?.extraBody).toBeUndefined();
+        });
+      });
+    });
+
+    it("honors a session_id set via the SDK-conventional config extraBody", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", extraBody: { session_id: "team-shared" } },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          // Lifted to the body root — no literal nested "extraBody" field.
+          expect(captured[0]?.extraBody).toEqual({ session_id: "team-shared" });
+        });
+      });
+    });
+
+    it("clamps overlong session_ids to the 256-char cap without merging distinct ids", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test" },
+          });
+
+          // Legacy workspace ids are `<project>-<branch>` basenames: two
+          // workspaces under one long project name differ only in the tail,
+          // so a plain prefix truncation would merge their sessions.
+          const longProject = "p".repeat(280);
+          for (const branch of ["alpha", "beta"]) {
+            const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+              workspaceId: `${longProject}-${branch}`,
+            });
+            expect(result.success).toBe(true);
+          }
+          const sessionIds = captured.map((options) => options?.extraBody?.session_id);
+          expect(sessionIds).toHaveLength(2);
+          for (const sessionId of sessionIds) {
+            if (typeof sessionId !== "string") {
+              throw new Error("expected a stamped string session_id");
+            }
+            expect(sessionId).toHaveLength(256);
+            expect(sessionId.startsWith("xum-ppp")).toBe(true);
+          }
+          expect(sessionIds[0]).not.toBe(sessionIds[1]);
+        });
+      });
+    });
+
+    it("clamps an overlong explicit config session_id instead of forwarding it", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", session_id: "s".repeat(300) },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          const sessionId = captured[0]?.extraBody?.session_id;
+          if (typeof sessionId !== "string") {
+            throw new Error("expected a session_id string");
+          }
+          expect(sessionId).toHaveLength(256);
+          expect(sessionId.startsWith("sss")).toBe(true);
+          // Still the user's static override, not the workspace stamp.
+          expect(sessionId).not.toContain("ws1234abcd");
+        });
+      });
+    });
+
+    it("keeps mux-internal config keys out of the request body", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: {
+              apiKey: "or-test",
+              apiKeyFile: "/tmp/never-send-this",
+              baseUrl: "https://openrouter.ai/api/v1",
+              enabled: true,
+              displayName: "My OpenRouter",
+            },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured[0]?.extraBody).toEqual({ session_id: "xum-ws1234abcd" });
+        });
+      });
+    });
+
+    it("omits session_id when no workspace context is available", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test" },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5");
+          expect(result.success).toBe(true);
+          expect(captured).toHaveLength(1);
+          expect(captured[0]?.extraBody).toBeUndefined();
+        });
+      });
+    });
+
+    it("sends session_id at the top level of the request body", async () => {
+      const bodies: unknown[] = [];
+      // Object.assign preserves fetch statics (matching this file's mock-fetch
+      // pattern) so runtimes touching e.g. fetch.preconnect keep working.
+      const respondingFetch = Object.assign(
+        (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+          const body = init?.body;
+          bodies.push(typeof body === "string" ? JSON.parse(body) : body);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "gen-test",
+                object: "chat.completion",
+                created: 1,
+                model: "openai/gpt-5",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: "ok" },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              }),
+              { headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        fetch
+      ) as typeof fetch;
+
+      await withCapturedOpenRouterOptions(
+        async () => {
+          await withTempConfig(async (config, factory) => {
+            new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+              openrouter: { apiKey: "or-test" },
+            });
+
+            const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+              workspaceId: "ws1234abcd",
+            });
+            expect(result.success).toBe(true);
+            if (!result.success) return;
+
+            await generateText({ model: result.data, prompt: "hi" });
+            expect(bodies[0]).toMatchObject({ session_id: "xum-ws1234abcd" });
+          });
+        },
+        (options) => ({ ...options, fetch: respondingFetch })
+      );
+    });
+
+    it("composes session_id with nested provider routing options", async () => {
+      await withCapturedOpenRouterOptions(async (captured) => {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openrouter: { apiKey: "or-test", sort: "price" },
+          });
+
+          const result = await factory.createModel("openrouter:openai/gpt-5", undefined, {
+            workspaceId: "ws1234abcd",
+          });
+          expect(result.success).toBe(true);
+          expect(captured[0]?.extraBody).toEqual({
+            provider: { sort: "price" },
+            session_id: "xum-ws1234abcd",
+          });
+        });
+      });
+    });
+  });
+
   it("honors explicit mux-gateway prefixes for compatibility", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({

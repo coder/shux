@@ -185,7 +185,13 @@ export async function generateWorkspaceIdentity(
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
-  latestUserMessage?: string
+  latestUserMessage?: string,
+  /**
+   * Workspace the title belongs to (absent for pre-creation naming);
+   * forwarded to model creation so provider-level session grouping
+   * (e.g. OpenRouter session_id) covers title traffic too.
+   */
+  workspaceId?: string
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
@@ -202,6 +208,7 @@ export async function generateWorkspaceIdentity(
 
     const modelResult = await aiService.createModel(modelString, undefined, {
       agentInitiated: true,
+      ...(workspaceId != null ? { workspaceId } : {}),
     });
     if (!modelResult.success) {
       lastError = mapModelCreationError(modelResult.error, modelString);

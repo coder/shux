@@ -62,6 +62,9 @@ export const OpenRouterProviderConfigSchema = BaseProviderConfigSchema.extend({
   data_collection: z.string().optional(),
   sort: z.string().optional(),
   quantizations: z.array(z.string()).optional(),
+  // Static override for the per-workspace session key mux stamps on requests;
+  // null disables session tagging entirely (nothing is sent).
+  session_id: z.string().nullable().optional(),
 });
 
 export const XAIProviderConfigSchema = BaseProviderConfigSchema.extend({

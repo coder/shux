@@ -312,6 +312,12 @@ Control which infrastructure providers handle your requests:
 
 See [OpenRouter Provider Routing docs](https://openrouter.ai/docs/features/provider-routing) for details.
 
+### OpenRouter Sessions
+
+Xum tags workspace requests sent through the OpenRouter provider with a per-workspace `session_id` (`xum-<workspace id>`). OpenRouter uses it as the [sticky-routing key](https://openrouter.ai/docs/guides/best-practices/prompt-caching), keeping a workspace's turns on the same upstream provider to maximize prompt-cache hits, and groups the workspace's requests in the Sessions view of its Logs page. Requests with no workspace context (such as naming a workspace that doesn't exist yet) are not tagged.
+
+To override the per-workspace value with a static one, set `"session_id": "<value>"` in the provider config; to disable session tagging entirely, set `"session_id": null`. A configured `x-session-id` header also suppresses the per-workspace default.
+
 ### xAI Search Orchestration
 
 Grok models support live web search. Xum enables this by default with `mode: "auto"`. Customize via [`searchParameters`](https://docs.x.ai/docs/resources/search) for regional focus, time filters, or to disable search.
