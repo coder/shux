@@ -202,6 +202,8 @@
               # Node + build tooling
               nodejs
               gnumake
+              # node-gyp requires Python when rebuilding Electron native modules.
+              python3
               stdenv.cc.cc.lib # Provides libstdc++.so.6 for DuckDB native bindings under Bun
 
               # Common CLIs

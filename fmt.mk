@@ -82,10 +82,11 @@ else ifeq ($(wildcard flake.nix),)
 	@echo "flake.nix not found; skipping Nix format check"
 else
 	@echo "Checking flake.nix formatting..."
+	@# Nix flakes in temp dirs still need a Git root so copied files are visible.
 	@tmp_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/fmt-nix-check.XXXXXX"); \
 	trap "rm -rf $$tmp_dir" EXIT; \
 	cp flake.nix flake.lock package.json bun.lock "$$tmp_dir/"; \
-	(cd "$$tmp_dir" && nix fmt -- flake.nix >/dev/null 2>&1); \
+	(cd "$$tmp_dir" && git init -q && git add flake.nix flake.lock package.json bun.lock && nix fmt -- flake.nix >/dev/null 2>&1); \
 	if ! cmp -s flake.nix "$$tmp_dir/flake.nix"; then \
 		echo "flake.nix is not formatted correctly. Run 'make fmt-nix' to fix."; \
 		diff -u flake.nix "$$tmp_dir/flake.nix" || true; \

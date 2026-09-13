@@ -35,12 +35,12 @@ if [ ! -d "$ELECTRON_PATH" ]; then
 fi
 
 HAS_NODE_PTY=0
-if [ -d "$NODE_PTY_PATH" ]; then
+if [ -f "$NODE_PTY_PATH/package.json" ]; then
   HAS_NODE_PTY=1
 fi
 
 HAS_DUCKDB=0
-if [ -d "$DUCKDB_NODE_API_PATH" ] && [ -d "$DUCKDB_NODE_BINDINGS_PATH" ]; then
+if [ -f "$DUCKDB_NODE_API_PATH/package.json" ] && [ -f "$DUCKDB_NODE_BINDINGS_PATH/package.json" ]; then
   HAS_DUCKDB=1
 fi
 

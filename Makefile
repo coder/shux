@@ -138,8 +138,22 @@ ensure-deps: node_modules/.installed
 # Rebuild native modules for Electron
 rebuild-native: node_modules/.installed ## Rebuild native modules (node-pty, DuckDB) for Electron
 	@echo "Rebuilding native modules for Electron..."
-	@npx @electron/rebuild -f -m node_modules/node-pty
-	@npx @electron/rebuild -f -m node_modules/@duckdb/node-bindings
+	@# Failed optional native installs can leave node_modules/.installed newer than package.json
+	@# while node-pty itself is missing; refresh once so this target can self-heal.
+	@if [ ! -f node_modules/node-pty/package.json ]; then \
+		echo "node-pty package missing; refreshing optional dependencies..."; \
+		bun install --frozen-lockfile; \
+	fi
+	@if [ -f node_modules/node-pty/package.json ]; then \
+		npx @electron/rebuild -f -m node_modules/node-pty; \
+	else \
+		echo "node-pty package missing; skipping node-pty rebuild"; \
+	fi
+	@if [ -f node_modules/@duckdb/node-bindings/package.json ]; then \
+		npx @electron/rebuild -f -m node_modules/@duckdb/node-bindings; \
+	else \
+		echo "DuckDB node bindings package missing; skipping DuckDB rebuild"; \
+	fi
 	@echo "Native modules rebuilt successfully"
 
 # Run compiled CLI with trailing arguments (builds only if missing)
