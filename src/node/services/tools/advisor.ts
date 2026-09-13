@@ -366,6 +366,16 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           }
         }
 
+        // An empty stream (for example a gateway hiccup) used to surface as a
+        // success-shaped result, so the caller saw "advice" that said nothing.
+        if (advice.trim().length === 0) {
+          return {
+            type: "error" as const,
+            isError: true,
+            message: `Advisor returned no advice (finish reason: ${finishReason}). Retry once or continue without it.`,
+          };
+        }
+
         return {
           type: "advice" as const,
           advice,

@@ -3,6 +3,9 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 /** Default per-turn usage cap for the experimental advisor tool. */
 export const ADVISOR_DEFAULT_MAX_USES_PER_TURN = 3;
 
+/** Upper bound on the advisor tool's `question` input (schema and description share it). */
+export const ADVISOR_QUESTION_MAX_CHARS = 2000;
+
 const ADVISOR_ENABLED_BY_DEFAULT_AGENT_IDS = new Set(["exec", "plan"]);
 
 export function isAdvisorEnabledByDefaultForAgent(agentId: string): boolean {
@@ -45,7 +48,7 @@ export const ADVISOR_USAGE_GUIDANCE =
 export const ADVISOR_TOOL_DESCRIPTION =
   "Ask a stronger model for strategic advice based on the live conversation transcript. " +
   ADVISOR_USAGE_GUIDANCE +
-  " Pass a brief `question` summarizing the decision or ambiguity.";
+  ` Pass a brief \`question\` (at most ${ADVISOR_QUESTION_MAX_CHARS} characters) summarizing the decision or ambiguity.`;
 
 /**
  * System prompt for the nested advisor model call.

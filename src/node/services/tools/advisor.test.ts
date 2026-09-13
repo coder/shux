@@ -683,6 +683,26 @@ describe("advisor tool", () => {
     expect(reportModelUsage).not.toHaveBeenCalled();
   });
 
+  it("returns an error instead of empty advice when the stream produced no text", async () => {
+    using tempDir = new TestTempDir("advisor-tool-empty-advice");
+    const reportModelUsage = mock((_event: ToolModelUsageEvent) => undefined);
+    const { config } = createToolConfig(tempDir.path, { reportModelUsage });
+    mockStreamTextSuccess({
+      text: "",
+      finishReason: "stop",
+      usage: { inputTokens: 12, outputTokens: 0, totalTokens: 12 },
+    });
+
+    const tool = createAdvisorTool(config);
+    const rawResult: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
+
+    const result = rawResult as { type?: unknown; isError?: unknown; message?: unknown };
+    expect(result.type).toBe("error");
+    expect(result.isError).toBe(true);
+    expect(result.message).toEqual(expect.stringContaining("stop"));
+    expect(reportModelUsage).toHaveBeenCalledTimes(1);
+  });
+
   it("sanitizes binary-like advisor provider failures", async () => {
     using tempDir = new TestTempDir("advisor-tool-sanitized-error");
     const { config } = createToolConfig(tempDir.path);
