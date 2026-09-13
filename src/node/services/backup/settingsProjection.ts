@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AppConfigOnDiskSchema, GoalDefaultsSchema } from "@/common/config/schemas/appConfigOnDisk";
+import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
@@ -67,7 +68,9 @@ type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
  * A backup's settings block. Every key an export writes is present, so a value the user reset
  * to its default (cleared agent overrides, deleted fallback chains) round-trips as that default
  * rather than as a gap the restore would fill from the target. `null` is the JSON spelling of
- * an unset value; a key that is absent, as in a block an older build wrote, keeps the local value.
+ * an unset value, except for advisorMaxUsesPerTurn, where the app itself uses null for
+ * "unlimited" and an unset cap therefore exports as the default cap. A key that is absent, as in
+ * a block an older build wrote, keeps the local value.
  */
 export type BackupSettings = {
   [K in BackedUpSettingsKey]?: NonNullable<ProjectsConfig[K]> | null;
@@ -161,6 +164,11 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   const projected: BackupSettings = {};
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     setSetting(projected, key, NORMALIZE[key](config[key]));
+  }
+  // The advisor reads null as "unlimited" and unset as the default cap, so an unset cap cannot
+  // take the block's null spelling: a default source would switch the target to unlimited.
+  if (config.advisorMaxUsesPerTurn === undefined) {
+    projected.advisorMaxUsesPerTurn = ADVISOR_DEFAULT_MAX_USES_PER_TURN;
   }
   return copyJson(projected);
 }

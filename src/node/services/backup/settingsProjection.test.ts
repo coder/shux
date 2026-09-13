@@ -3,6 +3,7 @@ import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
+import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import {
   mergeBackupSettings,
   projectBackupSettings,
@@ -19,7 +20,8 @@ const UNSET_EXPORT = {
   advisorModelString: null,
   advisorThinkingLevel: null,
   advisorReasoningMode: null,
-  advisorMaxUsesPerTurn: null,
+  // null would mean "unlimited" to the advisor, so the default cap stands in for unset.
+  advisorMaxUsesPerTurn: ADVISOR_DEFAULT_MAX_USES_PER_TURN,
   advisorMaxOutputTokens: null,
   taskSettings: DEFAULT_TASK_SETTINGS,
   heartbeatDefaultPrompt: null,
@@ -139,13 +141,31 @@ describe("settingsProjection", () => {
     expect(merged.agentAiDefaults).toEqual({});
     expect(merged.modelFallbacks).toBeUndefined();
     expect(merged.advisorModelString).toBeUndefined();
-    expect(merged.advisorMaxUsesPerTurn).toBeNull();
+    expect(merged.advisorMaxUsesPerTurn).toBe(ADVISOR_DEFAULT_MAX_USES_PER_TURN);
     expect(merged.chatTranscriptFullWidth).toBe(false);
     expect(merged.defaultRuntime).toBeUndefined();
     expect(merged.layoutPresets).toBeUndefined();
     expect(merged.apiServerPort).toBe(4321);
     // The round trip closes: the restored target exports what the source exported.
     expect(projectBackupSettings(merged)).toEqual(UNSET_EXPORT);
+  });
+
+  it("keeps the advisor's unlimited cap distinct from its default", () => {
+    // A source at the default cap must not restore as unlimited, and unlimited must survive.
+    const unlimited = projectBackupSettings({ projects: new Map(), advisorMaxUsesPerTurn: null });
+    expect(unlimited.advisorMaxUsesPerTurn).toBeNull();
+    const target: ProjectsConfig = { projects: new Map(), advisorMaxUsesPerTurn: null };
+    const fromDefault = readBackupSettings({
+      settings: projectBackupSettings({ projects: new Map() }),
+    }).settings!;
+    expect(mergeBackupSettings(target, fromDefault).advisorMaxUsesPerTurn).toBe(
+      ADVISOR_DEFAULT_MAX_USES_PER_TURN
+    );
+    const fromUnlimited = readBackupSettings({ settings: unlimited }).settings!;
+    expect(
+      mergeBackupSettings({ projects: new Map(), advisorMaxUsesPerTurn: 5 }, fromUnlimited)
+        .advisorMaxUsesPerTurn
+    ).toBeNull();
   });
 
   it("replaces the keys a sparse block carries and keeps the rest of the local config", () => {
