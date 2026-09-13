@@ -26,16 +26,16 @@ export function legacyAdoptionManifestPath(childSessionDir: string): string {
 
 /**
  * One adopted legacy file: content hash, child sidecar fingerprint, owner-store
- * relPath, and whether the adoption CREATED that owner file (provenance: a
+ * relPath, and whether the adoption CREATED that owner file (provenance: only
+ * such a copy may be removed again when the legacy source disappears; a
  * pre-existing identical owner note is the owner's own). `pending`: written
  * BEFORE the copy lands (provenance must not depend on the copy's existence: a
  * retry finding the bytes already at the target could not tell an interrupted
  * adoption from an owner note); cleared once the sidecar fold completed.
  *
  * Every field beyond the three strings is optional and unknown fields are
- * ignored on read, so later builds can extend the record (downgrade-time
- * reconciliation of edited/deleted sources) without invalidating manifests
- * written by this one.
+ * ignored on read, so a build that knows fewer of them still reads (and
+ * rewrites) a manifest written by this one; its records keep working here.
  */
 export interface LegacyAdoptionRecord {
   content: string;
@@ -45,20 +45,67 @@ export interface LegacyAdoptionRecord {
   pending?: boolean;
   /**
    * Identity of the owner file this adoption wrote (`ino:size:mtimeNs` right
-   * after the write): the copy is THIS generation of the file, not merely a
-   * file holding the adopted bytes — an owner who deleted and recreated (or
-   * edited and restored) the note to identical bytes owns the new file.
-   * Absent (write before stamping, or the stamp could not be taken): the copy
-   * is never treated as this adoption's.
+   * after the write). Deletion reconciliation requires the copy to be THIS
+   * generation of the file, not merely to hold the adopted bytes: an owner
+   * who deleted and recreated (or edited and restored) the note to identical
+   * bytes owns the new file, and a byte match alone would let a downgraded
+   * child's source deletion remove it. Absent (write before stamping, or the
+   * stamp could not be taken): never unchanged — the copy is preserved.
    */
   targetStamp?: string;
+  /**
+   * The copy this adoption created was since replaced outside it (rewritten,
+   * or deleted and recreated to identical bytes: `targetStamp` no longer
+   * matches), so the file is the owner's own. Kept apart from a note the
+   * owner already had when it was first adopted (`created` never set): that
+   * one still folds the child's pin toggles, a replaced copy never does —
+   * `created` alone cannot tell the two apart once provenance is lost.
+   */
+  replaced?: boolean;
+  /**
+   * Hash of the bytes an in-place replacement is about to write (set on the
+   * pending prior record, cleared once the pass completes). With `content`
+   * (the pre-write bytes) this lets a retry recognize the copy as this
+   * adoption's on either side of an interrupted write.
+   */
+  replacementContent?: string;
+  /**
+   * Identity (`ino:size:mtimeNs`) of the staged bytes an in-place replacement
+   * is about to install, taken on the staging entry before the install (a
+   * rename keeps it) and set together with `replacementContent`. A retry
+   * finds the installed copy by this stamp; a byte match alone never counts.
+   */
+  replacementStamp?: string;
+  /**
+   * Reconciliation of a deleted source is under way: the copy is about to be
+   * (or was just) removed. Set before the removal so a crash between the
+   * removal and the tombstone write is recovered as "removed by us" rather
+   * than "changed by the owner".
+   */
+  pendingDeletion?: boolean;
+  /**
+   * The legacy source was deleted (or renamed away) on a downgraded build and
+   * the copy reconciled. Kept rather than dropped: the child's pre-sharing
+   * refinement rows for this note (a delete's restore inverse, a rename's
+   * mirrored rename) still address the legacy path and need the mapping to
+   * be rolled back into the shared store; a reappearing source is adopted
+   * afresh (the record's other fields are stale then). Written together
+   * with `pending: true`: a build that knows neither this flag nor the
+   * reconciliation ignores it and would otherwise read the settled hash as
+   * "folded in earlier" — reporting a complete handover for a reappearing
+   * source while no copy exists. Pending, it re-adopts instead. Here,
+   * `deleted` takes precedence: a tombstone is not an interrupted adoption.
+   */
+  deleted?: boolean;
 }
 
 /**
  * Parse one manifest record. Lifecycle flags are raw JSON: a value that is
- * neither absent nor boolean fails CLOSED — `pending` reads as set (the pass
- * is redone), `created` as unset (no destructive provenance) — so a corrupted
- * flag can never make an interrupted pass look settled.
+ * neither absent nor boolean fails CLOSED — `pending`/`pendingDeletion` read
+ * as set (the pass is redone), `created`/`deleted` as unset (no destructive
+ * provenance; the source is reconciled as a plain unlisted note), `replaced`
+ * as set (the child's pin no longer reaches the file) — so a corrupted flag
+ * can never make an interrupted pass look settled.
  */
 function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null {
   if (typeof value !== "object" || value === null) return null;
@@ -70,7 +117,19 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
   ) {
     return null;
   }
+  // A present but non-string replacement hash is a malformed RECORD (not a
+  // flag to fail closed on): without it, a replacement pass that crashed
+  // after writing the new owner bytes leaves a copy reconciliation cannot
+  // recognize as this adoption's — a later source deletion would tombstone
+  // it as owner-owned and removal would report a complete handover while the
+  // adoption-created note stays visible without provenance.
+  if (record.replacementContent !== undefined && typeof record.replacementContent !== "string") {
+    return null;
+  }
   if (record.targetStamp !== undefined && typeof record.targetStamp !== "string") return null;
+  if (record.replacementStamp !== undefined && typeof record.replacementStamp !== "string") {
+    return null;
+  }
   const flag = (raw: unknown, malformed: boolean): boolean | undefined =>
     raw === undefined ? undefined : typeof raw === "boolean" ? raw : malformed;
   return {
@@ -79,6 +138,11 @@ function parseLegacyAdoptionRecord(value: unknown): LegacyAdoptionRecord | null 
     target: record.target,
     created: flag(record.created, false),
     pending: flag(record.pending, true),
+    pendingDeletion: flag(record.pendingDeletion, true),
+    deleted: flag(record.deleted, false),
+    replaced: flag(record.replaced, true),
+    replacementContent: record.replacementContent,
+    replacementStamp: record.replacementStamp,
     targetStamp: record.targetStamp,
   };
 }

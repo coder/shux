@@ -18,6 +18,7 @@
  */
 import { EventEmitter } from "events";
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
@@ -427,6 +428,34 @@ interface MemoryStore {
 
 const LEGACY_IMPORT_DIR = "imported";
 /**
+ * The per-child directory a conflicting legacy note is imported under. A
+ * workspace id is not a memory path segment by construction — a legacy id
+ * keeps its project basename's `~`, and an id may carry `..`, `%2e`, control
+ * or XML characters the grammar rejects (parseMemoryPath) — and a copy placed
+ * under such a segment would be written and settled yet filtered out of the
+ * index and unaddressable by every command, while removal then deletes the
+ * legacy source. Ids the grammar admits are used verbatim (every manifest
+ * written so far names them that way); the rest are escaped per UTF-8 byte
+ * as `=XX` (a `.` cannot be percent-encoded: `%2e` is itself rejected). A
+ * verbatim segment never contains `=` (such ids are escaped too), so the two
+ * forms cannot collide and an escaped segment decodes unambiguously.
+ */
+function legacyImportSegment(childId: string): string {
+  if (!childId.includes("=")) {
+    try {
+      parseMemoryPath(toVirtualPath("workspace", `${LEGACY_IMPORT_DIR}/${childId}/x`));
+      return childId;
+    } catch {
+      // escaped below
+    }
+  }
+  return Array.from(Buffer.from(childId, "utf-8"), (byte) =>
+    /[A-Za-z0-9_-]/.test(String.fromCharCode(byte))
+      ? String.fromCharCode(byte)
+      : `=${byte.toString(16).toUpperCase().padStart(2, "0")}`
+  ).join("");
+}
+/**
  * Directory beside the owner's memory root (in its session dir, OUTSIDE the
  * model-writable memory namespace — a legacy note may legitimately live under
  * any in-namespace path, dot-entries included) where the adoption pass stages
@@ -492,6 +521,19 @@ async function legacyStoreStamp(legacyRoot: string): Promise<string> {
 function isMissingPathError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | null)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** DT_UNKNOWN: readdir could not type the entry (no predicate holds). */
+function isDirentTypeUnknown(entry: Dirent): boolean {
+  return !(
+    entry.isFile() ||
+    entry.isDirectory() ||
+    entry.isSymbolicLink() ||
+    entry.isFIFO() ||
+    entry.isSocket() ||
+    entry.isBlockDevice() ||
+    entry.isCharacterDevice()
+  );
 }
 
 /**
@@ -588,9 +630,25 @@ class LocalMemoryStore implements MemoryStore {
         if (options?.strict !== true && results.length > MEMORY_MAX_FILES_PER_SCOPE) return;
         if (options?.includeDotfiles !== true && entry.name.startsWith(".")) continue;
         const childRel = dirRel === "" ? entry.name : `${dirRel}/${entry.name}`;
+        // A filesystem may report DT_UNKNOWN: every type predicate is false
+        // and the entry would drop out of the walk. Strict callers (removal's
+        // legacy handover) would then see a complete listing that omits a
+        // regular note or a whole subtree, so they classify by lstat instead;
+        // an unclassifiable entry fails the listing like an unreadable dir.
+        let kind: "dir" | "file" | "other";
         if (entry.isDirectory()) {
-          await walk(childRel);
+          kind = "dir";
         } else if (entry.isFile()) {
+          kind = "file";
+        } else if (options?.strict === true && isDirentTypeUnknown(entry)) {
+          const stat = await fsPromises.lstat(this.abs(childRel));
+          kind = stat.isDirectory() ? "dir" : stat.isFile() ? "file" : "other";
+        } else {
+          kind = "other";
+        }
+        if (kind === "dir") {
+          await walk(childRel);
+        } else if (kind === "file") {
           results.push(childRel);
         }
       }
@@ -1388,6 +1446,33 @@ export class MemoryService extends EventEmitter {
       const manifestPath = legacyAdoptionManifestPath(childSessionDir);
       const adopted = await this.readOrQuarantineAdoptionManifest(manifestPath, childId);
       const sidecarEntries = await this.metaService.getEntriesOrThrow();
+      // An adoption-created copy belongs to exactly ONE descendant: a second
+      // descendant whose note is byte-identical never reuses a sibling's
+      // copy (one child's in-place replacement would rewrite bytes the
+      // other still represents, one child's source deletion would remove a
+      // copy the other still needs, and their pins would collide on one
+      // file) — it gets its own under imported/<child>/. Ownership is by
+      // LIVE generation: a sibling's settled `created` record naming the
+      // path whose receipt (targetStamp, or replacementStamp on the far side
+      // of an interrupted replacement) equals the stamp of the file on disk.
+      // A path plus flags alone would read an owner-edited or recreated copy
+      // as the sibling's. The sibling manifests are read strictly, once per
+      // pass and only when a candidate is identical: an unreadable or
+      // malformed one cannot answer, and the note waits (transient skip)
+      // rather than reuse — or clear the pins of — a copy that may be a
+      // sibling's.
+      let siblingRecords: LegacyAdoptionRecord[] | null = null;
+      const siblingOwns = async (targetRelPath: string, liveStamp: string | null) => {
+        if (liveStamp === null) return false;
+        siblingRecords ??= await this.descendantAdoptionRecords(owner, childId);
+        return siblingRecords.some(
+          (record) =>
+            record.target === targetRelPath &&
+            record.created === true &&
+            record.deleted !== true &&
+            (record.targetStamp === liveStamp || record.replacementStamp === liveStamp)
+        );
+      };
       // The per-scope file cap is a store invariant (create/rename enforce
       // it): the copy stops at the owner store's remaining capacity so a
       // combined notebook cannot exceed it — an over-full scope is silently
@@ -1408,6 +1493,128 @@ export class MemoryService extends EventEmitter {
         writeFileAtomic(manifestPath, JSON.stringify(Object.fromEntries(adopted)), {
           encoding: "utf-8",
         });
+      // Legacy notes deleted or renamed on the downgraded build: a copy THIS
+      // adoption created, still holding the adopted bytes, follows the source
+      // out of the shared notebook (a rename's new name is adopted below like
+      // a fresh note). Reconciled BEFORE the listed notes are placed: the
+      // slot a removed copy frees is credited to this pass, so a rename in
+      // an owner store at capacity lands in the same pass instead of being
+      // skipped as "full" while its old copy still holds the slot; and a
+      // rename onto the path of its own conflict copy finds that path free
+      // rather than a file to reuse. Provenance and unchanged content are
+      // both required — an owner note that merely happened to be identical,
+      // or an adopted copy the owner has since edited, is the owner's and
+      // stays. Unlisted sources are only ever judged against the listing
+      // that succeeded above; a failed listing never reaches this point.
+      const listed = new Set(files);
+      for (const [relPath, previous] of adopted) {
+        if (listed.has(relPath) || previous.deleted === true) continue;
+        // Absence from the listing is not proof enough on its own: only a
+        // provable ENOENT on the source itself counts; any other outcome
+        // keeps the entry (and the copy) for a later pass. ENOTDIR is proof
+        // too: the downgraded build replaced `dir/` with a regular note,
+        // deleting every descendant.
+        const sourceGone = await fsPromises.lstat(path.join(legacyRoot, relPath)).then(
+          () => false,
+          (error: unknown) => isMissingPathError(error)
+        );
+        if (!sourceGone) continue;
+        let unchangedForTombstone = false;
+        if (previous.created === true) {
+          // Strict probe: a target that merely could not be inspected is not
+          // "changed" — dropping the entry on that basis would lose the
+          // provenance for good and leave the obsolete copy visible forever
+          // once the filesystem recovers. Keep the entry (and the pass
+          // incomplete) so the next access reconciles it. A directory,
+          // symlink, non-regular entry, escaping component or over-cap /
+          // non-UTF-8 file there is owner state (content null).
+          const targetContained = await store.assertContained(previous.target).then(
+            () => true,
+            () => false
+          );
+          let destination: "free" | { content: string | null } = "free";
+          try {
+            if (targetContained) {
+              destination = await this.inspectAdoptionDestination(store, previous.target);
+            }
+          } catch (error) {
+            log.warn(
+              "[MemoryService] cannot inspect an adopted legacy note's copy; retrying later",
+              { childId, owner, relPath, target: previous.target, error }
+            );
+            skipped++;
+            transientSkips++;
+            continue;
+          }
+          const current = destination === "free" ? null : destination.content;
+          // Ours only while it is a generation this adoption installed
+          // (targetStamp; replacementStamp on the far side of an interrupted
+          // in-place replacement — both receipts taken on the staged bytes,
+          // so a crash cannot have kept them from being recorded): identical
+          // bytes in a file the owner deleted and recreated, or edited and
+          // restored, are the owner's, and a record without a stamp preserves.
+          const currentHash = current === null ? null : sha256Hex(current);
+          const stamp = await adoptionTargetStamp(store.physicalPath(previous.target));
+          const unchanged =
+            currentHash !== null &&
+            stamp !== null &&
+            ((currentHash === previous.content && stamp === previous.targetStamp) ||
+              (previous.pending === true &&
+                currentHash === previous.replacementContent &&
+                stamp === previous.replacementStamp));
+          // A target PROVEN absent (contained path, strict probe ENOENT) while
+          // a deletion was pending was removed by the interrupted pass, not
+          // changed by the owner.
+          const removedByUs =
+            previous.pendingDeletion === true && targetContained && destination === "free";
+          unchangedForTombstone = unchanged || removedByUs;
+          if (unchanged) {
+            // Deletion provenance first: a crash after the removal but before
+            // the tombstone write must not make the retry read the missing
+            // copy as owner-changed (and drop the child's rollback mapping).
+            adopted.set(relPath, { ...previous, pendingDeletion: true });
+            await writeManifest();
+            // Metadata next: a sidecar failure then aborts the pass with the
+            // file and manifest entry intact, so the retry repeats both;
+            // the reverse order would strand the owner-key pin/usage once
+            // the file was gone and the entry dropped.
+            await this.metaService.removeKeys(
+              memoryLogicalKey("workspace", previous.target, {
+                projectPath: ctx.projectPath,
+                workspaceId: owner,
+              })
+            );
+            await store.remove(previous.target);
+            remainingCapacity++;
+            adoptedCount++;
+            log.info("[MemoryService] removed an adopted legacy note deleted on the old build", {
+              childId,
+              owner,
+              relPath,
+              target: previous.target,
+            });
+          }
+        }
+        // Kept as a tombstone, not dropped: the child's pre-sharing rows for
+        // this note still need relPath → target to be rolled back into the
+        // shared store (a delete's restore lands at the reconciled target;
+        // the reconciliation above never runs again for it).
+        // Destructive provenance survives only while the target was still
+        // this adoption's copy: a copy the owner edited is not the old
+        // path's to delete or restore any more.
+        // `pending` too (see LegacyAdoptionRecord.deleted): a build that
+        // predates the tombstone reads it as an unsettled adoption and
+        // re-adopts a reappearing source, instead of taking the settled hash
+        // for "folded in earlier" while no copy exists.
+        adopted.set(relPath, {
+          ...previous,
+          pendingDeletion: undefined,
+          deleted: true,
+          pending: true,
+          created: previous.created === true && unchangedForTombstone,
+        });
+        manifestDirty = true;
+      }
       for (const relPath of files) {
         // Same gates as a memory command. Name first: a legacy file whose
         // name the path grammar rejects (traversal-looking segments, control
@@ -1442,10 +1649,13 @@ export class MemoryService extends EventEmitter {
         }
         // Strict decode: invalid UTF-8 cannot be carried by a text write, but a
         // note that legitimately contains U+FFFD must not be mistaken for one
-        // (a lossy decode would make the two indistinguishable).
+        // (a lossy decode would make the two indistinguishable). BOM kept: a
+        // memory write admits a leading U+FEFF, and the default decoder would
+        // swallow it — the copy and its hash would then differ from the
+        // byte-exact source (and a BOM-less owner note would read as equal).
         let content: string;
         try {
-          content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
         } catch {
           skipped++;
           continue;
@@ -1461,29 +1671,46 @@ export class MemoryService extends EventEmitter {
           target: "",
           created: false,
         };
-        const previous = adopted.get(relPath);
+        // A record whose source was reconciled as deleted is kept only for
+        // the path mapping (rollbacks); a reappearing source is a fresh note.
+        const priorRecord = adopted.get(relPath);
+        const previous = priorRecord?.deleted === true ? undefined : priorRecord;
         if (
           previous?.content === record.content &&
           previous.sidecar === record.sidecar &&
-          previous.pending !== true
+          previous.pending !== true &&
+          // A deletion under way removed (or is about to remove) the copy: a
+          // source reappearing with the same bytes must be adopted anew.
+          previous.pendingDeletion !== true
         ) {
           continue; // folded in earlier, nothing changed since
         }
-        let target: { relPath: string; write: boolean } | null = null;
+        // `generation`: the stamp of the copy an in-place replacement installs
+        // over, re-checked right before the install.
+        let target: {
+          relPath: string;
+          write: boolean;
+          replaces?: boolean;
+          generation?: string;
+        } | null = null;
         // A child's pin toggle folds into the copy only while the copy is
         // this adoption's generation (see below) or the owner's identical
         // note it was folded into at first adoption; a copy the owner
-        // replaced since keeps the owner's pin.
+        // replaced since keeps the owner's pin — recorded as `replaced`, so
+        // the next pass still knows (its `created` is gone either way).
         let foldChildPin = true;
         if (previous !== undefined) {
           // The recorded target is reused only while it still holds bytes
           // this adoption put there — the owner may have edited, replaced or
           // deleted it since, and the child's note must not land on unrelated
           // content or a missing file. Unchanged legacy bytes (only the
-          // sidecar moved): reuse without a write. Otherwise the note is
-          // placed anew (legacyImportTarget: a legacy note edited on the
-          // downgraded build lands under imported/<child>/ beside the copy of
-          // its earlier bytes). Inspected strictly: a prior target that
+          // sidecar moved): reuse without a write. Legacy bytes edited on the
+          // downgraded build while the copy THIS adoption created is still
+          // untouched: the copy is replaced in place — placing the new bytes
+          // elsewhere would strand the old copy, provenance lost, in the
+          // model-visible notebook (and, both destinations taken, skip the
+          // edit for good). Otherwise the note is placed anew
+          // (legacyImportTarget). Inspected strictly: a prior target that
           // merely cannot be stat'ed or read right now is not "replaced" —
           // retry on the next access instead (the pass stays incomplete).
           let priorContent: string | null;
@@ -1498,27 +1725,62 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          if (priorContent === content) {
-            // Ours only while the copy is the generation this adoption
-            // installed (LegacyAdoptionRecord.targetStamp — a receipt taken
-            // on the staged bytes BEFORE they appear at the target, so even a
-            // pass interrupted between manifest and install left one).
-            // Identical bytes in another generation are the owner's: the
-            // owner may have deleted and recreated the note with the very
-            // same bytes, or — a pass interrupted before its install —
-            // another backend may have created it at the planned target.
-            // `pending` alone is never provenance: a stamp-less pending
-            // record (an older build's) is ambiguous and claims nothing.
-            const currentStamp =
-              (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
-            const ours =
-              previous.created === true &&
-              currentStamp !== undefined &&
-              currentStamp === previous.targetStamp;
+          // Ours only while the copy is a generation this adoption installed
+          // (LegacyAdoptionRecord.targetStamp / replacementStamp — receipts
+          // taken on the staged bytes BEFORE they appear at the target, so
+          // even a pass interrupted between manifest and install left one).
+          // Identical bytes in another generation are the owner's (the same
+          // rule deletion reconciliation applies): the owner may have deleted
+          // and recreated the note with the very same bytes, or — a pass
+          // interrupted before its install — another backend may have created
+          // it at the planned target. `pending` alone is never provenance: a
+          // stamp-less pending record (an older build's) is ambiguous and
+          // claims nothing.
+          const currentStamp =
+            (await adoptionTargetStamp(store.physicalPath(previous.target))) ?? undefined;
+          const ours =
+            previous.created === true &&
+            currentStamp !== undefined &&
+            (currentStamp === previous.targetStamp || currentStamp === previous.replacementStamp);
+          // A recorded target that is not ours may be a sibling's copy (an
+          // earlier build reused identical bytes across descendants, or the
+          // owner's replacement was itself a sibling's fresh adoption): then
+          // it is not this note's to reuse, and the note is placed anew.
+          let siblings = false;
+          if (!ours && priorContent === content) {
+            try {
+              siblings = await siblingOwns(previous.target, currentStamp ?? null);
+            } catch (error) {
+              log.warn(
+                "[MemoryService] cannot read a sibling's adoption manifest; retrying later",
+                { childId, owner, relPath, target: previous.target, error }
+              );
+              skipped++;
+              transientSkips++;
+              continue;
+            }
+          }
+          if (priorContent === content && !siblings) {
             target = { relPath: previous.target, write: false };
             record.created = ours;
             record.targetStamp = ours ? currentStamp : undefined;
-            foldChildPin = !(previous.created === true && !ours);
+            const replaced = previous.replaced === true || (previous.created === true && !ours);
+            if (replaced) record.replaced = true;
+            foldChildPin = !replaced;
+          } else if (
+            ours &&
+            priorContent !== null &&
+            [previous.content, previous.replacementContent].includes(sha256Hex(priorContent))
+          ) {
+            // Legacy bytes edited on the downgraded build while the copy is
+            // still this adoption's (either side of an interrupted
+            // replacement): replaced in place.
+            target = {
+              relPath: previous.target,
+              write: true,
+              replaces: true,
+              generation: currentStamp,
+            };
           }
         }
         if (target === null) {
@@ -1526,7 +1788,7 @@ export class MemoryService extends EventEmitter {
           // its lstat or read) is neither free nor different: the note waits
           // for the next pass with no copy made and no record written.
           try {
-            target = await this.legacyImportTarget(store, childId, relPath, content);
+            target = await this.legacyImportTarget(store, childId, relPath, content, siblingOwns);
           } catch (error) {
             log.warn("[MemoryService] cannot inspect a legacy note's destination; retrying later", {
               childId,
@@ -1544,7 +1806,7 @@ export class MemoryService extends EventEmitter {
           }
         }
         if (target.write) {
-          if (remainingCapacity <= 0) {
+          if (target.replaces !== true && remainingCapacity <= 0) {
             capacityExhausted = true;
             skipped++;
             continue;
@@ -1573,7 +1835,10 @@ export class MemoryService extends EventEmitter {
           // a file not yet there (nothing claimed) or names the installed
           // generation by stamp; a plain byte match never has to stand in
           // for provenance. Without the record, an installed copy would read
-          // as the owner's own note.
+          // as the owner's own note, and a legacy deletion could then never
+          // follow it out of the shared store. A replacement keeps the PRIOR
+          // record (old hash and stamp, same target) while pending: on either
+          // side of the install the retry recognizes the file by its stamp.
           const stagingPath = path.join(stagingDir, randomUUID());
           try {
             await fsPromises.mkdir(stagingDir, { recursive: true });
@@ -1595,20 +1860,35 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          adopted.set(relPath, {
-            ...record,
-            target: target.relPath,
-            created: true,
-            pending: true,
-            targetStamp: stagedStamp,
-          });
+          adopted.set(
+            relPath,
+            target.replaces === true && previous !== undefined
+              ? {
+                  ...previous,
+                  pending: true,
+                  replacementContent: record.content,
+                  replacementStamp: stagedStamp,
+                }
+              : {
+                  ...record,
+                  target: target.relPath,
+                  created: true,
+                  pending: true,
+                  targetStamp: stagedStamp,
+                }
+          );
           await writeManifest();
           // The destination as decided above, re-checked under the lock right
-          // before the install: a fresh placement must still be free.
+          // before the install: a fresh placement must still be free, a
+          // replacement must still be the generation it was decided against.
           // Anything else is owner state the rename must not clobber — the
           // staged bytes are dropped, the record restored, and the note is
           // placed on the next pass.
-          const installable = (await store.kind(target.relPath, { strict: true })) === null;
+          const installable =
+            target.replaces === true
+              ? (await adoptionTargetStamp(store.physicalPath(target.relPath))) ===
+                target.generation
+              : (await store.kind(target.relPath, { strict: true })) === null;
           const restoreRecord = async () => {
             await fsPromises.rm(stagingPath, { force: true });
             if (previous === undefined) adopted.delete(relPath);
@@ -1648,7 +1928,7 @@ export class MemoryService extends EventEmitter {
             transientSkips++;
             continue;
           }
-          remainingCapacity--;
+          if (target.replaces !== true) remainingCapacity--;
           imported++;
           record.created = true;
           // The generation of the file just installed (see targetStamp): the
@@ -1671,7 +1951,9 @@ export class MemoryService extends EventEmitter {
         if (childEntry !== undefined) {
           // A pending record still carries the sidecar state it was recorded
           // with: a fresh adoption's is the child's current state (no
-          // transition → first-adoption semantics).
+          // transition → first-adoption semantics), a pending replacement's
+          // is the prior record's — the child's toggle since must not be
+          // lost to the interrupted pass.
           const priorPinned = previous === undefined ? null : legacySidecarPinned(previous.sidecar);
           // Only an actual boolean transition of the child's pin overrides
           // the owner's; an unknown prior state never does.
@@ -1782,17 +2064,24 @@ export class MemoryService extends EventEmitter {
 
   /**
    * Where a legacy file lands in the owner store: its own relPath when free
-   * (write) or already identical (no write); the per-child import directory
-   * when the owner has different content there; null when even that slot is
-   * taken by different content (the file stays only in the legacy directory).
+   * (write) or already identical and the owner's own (no write); the
+   * per-child import directory when the owner has different content there
+   * or the identical file is another descendant's adoption-created copy;
+   * null when even that slot is taken by different content (the file stays
+   * only in the legacy directory). Throws when a sibling manifest the
+   * decision needs cannot be read (callers skip the note transiently).
    */
   private async legacyImportTarget(
     store: MemoryStore,
     childId: string,
     relPath: string,
-    content: string
+    content: string,
+    siblingOwns: (targetRelPath: string, liveStamp: string | null) => Promise<boolean>
   ): Promise<{ relPath: string; write: boolean } | null> {
-    for (const candidate of [relPath, `${LEGACY_IMPORT_DIR}/${childId}/${relPath}`]) {
+    for (const candidate of [
+      relPath,
+      `${LEGACY_IMPORT_DIR}/${legacyImportSegment(childId)}/${relPath}`,
+    ]) {
       // Never even compare through an escaping path (the write site re-checks).
       const contained = await store.assertContained(candidate).then(
         () => true,
@@ -1801,9 +2090,45 @@ export class MemoryService extends EventEmitter {
       if (!contained) continue;
       const destination = await this.inspectAdoptionDestination(store, candidate);
       if (destination === "free") return { relPath: candidate, write: true };
-      if (destination.content === content) return { relPath: candidate, write: false };
+      // Identical: the owner's own note is reused (no slot, the owner's pin
+      // stands); another descendant's adoption-created copy is not — this
+      // note gets its own copy at the next candidate.
+      if (
+        destination.content === content &&
+        !(await siblingOwns(candidate, await adoptionTargetStamp(store.physicalPath(candidate))))
+      ) {
+        return { relPath: candidate, write: false };
+      }
     }
     return null;
+  }
+
+  /**
+   * The settled adoption records of the owner's OTHER descendants, read
+   * strictly: the pass decides on their authority whether an identical owner
+   * file may be reused, so an unreadable or malformed sibling manifest fails
+   * the question (callers skip the note transiently) instead of answering
+   * "not a sibling's".
+   */
+  private async descendantAdoptionRecords(
+    owner: string,
+    childId: string
+  ): Promise<LegacyAdoptionRecord[]> {
+    const cfg = this.config.loadConfigOrDefault();
+    const resolve = workspaceMemoryOwnerResolver(cfg);
+    const records: LegacyAdoptionRecord[] = [];
+    for (const project of cfg.projects.values()) {
+      for (const workspace of project.workspaces) {
+        const id = workspace.id;
+        if (id === undefined || id === childId || id === owner || resolve(id) !== owner) continue;
+        const manifest = await readLegacyAdoptionManifest(
+          legacyAdoptionManifestPath(path.join(this.config.sessionsDir, id)),
+          { strict: true }
+        );
+        records.push(...manifest.values());
+      }
+    }
+    return records;
   }
 
   /**
@@ -1853,7 +2178,7 @@ export class MemoryService extends EventEmitter {
     const bytes = await store.readFilePrefixBytes(relPath, MEMORY_MAX_FILE_BYTES + 1);
     if (bytes.length > MEMORY_MAX_FILE_BYTES) return { content: null };
     try {
-      return { content: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+      return { content: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes) };
     } catch {
       return { content: null };
     }
