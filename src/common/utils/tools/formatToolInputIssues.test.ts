@@ -32,6 +32,21 @@ describe("formatToolInputIssues", () => {
     );
   });
 
+  test("caps the rendered issues and counts the rest", () => {
+    const input = { questions: Array.from({ length: 20 }, () => ({})) };
+    const schema = z.object({
+      questions: z.array(z.object({ question: z.string(), header: z.string() })),
+    });
+    const issues = issuesFor(schema, input);
+    expect(issues.length).toBe(40);
+
+    const message = formatToolInputIssues(issues, input);
+
+    expect(message.split("; ")).toHaveLength(9);
+    expect(message).toStartWith("questions.0.question: ");
+    expect(message).toEndWith("; and 32 more issues");
+  });
+
   test("joins multiple issues and only annotates string-origin size issues", () => {
     const input = { question: "x".repeat(2100), tags: ["a", "b"], nested: { count: 1 } };
     const schema = z.object({

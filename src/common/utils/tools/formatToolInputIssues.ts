@@ -25,12 +25,25 @@ export function isToolInputIssueArray(value: unknown): value is ToolInputIssue[]
 }
 
 /**
+ * A malformed array input yields one issue per entry per field, so a single bad call
+ * could otherwise expand into an unbounded summary in the next model request.
+ */
+const MAX_RENDERED_ISSUES = 8;
+
+/**
  * Render zod issues as one concise line: "<path>: <message>[ (received N characters)]".
  * Never echoes the input value itself; the AI SDK's own message does, which buries the
  * actionable issue under kilobytes of the model's rejected input.
  */
 export function formatToolInputIssues(issues: readonly ToolInputIssue[], input: unknown): string {
-  return issues.map((issue) => formatToolInputIssue(issue, input)).join("; ");
+  const rendered = issues
+    .slice(0, MAX_RENDERED_ISSUES)
+    .map((issue) => formatToolInputIssue(issue, input))
+    .join("; ");
+  const omitted = issues.length - Math.min(issues.length, MAX_RENDERED_ISSUES);
+  return omitted > 0
+    ? `${rendered}; and ${omitted} more issue${omitted === 1 ? "" : "s"}`
+    : rendered;
 }
 
 function formatToolInputIssue(issue: ToolInputIssue, input: unknown): string {
