@@ -103,7 +103,7 @@ describe("SelectableDiffRenderer drag selection", () => {
     }
   });
 
-  test("hovering the review button uses the full custom range-selection tooltip", async () => {
+  test("hovering the review button does not show a tooltip", async () => {
     const content = "+const a = 1;\n+const b = 2;";
 
     const { container } = render(
@@ -128,11 +128,9 @@ describe("SelectableDiffRenderer drag selection", () => {
 
     fireEvent.mouseEnter(commentButton!);
 
-    await waitFor(() => {
-      expect(document.body.textContent).toContain(
-        "Add review comment (Shift-click or drag to select range)"
-      );
-    });
+    expect(document.body.textContent).not.toContain(
+      "Add review comment (Shift-click or drag to select range)"
+    );
   });
 
   test("typing in the review composer does not schedule textarea layout work per key", async () => {
