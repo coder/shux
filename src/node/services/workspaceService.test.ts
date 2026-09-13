@@ -62,6 +62,7 @@ import type {
   WorkspaceMetadata,
 } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
+import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -15762,6 +15763,146 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 });
 
+describe("WorkspaceService remove shared memory owner pinning", () => {
+  const projectPath = "/tmp/proj-memory-pin";
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+  interface Entry {
+    id: string;
+    name: string;
+    path: string;
+    runtimeConfig: typeof runtimeConfig;
+    parentWorkspaceId?: string;
+    memoryOwnerWorkspaceId?: string;
+  }
+
+  /** owner → mid → grand: removing `mid` must keep `grand` on the owner's notebook. */
+  function buildTopology(): { projects: Map<string, { trusted: boolean; workspaces: Entry[] }> } {
+    return {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: "ws-owner", name: "owner", path: `${projectPath}/owner`, runtimeConfig },
+              {
+                id: "ws-mid",
+                name: "mid",
+                path: `${projectPath}/mid`,
+                runtimeConfig,
+                parentWorkspaceId: "ws-owner",
+              },
+              {
+                id: "ws-grand",
+                name: "grand",
+                path: `${projectPath}/grand`,
+                runtimeConfig,
+                parentWorkspaceId: "ws-mid",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+  }
+
+  function buildConfig(options: { persistPins: boolean }): {
+    config: Partial<Config>;
+    topology: ReturnType<typeof buildTopology>;
+  } {
+    const topology = buildTopology();
+    const config = {
+      rootDir: path.join(tmpdir(), "mux-memory-pin", `root-${crypto.randomUUID()}`),
+      srcDir: "/tmp/src",
+      sessionsDir: path.join(tmpdir(), "mux-memory-pin", `sessions-${crypto.randomUUID()}`),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath: `${projectPath}/mid`, projectPath })),
+      loadConfigOrDefault: mock(() => topology),
+      // Config swallows write failures: a pin that does not land must be
+      // caught by the removal's verified read-back, so the no-persist variant
+      // applies the edit to a throwaway copy.
+      editConfig: mock((edit: (cfg: ReturnType<typeof buildTopology>) => unknown) => {
+        edit(options.persistPins ? topology : buildTopology());
+        return Promise.resolve();
+      }),
+    } as unknown as Partial<Config>;
+    return { config, topology };
+  }
+
+  function buildAiService(): AIService {
+    class FakeAIService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({
+          success: true as const,
+          data: { id: "ws-mid", name: "mid", projectPath, runtimeConfig },
+        })
+      );
+    }
+    return new FakeAIService() as unknown as AIService;
+  }
+
+  test("pins surviving descendants to the root owner before tearing the middle node down", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config, topology } = buildConfig({ persistPins: true });
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const result = await workspaceService.remove("ws-mid");
+      expect(result.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      const grand = topology.projects
+        .get(projectPath)!
+        .workspaces.find((ws) => ws.id === "ws-grand");
+      expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+      // Once ws-mid is gone the pin keeps ws-grand on the root's notebook.
+      topology.projects.get(projectPath)!.workspaces = topology.projects
+        .get(projectPath)!
+        .workspaces.filter((ws) => ws.id !== "ws-mid");
+      expect(resolveWorkspaceMemoryOwnerId(topology as never, "ws-grand")).toBe("ws-owner");
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("aborts a non-forced removal (workspace intact) when the descendant pin does not persist", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { config } = buildConfig({ persistPins: false });
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        aiService: buildAiService(),
+      });
+      const refused = await workspaceService.remove("ws-mid");
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("retry the removal");
+      // Nothing destructive ran: no checkout deletion, no deregistration.
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+      expect(config.removeWorkspace).not.toHaveBeenCalled();
+
+      // Forced removal accepts the loss and proceeds.
+      const forced = await workspaceService.remove("ws-mid", true);
+      expect(forced.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+});
+
 describe("WorkspaceService remove desktop session cleanup", () => {
   const workspaceId = "ws-remove-desktop";
 
@@ -15853,6 +15994,47 @@ describe("WorkspaceService remove desktop session cleanup", () => {
 
     expect(result.success).toBe(false);
     expect(reopened).toEqual([workspaceId]);
+  });
+
+  test("remove() lifts the consolidation teardown gate only when it aborts before committing", async () => {
+    const calls: string[] = [];
+    workspaceService.setMemoryConsolidationService({
+      triggerInBackground: () => undefined,
+      triggerHarvestThenSweepInBackground: () => undefined,
+      cancelInFlightConsolidation: () => {
+        calls.push("cancel");
+        return Promise.resolve();
+      },
+      releaseRemovalCancellation: () => {
+        calls.push("release");
+      },
+      finalizeHarvestsForRemoval: () => {
+        calls.push("finalize");
+        return Promise.resolve();
+      },
+    });
+    // Aborted before the point of no return (live descendant tasks): the
+    // workspace stays intact, so any teardown gate is lifted again and no
+    // harvest state is finalized.
+    let descendants = true;
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => descendants })
+    );
+    const aborted = await workspaceService.remove(workspaceId);
+    expect(aborted.success).toBe(false);
+    expect(calls).toEqual(["release"]);
+    // Committed removal: cancelled (drained), harvest records finalized once
+    // the session directory is gone, and never released.
+    descendants = false;
+    calls.length = 0;
+    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    const removed = await workspaceService.remove(workspaceId);
+    expect(removed.success).toBe(true);
+    expect(existsSync(sessionDir)).toBe(false);
+    expect(calls.filter((call) => call === "cancel").length).toBeGreaterThan(0);
+    expect(calls).toContain("finalize");
+    expect(calls).not.toContain("release");
   });
 
   test("remove() flushes the timeline before deleting the session directory", async () => {

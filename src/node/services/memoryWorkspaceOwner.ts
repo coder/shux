@@ -19,7 +19,8 @@ type ProjectsConfig = ReturnType<Config["loadConfigOrDefault"]>;
  * parentWorkspaceId, so those fallbacks keep their private store usable.
  *
  * Pure over one config snapshot (indexed once per snapshot, see
- * workspaceMemoryOwnerResolver); MemoryService memoizes it.
+ * workspaceMemoryOwnerResolver); MemoryService memoizes it, removal calls it
+ * directly.
  */
 export function resolveWorkspaceMemoryOwnerId(cfg: ProjectsConfig, workspaceId: string): string {
   return workspaceMemoryOwnerResolver(cfg)(workspaceId);
@@ -68,7 +69,21 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
         }
         return workspaceId;
       }
+      // A pinned owner is recorded when an intermediate ancestor is removed
+      // (pinDescendantWorkspaceMemoryOwners), so it only speaks for a chain
+      // that DANGLES: while the recorded parent is still registered the walk
+      // follows it, and a pin that disagrees with a live parent (raw config,
+      // never produced by this code) heals on the next removal instead of
+      // redirecting the child into an unrelated tree's notebook. With the
+      // parent gone, a live pin decides; a pin whose owner is gone too leaves
+      // the child on its own store.
       const parentWorkspaceId = entry.parentWorkspaceId;
+      const parentLive =
+        parentWorkspaceId !== undefined && parentWorkspaceId !== "" && byId.has(parentWorkspaceId);
+      if (!parentLive) {
+        const pinned = entry.memoryOwnerWorkspaceId;
+        if (pinned !== undefined && pinned !== "" && byId.has(pinned)) return pinned;
+      }
       if (parentWorkspaceId === undefined || parentWorkspaceId === "") return current;
       current = parentWorkspaceId;
     }
@@ -79,4 +94,36 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
   };
   resolversBySnapshot.set(cfg, resolver);
   return resolver;
+}
+
+/**
+ * Removal of `removedWorkspaceId`: pin each surviving direct child to the
+ * owner it resolves to NOW, so the notebook it uses stays the same once the
+ * chain through the removed node dangles. The pin is whatever the walk
+ * resolves to while the node is still registered — an existing pin is
+ * overwritten by it (a live parent takes precedence over a pin in the
+ * resolver, so that IS the notebook the child has been using), and a stale
+ * one (its owner gone) is replaced likewise. Mutates the entries in place;
+ * returns the pins written, for the caller's verified read-back.
+ */
+export function pinDescendantWorkspaceMemoryOwners(
+  cfg: ProjectsConfig,
+  removedWorkspaceId: string
+): Map<string, string> {
+  assert(removedWorkspaceId.length > 0, "pinDescendantWorkspaceMemoryOwners requires an id");
+  const resolve = workspaceMemoryOwnerResolver(cfg);
+  const pinned = new Map<string, string>();
+  for (const project of cfg.projects.values()) {
+    for (const workspace of project.workspaces) {
+      if (workspace.parentWorkspaceId !== removedWorkspaceId || workspace.id === undefined) {
+        continue;
+      }
+      // Resolved before this loop mutates anything: every child's chain runs
+      // through the removed node, never through a sibling being pinned.
+      const owner = resolve(workspace.id);
+      workspace.memoryOwnerWorkspaceId = owner;
+      pinned.set(workspace.id, owner);
+    }
+  }
+  return pinned;
 }

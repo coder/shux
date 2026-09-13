@@ -131,7 +131,10 @@ import {
   deriveSideChannelModelCandidates,
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
-import { resolveWorkspaceMemoryOwnerId } from "@/node/services/memoryWorkspaceOwner";
+import {
+  pinDescendantWorkspaceMemoryOwners,
+  resolveWorkspaceMemoryOwnerId,
+} from "@/node/services/memoryWorkspaceOwner";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
@@ -2755,6 +2758,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private agentTaskIntegration?: AgentTaskIntegration;
@@ -3237,6 +3242,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
+    releaseRemovalCancellation(workspaceId: string): void;
+    finalizeHarvestsForRemoval(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
   }
@@ -5954,6 +5961,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.removingWorkspaces.add(workspaceId);
     let timelineClosed = false;
     let removedFromConfig = false;
+    // Set once removal passes its point of no return (session teardown and
+    // tombstone follow unconditionally); an abort before that leaves the
+    // workspace registered and intact, so the finally lifts the consolidation
+    // teardown gate the drains below installed.
+    let removalCommitted = false;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6030,6 +6042,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.sessionTimingService?.waitForIdle(workspaceId);
 
       let parentWorkspaceId: string | null = null;
+      // Memory owner resolved while the workspace was still fully registered
+      // (metadata path); reused for the destructive step below.
+      let verifiedSharedMemoryOwnerId: string | null = null;
       let childTaskModelString: string | undefined;
       let childTaskThinkingLevel: ThinkingLevel | undefined;
 
@@ -6098,6 +6113,45 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
+        // Shared workspace memory (sub-agents write into their task-tree
+        // owner's store). BEFORE any destructive step — so a failure leaves a
+        // fully intact, retryable workspace: pin the owner on surviving
+        // descendants (their parent chain is about to lose this node),
+        // verified by reading the config back because Config swallows write
+        // failures.
+        const sharedMemoryOwnerId = resolveWorkspaceMemoryOwnerId(
+          this.config.loadConfigOrDefault(),
+          workspaceId
+        );
+        verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
+        if (sharedMemoryOwnerId !== workspaceId) {
+          try {
+            let pinnedOwners = new Map<string, string>();
+            await this.config.editConfig((cfg) => {
+              pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
+              return cfg;
+            });
+            const persisted = this.config.loadConfigOrDefault();
+            for (const [id, owner] of pinnedOwners) {
+              const entry = findWorkspaceEntry(persisted, id);
+              if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
+                throw new Error(`memory owner pin for descendant ${id} did not persist`);
+              }
+            }
+          } catch (error) {
+            if (!force) {
+              return Err(
+                `Failed to hand this sub-agent's shared workspace memory over to its owner (${getErrorMessage(error)}); the workspace was left intact — retry the removal`
+              );
+            }
+            log.warn("Forced removal: shared-memory handover to the owner failed", {
+              workspaceId,
+              sharedMemoryOwnerId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -6394,6 +6448,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       //
       // Intentionally deferred until we're committed to removal: if runtime deletion fails with
       // force=false we return early and keep init state intact so init-end can refresh metadata.
+      removalCommitted = true;
       this.initStateManager.clearInMemoryState(workspaceId);
 
       // Dispose the session before deleting its directory: disposal aborts the active stream, and
@@ -6482,10 +6537,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // hold that store's lock too, so a child mutation admitted under the
         // owner key cannot commit after this tombstone. The workspace is
         // still registered here, so its parent chain resolves.
-        const memoryOwnerId = resolveWorkspaceMemoryOwnerId(
-          this.config.loadConfigOrDefault(),
-          workspaceId
-        );
+        const memoryOwnerId =
+          verifiedSharedMemoryOwnerId ??
+          resolveWorkspaceMemoryOwnerId(this.config.loadConfigOrDefault(), workspaceId);
         await removeSessionDirUnderMemoryLocks({
           rootDir: this.config.rootDir,
           sessionDir,
@@ -6496,12 +6550,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               ? undefined
               : path.join(this.config.sessionsDir, memoryOwnerId),
         });
+        // Only once the session (and with it the transcript) is gone are the
+        // retryable harvest records truly unrecoverable; an aborted removal
+        // above must leave them retryable.
+        await this.memoryConsolidationService?.finalizeHarvestsForRemoval(workspaceId);
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
         // writable by foreign backends forever — abort the removal (the
         // workspace stays registered and retryable) instead of proceeding
         // to deregistration below.
         if (error instanceof TombstoneNotDurableError) {
+          // No durable tombstone was published: the workspace stays
+          // registered with its session directory intact, so the
+          // consolidation teardown gate is lifted again in the finally like
+          // any pre-commit abort.
+          removalCommitted = false;
           throw error;
         }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
@@ -6627,6 +6690,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      if (!removalCommitted) {
+        this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+      }
       if (releaseOverridesLock !== undefined) {
         try {
           await releaseOverridesLock();
