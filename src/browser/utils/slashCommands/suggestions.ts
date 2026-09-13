@@ -2,7 +2,7 @@
  * Slash command suggestions generation
  */
 
-import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
+import { filterAndRankByNameMatch } from "@/browser/utils/suggestionMatching";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { getSlashCommandDefinitions } from "./parser";
@@ -22,12 +22,10 @@ function filterAndMapSuggestions<T extends SuggestionDefinition>(
   build: (definition: T) => SlashSuggestion,
   filter?: (definition: T) => boolean
 ): SlashSuggestion[] {
-  return definitions
-    .filter((definition) => {
-      if (filter && !filter(definition)) return false;
-      return matchesNameBySegmentPrefix(definition.key, partial);
-    })
-    .map((definition) => build(definition));
+  const candidates = filter ? definitions.filter(filter) : [...definitions];
+  return filterAndRankByNameMatch(candidates, partial, (definition) => definition.key).map(
+    (definition) => build(definition)
+  );
 }
 
 function buildTopLevelSuggestions(
@@ -94,32 +92,35 @@ function buildTopLevelSuggestions(
   // whose replacement IS the expansion text (no parser/send-path involvement).
   // Built-in command keys and skill names take precedence on collision.
   const claimedSkillNames = new Set(skillDefinitions.map((definition) => definition.key));
-  const pluginCommandSuggestions = (context.pluginCommands ?? [])
-    .filter(
+  const pluginCommandSuggestions = filterAndRankByNameMatch(
+    (context.pluginCommands ?? []).filter(
       (command) =>
         !SLASH_COMMAND_DEFINITION_MAP.has(command.name) && !claimedSkillNames.has(command.name)
-    )
-    .filter((command) => matchesNameBySegmentPrefix(command.name, partial))
-    .map((command) => ({
-      id: `plugin-command:${command.name}`,
-      display: `/${command.name}`,
-      description: `${command.description ?? "Plugin command"} (plugin:${command.pluginName})`,
-      replacement: command.expansion,
-    }));
+    ),
+    partial,
+    (command) => command.name
+  ).map((command) => ({
+    id: `plugin-command:${command.name}`,
+    display: `/${command.name}`,
+    description: `${command.description ?? "Plugin command"} (plugin:${command.pluginName})`,
+    replacement: command.expansion,
+  }));
 
-  const promptSuggestions = (context.mcpPrompts ?? [])
-    .filter((prompt) => matchesNameBySegmentPrefix(prompt.commandKey, partial))
-    .map((prompt) => {
-      const argumentHint = (prompt.arguments ?? [])
-        .map((argument) => `[${argument.name}${argument.required ? "" : "?"}]`)
-        .join(" ");
-      return {
-        id: `mcp-prompt:${prompt.commandKey}`,
-        display: `/${prompt.commandKey}${argumentHint ? ` ${argumentHint}` : ""}`,
-        description: `${prompt.description ?? "MCP prompt"} (${prompt.serverName})`,
-        replacement: `/${prompt.commandKey} `,
-      };
-    });
+  const promptSuggestions = filterAndRankByNameMatch(
+    context.mcpPrompts ?? [],
+    partial,
+    (prompt) => prompt.commandKey
+  ).map((prompt) => {
+    const argumentHint = (prompt.arguments ?? [])
+      .map((argument) => `[${argument.name}${argument.required ? "" : "?"}]`)
+      .join(" ");
+    return {
+      id: `mcp-prompt:${prompt.commandKey}`,
+      display: `/${prompt.commandKey}${argumentHint ? ` ${argumentHint}` : ""}`,
+      description: `${prompt.description ?? "MCP prompt"} (${prompt.serverName})`,
+      replacement: `/${prompt.commandKey} `,
+    };
+  });
 
   // Model alias one-shot suggestions (e.g., /haiku, /sonnet, /opus+high).
   // The build callback below hardcodes the trailing space, so `appendSpace`

@@ -301,3 +301,39 @@ describe("getSlashCommandSuggestions", () => {
     });
   });
 });
+
+describe("suggestion ranking", () => {
+  const agentSkills = [
+    {
+      name: "auto-lint",
+      description: "Run the linters automatically",
+      scope: "project" as const,
+    },
+    {
+      name: "lint",
+      description: "Run the linters",
+      scope: "project" as const,
+    },
+    {
+      name: "lint-fix",
+      description: "Run the linters and fix findings",
+      scope: "project" as const,
+    },
+  ];
+
+  it("ranks an exact skill name above prefix and segment matches", () => {
+    const suggestions = getSlashCommandSuggestions("/lint", { agentSkills });
+    const skillIds = suggestions
+      .filter((suggestion) => suggestion.id.startsWith("skill:"))
+      .map((suggestion) => suggestion.id);
+    expect(skillIds).toEqual(["skill:lint", "skill:lint-fix", "skill:auto-lint"]);
+  });
+
+  it("keeps discovery order for a bare slash", () => {
+    const suggestions = getSlashCommandSuggestions("/", { agentSkills });
+    const skillIds = suggestions
+      .filter((suggestion) => suggestion.id.startsWith("skill:"))
+      .map((suggestion) => suggestion.id);
+    expect(skillIds).toEqual(["skill:auto-lint", "skill:lint", "skill:lint-fix"]);
+  });
+});
