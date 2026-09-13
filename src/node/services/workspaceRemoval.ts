@@ -142,6 +142,16 @@ export async function removeSessionDirUnderMemoryLocks(args: {
    * succeeding or still-active) attempt relies on.
    */
   attemptId: string;
+  /**
+   * Session dir of the workspace whose `memory/` this workspace's
+   * `/memories/workspace` resolves to when that is ANOTHER workspace (a
+   * sub-agent sharing its task tree's notebook, memoryWorkspaceOwner.ts).
+   * Its store lock is held too: a child mutation is admitted under the
+   * OWNER's store key while journaling into this session dir, so a removal
+   * that took only this session's keys could publish the tombstone between
+   * the mutation's tombstone check and its commit.
+   */
+  sharedWorkspaceMemorySessionDir?: string;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -159,6 +169,15 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     path.join(args.sessionDir, "memory")
   );
   const sharedMemoryKey = memoryMutationLockKey(args.rootDir, path.join(args.rootDir, "memory"));
+  const ownerMemoryKeys =
+    args.sharedWorkspaceMemorySessionDir === undefined
+      ? []
+      : [
+          memoryMutationLockKey(
+            args.rootDir,
+            path.join(args.sharedWorkspaceMemorySessionDir, "memory")
+          ),
+        ];
   // The session dir itself is a third target key (r63): session-scoped
   // sidecar writers (headless usage) serialize their tombstone check +
   // commit against this same key, closing their check→write window.
@@ -200,7 +219,7 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     });
     await withTargetMutationLocks(
       args.rootDir,
-      [sessionDirKey, workspaceMemoryKey, sharedMemoryKey],
+      [sessionDirKey, workspaceMemoryKey, sharedMemoryKey, ...ownerMemoryKeys],
       async () => {
         // History append serialization (r63): a foreign backend's in-flight
         // stream can be mid-append under the history write lock; acquiring

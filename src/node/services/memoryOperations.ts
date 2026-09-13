@@ -23,7 +23,7 @@ import {
   resolveMemoryProjectIdentity,
   type MemoryScopeContext,
 } from "./memoryService";
-import { memoryLogicalKey } from "./memoryMeta";
+import { MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
 
 type MemoryContext = Pick<
   ORPCContext,
@@ -57,6 +57,8 @@ function workspaceNotFound(workspaceId: string | null | undefined): string {
 
 interface ResolvedMemoryScope {
   projectPath: string;
+  /** Task-tree root whose store backs workspace scope ("" without a workspace); keys sidecar pins/stats. */
+  ownerWorkspaceId: string;
   scopeCtx: MemoryScopeContext;
 }
 
@@ -73,19 +75,24 @@ function resolveMemoryScope(
     if (workspaceId == null)
       return {
         projectPath: "",
+        ownerWorkspaceId: "",
         scopeCtx: { runtime: null, checkoutCwd: "", workspaceId: "", projectPath: "" },
       };
     const metadata = yield* Effect.promise(() => context.workspaceService.getInfo(workspaceId));
     if (!metadata) return yield* Effect.fail(new MemoryWorkspaceNotFoundError({ workspaceId }));
     const projectPath = resolveMemoryProjectIdentity(metadata);
+    const scopeCtx: MemoryScopeContext = {
+      runtime: createRuntimeForWorkspace(metadata),
+      checkoutCwd: "",
+      workspaceId,
+      projectPath,
+    };
     return {
       projectPath,
-      scopeCtx: {
-        runtime: createRuntimeForWorkspace(metadata),
-        checkoutCwd: "",
-        workspaceId,
-        projectPath,
-      },
+      // Same per-context resolution the store/notify paths use, so sidecar keys
+      // and the physical store never disagree about the owner within a request.
+      ownerWorkspaceId: context.memoryService.ownerWorkspaceIdFor(scopeCtx),
+      scopeCtx,
     };
   });
 }
@@ -102,7 +109,7 @@ export function listMemoryEffect(context: MemoryContext, input: Input<typeof sch
       context.memoryService.listIndexEntries(resolved.scopeCtx)
     );
     const meta = yield* context.memoryMetaService.effects.getEntries();
-    const ids = { projectPath: resolved.projectPath, workspaceId: input.workspaceId ?? "" };
+    const ids = { projectPath: resolved.projectPath, workspaceId: resolved.ownerWorkspaceId };
     return {
       success: true as const,
       data: {
@@ -227,26 +234,27 @@ export function setMemoryPinnedEffect(
         success: false as const,
         error: "Project memory is unavailable: no project is associated with this session",
       };
-    return yield* context.memoryMetaService.effects
-      .setPinned(
-        memoryLogicalKey(scope, relPath, {
-          projectPath: resolved.projectPath,
-          workspaceId: input.workspaceId ?? "",
-        }),
-        input.pinned
+    // Sidecar write + change event, committed under the store's mutation
+    // lock by MemoryService (workspace scope).
+    return yield* Effect.tryPromise({
+      try: () => context.memoryService.setPinned(resolved.scopeCtx, input.path, input.pinned),
+      catch: (error: unknown) => error,
+    }).pipe(
+      Effect.map(() => ({ success: true as const, data: undefined })),
+      // Sidecar write failures (disk full, permissions) arrive as the typed
+      // MemoryMetaWriteError; lock timeouts and command errors map onto the
+      // same legacy string error channel instead of escaping as an untyped
+      // INTERNAL_SERVER_ERROR rejection.
+      Effect.catch((error) =>
+        Effect.succeed({
+          success: false as const,
+          error:
+            error instanceof MemoryMetaWriteError
+              ? `Failed to persist pin state: ${error.reason}`
+              : `Failed to update pin: ${getErrorMessage(error)}`,
+        })
       )
-      .pipe(
-        Effect.map(() => ({ success: true as const, data: undefined })),
-        // Sidecar write failures (disk full, permissions) arrive as the typed
-        // MemoryMetaWriteError and map onto the legacy string error channel
-        // instead of escaping as an untyped INTERNAL_SERVER_ERROR rejection.
-        Effect.catchTag("MemoryMetaWriteError", (error) =>
-          Effect.succeed({
-            success: false as const,
-            error: `Failed to persist pin state: ${error.reason}`,
-          })
-        )
-      );
+    );
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
 }
 

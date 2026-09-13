@@ -93,6 +93,12 @@ interface MemoryConsolidationRunOptions {
    */
   skipWorkspaceDebounce?: boolean;
   skipHarvestRecovery?: boolean;
+  /**
+   * Set by maybeRun when a sub-agent's trigger is redirected to its owner: the
+   * child's own durable removal tombstone then gates the owner run too, since
+   * a child mid-teardown must not mutate the shared notebook.
+   */
+  actingWorkspaceId?: string;
 }
 
 interface ExperimentsCheck {
@@ -414,8 +420,12 @@ export class MemoryConsolidationService extends EventEmitter {
       const workspace = self.config.findWorkspace(workspaceId);
       const projectPath = workspace == null ? "" : resolveConsolidationProjectPath(workspace);
       const globalRecord = findNewestWorkspaceRecord(file.workspaces);
+      // The workspace record describes the STORE the tab shows: for a
+      // sub-agent that is the owner's (runs are redirected there, see
+      // maybeRun); harvests stay per acting workspace.
+      const ownerWorkspaceId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
       return {
-        workspaceRecord: file.workspaces[workspaceId] ?? null,
+        workspaceRecord: file.workspaces[ownerWorkspaceId] ?? null,
         projectRecord: projectPath === "" ? null : (file.projects[projectPath] ?? null),
         globalRecord,
         latestHarvestRecord: findNewestHarvestRecord(file.harvestsByWorkspace[workspaceId]),
@@ -494,10 +504,22 @@ export class MemoryConsolidationService extends EventEmitter {
     const self = this;
     return Effect.gen(function* () {
       const sidecar = yield* self.loadEffect();
-      const records = sidecar.harvestsByWorkspace[workspaceId];
-      if (records === undefined) return;
+      // Harvest buckets are keyed by the ACTING workspace, but a sub-agent's
+      // runs redirect to its owner (see maybeRun) and the launch sweep skips
+      // children, so an owner run must retry every tree member's bucket or a
+      // child's failed/stale harvest would never be recovered.
+      const cfg = self.config.loadConfigOrDefault();
+      const records = Object.entries(sidecar.harvestsByWorkspace)
+        .filter(
+          ([bucketId]) =>
+            !self.removalCancelled.has(bucketId) &&
+            (bucketId === workspaceId ||
+              self.memoryService.resolveWorkspaceMemoryOwnerId(bucketId, () => cfg) === workspaceId)
+        )
+        .flatMap(([, bucket]) => Object.values(bucket));
+      if (records.length === 0) return;
 
-      const retryable = Object.values(records)
+      const retryable = records
         .filter((record) => {
           if (record.completionMetadata === undefined) return false;
           if (record.attemptCount >= HARVEST_MAX_ATTEMPTS) return false;
@@ -542,26 +564,48 @@ export class MemoryConsolidationService extends EventEmitter {
     return Effect.promise(() => isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId));
   }
 
-  /** Register one run's removal controller; disposed when the run settles. */
-  private trackRunController(workspaceId: string): {
+  /**
+   * Register one run's removal controller; disposed when the run settles.
+   * A run made on a sub-agent's behalf over the OWNER's store (a redirected
+   * trigger, the post-harvest sweep) is registered under the acting child's
+   * id too: the child's removal drain (cancelInFlightConsolidation) must abort
+   * it — a cancelled child harvest deliberately falls through to this sweep,
+   * which could otherwise keep mutating the shared notebook for its whole
+   * run after the removal's bounded drain returned.
+   */
+  private trackRunController(
+    workspaceId: string,
+    actingWorkspaceId?: string
+  ): {
     controller: AbortController;
     dispose: () => void;
   } {
     const controller = new AbortController();
+    const ids = [
+      workspaceId,
+      ...(actingWorkspaceId !== undefined && actingWorkspaceId !== workspaceId
+        ? [actingWorkspaceId]
+        : []),
+    ];
     // r61: a run registered after teardown began (follow-on sweep/recovery
     // racing the entry checks) must start already aborted.
-    if (this.removalCancelled.has(workspaceId)) {
+    if (ids.some((id) => this.removalCancelled.has(id))) {
       controller.abort();
     }
-    const set = this.runControllers.get(workspaceId) ?? new Set<AbortController>();
-    set.add(controller);
-    this.runControllers.set(workspaceId, set);
+    const sets = ids.map((id) => {
+      const set = this.runControllers.get(id) ?? new Set<AbortController>();
+      set.add(controller);
+      this.runControllers.set(id, set);
+      return [id, set] as const;
+    });
     return {
       controller,
       dispose: () => {
-        set.delete(controller);
-        if (set.size === 0 && this.runControllers.get(workspaceId) === set) {
-          this.runControllers.delete(workspaceId);
+        for (const [id, set] of sets) {
+          set.delete(controller);
+          if (set.size === 0 && this.runControllers.get(id) === set) {
+            this.runControllers.delete(id);
+          }
         }
       },
     };
@@ -667,8 +711,40 @@ export class MemoryConsolidationService extends EventEmitter {
     options: MemoryConsolidationRunOptions = {}
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
-    if (this.removalCancelled.has(workspaceId)) {
+    // Sub-agents share their task-tree owner's /memories/workspace store
+    // (MemoryService.resolveWorkspaceMemoryOwnerId): a child's manual or
+    // post-compaction run consolidates the OWNER's notebook under the owner's
+    // in-flight lock, so it never races the owner's own runs and the child's
+    // harvested candidates are actually swept. Archive is the owner's own
+    // one-shot promotion pass; a child archive must not trigger it. Compared
+    // by resolved owner, not parentWorkspaceId: a dangling/cyclic chain falls
+    // back to a private store that must stay consolidatable.
+    //
+    // The acting child's own teardown gate comes BEFORE the redirect:
+    // cancelInFlightConsolidation(child) marks only the child id, and an
+    // owner-keyed run reserved after that would neither be refused by the
+    // owner's check below nor be cancellable by the child's removal drain.
+    if (
+      this.removalCancelled.has(workspaceId) ||
+      (options.actingWorkspaceId !== undefined &&
+        this.removalCancelled.has(options.actingWorkspaceId))
+    ) {
       return Err("workspace is being removed; consolidation refused");
+    }
+    const ownerWorkspaceId = this.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId);
+    if (ownerWorkspaceId !== workspaceId) {
+      if (trigger === "archive") {
+        return Err(
+          "sub-agent workspaces share their owner's workspace memory; the owner's archive pass promotes it"
+        );
+      }
+      // The owner run's recovery covers this child's harvest bucket too. The
+      // child's durable tombstone is probed behind the reservation, like the
+      // owner's (actingWorkspaceId).
+      return this.maybeRun(ownerWorkspaceId, trigger, {
+        ...options,
+        actingWorkspaceId: options.actingWorkspaceId ?? workspaceId,
+      });
     }
     const active = this.inFlight.get(workspaceId);
     if (active !== undefined) {
@@ -686,7 +762,7 @@ export class MemoryConsolidationService extends EventEmitter {
     // would otherwise also pass the check and start a second concurrent run
     // over the same directories. runPromise starts the fiber synchronously,
     // and the map is populated before this frame yields either way.
-    const removal = this.trackRunController(workspaceId);
+    const removal = this.trackRunController(workspaceId, options.actingWorkspaceId);
     const run = Effect.runPromise(
       this.runLockedEffect(workspaceId, trigger, options, removal.controller.signal)
     );
@@ -698,7 +774,17 @@ export class MemoryConsolidationService extends EventEmitter {
       this.inFlight.delete(workspaceId);
       removal.dispose();
     }
-    if (options.skipHarvestRecovery !== true) {
+    // Removal cancelled this run: recovery would spawn child harvests outside
+    // the cancellation registry being drained (their controllers were never
+    // registered), mutating the shared inbox during destructive teardown.
+    // A child-initiated run is keyed by the OWNER, so the acting child's own
+    // cancellation must gate it too.
+    if (
+      options.skipHarvestRecovery !== true &&
+      !this.removalCancelled.has(workspaceId) &&
+      (options.actingWorkspaceId === undefined ||
+        !this.removalCancelled.has(options.actingWorkspaceId))
+    ) {
       await Effect.runPromise(this.recoverRetryableHarvestsEffect(workspaceId));
     }
     return result;
@@ -719,6 +805,12 @@ export class MemoryConsolidationService extends EventEmitter {
       if (yield* self.isRemovalTombstonedEffect(workspaceId)) {
         return Err("workspace is being removed; consolidation refused");
       }
+      if (
+        options.actingWorkspaceId !== undefined &&
+        (yield* self.isRemovalTombstonedEffect(options.actingWorkspaceId))
+      ) {
+        return Err("workspace is being removed; consolidation refused");
+      }
 
       // Manual runs bypass debounce (an explicit /dream is explicit intent).
       // Archive too: it is the workspace's one-shot final pass — the only
@@ -733,6 +825,11 @@ export class MemoryConsolidationService extends EventEmitter {
 
       const workspace = self.config.findWorkspace(workspaceId);
       if (!workspace) return Err(`workspace not found: ${workspaceId}`);
+      // Sub-agents share their task-tree owner's /memories/workspace store
+      // (MemoryService.resolveWorkspaceMemoryOwnerId), so a Dream run from a
+      // child would consolidate the owner's notebook concurrently with the
+      // owner's own runs. Children still harvest into the shared inbox; only
+      // the owner sweeps it.
 
       const agentBody = yield* Effect.promise(() => resolveDreamAgentBody(self.config.rootDir));
       if (agentBody === null) return Err("dream agent definition is missing");
@@ -957,7 +1054,16 @@ export class MemoryConsolidationService extends EventEmitter {
           .pipe(Effect.catch(journalHarvestFailure), Effect.catchDefect(journalHarvestFailure));
       }
 
-      return yield* Effect.promise(() => self.runCompactionSweepAfterHarvest(metadata.workspaceId));
+      // A sub-agent's inbox lives in the owner's store: wait on and run the
+      // OWNER's consolidation (see maybeRun) so the harvest is actually swept —
+      // still as the acting CHILD, so the child's in-process cancellation,
+      // durable tombstone and removal drain bind the owner-keyed run too.
+      return yield* Effect.promise(() =>
+        self.runCompactionSweepAfterHarvest(
+          self.memoryService.resolveWorkspaceMemoryOwnerId(metadata.workspaceId),
+          metadata.workspaceId
+        )
+      );
     });
   }
 
@@ -1069,7 +1175,8 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   private async runCompactionSweepAfterHarvest(
-    workspaceId: string
+    workspaceId: string,
+    actingWorkspaceId: string
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     for (;;) {
       const active = this.inFlight.get(workspaceId);
@@ -1082,6 +1189,7 @@ export class MemoryConsolidationService extends EventEmitter {
       const result = await this.maybeRun(workspaceId, trigger, {
         skipWorkspaceDebounce: true,
         skipHarvestRecovery: true,
+        ...(actingWorkspaceId !== workspaceId ? { actingWorkspaceId } : {}),
       });
       if (!result.success && result.error === "a consolidation run is already in flight") {
         continue;
@@ -1193,7 +1301,8 @@ export class MemoryConsolidationService extends EventEmitter {
       let globalLastRunAt = findNewestWorkspaceRecord(sidecar.workspaces)?.lastRunAt ?? 0;
       const archivedById = new Map<string, boolean>();
       const projectPathByWorkspace = new Map<string, string>();
-      for (const [configProjectPath, project] of self.config.loadConfigOrDefault().projects) {
+      const cfg = self.config.loadConfigOrDefault();
+      for (const [configProjectPath, project] of cfg.projects) {
         for (const workspace of project.workspaces) {
           if (workspace.id === undefined) continue;
           archivedById.set(
@@ -1216,8 +1325,18 @@ export class MemoryConsolidationService extends EventEmitter {
         ])
       );
 
-      let started = 0;
+      // Shared stores: a child's writes are keyed under its owner, so the
+      // owner's row absorbs every tree member's recency (a notebook is idle
+      // only when the WHOLE tree is) and child rows are then dropped —
+      // running a child would just redirect to the owner anyway.
+      const treeRecency = new Map<string, number>();
       for (const [workspaceId, recency] of recencyByWorkspace) {
+        const ownerId = self.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, () => cfg);
+        treeRecency.set(ownerId, Math.max(treeRecency.get(ownerId) ?? 0, recency));
+      }
+
+      let started = 0;
+      for (const [workspaceId, recency] of treeRecency) {
         if (started >= MEMORY_CONSOLIDATION_LAUNCH_SWEEP_CAP) break;
         if (now - recency < MEMORY_CONSOLIDATION_IDLE_MS) continue;
         if (archivedById.get(workspaceId) === true) continue;

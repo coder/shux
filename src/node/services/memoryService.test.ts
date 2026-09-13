@@ -1,4 +1,4 @@
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 
 import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 
@@ -16,7 +16,7 @@ import {
   type MemoryScopeContext,
   type PinnedFileMutation,
 } from "./memoryService";
-import { MemoryMetaService } from "./memoryMeta";
+import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
 import {
   MemoryRefinementActionSchema,
   REFINEMENT_CAPTURE_MAX_FILES,
@@ -24,6 +24,8 @@ import {
   RefinementInverseSchema,
 } from "@/common/types/refinement";
 import { applyRefinementInverse, readRefinementEvents } from "./refinement/refinementTestHelpers";
+import { rollbackRefinement } from "./refinement/refinementRollback";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { TestTempDir } from "./tools/testHelpers";
 
 function pathExists(target: string): Promise<boolean> {
@@ -860,6 +862,387 @@ describe("MemoryService", () => {
       if (viewed.success) {
         expect(viewed.output).toContain("remember me");
       }
+    });
+  });
+
+  describe("sub-agent workspace memory sharing", () => {
+    /** Register owner → child → grandchild so parentWorkspaceId chains resolve. */
+    async function registerTaskTree(fixture: MemoryFixture): Promise<void> {
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.set(FIXTURE_PROJECT_PATH, {
+          workspaces: [
+            { id: "ws-owner", name: "owner", path: "/checkouts/owner" },
+            {
+              id: "ws-child",
+              name: "child",
+              path: "/checkouts/child",
+              parentWorkspaceId: "ws-owner",
+            },
+            {
+              id: "ws-grandchild",
+              name: "grandchild",
+              path: "/checkouts/grandchild",
+              parentWorkspaceId: "ws-child",
+            },
+            { id: "ws-solo", name: "solo", path: "/checkouts/solo" },
+          ],
+        });
+        return cfg;
+      });
+    }
+
+    it("resolves the task-tree root as the owner; unknown and parentless ids resolve to themselves", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-owner")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild")).toBe("ws-owner");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-solo")).toBe("ws-solo");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-unregistered")).toBe(
+        "ws-unregistered"
+      );
+    });
+
+    it("resolves from a caller snapshot without touching the config file", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const cfg = fixture.config.loadConfigOrDefault();
+      const stamp = spyOn(fixture.config, "configFileStamp");
+      const load = spyOn(fixture.config, "loadConfigOrDefault");
+      // Bulk passes (launch sweep over every recorded workspace) must not pay
+      // one synchronous stat per workspace on the main process.
+      for (const id of ["ws-owner", "ws-child", "ws-grandchild", "ws-solo"]) {
+        fixture.service.resolveWorkspaceMemoryOwnerId(id, () => cfg);
+      }
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-grandchild", () => cfg)).toBe(
+        "ws-owner"
+      );
+      expect(stamp).not.toHaveBeenCalled();
+      expect(load).not.toHaveBeenCalled();
+    });
+
+    it("stores a sub-agent's workspace notes in the owner's session dir, visible to the whole tree", async () => {
+      using fixture = await createFixture("ws-grandchild");
+      await registerTaskTree(fixture);
+      const events: unknown[] = [];
+      fixture.service.on("change", (event) => events.push(event));
+
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/context-notes.md",
+        "found the bug in parser.ts",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+
+      // Physically in the OWNER's session dir, not the grandchild's.
+      const ownerPhysical = path.join(
+        fixture.config.sessionsDir,
+        "ws-owner",
+        "memory",
+        "context-notes.md"
+      );
+      expect(await fsPromises.readFile(ownerPhysical, "utf-8")).toBe("found the bug in parser.ts");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-grandchild", "memory"))
+      ).toBe(false);
+
+      // Owner and sibling child read the same file through their own contexts.
+      for (const workspaceId of ["ws-owner", "ws-child"]) {
+        const viewed = await fixture.service.view(
+          { ...fixture.ctx, workspaceId },
+          "/memories/workspace/context-notes.md"
+        );
+        expect(viewed.success).toBe(true);
+        if (viewed.success) expect(viewed.output).toContain("found the bug in parser.ts");
+      }
+      // An unrelated workspace does not see it.
+      const solo = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-solo" },
+        "/memories/workspace/context-notes.md"
+      );
+      expect(solo.success).toBe(false);
+
+      // Change events name the owner so the owner's Memory tab (and every
+      // tree member's) refreshes; sidecar stats are keyed by the owner too.
+      // The two tree-member views publish as well: a read re-ranks the shared
+      // hot set, so sibling sessions must drop their cached memory context.
+      const ownerEvent = {
+        scope: "workspace",
+        path: "/memories/workspace/context-notes.md",
+        actor: "agent",
+        workspaceId: "ws-owner",
+        projectPath: FIXTURE_PROJECT_PATH,
+      };
+      expect(events).toEqual([ownerEvent, ownerEvent, ownerEvent]);
+      const meta = await fixture.metaService.getEntries();
+      expect(
+        meta.get(
+          memoryLogicalKey("workspace", "context-notes.md", {
+            projectPath: "",
+            workspaceId: "ws-owner",
+          })
+        )?.lastWriteAt
+      ).not.toBeNull();
+      expect(
+        meta.has(
+          memoryLogicalKey("workspace", "context-notes.md", {
+            projectPath: "",
+            workspaceId: "ws-grandchild",
+          })
+        )
+      ).toBe(false);
+    });
+
+    it("refuses a sub-agent's mutation once the owner's removal tombstone exists", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const tombstone = workspaceRemovalTombstonePath(fixture.config.rootDir, "ws-owner");
+      await fsPromises.mkdir(path.dirname(tombstone), { recursive: true });
+      await fsPromises.writeFile(tombstone, "");
+
+      // The child itself is alive, but its notebook is the removed owner's:
+      // committing would recreate the deleted owner directory.
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/n.md",
+        "shared",
+        "agent"
+      );
+      expect(created.success).toBe(false);
+      if (!created.success) expect(created.error).toContain("ws-owner was removed");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"))
+      ).toBe(false);
+      // Global scope is not the owner's store and stays writable.
+      const globalCreate = await fixture.service.create(
+        fixture.ctx,
+        "/memories/global/n.md",
+        "mine",
+        "agent"
+      );
+      expect(globalCreate.success).toBe(true);
+    });
+
+    it("journals a sub-agent's workspace-scope mutation in its own session", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/n.md",
+        "shared",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+
+      // Attribution stays with the acting workspace: the row is in the
+      // child's journal but its inverse points into the owner's memory dir.
+      const childSessionDir = path.join(fixture.config.sessionsDir, "ws-child");
+      const ownerSessionDir = path.join(fixture.config.sessionsDir, "ws-owner");
+      const events = await readRefinementEvents(childSessionDir);
+      expect(events).toHaveLength(1);
+      expect(await readRefinementEvents(ownerSessionDir)).toHaveLength(0);
+      const physical = path.join(ownerSessionDir, "memory", "n.md");
+      expect(events[0].data.inverse).toEqual({ op: "delete-files", paths: [physical] });
+
+      // Confinement: the child's own memory root does not admit the path.
+      const refused = await rollbackRefinement({
+        sessionDir: childSessionDir,
+        id: events[0].id,
+        evidence: { toolName: "test", actor: "user" },
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) expect(refused.error).toContain("outside every memory scope root");
+      expect(await pathExists(physical)).toBe(true);
+    });
+
+    it("re-resolves the owner after config changes so a removed owner's child falls back to its own store", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
+
+      // The owner is deregistered (removal with a live shared-checkout child);
+      // the dangling chain must not keep pointing at the removed owner.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        return cfg;
+      });
+      // Live sessions of formerly-shared children are told to drop their cache.
+      expect(invalidated).toEqual([["ws-child"]]);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/after.md",
+        "own store now",
+        "agent"
+      );
+      expect(created.success).toBe(true);
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-child", "memory", "after.md"))
+      ).toBe(true);
+    });
+
+    it("ignores config edits that leave the memory topology unchanged", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
+
+      // Ordinary churn (a retitle) must not make every live child rebuild its
+      // memory context, and the unchanged mapping stays memoized.
+      await fixture.config.editConfig((cfg) => {
+        const project = cfg.projects.get(FIXTURE_PROJECT_PATH)!;
+        project.workspaces.find((ws) => ws.id === "ws-child")!.title = "renamed";
+        return cfg;
+      });
+      expect(invalidated).toEqual([]);
+      const load = spyOn(fixture.config, "loadConfigOrDefault");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(load).not.toHaveBeenCalled();
+    });
+
+    it("re-resolves the owner after an EXTERNAL config rewrite (another backend removed it)", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+
+      // Rewrite config.json directly: no local onConfigChanged fires, only the
+      // file's stamp changes — as when a second backend deregisters the owner.
+      const configFile = path.join(fixture.xumHome, "config.json");
+      // On disk, projects are [path, project] tuples.
+      const raw = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ id: string }> }]>;
+      };
+      const project = raw.projects.find(([projectPath]) => projectPath === FIXTURE_PROJECT_PATH);
+      expect(project).toBeDefined();
+      project![1].workspaces = project![1].workspaces.filter((ws) => ws.id !== "ws-owner");
+      await fsPromises.writeFile(configFile, JSON.stringify(raw, null, 2));
+      // Same-tick same-size rewrites can leave mtime unchanged; force a distinct stamp.
+      await fsPromises.utimes(
+        configFile,
+        new Date(Date.now() + 5_000),
+        new Date(Date.now() + 5_000)
+      );
+
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+    });
+
+    it("announces the self→shared transition when config.json recovers after being unreadable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const invalidated: string[][] = [];
+      fixture.service.on("ownersInvalidated", (ids: string[]) => invalidated.push(ids));
+
+      // config.json vanishes (another backend mid-rewrite): the child cannot
+      // resolve its tree and falls back to its private store...
+      const configFile = path.join(fixture.xumHome, "config.json");
+      const parked = `${configFile}.parked`;
+      await fsPromises.rename(configFile, parked);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      expect(invalidated).toEqual([]);
+
+      // ...and once it is back, sessions that built a context on the fallback
+      // store must be told, even though no shared mapping was ever memoized.
+      await fsPromises.rename(parked, configFile);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      expect(invalidated).toEqual([["ws-child"]]);
+    });
+
+    it("does not memoize the self fallback taken while config.json is unreadable but unchanged", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // The file stats the same (no stamp change) but cannot be read/parsed
+      // for a moment (EACCES interval, non-atomic writer): the lenient load
+      // yields the empty default while the strict one throws.
+      const real = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError) throw new Error("EACCES: permission denied");
+          return { ...real(), projects: new Map() };
+        }
+      );
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+      // Readability returns without the stamp moving: the next resolution
+      // must see the real tree instead of a pinned fallback.
+      unreadable.mockRestore();
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+    });
+
+    it("keeps the owner memo retryable when a local config edit notifies while the file is unreadable", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      // A local edit removes the owner. The change notification fires while
+      // the file cannot be read (a swallowed late write failure): the memo
+      // must not be stamped as current, or the stale mapping survives until
+      // an unrelated rewrite once readability returns without a stamp change.
+      const real = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError) throw new Error("EACCES: permission denied");
+          return { ...real(), projects: new Map() };
+        }
+      );
+      await fixture.config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((ws) => ws.id !== "ws-owner");
+        }
+        return cfg;
+      });
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      unreadable.mockRestore();
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-child");
+    });
+
+    it("refuses to commit into a self-fallback store once config.json has recovered", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      // Mid-command race: the command resolves its store while config.json is
+      // unreadable (self-fallback) and the file recovers before the commit
+      // check inside the mutation lock. Only the command's FIRST resolution
+      // is faked; the pre-commit re-resolution sees the recovered tree.
+      spyOn(fixture.service, "resolveWorkspaceMemoryOwnerId").mockImplementationOnce(
+        () => "ws-child"
+      );
+      const created = await fixture.service.create(
+        fixture.ctx,
+        "/memories/workspace/late.md",
+        "x",
+        "agent"
+      );
+      expect(created.success).toBe(false);
+      if (!created.success) expect(created.error).toContain("Ownership of the workspace notebook");
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-child", "memory", "late.md"))
+      ).toBe(false);
+      expect(
+        await pathExists(path.join(fixture.config.sessionsDir, "ws-owner", "memory", "late.md"))
+      ).toBe(false);
+    });
+
+    it("keeps memoized owners when a changed config.json cannot be read", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      // The stamp moves (a rewrite) but the contents are unreadable for a
+      // moment: the memo must not be replaced by the empty default's self
+      // fallbacks, and the pass must be retried once readable.
+      const real = fixture.config.loadConfigOrDefault.bind(fixture.config);
+      const unreadable = spyOn(fixture.config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError) throw new Error("EACCES: permission denied");
+          return { ...real(), projects: new Map() };
+        }
+      );
+      spyOn(fixture.config, "configFileStamp").mockReturnValue("rewritten");
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
+      unreadable.mockRestore();
+      expect(fixture.service.resolveWorkspaceMemoryOwnerId("ws-child")).toBe("ws-owner");
     });
   });
 

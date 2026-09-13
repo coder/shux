@@ -313,6 +313,48 @@ describe("consolidation memory tool rails", () => {
     ).toContain("polished");
   });
 
+  it("enforces pin protection inside the mutation against the store the command binds to", async () => {
+    using fixture = await createFixture();
+    const sessionMemory = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
+    await fsPromises.mkdir(sessionMemory, { recursive: true });
+    await fsPromises.writeFile(path.join(sessionMemory, "pinned.md"), "keep me\n");
+    await fixture.metaService.setPinned(
+      memoryLogicalKey("workspace", "pinned.md", {
+        projectPath: fixture.ctx.projectPath,
+        workspaceId: fixture.ctx.workspaceId,
+      }),
+      true
+    );
+    // The tool's pre-check resolves the shared-store owner on its own; make
+    // that resolution disagree with the command's (as a transiently unreadable
+    // config.json can, falling back to a different store) so the pre-check
+    // looks at the wrong sidecar key and passes. The command itself must
+    // still refuse: its check runs in-lock against the owner its store is
+    // bound to.
+    const resolve = spyOn(fixture.memoryService, "resolveWorkspaceMemoryOwnerId");
+    resolve.mockImplementationOnce(() => "ws-elsewhere");
+    try {
+      const deletion = await execute(fixture.tool, {
+        command: "delete",
+        path: "/memories/workspace/pinned.md",
+      });
+      expect(deletion.success).toBe(false);
+      if (!deletion.success) expect(deletion.error).toContain("pinned");
+      expect(await pathExists(path.join(sessionMemory, "pinned.md"))).toBe(true);
+      resolve.mockImplementationOnce(() => "ws-elsewhere");
+      const rename = await execute(fixture.tool, {
+        command: "rename",
+        old_path: "/memories/workspace/pinned.md",
+        new_path: "/memories/workspace/moved.md",
+      });
+      expect(rename.success).toBe(false);
+      if (!rename.success) expect(rename.error).toContain("pinned");
+      expect(await pathExists(path.join(sessionMemory, "pinned.md"))).toBe(true);
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
   it("rejects deleting or renaming a directory that contains a pinned file", async () => {
     using fixture = await createFixture();
     const nestedDir = path.join(fixture.globalMemoryDir, "nested");

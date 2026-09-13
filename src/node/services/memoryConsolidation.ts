@@ -244,6 +244,11 @@ export function createConsolidationMemoryTool(args: {
     // Deletes/renames may target a directory (MemoryService removes
     // recursively), so reject when the path itself OR anything under it is
     // pinned — otherwise `delete dir/` would silently destroy dir/pinned.md.
+    // This pre-check gives the model (and dry-run staging) early feedback;
+    // the AUTHORITATIVE check runs inside MemoryService's mutation lock
+    // against the owner the command's store is actually bound to
+    // (`rejectPinned` below): the owner resolved here can differ from the
+    // command's when config.json is transiently unreadable in between.
     if (target.command === "delete" || target.command === "rename") {
       const { scope, relPath } = parseMemoryPath(target.path);
       assert(
@@ -253,7 +258,11 @@ export function createConsolidationMemoryTool(args: {
       const entries = await metaService.getEntries();
       const key = memoryLogicalKey(scope, relPath, {
         projectPath: ctx.projectPath,
-        workspaceId: ctx.workspaceId,
+        // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
+        workspaceId:
+          ctx.workspaceId === ""
+            ? ""
+            : memoryService.resolveWorkspaceMemoryOwnerId(ctx.workspaceId),
       });
       const subtreePrefix = `${key}/`;
       for (const [entryKey, entry] of entries) {
@@ -327,6 +336,7 @@ export function createConsolidationMemoryTool(args: {
       const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
         expectedTargetFingerprint: args.expectedTargetFingerprints?.get(toolCallId),
         abortSignal: args.abortSignal,
+        rejectPinned: true,
       });
       journal.push({
         ...target,

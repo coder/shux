@@ -65,7 +65,7 @@ import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
-import { MemoryService } from "@/node/services/memoryService";
+import { MemoryService, type MemoryChangeEvent } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
@@ -585,6 +585,25 @@ export const CoreWiringLive: Layer.Layer<
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    // Workspace-scope change events carry the memory OWNER (task-tree root);
+    // every live session resolving to that owner reads the same notebook.
+    memoryService.on("change", (event: MemoryChangeEvent) => {
+      if (event.scope !== "workspace" || event.workspaceId === "") return;
+      // One config snapshot for the whole pass: cold owner lookups would
+      // otherwise parse the config once per live session, synchronously.
+      let cfg: ReturnType<typeof config.loadConfigOrDefault> | undefined;
+      const snapshot = () => (cfg ??= config.loadConfigOrDefault());
+      workspaceService.invalidateMemoryContextWhere(
+        (workspaceId) =>
+          memoryService.resolveWorkspaceMemoryOwnerId(workspaceId, snapshot) === event.workspaceId
+      );
+    });
+    // Ownership itself changed (an owner was removed while its sub-agents
+    // live on): those sessions' cached contexts still describe the old store.
+    memoryService.on("ownersInvalidated", (workspaceIds: string[]) => {
+      const affected = new Set(workspaceIds);
+      workspaceService.invalidateMemoryContextWhere((workspaceId) => affected.has(workspaceId));
+    });
     if (opts.devToolsService) {
       // DevTools debug-log cleanup when workspaces are archived/removed.
       workspaceService.setDevToolsService(opts.devToolsService);

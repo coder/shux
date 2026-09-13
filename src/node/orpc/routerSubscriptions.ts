@@ -24,6 +24,7 @@ import type { LogEntry } from "@/node/services/logBuffer";
 import { subscribeLogFeed } from "@/node/services/logBuffer";
 import {
   resolveMemoryProjectIdentity,
+  toVirtualPath,
   type MemoryChangeEvent,
 } from "@/node/services/memoryService";
 
@@ -207,20 +208,48 @@ export function subscribeMemoryChanges(
     validate?.();
     const metadata = workspaceId ? await context.workspaceService.getInfo(workspaceId) : null;
     const projectPath = metadata ? resolveMemoryProjectIdentity(metadata) : null;
+    // Workspace-scope events carry the memory OWNER (task-tree root), which is
+    // also the store this subscriber's workspace displays. Resolved per event
+    // (memoized, cheap): the owner can change while the tab stays open — a
+    // removed owner makes the child fall back to its own store.
     yield* runtimeSubscription(context, {
       signal,
       subscribe: (emit) => {
         const onChange = (event: MemoryChangeEvent) => {
-          if (event.scope === "workspace" && event.workspaceId !== workspaceId) return;
+          if (
+            event.scope === "workspace" &&
+            event.workspaceId !==
+              (workspaceId
+                ? context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId)
+                : null)
+          )
+            return;
           if (event.scope === "project" && event.projectPath !== projectPath) return;
           emit.push(event);
         };
         const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) =>
           emit.push(event);
+        // Ownership changed for this workspace (its owner was removed; it
+        // now reads its own store). No mutation event accompanies a removal,
+        // so synthesize a root-addressed refresh for the file list and the
+        // consolidation status, both of which described the old store.
+        const onOwnersInvalidated = (workspaceIds: string[]) => {
+          if (!workspaceId || !workspaceIds.includes(workspaceId)) return;
+          emit.push({
+            scope: "workspace",
+            path: toVirtualPath("workspace", ""),
+            actor: "user",
+            workspaceId: context.memoryService.resolveWorkspaceMemoryOwnerId(workspaceId),
+            projectPath: projectPath ?? "",
+          });
+          emit.push({ kind: "consolidation_status", workspaceId, projectPath: projectPath ?? "" });
+        };
         context.memoryService.on("change", onChange);
+        context.memoryService.on("ownersInvalidated", onOwnersInvalidated);
         context.memoryConsolidationService.on("statusChange", onStatusChange);
         return () => {
           context.memoryService.off("change", onChange);
+          context.memoryService.off("ownersInvalidated", onOwnersInvalidated);
           context.memoryConsolidationService.off("statusChange", onStatusChange);
         };
       },

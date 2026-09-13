@@ -1098,6 +1098,24 @@ export class AgentSession {
    * prompt-cache-stable bytes without preserving stale files forever.
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+
+  /**
+   * Drop the cached memory context so the next stream rebuilds the index and
+   * hot set from disk. Own memory tool calls clear it on tool-call-end; this
+   * entry point is for writes by OTHER sessions to a store this session also
+   * reads (a sub-agent editing the task tree's shared workspace notes).
+   */
+  invalidateMemoryContext(): void {
+    this.memoryContextByModelString.clear();
+    // A build already awaiting buildMemorySessionContext read the pre-write
+    // files, and a rollover candidate stages its cache in a separate map that
+    // is installed later: bumping the generation stops both from
+    // (re)populating the cache with the stale snapshot.
+    this.memoryContextGeneration++;
+  }
+
+  private memoryContextGeneration = 0;
+
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
    * when post-compaction context is disabled.
@@ -5822,6 +5840,7 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
+    const cacheGeneration = this.memoryContextGeneration;
     // Admission must not pause the goal yet, but the pinned tools must match the later manual pause.
     let prospectiveGoalStatusForToolAvailability: StreamMessageOptions["prospectiveGoalStatusForToolAvailability"];
     if (manualIntervention && this.workspaceGoalService) {
@@ -5925,7 +5944,14 @@ export class AgentSession {
         : prepared;
     return Ok({
       start: (startOptions) => {
-        this.memoryContextByModelString = cache;
+        // A shared-notebook write by another tree session while this
+        // candidate was prepared invalidated the installed map only; the
+        // staged one is then unavoidably stale for this request and must
+        // not be reused by later turns.
+        this.memoryContextByModelString =
+          cacheGeneration === this.memoryContextGeneration
+            ? cache
+            : new Map<string, CachedMemoryContext>();
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -11273,6 +11299,7 @@ export class AgentSession {
       return cached.context ?? undefined;
     }
 
+    const generation = this.memoryContextGeneration;
     // Guard for test mocks that may not implement buildMemorySessionContext.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
@@ -11281,13 +11308,16 @@ export class AgentSession {
             tokenBudgetActive,
           })
         : null;
-    cache.set(modelString, {
-      context,
-      includesHotMemories: includeHotMemories,
-      tokenBudgetActive,
-      memoryEnabled,
-      hotSetEnabled,
-    });
+    // Invalidated mid-build: serve this snapshot once, do not cache it.
+    if (generation === this.memoryContextGeneration) {
+      cache.set(modelString, {
+        context,
+        includesHotMemories: includeHotMemories,
+        tokenBudgetActive,
+        memoryEnabled,
+        hotSetEnabled,
+      });
+    }
     return context ?? undefined;
   }
 
