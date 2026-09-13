@@ -86,6 +86,7 @@ import {
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
+import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   computeActiveToolNames,
@@ -2801,6 +2802,7 @@ export class StreamManager {
       },
       onChunk: request.onChunk,
       tools: request.tools,
+      experimental_transform: summarizeInvalidToolInputErrors(),
       stopWhen: this.createStopWhenCondition(request),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
       providerOptions: request.providerOptions as any, // Pass provider-specific options (thinking/reasoning config)

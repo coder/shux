@@ -225,6 +225,40 @@ describe("ToolBridge", () => {
       expect(mockExecute).toHaveBeenCalledTimes(1);
     });
 
+    it("reports the received length for a string size violation", async () => {
+      const tools: Record<string, Tool> = {
+        file_read: createMockTool(
+          "file_read",
+          z.object({ path: z.string().max(10) }),
+          mock(() => ({ result: "ok" }))
+        ),
+      };
+      const bridge = new ToolBridge(tools);
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      bridge.register(
+        createMockRuntime({
+          registerObject: mock(
+            (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+              if (name === "mux") registeredMux = obj;
+              return undefined;
+            }
+          ),
+        })
+      );
+
+      const fileRead = registeredMux.file_read as (...args: unknown[]) => Promise<unknown>;
+      const path = "y".repeat(25);
+      try {
+        await fileRead({ path });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        const message = String(e);
+        expect(message).toContain("Invalid arguments for file_read: path:");
+        expect(message).toContain("(received 25 characters)");
+        expect(message).not.toContain(path);
+      }
+    });
+
     it("passes args through for JSON-Schema (MCP-style) tools", async () => {
       // MCP tools carry the AI SDK's jsonSchema() wrapper instead of a Zod
       // schema. Regression: validateArgs called schema.safeParse on it and

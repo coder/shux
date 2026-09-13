@@ -60,7 +60,7 @@ import {
   BASH_MAX_TOTAL_BYTES,
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
-import { ADVISOR_TOOL_DESCRIPTION } from "@/common/constants/advisor";
+import { ADVISOR_QUESTION_MAX_CHARS, ADVISOR_TOOL_DESCRIPTION } from "@/common/constants/advisor";
 import {
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
@@ -246,7 +246,7 @@ export const HeartbeatToolArgsSchema = z
 export const AdvisorToolInputSchema = z
   .object({
     // Advisor prompts often need tradeoff context; keep bounded while allowing a compact brief.
-    question: z.string().min(1).max(2000).nullish(),
+    question: z.string().min(1).max(ADVISOR_QUESTION_MAX_CHARS).nullish(),
   })
   .strict();
 
