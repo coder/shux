@@ -273,9 +273,11 @@ describe("settingsProjection", () => {
       "layoutPresets",
     ]);
     expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
-    expect(readBackupSettings({ settings: { layoutPresets: "garbage" } }).unsupported).toEqual([
-      "layoutPresets",
-    ]);
+    for (const layoutPresets of ["garbage", { version: 2, slots: "corrupt" }]) {
+      expect(readBackupSettings({ settings: { layoutPresets } }).unsupported).toEqual([
+        "layoutPresets",
+      ]);
+    }
 
     const current: ProjectsConfig = {
       projects: new Map(),

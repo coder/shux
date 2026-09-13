@@ -1,6 +1,7 @@
-import { z } from "zod";
+import type { z } from "zod";
 import { AppConfigOnDiskSchema, GoalDefaultsSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
+import { LayoutPresetsConfigSchema } from "@/common/orpc/schemas/uiLayouts";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
@@ -123,20 +124,16 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
 };
 
 /**
- * The on-disk schema leaves layoutPresets unknown and its normalizer reads a version it does not
- * know as an empty config, which a restore would turn into deleting the target's presets. Pin
- * the versions this build migrates so a newer document is reported as unsupported instead.
- */
-const LAYOUT_PRESETS_SCHEMA = z
-  .object({ version: z.union([z.literal(1), z.literal(2)]) })
-  .passthrough();
-
-/**
  * Per-key schemas rather than one picked object: the on-disk schema is passthrough, which would
  * carry any key of a repository-controlled document into the config, and each key accepts null.
+ * layoutPresets is unknown on disk and its normalizer reads anything it cannot parse (a newer
+ * version, corrupt slots) as an empty config, which a restore would turn into deleting the
+ * target's presets; the strict schema the layouts API saves through is used instead, so such a
+ * document is reported as unsupported.
  */
 function fieldSchema(key: BackedUpSettingsKey): z.ZodType {
-  const schema = key === "layoutPresets" ? LAYOUT_PRESETS_SCHEMA : AppConfigOnDiskSchema.shape[key];
+  const schema =
+    key === "layoutPresets" ? LayoutPresetsConfigSchema : AppConfigOnDiskSchema.shape[key];
   return schema.nullable();
 }
 

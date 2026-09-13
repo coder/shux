@@ -154,6 +154,15 @@ function describeRestoredFiles(count: number): string {
   return `${count} file${count === 1 ? "" : "s"}`;
 }
 
+/** A restore rewrites config behind the renderer's localStorage mirrors. */
+async function reseedConfigMirrors(api: APIClient): Promise<void> {
+  try {
+    seedConfigMirrors(await api.config.getConfig());
+  } catch {
+    // Best-effort: the mirrors re-seed on the next startup.
+  }
+}
+
 function ChangeList(props: {
   title: string;
   emptyLabel: string;
@@ -562,7 +571,9 @@ export function BackupSection() {
       });
       if (!result.success) {
         // A failure after the snapshot completed may have overwritten files already; the
-        // snapshot is the only recovery path, so its location belongs in the error.
+        // snapshot is the only recovery path, so its location belongs in the error. Config may
+        // have been rewritten as well, so the mirrors are re-seeded as after a success.
+        if (result.error.snapshotPath != null) await reseedConfigMirrors(api);
         setActionError(
           result.error.snapshotPath != null
             ? `${getOperationErrorMessage(result.error)} Your settings from before the restore are saved at: ${result.error.snapshotPath}`
@@ -608,12 +619,7 @@ export function BackupSection() {
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setUnsupportedSettings(result.data.unsupportedSettings);
-      // The restore rewrote config behind the renderer's localStorage mirrors.
-      try {
-        seedConfigMirrors(await api.config.getConfig());
-      } catch {
-        // Best-effort: the mirrors re-seed on the next startup.
-      }
+      await reseedConfigMirrors(api);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
