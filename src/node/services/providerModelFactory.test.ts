@@ -39,6 +39,7 @@ import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
 import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
+import { advisorWireCachePolicy } from "./tools/advisorTelemetry";
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 const LOCAL_VLLM_MODEL = "qwen3-coder";
@@ -2494,11 +2495,93 @@ describe("wrapFetchWithXAIServiceTier", () => {
 // Effort "xhigh" and thinking.display flow through the SDK directly as of
 // @ai-sdk/anthropic 4.0.11 (see buildProviderOptions), so the wrapper must NOT
 // rewrite reasoning fields — it only normalizes cache_control.
+describe("Anthropic cache request observation", () => {
+  it.each([
+    { ttl: undefined, marked: false, count: 1, expectedTtl: "5m" },
+    { ttl: "1h", marked: false, count: 1, expectedTtl: "1h" },
+    { ttl: "1h", marked: true, count: 2, expectedTtl: "1h" },
+  ] as const)(
+    "observes pinned model wire markers: %j",
+    async ({ ttl, marked, count, expectedTtl }) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        store.saveProvidersConfig({ anthropic: { apiKey: "test-key", cacheTtl: ttl } });
+        await saveRoutePriority(config, ["direct"]);
+        const observed: unknown[] = [];
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModelWithPinnedOptions(
+            "anthropic:claude-sonnet-4-20250514",
+            {
+              onAnthropicRequest: (body) => observed.push(body),
+            }
+          );
+          if (!result.success) throw new Error(result.error.type);
+          // The capture fetch has no model response. Only request serialization matters here.
+          await generateText({
+            model: result.data.model,
+            maxRetries: 0,
+            messages: [
+              ...(marked
+                ? [
+                    {
+                      role: "assistant" as const,
+                      content: "Earlier advice",
+                      providerOptions: {
+                        anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } },
+                      },
+                    },
+                  ]
+                : []),
+              { role: "user", content: "hello" },
+            ],
+          }).catch((error: unknown) => {
+            if (calls.length === 0) throw error;
+          });
+          expect(observed).toHaveLength(1);
+          expect(calls).toHaveLength(1);
+          expect(observed[0]).toEqual(parseSentBody(calls[0]));
+          expect(advisorWireCachePolicy(observed[0])).toEqual({
+            cache_marker_count: count,
+            cache_ttl: expectedTtl,
+          });
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
+  it("keeps wire injection when the observer throws", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, "1h", {
+      onRequest: () => {
+        throw new Error("observer failed");
+      },
+    });
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      }),
+    });
+    expect(calls).toHaveLength(1);
+    expect(advisorWireCachePolicy(parseSentBody(calls[0]))).toEqual({
+      cache_marker_count: 1,
+      cache_ttl: "1h",
+    });
+  });
+});
+
 describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
   it("strips existing cache markers when injection is disabled", async () => {
     const { calls, fakeFetch } = createCapturingFetch();
+    let observed: unknown;
     const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, undefined, {
       injectCacheControl: false,
+      onRequest: (body) => {
+        observed = body;
+      },
     });
 
     // Markers the request pipeline can serialize before the wrapper runs:
@@ -2523,6 +2606,10 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
     const sent = JSON.stringify(parseSentBody(calls[0]));
     expect(sent).not.toContain("cache_control");
     expect(sent).not.toContain("cacheControl");
+    expect(advisorWireCachePolicy(observed)).toEqual({
+      cache_marker_count: 0,
+      cache_ttl: "unknown",
+    });
   });
 
   it("keeps markers when injection is enabled", async () => {
