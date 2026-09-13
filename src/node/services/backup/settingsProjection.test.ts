@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { ProjectsConfig } from "@/common/types/project";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import {
@@ -8,21 +9,18 @@ import {
   readBackupSettings,
 } from "./settingsProjection";
 
-const agentAiDefaults: ProjectsConfig["agentAiDefaults"] = {
-  exec: {
-    modelString: "anthropic:claude-exec",
-    thinkingLevel: "high",
-    subagent: { modelString: "openai:gpt-sub", thinkingLevel: "low" },
-  },
-  plan: { modelString: "openai:gpt-plan", reasoningMode: "pro", advisorEnabled: true },
-  review: { enabled: false },
-};
-
 describe("settingsProjection", () => {
   it("projects portable settings and leaves machine-local keys behind", () => {
-    const config: ProjectsConfig = {
-      projects: new Map([["/repo", { workspaces: [] }]]),
-      agentAiDefaults,
+    const portable = {
+      agentAiDefaults: {
+        exec: {
+          modelString: "anthropic:claude-exec",
+          thinkingLevel: "high",
+          subagent: { modelString: "openai:gpt-sub", thinkingLevel: "low" },
+        },
+        plan: { modelString: "openai:gpt-plan", reasoningMode: "pro", advisorEnabled: true },
+        review: { enabled: false },
+      },
       defaultModel: "anthropic:claude-exec",
       hiddenModels: ["openai:gpt-old"],
       minThinkingLevelByModel: { "openai:gpt-plan": "medium" },
@@ -50,6 +48,10 @@ describe("settingsProjection", () => {
       worktreeArchiveBehavior: "snapshot",
       runtimeEnablement: { docker: false },
       defaultRuntime: "worktree",
+    } satisfies Partial<ProjectsConfig>;
+    const config: ProjectsConfig = {
+      projects: new Map([["/repo", { workspaces: [] }]]),
+      ...portable,
       apiServerPort: 4321,
       apiServerBindHost: "0.0.0.0",
       terminalDefaultShell: "/bin/fish",
@@ -65,36 +67,7 @@ describe("settingsProjection", () => {
 
     const projected = projectBackupSettings(config);
 
-    expect(projected).toEqual({
-      agentAiDefaults,
-      defaultModel: "anthropic:claude-exec",
-      hiddenModels: ["openai:gpt-old"],
-      minThinkingLevelByModel: { "openai:gpt-plan": "medium" },
-      modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
-      advisorModelString: "openai:gpt-advisor",
-      advisorThinkingLevel: "xhigh",
-      advisorReasoningMode: "pro",
-      advisorMaxUsesPerTurn: 3,
-      advisorMaxOutputTokens: null,
-      taskSettings: {
-        maxParallelAgentTasks: 4,
-        maxTaskNestingDepth: 2,
-        preserveSubagentsUntilArchive: true,
-      },
-      heartbeatDefaultPrompt: "Check in",
-      heartbeatDefaultIntervalMs: 15 * 60 * 1000,
-      goalDefaults: {
-        defaultBudgetCents: 500,
-        defaultTurnCap: 20,
-        alwaysRequireExplicitBudget: false,
-      },
-      chatTranscriptFullWidth: true,
-      llmDebugLogs: false,
-      coderWorkspaceArchiveBehavior: "delete",
-      worktreeArchiveBehavior: "snapshot",
-      runtimeEnablement: { docker: false },
-      defaultRuntime: "worktree",
-    });
+    expect(projected).toEqual(portable);
     expect(JSON.stringify(projected)).not.toContain("governor-secret");
     // A copy, not a view: editing the projection must not reach the live config.
     expect(projected.agentAiDefaults).not.toBe(config.agentAiDefaults);
@@ -135,8 +108,7 @@ describe("settingsProjection", () => {
     expect(merged.defaultModel).toBe("openai:gpt-local");
     expect(merged.apiServerPort).toBe(4321);
     expect(merged.terminalDefaultShell).toBe("/bin/fish");
-    expect(merged.taskSettings?.maxParallelAgentTasks).toBe(2);
-    expect(merged.taskSettings?.maxTaskNestingDepth).toBeGreaterThan(0);
+    expect(merged.taskSettings).toEqual({ ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 2 });
     expect(merged.layoutPresets).toEqual(DEFAULT_LAYOUT_PRESETS_CONFIG);
     expect(merged.migrations).toEqual({
       daybreakModelsHidden: true,

@@ -70,9 +70,8 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
     if (config[key] !== undefined) picked[key] = config[key];
   }
   // Mirrors what a saved config loads back as, so a fresh install's first export, the export
-  // after its first save, and the post-restore check all see the same values: goalDefaults
-  // always resolves to the effective defaults, while an empty agent map, an empty layout config,
-  // and a false full-width flag are stored as absent.
+  // after its first save, and the post-restore check agree: goalDefaults always resolves to the
+  // effective defaults; an empty agent map, empty layouts, and a false full-width flag are absent.
   picked.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
   if (config.agentAiDefaults !== undefined && Object.keys(config.agentAiDefaults).length === 0) {
     delete picked.agentAiDefaults;
@@ -87,8 +86,8 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
 }
 
 /**
- * The `settings` block of a preferences document. Throws on a malformed block so the payload
- * readers reject the backup before a restore writes anything.
+ * Throws on a malformed `settings` block so the payload readers reject the backup before a
+ * restore writes anything.
  */
 export function readBackupSettings(document: unknown): BackupSettings | undefined {
   if (!isPlainObject(document) || document.settings === undefined) return undefined;

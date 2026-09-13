@@ -250,12 +250,14 @@ describe("backup payload", () => {
   it("keeps the settings block out of the preferences projection older builds rely on", () => {
     // An older build parses the whole document as preferences; the block must be dropped by
     // that parse rather than rejected, or newer backups would stop restoring there.
-    const settings = { defaultModel: "anthropic:claude-exec", heartbeatDefaultIntervalMs: 1 };
-    const document = { appearance: { theme: "dark" }, settings };
-    const { settings: _settings, ...withoutSettings } = document;
-    expect(projectBackupPreferences(document)).toEqual(projectBackupPreferences(withoutSettings));
+    const preferences = { appearance: { theme: "dark" } };
+    const document = {
+      ...preferences,
+      settings: { defaultModel: "anthropic:claude-exec", heartbeatDefaultIntervalMs: 1 },
+    };
+    expect(projectBackupPreferences(document)).toEqual(projectBackupPreferences(preferences));
     expect(mergeBackupPreferences({ appearance: { theme: "light" } }, document)).toEqual(
-      mergeBackupPreferences({ appearance: { theme: "light" } }, withoutSettings)
+      mergeBackupPreferences({ appearance: { theme: "light" } }, preferences)
     );
   });
 
