@@ -153,6 +153,30 @@ describe("InitStateManager", () => {
       expect(events[2].type).toBe("init-end");
     });
 
+    it("marks a replayed init-start as completed only once the init has finished", async () => {
+      const workspaceId = "test-workspace";
+      const starts: Array<Extract<WorkspaceInitEvent, { type: "init-start" }>> = [];
+      manager.on("init-start", (event: Extract<WorkspaceInitEvent, { type: "init-start" }>) =>
+        starts.push(event)
+      );
+
+      manager.startInit(workspaceId, "/path/to/hook");
+      manager.appendOutput(workspaceId, "Line 1", false);
+      await manager.replayInit(workspaceId);
+      expect(starts).toHaveLength(2);
+      expect(starts[1].replay).toBe(true);
+      expect(starts[1].completed).toBeUndefined();
+
+      await manager.endInit(workspaceId, 1);
+      starts.length = 0;
+      await manager.replayInit(workspaceId);
+      expect(starts).toHaveLength(1);
+      // Persisted endTime from the state record, not the replay clock.
+      const persisted = manager.getInitState(workspaceId);
+      expect(starts[0].completed).toEqual({ exitCode: 1, endTime: persisted!.endTime! });
+      expect(starts[0].completed!.endTime).toBeGreaterThanOrEqual(starts[0].timestamp);
+    });
+
     it("should replay from disk when not in memory", async () => {
       const workspaceId = "test-workspace";
       const events: Array<WorkspaceInitEvent & { workspaceId: string }> = [];

@@ -164,6 +164,60 @@ describe("Init display after cleanup changes", () => {
     expect((messages[0] as InitDisplayedMessage).exitCode).toBe(0);
   });
 
+  it.each([
+    { exitCode: 0, status: "success" as const },
+    { exitCode: 1, status: "error" as const },
+  ])(
+    "never publishes a running row while replaying a completed init (exit $exitCode)",
+    ({ exitCode, status }) => {
+      const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
+      const statuses: string[] = [];
+      const record = () => {
+        const init = aggregator
+          .getDisplayedMessages()
+          .find((message) => message.type === "workspace-init");
+        statuses.push(init ? init.status : "missing");
+      };
+
+      aggregator.handleMessage({
+        type: "init-start",
+        hookPath: "/project",
+        timestamp: 1_000,
+        replay: true,
+        completed: { exitCode, endTime: 4_500 },
+      });
+      record();
+      for (const [index, line] of ["Preparing checkout", "Running hook"].entries()) {
+        aggregator.handleMessage({
+          type: "init-output",
+          line,
+          step: true,
+          timestamp: 2_000 + index,
+          lineNumber: index,
+          replay: true,
+        });
+        aggregator.flushPendingInitOutput();
+        record();
+      }
+      aggregator.handleMessage({ type: "init-end", exitCode, timestamp: 4_500, replay: true });
+      record();
+
+      expect(statuses).toEqual([status, status, status, status]);
+      const init = aggregator
+        .getDisplayedMessages()
+        .find((message) => message.type === "workspace-init");
+      expect(init).toMatchObject({
+        status,
+        exitCode,
+        durationMs: 3_500,
+        lines: [
+          { line: "Preparing checkout", isError: false, step: true },
+          { line: "Running hook", isError: false, step: true },
+        ],
+      });
+    }
+  );
+
   it("should treat replayed init-start/output for the same running init as idempotent", () => {
     const aggregator = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
 

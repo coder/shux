@@ -3275,6 +3275,88 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("completed init replay", () => {
+    it.each([
+      { exitCode: 0, status: "success" },
+      { exitCode: 1, status: "error" },
+    ])(
+      "never publishes a running init row while replaying a finished init (exit $exitCode)",
+      async ({ exitCode, status }) => {
+        const workspaceId = `completed-init-replay-${exitCode}`;
+        let releaseCaughtUp!: () => void;
+        const caughtUpReady = new Promise<void>((resolve) => {
+          releaseCaughtUp = resolve;
+        });
+        const replayedInit: WorkspaceChatMessage[] = [
+          {
+            type: "init-start",
+            hookPath: "/project",
+            timestamp: 1_000,
+            replay: true,
+            completed: { exitCode, endTime: 4_500 },
+          },
+          {
+            type: "init-output",
+            line: "Preparing checkout",
+            step: true,
+            isError: false,
+            timestamp: 2_000,
+            lineNumber: 0,
+            replay: true,
+          },
+          {
+            type: "init-output",
+            line: "Running hook",
+            step: true,
+            isError: false,
+            timestamp: 2_001,
+            lineNumber: 1,
+            replay: true,
+          },
+          { type: "init-end", exitCode, timestamp: 4_500, replay: true },
+        ];
+        mockChatStreamFor(workspaceId, async function* () {
+          for (const event of replayedInit) {
+            yield event;
+            await tick();
+          }
+          await caughtUpReady;
+          yield { type: "caught-up", replay: "full" };
+        });
+
+        const findInitRow = () =>
+          store
+            .getWorkspaceState(workspaceId)
+            .messages.find((message) => message.type === "workspace-init");
+
+        createAndAddWorkspace(store, workspaceId);
+        const publishedStatuses: string[] = [];
+        const unsubscribe = store.subscribeKey(workspaceId, () => {
+          const init = findInitRow();
+          if (init) publishedStatuses.push(init.status);
+        });
+
+        expect(
+          await waitUntil(() => {
+            const init = findInitRow();
+            return init?.exitCode === exitCode && init.lines.length === 2;
+          })
+        ).toBe(true);
+        expect(store.getWorkspaceState(workspaceId).isTranscriptCaughtUp).toBe(false);
+
+        releaseCaughtUp();
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).isTranscriptCaughtUp)
+        ).toBe(true);
+        unsubscribe();
+
+        expect(publishedStatuses.length).toBeGreaterThan(0);
+        expect(publishedStatuses.every((published) => published === status)).toBe(true);
+        expect(findInitRow()).toMatchObject({ status, exitCode, durationMs: 3_500 });
+      }
+    );
+  });
+
   describe("history pagination", () => {
     it("initializes pagination from the oldest loaded history sequence on caught-up", async () => {
       const workspaceId = "history-pagination-workspace-1";

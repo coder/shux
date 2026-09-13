@@ -3035,14 +3035,17 @@ export class StreamingMessageAggregator {
       }
 
       this.clearReplayInitVisiblePrefix();
+      // A replayed finished init lands as terminal from its first snapshot so the row never
+      // flashes "Creating workspace" between the replayed init-start and init-end.
+      const completed = data.completed;
       this.initState = {
-        status: "running",
+        status: completed ? (completed.exitCode === 0 ? "success" : "error") : "running",
         hookPath: data.hookPath,
         lines: [],
         progress: null,
-        exitCode: null,
+        exitCode: completed?.exitCode ?? null,
         startTime: data.timestamp,
-        endTime: null,
+        endTime: completed?.endTime ?? null,
       };
       this.invalidateCache();
       return true;
