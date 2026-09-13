@@ -269,6 +269,31 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
   }
 
+  /**
+   * Verify that Plan Mode can create its runtime-local Mux home without assuming
+   * the host user's ownership. This keeps a misconfigured remoteUser actionable
+   * instead of failing later from an unrelated file tool invocation.
+   */
+  private async verifyRemoteMuxHomeWritable(abortSignal?: AbortSignal): Promise<void> {
+    const stream = await this.exec(
+      'if [ -e "$HOME/.mux" ]; then test -w "$HOME/.mux"; else test -w "$HOME"; fi',
+      {
+        cwd: this.getContainerBasePath(),
+        timeout: 10,
+        abortSignal,
+      }
+    );
+    await stream.stdin.close();
+    const exitCode = await stream.exitCode;
+
+    if (exitCode !== 0) {
+      throw new RuntimeError(
+        "Devcontainer Mux home is not writable; verify the remote user's HOME permissions.",
+        "file_io"
+      );
+    }
+  }
+
   private async fetchRemoteHome(abortSignal?: AbortSignal): Promise<void> {
     if (!this.currentWorkspacePath) return;
     if (abortSignal?.aborted) return;
@@ -384,6 +409,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       this.remoteUser = result.remoteUser;
       this.currentWorkspacePath = workspacePath;
       await this.fetchRemoteHome(abortSignal);
+      await this.verifyRemoteMuxHomeWritable(abortSignal);
 
       await this.setupCredentials(env, abortSignal);
 
@@ -743,6 +769,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       this.remoteWorkspaceFolder = result.remoteWorkspaceFolder;
       this.remoteUser = result.remoteUser;
       await this.fetchRemoteHome(options?.signal);
+      await this.verifyRemoteMuxHomeWritable(options?.signal);
 
       await this.setupCredentials(this.lastCredentialEnv, options?.signal);
 

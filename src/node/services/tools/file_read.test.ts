@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -32,6 +33,24 @@ function createTestFileReadTool(options?: { cwd?: string }) {
   };
 }
 
+class RecordingDevcontainerRuntime extends DevcontainerRuntime {
+  readPaths: string[] = [];
+
+  override stat(): Promise<{ size: number; modifiedTime: Date; isDirectory: boolean }> {
+    return Promise.resolve({ size: 5, modifiedTime: new Date(), isDirectory: false });
+  }
+
+  override readFile(filePath: string): ReadableStream<Uint8Array> {
+    this.readPaths.push(filePath);
+    return new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("plan\n"));
+        controller.close();
+      },
+    });
+  }
+}
+
 describe("file_read tool", () => {
   let testDir: string;
   let testFilePath: string;
@@ -45,6 +64,31 @@ describe("file_read tool", () => {
   afterEach(async () => {
     // Clean up test directory
     await fs.rm(testDir, { recursive: true, force: true });
+  });
+
+  it("reads tilde paths from the Dev Container user's home", async () => {
+    const planPath = "~/.mux/plans/test-project/devcontainer-plan.md";
+    const runtime = new RecordingDevcontainerRuntime({
+      srcBaseDir: "/tmp/mux",
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const runtimeState = runtime as unknown as { remoteUser?: string };
+    runtimeState.remoteUser = "node";
+
+    const tool = createFileReadTool({
+      ...getTestDeps(),
+      cwd: "/workspace/project",
+      runtime,
+      runtimeTempDir: "/tmp",
+    });
+
+    const result = (await tool.execute!(
+      { path: planPath },
+      mockToolCallOptions
+    )) as FileReadToolResult;
+
+    expect(result.success).toBe(true);
+    expect(runtime.readPaths).toEqual(["/home/node/.mux/plans/test-project/devcontainer-plan.md"]);
   });
 
   it("should read entire file with line numbers", async () => {

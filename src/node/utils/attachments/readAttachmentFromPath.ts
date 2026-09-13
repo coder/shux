@@ -220,7 +220,7 @@ export async function readAttachFileFromPath(
     "attach_file requires a path"
   );
 
-  const { resolvedPath } = resolvePathWithinCwd(args.path, args.cwd, args.runtime);
+  const { resolvedPath } = await resolvePathWithinCwd(args.path, args.cwd, args.runtime);
   const fileStat = await statRegularFile(args, resolvedPath);
   const filename = getFallbackFilename(resolvedPath, args.filename);
   const mediaType = getSupportedAttachmentMediaType({

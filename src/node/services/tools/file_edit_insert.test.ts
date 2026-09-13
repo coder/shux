@@ -6,6 +6,7 @@ import { createFileEditInsertTool } from "./file_edit_insert";
 import type { FileEditInsertToolArgs, FileEditInsertToolResult } from "@/common/types/tools";
 import type { ToolExecutionOptions } from "ai";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { getTestDeps } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -170,6 +171,49 @@ describe("file_edit_insert tool", () => {
       expect(result.error).toContain("Provide either insert_before or insert_after guard");
     }
   });
+});
+
+class RecordingDevcontainerRuntime extends DevcontainerRuntime {
+  writtenPaths: string[] = [];
+
+  override stat(): Promise<never> {
+    return Promise.reject(new Error("file does not exist"));
+  }
+
+  override writeFile(filePath: string): WritableStream<Uint8Array> {
+    this.writtenPaths.push(filePath);
+    return new WritableStream<Uint8Array>();
+  }
+}
+
+it("creates plan files in the Dev Container user's home", async () => {
+  const planPath = "~/.mux/plans/test-project/devcontainer-plan.md";
+  const runtime = new RecordingDevcontainerRuntime({
+    srcBaseDir: "/tmp/mux",
+    configPath: ".devcontainer/devcontainer.json",
+  });
+  const runtimeState = runtime as unknown as { remoteUser?: string };
+  runtimeState.remoteUser = "node";
+
+  const tool = createFileEditInsertTool({
+    ...getTestDeps(),
+    cwd: "/workspace/project",
+    runtime,
+    runtimeTempDir: "/tmp",
+    planFileOnly: true,
+    planFilePath: planPath,
+  });
+
+  const result = (await tool.execute!(
+    { path: planPath, content: "# Plan\n" },
+    mockToolCallOptions
+  )) as FileEditInsertToolResult;
+
+  expect(result.success).toBe(true);
+  expect(runtime.writtenPaths).toEqual(["/home/node/.mux/plans/test-project/devcontainer-plan.md"]);
+  expect(runtime.writtenPaths).not.toContain(
+    "/home/host-user/.mux/plans/test-project/devcontainer-plan.md"
+  );
 });
 
 describe("file_edit_insert outside-cwd access", () => {

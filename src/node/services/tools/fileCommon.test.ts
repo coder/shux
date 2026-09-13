@@ -10,6 +10,7 @@ import {
   MAX_FILE_SIZE,
 } from "./fileCommon";
 import type { createRuntime as CreateRuntimeFn } from "@/node/runtime/runtimeFactory";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 
 /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
 const {
@@ -205,27 +206,64 @@ describe("fileCommon", () => {
     const cwd = "/workspace/project";
     const runtime = createRuntime({ type: "local", srcBaseDir: cwd });
 
-    it("keeps resolving configured plan files outside cwd", () => {
+    it("keeps resolving configured plan files outside cwd", async () => {
       const planFilePath = "/home/user/.mux/plans/plan.md";
-      const result = resolvePathWithinCwd(planFilePath, cwd, runtime);
+      const result = await resolvePathWithinCwd(planFilePath, cwd, runtime);
 
       expect(result.correctedPath).toBe(planFilePath);
       expect(result.resolvedPath).toBe(planFilePath);
     });
 
-    it("keeps resolving unrelated absolute paths outside cwd", () => {
+    it("keeps resolving unrelated absolute paths outside cwd", async () => {
       const otherPath = "/home/user/.mux/plans/other.md";
-      const result = resolvePathWithinCwd(otherPath, cwd, runtime);
+      const result = await resolvePathWithinCwd(otherPath, cwd, runtime);
 
       expect(result.correctedPath).toBe(otherPath);
       expect(result.resolvedPath).toBe(otherPath);
     });
 
-    it("resolves relative paths that traverse outside cwd", () => {
-      const result = resolvePathWithinCwd("../plans/ancestor.md", cwd, runtime);
+    it("resolves relative paths that traverse outside cwd", async () => {
+      const result = await resolvePathWithinCwd("../plans/ancestor.md", cwd, runtime);
 
       expect(result.correctedPath).toBe("../plans/ancestor.md");
       expect(result.resolvedPath).toBe("/workspace/plans/ancestor.md");
+    });
+
+    it("resolves tilde paths using the Dev Container remote home", async () => {
+      const runtime = new DevcontainerRuntime({
+        srcBaseDir: "/tmp/mux",
+        configPath: ".devcontainer/devcontainer.json",
+      });
+      const runtimeState = runtime as unknown as { remoteHomeDir?: string };
+      runtimeState.remoteHomeDir = "/home/node";
+
+      const result = await resolvePathWithinCwd(
+        "~/.mux/plans/test-project/devcontainer-plan.md",
+        cwd,
+        runtime
+      );
+
+      expect(result.resolvedPath).toBe("/home/node/.mux/plans/test-project/devcontainer-plan.md");
+      expect(result.resolvedPath).not.toBe(
+        "/home/host-user/.mux/plans/test-project/devcontainer-plan.md"
+      );
+    });
+
+    it("uses the Dev Container remote-user fallback before its home is cached", async () => {
+      const runtime = new DevcontainerRuntime({
+        srcBaseDir: "/tmp/mux",
+        configPath: ".devcontainer/devcontainer.json",
+      });
+      const runtimeState = runtime as unknown as { remoteUser?: string };
+      runtimeState.remoteUser = "node";
+
+      const result = await resolvePathWithinCwd(
+        "~/.mux/plans/test-project/devcontainer-plan.md",
+        cwd,
+        runtime
+      );
+
+      expect(result.resolvedPath).toBe("/home/node/.mux/plans/test-project/devcontainer-plan.md");
     });
   });
 

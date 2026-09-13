@@ -71,6 +71,54 @@ describe("executeFileEditOperation", () => {
       expect(normalizeCallForFilePath.basePath).toBe(testCwd);
     }
   });
+
+  test("uses the runtime home for Dev Container tilde edits", async () => {
+    const planPath = "~/.mux/plans/test-project/devcontainer-plan.md";
+    const resolvedPlanPath = "/home/node/.mux/plans/test-project/devcontainer-plan.md";
+    const writtenPaths: string[] = [];
+    const runtime = {
+      normalizePath: jest.fn<(targetPath: string, basePath: string) => string>(
+        () => "/home/host-user/.mux/plans/test-project/devcontainer-plan.md"
+      ),
+      resolvePath: jest.fn<(targetPath: string) => Promise<string>>(() =>
+        Promise.resolve(resolvedPlanPath)
+      ),
+      stat: jest
+        .fn<() => Promise<{ size: number; modifiedTime: Date; isDirectory: boolean }>>()
+        .mockResolvedValue({ size: 5, modifiedTime: new Date(), isDirectory: false }),
+      readFile: jest.fn<() => ReadableStream<Uint8Array>>(
+        () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("old\n"));
+              controller.close();
+            },
+          })
+      ),
+      writeFile: jest.fn<(filePath: string) => WritableStream<Uint8Array>>((filePath: string) => {
+        writtenPaths.push(filePath);
+        return new WritableStream<Uint8Array>();
+      }),
+    } as unknown as Runtime;
+
+    const result = await executeFileEditOperation({
+      config: {
+        cwd: "/workspace/project",
+        runtime,
+        runtimeTempDir: "/tmp",
+        ...getTestDeps(),
+      },
+      filePath: planPath,
+      operation: () => ({ success: true, newContent: "updated\n", metadata: {} }),
+    });
+
+    expect(result.success).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- asserting calls on a Jest mock
+    expect(runtime.resolvePath).toHaveBeenCalledWith(planPath);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- asserting calls on a Jest mock
+    expect(runtime.normalizePath).not.toHaveBeenCalled();
+    expect(writtenPaths).toEqual([resolvedPlanPath]);
+  });
 });
 
 describe("executeFileEditOperation outside-cwd access", () => {

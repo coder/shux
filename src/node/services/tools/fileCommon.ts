@@ -278,16 +278,26 @@ export function validatePathInCwd(
  * the exact path the user asked us to touch instead of imposing a stricter
  * workspace-only rule.
  */
-export function resolvePathWithinCwd(
+export async function resolvePathWithinCwd(
   filePath: string,
   cwd: string,
   runtime: Runtime
-): { correctedPath: string; resolvedPath: string; warning?: string } {
+): Promise<{ correctedPath: string; resolvedPath: string; warning?: string }> {
   const redundantPrefixResult = validateNoRedundantPrefix(filePath, cwd, runtime);
   const correctedPath = redundantPrefixResult?.correctedPath ?? filePath;
+  const trimmedPath = correctedPath.trim();
+
+  // A Dev Container's home belongs to its remote user, not the Mux host process.
+  // Resolve tilde paths through the runtime so a tool never leaks host HOME into a
+  // command that will execute inside the container.
+  const resolvedPath =
+    trimmedPath === "~" || trimmedPath.startsWith("~/")
+      ? await runtime.resolvePath(correctedPath)
+      : runtime.normalizePath(correctedPath, cwd);
+
   return {
     correctedPath,
-    resolvedPath: runtime.normalizePath(correctedPath, cwd),
+    resolvedPath,
     warning: redundantPrefixResult?.warning,
   };
 }

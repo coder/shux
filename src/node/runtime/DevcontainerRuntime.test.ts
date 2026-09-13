@@ -70,6 +70,62 @@ describe("DevcontainerRuntime.stat", () => {
   });
 });
 
+interface DevcontainerRuntimeWithHomeValidation {
+  remoteHomeDir?: string;
+  remoteUser?: string;
+  verifyRemoteMuxHomeWritable(abortSignal?: AbortSignal): Promise<void>;
+}
+
+class HomeValidationDevcontainerRuntime extends DevcontainerRuntime {
+  commands: string[] = [];
+  exitCode = 0;
+
+  override exec(command: string, _options: ExecOptions): Promise<ExecStream> {
+    this.commands.push(command);
+    return Promise.resolve({
+      stdout: createTextStream(""),
+      stderr: createTextStream(""),
+      stdin: createSinkStream(),
+      exitCode: Promise.resolve(this.exitCode),
+      duration: Promise.resolve(0),
+    });
+  }
+}
+
+describe("DevcontainerRuntime remote Mux home validation", () => {
+  it("checks the configured remote user's Mux home without creating it", async () => {
+    const runtime = new HomeValidationDevcontainerRuntime({
+      srcBaseDir: "/tmp/mux",
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const internals = runtime as unknown as DevcontainerRuntimeWithHomeValidation;
+    internals.remoteUser = "node";
+    internals.remoteHomeDir = "/home/node";
+
+    await internals.verifyRemoteMuxHomeWritable();
+
+    expect(runtime.commands).toEqual([
+      'if [ -e "$HOME/.mux" ]; then test -w "$HOME/.mux"; else test -w "$HOME"; fi',
+    ]);
+  });
+
+  it("reports an actionable error when its Mux home is not writable", async () => {
+    const runtime = new HomeValidationDevcontainerRuntime({
+      srcBaseDir: "/tmp/mux",
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    runtime.exitCode = 1;
+    const internals = runtime as unknown as DevcontainerRuntimeWithHomeValidation;
+    internals.remoteUser = "node";
+    internals.remoteHomeDir = "/home/node";
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test expect().rejects requires await
+    await expect(internals.verifyRemoteMuxHomeWritable()).rejects.toThrow(
+      "Devcontainer Mux home is not writable; verify the remote user's HOME permissions."
+    );
+  });
+});
+
 describe("DevcontainerRuntime.resolvePath", () => {
   it("resolves ~ to cached remoteHomeDir", async () => {
     const runtime = createRuntime({ remoteHomeDir: "/home/coder" });
