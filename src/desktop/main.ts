@@ -727,8 +727,11 @@ async function showSplashScreen() {
 function closeSplashScreen() {
   if (splashWindow) {
     console.log(`[${timestamp()}] Closing splash screen...`);
-    splashWindow.close();
+    const win = splashWindow;
     splashWindow = null;
+    if (!win.isDestroyed()) {
+      win.destroy(); // Immediate destruction - avoids race with internal renderer scripts
+    }
   }
 }
 

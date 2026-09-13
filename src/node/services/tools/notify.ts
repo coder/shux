@@ -77,7 +77,7 @@ async function sendElectronNotification(
     notification.on("click", () => {
       const windows = BrowserWindow.getAllWindows();
       const mainWindow = windows[0];
-      if (mainWindow) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
         // Restore if minimized, then focus
         if (mainWindow.isMinimized()) {
           mainWindow.restore();
