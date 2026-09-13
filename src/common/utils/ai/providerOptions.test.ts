@@ -327,6 +327,29 @@ describe("buildProviderOptions - mappedToModel resolution", () => {
     expect(anthropic.effort).toBe("high");
   });
 
+  test("resolves custom alias to gpt-5.3-codex-spark for reasoning summary gating", () => {
+    const providersConfig = createMockProvidersConfig({
+      "openai:custom-spark": "openai:gpt-5.3-codex-spark",
+    });
+
+    const result = buildProviderOptions(
+      "openai:custom-spark",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      providersConfig
+    ) as Record<string, unknown>;
+    const openai = result.openai as Record<string, unknown> | undefined;
+
+    expect(openai).toBeDefined();
+    expect(openai?.reasoningEffort).toBe("medium");
+    expect(openai?.reasoningSummary).toBeUndefined();
+    expect(openai?.include).toEqual(["reasoning.encrypted_content"]);
+  });
+
   test("works without providersConfig (backward compat)", () => {
     const result = buildProviderOptions("anthropic:claude-sonnet-4-5-20250514", "medium");
 
