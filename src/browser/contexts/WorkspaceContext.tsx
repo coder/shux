@@ -32,14 +32,11 @@ import {
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
   migrateWorkspaceStorage,
-  AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
-  DEFAULT_RUNTIME_KEY,
   GATEWAY_ENABLED_KEY,
   GATEWAY_MODELS_KEY,
   HIDDEN_MODELS_KEY,
   LAUNCH_BEHAVIOR_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
@@ -52,7 +49,6 @@ import {
   readPersistedState,
   readPersistedString,
   subscribePersistedStateWrites,
-  syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
@@ -64,7 +60,7 @@ import {
   parseRightSidebarLayoutState,
   removeTabEverywhere,
 } from "@/browser/utils/rightSidebarLayout";
-import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { seedConfigMirrors } from "@/browser/utils/configMirrors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
@@ -690,29 +686,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             dirtyKeys.add(key);
         }
         // Read legacy local preferences before backend hydration can overwrite them.
-        const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
-        updatePersistedState(
-          AGENT_AI_DEFAULTS_KEY,
-          normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
+        // Seeding from the backend is what lets a port switch keep the same UI state.
+        seedConfigMirrors(
+          { ...cfg, ...migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys) },
+          dirtyKeys
         );
-
-        // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && modelPrefs.defaultModel !== undefined) {
-          syncPersistedStateFromBackend(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
-        }
-        if (!dirtyKeys.has(HIDDEN_MODELS_KEY) && modelPrefs.hiddenModels !== undefined) {
-          syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
-        }
-
-        // Seed runtime enablement from backend so switching ports doesn't reset the UI.
-        if (cfg.runtimeEnablement !== undefined) {
-          updatePersistedState(RUNTIME_ENABLEMENT_KEY, cfg.runtimeEnablement);
-        }
-
-        // Seed global default runtime so workspace defaults survive port changes.
-        if (cfg.defaultRuntime !== undefined) {
-          updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
-        }
 
         // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
         // check if the user had non-default values in the old localStorage keys.

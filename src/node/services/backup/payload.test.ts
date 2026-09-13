@@ -30,6 +30,7 @@ import {
   createBackupPayload,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
+  projectBackupPreferences,
   matchedProjectWrites,
   planProjectBundleRestore,
   planRestoreWrites,
@@ -56,6 +57,7 @@ import {
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
+import { readBackupSettings } from "./settingsProjection";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 
 async function isExecutable(filePath: string): Promise<boolean> {
@@ -210,6 +212,10 @@ describe("backup payload", () => {
           defaultBaseByProject: { "/private/project": "main" },
         },
       },
+      settings: {
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" } },
+        defaultModel: "anthropic:claude-exec",
+      },
     });
 
     expect(payload.files.map((file) => file.path)).toEqual([
@@ -234,7 +240,80 @@ describe("backup payload", () => {
         autoCompactionThresholdByModel: { "openai/gpt": 75 },
       },
       review: { includeUncommitted: true },
+      settings: {
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" } },
+        defaultModel: "anthropic:claude-exec",
+      },
     });
+  });
+
+  it("keeps the settings block out of the preferences projection older builds rely on", () => {
+    // An older build parses the whole document as preferences; the block must be dropped by
+    // that parse rather than rejected, or newer backups would stop restoring there.
+    const preferences = { appearance: { theme: "dark" } };
+    const document = {
+      ...preferences,
+      settings: { defaultModel: "anthropic:claude-exec", heartbeatDefaultIntervalMs: 1 },
+    };
+    expect(projectBackupPreferences(document)).toEqual(projectBackupPreferences(preferences));
+    expect(mergeBackupPreferences({ appearance: { theme: "light" } }, document)).toEqual(
+      mergeBackupPreferences({ appearance: { theme: "light" } }, preferences)
+    );
+  });
+
+  it("restores a settings block, accepts its absence, and skips values it does not understand", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");
+    const settings = {
+      defaultModel: "anthropic:claude-exec",
+      agentAiDefaults: { exec: { thinkingLevel: "high" as const } },
+    };
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      settings,
+    });
+    const destination = path.join(tempDir, "with-settings");
+    await writeBackupPayload(destination, payload);
+    const restoreRoot = path.join(tempDir, "target");
+    await fs.mkdir(restoreRoot, { recursive: true });
+
+    const restored = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(restored.backupPreferences)).toEqual({ settings, unsupported: [] });
+
+    // A backup written by a build that predates the block.
+    await tamperPayloadFile(destination, "preferences.json", '{"appearance":{"theme":"dark"}}\n');
+    const older = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(older.backupPreferences)).toEqual({
+      settings: undefined,
+      unsupported: [],
+    });
+    expect(mergeBackupPreferences({}, older.backupPreferences)).toEqual({
+      appearance: { theme: "dark" },
+    });
+
+    // A backup written by a newer build, with a value this build's schema does not know: the
+    // rest of the backup restores and the field is reported rather than failing the restore.
+    await tamperPayloadFile(
+      destination,
+      "preferences.json",
+      '{"settings":{"agentAiDefaults":{"exec":{"thinkingLevel":"bogus"}},"defaultModel":"anthropic:claude-plan"}}\n'
+    );
+    const newer = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(newer.backupPreferences)).toEqual({
+      settings: { defaultModel: "anthropic:claude-plan" },
+      unsupported: ["agentAiDefaults"],
+    });
+    expect(await fs.readFile(path.join(restoreRoot, "AGENTS.md"), "utf-8")).toBe("backed up\n");
   });
 
   it("keeps MCP commands and URLs while redacting literal header values", async () => {

@@ -57,6 +57,7 @@ function renderBackupSection() {
               },
             ],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             pushError: null,
           },
         })

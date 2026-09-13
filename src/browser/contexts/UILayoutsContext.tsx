@@ -129,6 +129,43 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     void refresh();
   }, [refresh]);
 
+  // Presets change behind this provider when a settings restore rewrites config, so hotkeys
+  // and palette entries would keep applying the old slots until the app reloaded.
+  useEffect(() => {
+    const onConfigChanged = api?.config?.onConfigChanged;
+    if (!onConfigChanged) return;
+
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    let iterator: AsyncIterator<unknown> | null = null;
+
+    const runSubscription = async () => {
+      try {
+        const subscribedIterator = await onConfigChanged(undefined, { signal });
+        if (signal.aborted) {
+          void subscribedIterator.return?.();
+          return;
+        }
+
+        iterator = subscribedIterator;
+        for await (const _ of subscribedIterator) {
+          if (signal.aborted) break;
+          // Awaited so two changes in quick succession cannot let the older response land last.
+          await refresh();
+        }
+      } catch {
+        // Config subscriptions are cancelled during unmounts and API reconnects.
+      }
+    };
+
+    void runSubscription();
+
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api, refresh]);
+
   const applySlotToWorkspace = useCallback(
     async (workspaceId: string, slot: LayoutSlotNumber): Promise<void> => {
       const preset = getPresetForSlot(layoutPresets, slot);

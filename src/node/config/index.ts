@@ -168,7 +168,7 @@ function normalizeWorkspaceMetadataHeartbeat(
   };
 }
 
-function parseOptionalNonEmptyString(value: unknown): string | undefined {
+export function parseOptionalNonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -417,7 +417,7 @@ function normalizeRouteOverridesRecord(value: unknown): Record<string, string> |
  * values that aren't valid thinking levels are dropped, keeping a malformed config
  * from bricking startup (self-healing on load).
  */
-function normalizeMinThinkingLevelByModel(
+export function normalizeMinThinkingLevelByModel(
   value: unknown
 ): Record<string, ThinkingLevel> | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -437,7 +437,7 @@ function normalizeMinThinkingLevelByModel(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function normalizeModelFallbacks(value: unknown): ModelFallbacks | undefined {
+export function normalizeModelFallbacks(value: unknown): ModelFallbacks | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return undefined;
   }
@@ -483,7 +483,7 @@ function areStringArraysEqual(a: string[], b: string[]): boolean {
   return true;
 }
 
-function normalizeOptionalModelString(value: unknown): string | undefined {
+export function normalizeOptionalModelString(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
@@ -506,7 +506,7 @@ function normalizeOptionalModelString(value: unknown): string | undefined {
   return normalized;
 }
 
-function normalizeOptionalModelStringArray(value: unknown): string[] | undefined {
+export function normalizeOptionalModelStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
@@ -525,7 +525,7 @@ function normalizeOptionalModelStringArray(value: unknown): string[] | undefined
   return value.length > 0 && out.length === 0 ? undefined : out;
 }
 
-function normalizeAiDefaultsModelStrings<
+export function normalizeAiDefaultsModelStrings<
   T extends Record<string, { modelString?: string; subagent?: { modelString?: string } }>,
 >(value: T): T {
   let modified = false;
@@ -587,7 +587,7 @@ function parseOptionalPort(value: unknown): number | undefined {
   return value;
 }
 
-function parseOptionalPositiveInteger(value: unknown): number | undefined {
+export function parseOptionalPositiveInteger(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
   }
@@ -603,7 +603,7 @@ function parseOptionalThinkingLevel(value: unknown): ThinkingLevel | undefined {
   return coerceThinkingLevel(value);
 }
 
-function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
+export function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
   }
@@ -615,7 +615,7 @@ function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   return value;
 }
 
-function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementId | undefined {
+export function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementId | undefined {
   const trimmed = parseOptionalNonEmptyString(value);
   if (!trimmed) {
     return undefined;
@@ -629,7 +629,7 @@ function normalizeRuntimeEnablementId(value: unknown): RuntimeEnablementId | und
   return undefined;
 }
 
-function normalizeRuntimeEnablementOverrides(
+export function normalizeRuntimeEnablementOverrides(
   value: unknown
 ): Partial<Record<RuntimeEnablementId, false>> | undefined {
   if (!value || typeof value !== "object") {

@@ -127,6 +127,11 @@ export const backup = {
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
         /**
+         * Backed-up settings whose values this build does not understand (a newer build's
+         * export); a restore keeps the local values for them.
+         */
+        unsupportedSettings: z.array(z.string()),
+        /**
          * Why the push half could not be computed, if it could not. The restore half is
          * still reported so a local export problem never blocks reviewing or approving
          * what a restore would bring in.
@@ -167,6 +172,8 @@ export const backup = {
         projectImportResults: z.array(BackupProjectImportResultSchema),
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
+        /** Backed-up settings left at their local values; see the preview output. */
+        unsupportedSettings: z.array(z.string()),
         /**
          * Candidates left unimported for lack of approval (no preview, or unchecked). Fresh
          * tokens, so the UI can offer them for approval right away.

@@ -23,6 +23,7 @@ import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/cons
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
+import type { BackupSettings } from "./settingsProjection";
 
 export const BACKUP_SCHEMA_VERSION = 1;
 export const BACKUP_MANIFEST_FILE = "manifest.json";
@@ -124,6 +125,7 @@ export interface BackupPayload {
 export interface CreateBackupPayloadOptions {
   muxRoot: string;
   preferences?: UserPreferences;
+  settings?: BackupSettings;
   muxVersion: string;
   sourceLabel: string;
   exportedAt?: string;
@@ -857,11 +859,18 @@ function copyJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-export function serializeBackupPreferences(preferences: unknown): Buffer {
-  return Buffer.from(
-    `${JSON.stringify(projectBackupPreferences(preferences), null, 2)}\n`,
-    "utf-8"
-  );
+/**
+ * Top-level settings ride inside preferences.json rather than in a payload file of their own:
+ * an older build's manifest parser refuses unknown payload paths, while its non-strict
+ * UserPreferencesSchema strips the unknown `settings` key and restores what it understands.
+ */
+export function serializeBackupPreferences(
+  preferences: unknown,
+  settings?: BackupSettings
+): Buffer {
+  const document: Record<string, unknown> = { ...projectBackupPreferences(preferences) };
+  if (settings !== undefined && Object.keys(settings).length > 0) document.settings = settings;
+  return Buffer.from(`${JSON.stringify(document, null, 2)}\n`, "utf-8");
 }
 
 type Appearance = NonNullable<UserPreferences["appearance"]>;
@@ -1484,7 +1493,7 @@ export async function createBackupPayload(
   }
   files.push({
     path: "preferences.json",
-    content: serializeBackupPreferences(options.preferences),
+    content: serializeBackupPreferences(options.preferences, options.settings),
   });
   // Count and complexity only: this payload may be a local snapshot, whose names keep
   // current-filesystem forms that portable validation would refuse. Collection already
