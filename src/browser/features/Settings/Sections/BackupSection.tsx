@@ -14,6 +14,7 @@ import {
 } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -87,17 +88,6 @@ function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
 function getOperationErrorMessage(error: BackupOperationError): string {
   if (!error.files?.length) return error.message;
   return `${error.message}: ${error.files.join(", ")}`;
-}
-
-function getCredentialLabel(credential: BackupValidation["credential"]): string {
-  switch (credential) {
-    case "ssh":
-      return "SSH key or agent";
-    case "gh":
-      return "GitHub CLI";
-    case "ambient":
-      return "system git credentials";
-  }
 }
 
 /**
@@ -524,7 +514,7 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setStatusMessage(
-        `Backed up settings at ${result.data.commit} using ${getCredentialLabel(result.data.credential)}.`
+        `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -811,7 +801,7 @@ export function BackupSection() {
         {validation ? (
           <div className="bg-background-secondary rounded-md px-3 py-2 text-xs">
             <div className="text-foreground">
-              Credential used: {getCredentialLabel(validation.credential)}
+              Credential used: {BACKUP_CREDENTIAL_LABELS[validation.credential]}
             </div>
             <div className="text-muted mt-1">
               {validation.empty

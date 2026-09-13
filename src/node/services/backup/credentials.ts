@@ -1,6 +1,7 @@
 import type { BackupCredentialKind } from "@/common/orpc/schemas/backup";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
+import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 
 const NON_INTERACTIVE_ENV = {
@@ -232,13 +233,17 @@ export class BackupRemoteUnreachableError extends Error {
 export class BackupAuthFailedError extends Error {
   readonly code = "AUTH_FAILED";
 
-  constructor(cause: unknown) {
-    super(
-      "Could not authenticate to the backup repository. Check your SSH key or `gh auth login`.",
-      { cause }
-    );
+  constructor(message: string, cause: unknown) {
+    super(message, { cause });
     this.name = "BackupAuthFailedError";
   }
+}
+
+const LOGIN_FAILED_MESSAGE =
+  "Could not authenticate to the backup repository. Check your SSH key or `gh auth login`.";
+
+function accessDeniedMessage(credential: BackupCredential, error: unknown): string {
+  return `Access to the backup repository was denied (credential: ${BACKUP_CREDENTIAL_LABELS[credential]}): ${remoteReason(error)} Check that the URL names the right repository and that the account behind this credential, or the integration that issues its token, has write access to it.`;
 }
 
 export interface GitCredentialOptions extends Omit<ExecFileAsyncOptions, "killTreeOnTermination"> {
@@ -385,7 +390,20 @@ async function controlledCredentials(
  * the ladder retry with the ambient helper, which may hold a writable credential.
  */
 const AUTH_FAILURE_PATTERN =
-  /authentication failed|could not read (?:username|password)|permission denied|permission to [^\n]*denied|publickey|access denied|repository not found|terminal prompts disabled|invalid username or (?:password|token)|returned error: 40[13]|authentication is required/i;
+  /authentication failed|could not read (?:username|password)|permission denied|permission to [^\n]*denied|publickey|access denied|repository not found|marked as read.?only|terminal prompts disabled|invalid username or (?:password|token)|returned error: 40[13]|authentication is required/i;
+
+/**
+ * GitHub answers a recognised token that lacks the repository with 403 and a `remote:` reason,
+ * and hides an invisible private repository behind "Repository not found"; over ssh the same
+ * refusal reads "Permission to X denied to Y". A login prompt cannot fix any of these, so the
+ * denying rung's diagnosis wins over a later rung that merely had no credential to offer.
+ */
+const ACCESS_DENIED_PATTERN =
+  /write access to repository not granted|permission to [^\n]*denied|repository not found|marked as read.?only|returned error: 403/i;
+
+const REMOTE_REASON_LINES = /^(?:remote|ERROR):[ \t]*(.+)$/gm;
+const FATAL_LINE = /^fatal:[ \t]*(.+)$/m;
+const REMOTE_REASON_MAX_LENGTH = 200;
 
 /**
  * Local object-store failures also say "Permission denied", so they are excluded first.
@@ -399,14 +417,42 @@ const LOCAL_FILESYSTEM_FAILURE_PATTERN =
 const REMOTE_UNREACHABLE_PATTERN =
   /could not resolve (?:host|hostname|proxy)|name or service not known|temporary failure in name resolution|connection (?:refused|timed out|reset)|network is (?:unreachable|down)|no route to host|failed to connect to|couldn't connect to server|operation timed out|returned error: 5\d\d|service unavailable|bad gateway|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH/i;
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function isAuthenticationFailure(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorText(error);
   if (LOCAL_FILESYSTEM_FAILURE_PATTERN.test(message)) return false;
   return AUTH_FAILURE_PATTERN.test(message);
 }
 
+function isAccessDenied(error: unknown): boolean {
+  return isAuthenticationFailure(error) && ACCESS_DENIED_PATTERN.test(errorText(error));
+}
+
+function remoteReason(error: unknown): string {
+  const stderr =
+    error instanceof Error ? (error as Error & { stderr?: unknown }).stderr : undefined;
+  const text = typeof stderr === "string" ? stderr : errorText(error);
+  // Server progress arrives as `remote:` lines too, so the denial is the line that matched the
+  // classifier, wherever it sits, not whichever line the server sent first.
+  const remoteLines = Array.from(text.matchAll(REMOTE_REASON_LINES), (match) => match[1]);
+  const fatalLine = FATAL_LINE.exec(text)?.[1];
+  const line =
+    [...remoteLines, ...(fatalLine === undefined ? [] : [fatalLine])].find((candidate) =>
+      ACCESS_DENIED_PATTERN.test(candidate)
+    ) ??
+    remoteLines[0] ??
+    fatalLine ??
+    text.split("\n").find((candidate) => candidate.trim() !== "") ??
+    "";
+  const reason = line.trim().slice(0, REMOTE_REASON_MAX_LENGTH);
+  return /[.!?]$/.test(reason) ? reason : `${reason}.`;
+}
+
 function isRemoteUnreachable(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorText(error);
   if (LOCAL_FILESYSTEM_FAILURE_PATTERN.test(message)) return false;
   // A blackholed remote may emit no diagnostic before timeout kills Git, so key on `signal`.
   if (isSignalTermination(error)) return true;
@@ -417,6 +463,11 @@ function isSignalTermination(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const signal = (error as Error & { signal?: unknown }).signal;
   return typeof signal === "string" && signal !== "";
+}
+
+interface AuthenticationFailure {
+  credential: BackupCredential;
+  error: unknown;
 }
 
 export async function runGitWithCredentialLadder(
@@ -430,6 +481,7 @@ export async function runGitWithCredentialLadder(
     onStderrData: options.onStderrData,
   };
 
+  const failures: AuthenticationFailure[] = [];
   for (const controlled of await controlledCredentials(args, options)) {
     try {
       const result = await run("git", [...controlled.argsPrefix, ...args], {
@@ -449,6 +501,7 @@ export async function runGitWithCredentialLadder(
         if (isRemoteUnreachable(error)) throw new BackupRemoteUnreachableError(error);
         throw error;
       }
+      failures.push({ credential: controlled.credential, error });
     }
   }
 
@@ -469,7 +522,16 @@ export async function runGitWithCredentialLadder(
   } catch (error) {
     // Every rung has now failed. A raw git error carries a numeric exit code, which the
     // service cannot distinguish from a local filesystem failure.
-    if (isAuthenticationFailure(error)) throw new BackupAuthFailedError(error);
+    if (isAuthenticationFailure(error)) {
+      failures.push({ credential: "ambient", error });
+      const denied = failures.find((failure) => isAccessDenied(failure.error));
+      throw denied === undefined
+        ? new BackupAuthFailedError(LOGIN_FAILED_MESSAGE, error)
+        : new BackupAuthFailedError(
+            accessDeniedMessage(denied.credential, denied.error),
+            denied.error
+          );
+    }
     if (isRemoteUnreachable(error)) throw new BackupRemoteUnreachableError(error);
     throw error;
   }
