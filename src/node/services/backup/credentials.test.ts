@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 import {
   BackupAuthFailedError,
   BackupRemoteUnreachableError,
@@ -234,6 +235,8 @@ exit 128
     // The service maps any error it cannot classify to IO_ERROR, which would tell the
     // user their disk failed when their credential is what expired.
     expect((caught as BackupAuthFailedError).code).toBe("AUTH_FAILED");
+    // No rung was recognised by the remote, so signing in is the advice that can help.
+    expect((caught as Error).message).toContain("gh auth login");
   });
 
   it("treats a push denied by write permissions as an authentication failure", async () => {
@@ -272,6 +275,121 @@ exit 128
     // still deserves a turn in case it is the one with write access.
     const attempts = (await fs.readFile(logPath, "utf-8")).split("---\n").filter(Boolean);
     expect(attempts).toHaveLength(2);
+  });
+
+  it("reports a write-access denial as a repository permission problem", async () => {
+    if (process.platform === "win32") return;
+    await writeExecutable(path.join(binDir, "gh"), "#!/bin/sh\nexit 0\n");
+    await writeExecutable(
+      path.join(binDir, "git"),
+      `#!/bin/sh
+case "$*" in
+  *core.sshCommand*) exit 1 ;;
+esac
+printf '%s\\n' '---' >> "$GIT_LOG"
+printf '%s\\n' "$@" >> "$GIT_LOG"
+echo 'remote: Write access to repository not granted.' >&2
+echo "fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 403" >&2
+exit 128
+`
+    );
+
+    let caught: unknown;
+    try {
+      await withPath(binDir, () =>
+        runGitWithCredentialLadder(["push", "origin", "HEAD:refs/heads/main"], {
+          repoUrl: "https://github.com/owner/repo.git",
+          env: { GIT_LOG: logPath },
+        })
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackupAuthFailedError);
+    const thrown = caught as BackupAuthFailedError;
+    expect(thrown.code).toBe("AUTH_FAILED");
+    // The remote recognised the credential and refused the repository, so the user is
+    // pointed at repository permissions rather than at signing in again.
+    expect(thrown.message).toContain("Write access to repository not granted");
+    expect(thrown.message).toContain(BACKUP_CREDENTIAL_LABELS.gh);
+    expect(thrown.message).not.toContain("gh auth login");
+    expect((thrown.cause as Error).message).toContain("Write access to repository not granted");
+    const attempts = (await fs.readFile(logPath, "utf-8")).split("---\n").filter(Boolean);
+    expect(attempts).toHaveLength(2);
+  });
+
+  it("prefers the rung the remote recognised over one that had no credential", async () => {
+    if (process.platform === "win32") return;
+    await writeExecutable(path.join(binDir, "gh"), "#!/bin/sh\nexit 0\n");
+    await writeExecutable(
+      path.join(binDir, "git"),
+      `#!/bin/sh
+case "$*" in
+  *core.sshCommand*) exit 1 ;;
+  *credential.helper*)
+    echo 'remote: Write access to repository not granted.' >&2
+    echo "fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 403" >&2
+    exit 128 ;;
+esac
+echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
+exit 128
+`
+    );
+
+    let caught: unknown;
+    try {
+      await withPath(binDir, () =>
+        runGitWithCredentialLadder(["push", "origin", "HEAD:refs/heads/main"], {
+          repoUrl: "https://github.com/owner/repo.git",
+          env: { GIT_LOG: logPath },
+        })
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackupAuthFailedError);
+    // The ambient rung failed last, but only because it had nothing to offer; the gh rung's
+    // denial is the diagnosis that explains what to fix.
+    const message = (caught as Error).message;
+    expect(message).toContain(BACKUP_CREDENTIAL_LABELS.gh);
+    expect(message).toContain("Write access to repository not granted");
+    expect(message).not.toContain("terminal prompts disabled");
+    expect(message).not.toContain("gh auth login");
+  });
+
+  it("reports an ssh access denial with the ssh credential", async () => {
+    if (process.platform === "win32") return;
+    await writeExecutable(
+      path.join(binDir, "git"),
+      `#!/bin/sh
+case "$*" in
+  *core.sshCommand*) exit 1 ;;
+esac
+echo 'ERROR: Permission to owner/repo.git denied to someone.' >&2
+echo 'fatal: Could not read from remote repository.' >&2
+exit 128
+`
+    );
+
+    let caught: unknown;
+    try {
+      await withPath(binDir, () =>
+        runGitWithCredentialLadder(["ls-remote", "git@github.com:owner/repo.git"], {
+          repoUrl: "git@github.com:owner/repo.git",
+          env: { GIT_LOG: logPath },
+        })
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(BackupAuthFailedError);
+    const message = (caught as Error).message;
+    expect(message).toContain(BACKUP_CREDENTIAL_LABELS.ssh);
+    expect(message).toContain("Permission to owner/repo.git denied to someone");
+    expect(message).not.toContain("gh auth login");
   });
 
   it("leaves a non-authentication ambient failure unclassified", async () => {
