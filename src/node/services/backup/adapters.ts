@@ -13,7 +13,7 @@ import {
 import { log } from "@/node/services/log";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
-import type { ProjectConfig } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import {
@@ -76,6 +76,11 @@ import {
   type MatchedProjectEntry,
   type ProjectBundleRestorePlan,
 } from "./payload";
+import {
+  mergeBackupSettings,
+  projectBackupSettings,
+  readBackupSettings,
+} from "./settingsProjection";
 
 /**
  * Parses `git status --porcelain=v1 -z`, whose records are NUL-terminated with verbatim
@@ -241,13 +246,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     return await resolveContainedPath(repositoryRoot, segments.join("/"));
   }
 
-  function localPreferences() {
-    return options.config.loadConfigOrDefault().userPreferences;
-  }
-
-  /** The portable subset an export writes. Machine-local keys are excluded by design. */
-  function exportablePreferences() {
-    return projectBackupPreferences(localPreferences() ?? {});
+  function backupSettingsDiffer(a: ProjectsConfig, b: ProjectsConfig): boolean {
+    return JSON.stringify(projectBackupSettings(a)) !== JSON.stringify(projectBackupSettings(b));
   }
 
   async function localFilesByPath(): Promise<Map<string, BackupFile>> {
@@ -255,9 +255,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   }
 
   async function buildPayload(overrides?: { keepLocalSecrets: true }) {
+    // Both projections are the portable subsets an export writes; machine-local keys are
+    // excluded by design.
+    const config = options.config.loadConfigOrDefault();
     return await createBackupPayload({
       muxRoot,
-      preferences: exportablePreferences(),
+      preferences: projectBackupPreferences(config.userPreferences ?? {}),
+      settings: projectBackupSettings(config),
       muxVersion: resolveMuxVersion(),
       sourceLabel: path.basename(muxRoot),
       // The service owns the user-facing override, so report rather than throw.
@@ -562,9 +566,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // file, so compare the merge result. A backup that only repeats values the local
         // config already holds changes nothing.
         if (file.path === "preferences.json") {
-          const local = localPreferences();
-          const merged = mergeBackupPreferences(local, JSON.parse(file.content.toString("utf-8")));
-          if (!serializeBackupPreferences(local).equals(serializeBackupPreferences(merged))) {
+          const document: unknown = JSON.parse(file.content.toString("utf-8"));
+          const localConfig = options.config.loadConfigOrDefault();
+          const local = localConfig.userPreferences;
+          const merged = mergeBackupPreferences(local, document);
+          const backupSettings = readBackupSettings(document);
+          if (
+            !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
+            (backupSettings !== undefined &&
+              backupSettingsDiffer(localConfig, mergeBackupSettings(localConfig, backupSettings)))
+          ) {
             changes.push({ status: "M", path: file.path });
           }
           continue;
@@ -699,16 +710,22 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         if (result.backupPreferences !== undefined) {
-          let merged: ReturnType<typeof normalizeUserPreferences> | undefined;
+          const backupSettings = readBackupSettings(result.backupPreferences);
+          let merged: ProjectsConfig | undefined;
           await options.config.editConfig(
             (current) => {
               // Merged against the config this edit reads, not a snapshot taken before the
               // restore: a whole-object write would otherwise discard preferences another
               // window saved meanwhile, including the machine-local keys no backup carries.
-              merged = normalizeUserPreferences(
-                mergeBackupPreferences(current.userPreferences, result.backupPreferences)
-              );
-              return { ...current, userPreferences: merged };
+              const next: ProjectsConfig = {
+                ...current,
+                userPreferences: normalizeUserPreferences(
+                  mergeBackupPreferences(current.userPreferences, result.backupPreferences)
+                ),
+              };
+              merged =
+                backupSettings === undefined ? next : mergeBackupSettings(next, backupSettings);
+              return merged;
             },
             // Inside the project restore's registration window the edit must ride that
             // window's hold: taking its own would wait on itself.
@@ -718,10 +735,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           // the preferences landed. Compared through the backup projection because every
           // key a restore can change is portable, so a lost write is visible there, while
           // machine-local keys the load path normalizes differently stay out of the check.
-          const stored = options.config.loadConfigOrDefault().userPreferences;
+          const stored = options.config.loadConfigOrDefault();
           if (
             merged !== undefined &&
-            !serializeBackupPreferences(stored ?? {}).equals(serializeBackupPreferences(merged))
+            (!serializeBackupPreferences(stored.userPreferences ?? {}).equals(
+              serializeBackupPreferences(merged.userPreferences)
+            ) ||
+              backupSettingsDiffer(stored, merged))
           ) {
             throw new BackupServiceError(
               "IO_ERROR",

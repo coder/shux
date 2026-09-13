@@ -343,6 +343,50 @@ describe("BackupService against a real repository", () => {
     expect(service.getSettings()?.lastRestoredCommit).toBe(pushed.data.commit);
   });
 
+  it("round-trips model and agent settings through config.json", async () => {
+    // Through the real Config, so the restore's post-write check runs against what the
+    // save and load normalizers actually persist rather than an in-memory stand-in.
+    const backedUp = {
+      agentAiDefaults: {
+        exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" as const },
+        plan: { modelString: "openai:gpt-plan", advisorEnabled: true },
+      },
+      defaultModel: "anthropic:claude-exec",
+      hiddenModels: ["openai:gpt-old"],
+      advisorMaxUsesPerTurn: 2,
+      heartbeatDefaultPrompt: "Check in",
+      taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 2 },
+    };
+    await config.editConfig((current) => ({ ...current, ...backedUp, apiServerPort: 4321 }));
+    await pushOrThrow();
+
+    await config.editConfig((current) => ({
+      ...current,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
+      defaultModel: "openai:gpt-local",
+      hiddenModels: [],
+      advisorMaxUsesPerTurn: null,
+      heartbeatDefaultPrompt: "Local prompt",
+      taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 1 },
+      apiServerPort: 9999,
+    }));
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+
+    const loaded = config.loadConfigOrDefault();
+    expect(loaded.agentAiDefaults).toMatchObject(backedUp.agentAiDefaults);
+    expect(loaded.defaultModel).toBe(backedUp.defaultModel);
+    expect(loaded.hiddenModels).toEqual(backedUp.hiddenModels);
+    expect(loaded.advisorMaxUsesPerTurn).toBe(backedUp.advisorMaxUsesPerTurn);
+    expect(loaded.heartbeatDefaultPrompt).toBe(backedUp.heartbeatDefaultPrompt);
+    expect(loaded.taskSettings).toMatchObject(backedUp.taskSettings);
+    expect(loaded.apiServerPort).toBe(9999);
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.restoreChanges).toEqual([]);
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();

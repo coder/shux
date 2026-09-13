@@ -30,6 +30,7 @@ import {
   createBackupPayload,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
+  projectBackupPreferences,
   matchedProjectWrites,
   planProjectBundleRestore,
   planRestoreWrites,
@@ -56,6 +57,7 @@ import {
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
+import { readBackupSettings } from "./settingsProjection";
 import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 
 async function isExecutable(filePath: string): Promise<boolean> {
@@ -210,6 +212,10 @@ describe("backup payload", () => {
           defaultBaseByProject: { "/private/project": "main" },
         },
       },
+      settings: {
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" } },
+        defaultModel: "anthropic:claude-exec",
+      },
     });
 
     expect(payload.files.map((file) => file.path)).toEqual([
@@ -234,7 +240,71 @@ describe("backup payload", () => {
         autoCompactionThresholdByModel: { "openai/gpt": 75 },
       },
       review: { includeUncommitted: true },
+      settings: {
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-exec", thinkingLevel: "high" } },
+        defaultModel: "anthropic:claude-exec",
+      },
     });
+  });
+
+  it("keeps the settings block out of the preferences projection older builds rely on", () => {
+    // An older build parses the whole document as preferences; the block must be dropped by
+    // that parse rather than rejected, or newer backups would stop restoring there.
+    const settings = { defaultModel: "anthropic:claude-exec", heartbeatDefaultIntervalMs: 1 };
+    const document = { appearance: { theme: "dark" }, settings };
+    const { settings: _settings, ...withoutSettings } = document;
+    expect(projectBackupPreferences(document)).toEqual(projectBackupPreferences(withoutSettings));
+    expect(mergeBackupPreferences({ appearance: { theme: "light" } }, document)).toEqual(
+      mergeBackupPreferences({ appearance: { theme: "light" } }, withoutSettings)
+    );
+  });
+
+  it("restores a settings block, accepts its absence, and rejects a malformed one before writing", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");
+    const settings = {
+      defaultModel: "anthropic:claude-exec",
+      agentAiDefaults: { exec: { thinkingLevel: "high" as const } },
+    };
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      settings,
+    });
+    const destination = path.join(tempDir, "with-settings");
+    await writeBackupPayload(destination, payload);
+    const restoreRoot = path.join(tempDir, "target");
+    await fs.mkdir(restoreRoot, { recursive: true });
+
+    const restored = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(restored.backupPreferences)).toEqual(settings);
+
+    // A backup written by a build that predates the block.
+    await tamperPayloadFile(destination, "preferences.json", '{"appearance":{"theme":"dark"}}\n');
+    const older = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(older.backupPreferences)).toBeUndefined();
+    expect(mergeBackupPreferences({}, older.backupPreferences)).toEqual({
+      appearance: { theme: "dark" },
+    });
+
+    const malformed = '{"settings":{"agentAiDefaults":{"exec":{"thinkingLevel":"bogus"}}}}\n';
+    await tamperPayloadFile(destination, "preferences.json", malformed);
+    await captureRejection(readBackupPayload(destination));
+    const untouched = path.join(tempDir, "untouched");
+    await fs.mkdir(untouched, { recursive: true });
+    await captureRejection(
+      restoreBackupPayload({
+        muxRoot: untouched,
+        payload: withPayloadFileText(payload, "preferences.json", malformed),
+      })
+    );
+    expect(await fs.readdir(untouched)).toEqual([]);
   });
 
   it("keeps MCP commands and URLs while redacting literal header values", async () => {

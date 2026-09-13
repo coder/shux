@@ -1196,6 +1196,102 @@ describe("backup adapters", () => {
     }
   });
 
+  it("restores model and agent settings through config and leaves machine-local ones alone", async () => {
+    const backedUp = {
+      agentAiDefaults: {
+        exec: {
+          modelString: "anthropic:claude-exec",
+          thinkingLevel: "high" as const,
+          subagent: { modelString: "openai:gpt-sub" },
+        },
+        plan: { modelString: "openai:gpt-plan", advisorEnabled: true },
+      },
+      defaultModel: "anthropic:claude-exec",
+      hiddenModels: ["openai:gpt-old"],
+      advisorMaxUsesPerTurn: 2,
+    };
+    config.state = { projects: new Map(), ...backedUp, apiServerPort: 4321 };
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+
+    const repository = await gitRepo.prepare(settings);
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    const published = JSON.parse(
+      await fs.readFile(path.join(repository.rootDir, settings.path, "preferences.json"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(published.settings).toMatchObject(backedUp);
+    expect(JSON.stringify(published)).not.toContain("apiServerPort");
+
+    config.state = {
+      projects: new Map(),
+      agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
+      defaultModel: "openai:gpt-local",
+      hiddenModels: ["openai:gpt-old"],
+      advisorMaxUsesPerTurn: 2,
+      apiServerPort: 9999,
+      terminalDefaultShell: "/bin/fish",
+    };
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    expect(preview.changes).toEqual([{ status: "M", path: "preferences.json" }]);
+
+    await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjects: [],
+    });
+    expect(config.state.agentAiDefaults).toEqual(backedUp.agentAiDefaults);
+    expect(config.state.defaultModel).toBe("anthropic:claude-exec");
+    expect(config.state.apiServerPort).toBe(9999);
+    expect(config.state.terminalDefaultShell).toBe("/bin/fish");
+
+    // Restoring again changes nothing once the settings already match.
+    const afterRestore = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    expect(afterRestore.changes).toEqual([]);
+  });
+
+  it("reports a lost settings write instead of restoring silently", async () => {
+    config.state = { projects: new Map(), defaultModel: "anthropic:claude-exec" };
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const repository = await gitRepo.prepare(settings);
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+
+    config.state = { projects: new Map(), defaultModel: "openai:gpt-local" };
+    spyOn(config, "editConfig").mockImplementation((edit) => {
+      edit(config.state);
+      return Promise.resolve();
+    });
+
+    const error = await captureRejection(
+      payload.restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: false,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjects: [],
+      })
+    );
+    expect((error as Error).message).toContain("could not be written");
+  });
+
   it("keeps preferences another window saved while the restore ran", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");

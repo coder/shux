@@ -54,6 +54,7 @@ const INCLUDED_SETTINGS = [
   "Agent skills",
   "Global memory",
   "MCP server configuration",
+  "Model and agent settings",
   "Portable preferences",
 ] as const;
 
