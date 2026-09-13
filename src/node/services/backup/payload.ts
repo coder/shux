@@ -23,7 +23,7 @@ import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/cons
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
-import { readBackupSettings, type BackupSettings } from "./settingsProjection";
+import type { BackupSettings } from "./settingsProjection";
 
 export const BACKUP_SCHEMA_VERSION = 1;
 export const BACKUP_MANIFEST_FILE = "manifest.json";
@@ -1841,9 +1841,7 @@ async function readBackupPayloadUnchecked(
   // writes anything. Otherwise a later parse failure leaves a half-restored install.
   const preferencesFile = files.find((file) => file.path === "preferences.json");
   if (preferencesFile) {
-    const parsed: unknown = JSON.parse(preferencesFile.content.toString("utf-8"));
-    projectBackupPreferences(parsed);
-    readBackupSettings(parsed);
+    projectBackupPreferences(JSON.parse(preferencesFile.content.toString("utf-8")));
   }
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   const parsedMcp = mcpFile
@@ -2546,7 +2544,6 @@ export async function planRestoreWrites(
       // that edit runs rather than as it was before the restore.
       const parsed: unknown = JSON.parse(file.content.toString("utf-8"));
       projectBackupPreferences(parsed);
-      readBackupSettings(parsed);
       backupPreferences = parsed;
       continue;
     }

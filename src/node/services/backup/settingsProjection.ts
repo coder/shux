@@ -73,6 +73,18 @@ export type BackupSettings = {
   [K in BackedUpSettingsKey]?: NonNullable<ProjectsConfig[K]> | null;
 };
 
+export interface BackupSettingsRead {
+  /** The keys this build can apply; undefined when the document carries no settings block. */
+  settings: BackupSettings | undefined;
+  /**
+   * Keys whose values fail this build's schema, so a restore keeps the local value: a newer
+   * build's export (a thinking level or runtime this build predates) or a damaged document.
+   * Reported rather than failing the restore, which would strand every other backed-up file
+   * behind an upgrade.
+   */
+  unsupported: string[];
+}
+
 /**
  * The canonical in-memory value of each setting, using the same normalization Config applies
  * on save and load. Export, read, merge, and the post-write check all go through this table, so
@@ -143,36 +155,27 @@ export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
   return copyJson(projected);
 }
 
-/**
- * Reads and canonicalizes the `settings` block of a preferences document. Throws on a malformed
- * block, naming the fields, so the payload readers reject the backup before a restore writes
- * anything and the Backup screen can say what is wrong with the document.
- */
-export function readBackupSettings(document: unknown): BackupSettings | undefined {
-  if (!isPlainObject(document) || document.settings === undefined) return undefined;
+/** Reads and canonicalizes the `settings` block of a preferences document. */
+export function readBackupSettings(document: unknown): BackupSettingsRead {
+  if (!isPlainObject(document) || document.settings === undefined) {
+    return { settings: undefined, unsupported: [] };
+  }
   const block = document.settings;
   if (!isPlainObject(block)) {
-    throw new Error("Backup preferences.json has an invalid settings block (expected an object)");
+    return { settings: undefined, unsupported: ["settings (not an object)"] };
   }
   const settings: BackupSettings = {};
-  const issues: string[] = [];
+  const unsupported: string[] = [];
   for (const key of BACKED_UP_SETTINGS_KEYS) {
     if (!(key in block)) continue;
     const parsed = fieldSchema(key).safeParse(block[key]);
     if (parsed.success) {
       setSetting(settings, key, NORMALIZE[key](parsed.data));
-      continue;
-    }
-    for (const issue of parsed.error.issues) {
-      issues.push(`${[key, ...issue.path].map(String).join(".")}: ${issue.message}`);
+    } else {
+      unsupported.push(key);
     }
   }
-  if (issues.length > 0) {
-    throw new Error(
-      `Backup preferences.json has an invalid settings block (${issues.slice(0, 3).join("; ")})`
-    );
-  }
-  return settings;
+  return { settings, unsupported };
 }
 
 /** Each key the block carries replaces the local value; keys it lacks keep the local value. */

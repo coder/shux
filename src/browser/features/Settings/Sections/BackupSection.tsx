@@ -207,6 +207,7 @@ export function BackupSection() {
   >({});
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
+  const [unsupportedSettings, setUnsupportedSettings] = useState<string[]>([]);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -483,6 +484,7 @@ export function BackupSection() {
         return next;
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setUnsupportedSettings(result.data.unsupportedSettings);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -601,6 +603,7 @@ export function BackupSection() {
         mergeImportResults(previous, result.data.projectImportResults)
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setUnsupportedSettings(result.data.unsupportedSettings);
       // The restore rewrote config behind the renderer's localStorage mirrors.
       try {
         seedConfigMirrors(await api.config.getConfig());
@@ -987,6 +990,14 @@ export function BackupSection() {
         <div className="border-border-light text-muted rounded-md border p-3 text-xs">
           This backup carries a project bundle, but project backup is disabled here, so it was
           skipped. Enable “Include project list &amp; project memories” and save to restore it.
+        </div>
+      ) : null}
+
+      {unsupportedSettings.length > 0 ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          This version does not understand some backed-up settings, so they keep their current
+          values here: <code className="text-foreground">{unsupportedSettings.join(", ")}</code>.
+          They were likely saved by a newer Xum; update and restore again to apply them.
         </div>
       ) : null}
 

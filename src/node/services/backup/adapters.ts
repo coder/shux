@@ -544,6 +544,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           commandApprovals: [],
           projectImports: [],
           projectBundleSkipped: false,
+          unsupportedSettings: [],
         };
       }
 
@@ -561,6 +562,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         restoredPaths
       );
       const changes: BackupFileChange[] = [];
+      let unsupportedSettings: string[] = [];
       for (const file of payload.files) {
         // Preferences live in config, and restore merges them rather than replacing the
         // file, so compare the merge result. A backup that only repeats values the local
@@ -571,10 +573,14 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           const local = localConfig.userPreferences;
           const merged = mergeBackupPreferences(local, document);
           const backupSettings = readBackupSettings(document);
+          unsupportedSettings = backupSettings.unsupported;
           if (
             !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
-            (backupSettings !== undefined &&
-              backupSettingsDiffer(localConfig, mergeBackupSettings(localConfig, backupSettings)))
+            (backupSettings.settings !== undefined &&
+              backupSettingsDiffer(
+                localConfig,
+                mergeBackupSettings(localConfig, backupSettings.settings)
+              ))
           ) {
             changes.push({ status: "M", path: file.path });
           }
@@ -623,6 +629,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         ),
         projectImports,
         projectBundleSkipped,
+        unsupportedSettings,
       };
     },
 
@@ -703,14 +710,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
 
       const restoreCore = async (
         registration: ProjectRegistrationLockHandle | null
-      ): Promise<{ localOnlyFiles: string[] }> => {
+      ): Promise<{ localOnlyFiles: string[]; unsupportedSettings: string[] }> => {
         const result = await restoreBackupPayload({
           muxRoot,
           payload,
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
+        let unsupportedSettings: string[] = [];
         if (result.backupPreferences !== undefined) {
           const backupSettings = readBackupSettings(result.backupPreferences);
+          unsupportedSettings = backupSettings.unsupported;
           let merged: ProjectsConfig | undefined;
           await options.config.editConfig(
             (current) => {
@@ -724,7 +733,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
                 ),
               };
               merged =
-                backupSettings === undefined ? next : mergeBackupSettings(next, backupSettings);
+                backupSettings.settings === undefined
+                  ? next
+                  : mergeBackupSettings(next, backupSettings.settings);
               return merged;
             },
             // Inside the project restore's registration window the edit must ride that
@@ -749,13 +760,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             );
           }
         }
-        return { localOnlyFiles: result.localOnlyFiles };
+        return { localOnlyFiles: result.localOnlyFiles, unsupportedSettings };
       };
 
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
-      let core: { localOnlyFiles: string[] };
+      let core: { localOnlyFiles: string[]; unsupportedSettings: string[] };
       // The bundle itself is read here — the repo lock holds the checkout stable — but its
       // plan is computed inside the memory lock below, where the inputs it depends on are.
       const bundle = restoreOptions.includeProjects ? await readProjectBundle(sourceDir) : null;
@@ -885,6 +896,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         changedFiles: [...changedFiles, ...memoryChanges].sort(),
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
+        unsupportedSettings: core.unsupportedSettings,
         restoredProjectMemory,
       };
     },

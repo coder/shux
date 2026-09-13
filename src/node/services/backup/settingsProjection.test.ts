@@ -133,7 +133,7 @@ describe("settingsProjection", () => {
 
     const merged = mergeBackupSettings(
       target,
-      readBackupSettings({ settings: projectBackupSettings({ projects: new Map() }) })!
+      readBackupSettings({ settings: projectBackupSettings({ projects: new Map() }) }).settings!
     );
 
     expect(merged.agentAiDefaults).toEqual({});
@@ -167,7 +167,7 @@ describe("settingsProjection", () => {
         taskSettings: { maxParallelAgentTasks: 2 },
         layoutPresets: { version: 2, slots: [] },
       },
-    })!;
+    }).settings!;
     const merged = mergeBackupSettings(current, sparse);
 
     expect(merged.agentAiDefaults).toEqual({ plan: { modelString: "anthropic:claude-plan" } });
@@ -196,7 +196,7 @@ describe("settingsProjection", () => {
   it("canonicalizes accepted values the way config.json persists them", () => {
     // A schema-valid document can still hold spellings the save path would rewrite; reading
     // them canonically is what makes the post-write comparison hold.
-    const settings = readBackupSettings({
+    const { settings } = readBackupSettings({
       settings: {
         defaultModel: " anthropic:claude-exec ",
         hiddenModels: ["openai:gpt-a", "openai:gpt-a", " "],
@@ -217,9 +217,10 @@ describe("settingsProjection", () => {
     });
   });
 
-  it("reads only the portable settings block and rejects a malformed one", () => {
-    expect(readBackupSettings({ appearance: { theme: "dark" } })).toBeUndefined();
-    expect(readBackupSettings(undefined)).toBeUndefined();
+  it("reads only the portable settings block", () => {
+    const none = { settings: undefined, unsupported: [] };
+    expect(readBackupSettings({ appearance: { theme: "dark" } })).toEqual(none);
+    expect(readBackupSettings(undefined)).toEqual(none);
 
     expect(
       readBackupSettings({
@@ -230,15 +231,35 @@ describe("settingsProjection", () => {
           unknownKey: true,
         },
       })
-    ).toEqual({ defaultModel: "anthropic:claude-plan" });
+    ).toEqual({ settings: { defaultModel: "anthropic:claude-plan" }, unsupported: [] });
+  });
 
-    // The error names the field so the Backup screen can say what is wrong with the document.
-    expect(() =>
-      readBackupSettings({ settings: { agentAiDefaults: { exec: { thinkingLevel: "bogus" } } } })
-    ).toThrow(/settings block \(agentAiDefaults\.exec\.thinkingLevel: /);
-    expect(() => readBackupSettings({ settings: { heartbeatDefaultIntervalMs: 1 } })).toThrow(
-      /heartbeatDefaultIntervalMs/
-    );
-    expect(() => readBackupSettings({ settings: null })).toThrow(/expected an object/);
+  it("keeps the local value for fields this build does not understand and names them", () => {
+    // A newer build's export (or a damaged document): the other fields still apply, and the
+    // restore reports the skipped ones instead of refusing the whole backup on a downgrade.
+    const read = readBackupSettings({
+      settings: {
+        agentAiDefaults: { exec: { thinkingLevel: "bogus" } },
+        heartbeatDefaultIntervalMs: 1,
+        defaultModel: "anthropic:claude-plan",
+      },
+    });
+    expect(read.unsupported).toEqual(["agentAiDefaults", "heartbeatDefaultIntervalMs"]);
+    expect(read.settings).toEqual({ defaultModel: "anthropic:claude-plan" });
+
+    const current: ProjectsConfig = {
+      projects: new Map(),
+      agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
+      heartbeatDefaultIntervalMs: 900_000,
+    };
+    const merged = mergeBackupSettings(current, read.settings!);
+    expect(merged.agentAiDefaults).toEqual(current.agentAiDefaults);
+    expect(merged.heartbeatDefaultIntervalMs).toBe(900_000);
+    expect(merged.defaultModel).toBe("anthropic:claude-plan");
+
+    expect(readBackupSettings({ settings: null })).toEqual({
+      settings: undefined,
+      unsupported: ["settings (not an object)"],
+    });
   });
 });

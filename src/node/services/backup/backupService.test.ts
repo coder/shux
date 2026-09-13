@@ -93,6 +93,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
       }),
     validateRestore: () =>
       Promise.resolve({ hasProjectBundle: false, projectImports: [], matchedProjects: [] }),
@@ -102,6 +103,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         changedFiles: [],
         localOnlyFiles: [],
         projectBundleSkipped: false,
+        unsupportedSettings: [],
         restoredProjectMemory: [],
       }),
     prepareProjectImports: () =>
@@ -185,6 +187,7 @@ describe("BackupService", () => {
             changedFiles: ["AGENTS.md"],
             localOnlyFiles: ["skills/local/SKILL.md"],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [],
           });
         },
@@ -380,6 +383,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
           };
         },
       }),
@@ -425,6 +429,7 @@ describe("BackupService", () => {
             changedFiles: ["AGENTS.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [],
           };
         },
@@ -539,6 +544,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
           });
         },
         exportTo: () => {
@@ -575,6 +581,7 @@ describe("BackupService", () => {
             commandApprovals: [],
             projectImports: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
           });
         },
         exportTo: (options) => {
@@ -595,6 +602,7 @@ describe("BackupService", () => {
             changedFiles: [],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [],
           });
         },
@@ -2617,6 +2625,7 @@ describe("BackupService project imports", () => {
             changedFiles: [],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [],
           });
         },
@@ -2650,6 +2659,7 @@ describe("BackupService project imports", () => {
             changedFiles: ["memory/project/matched-abc/deep/notes.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [
               {
                 projectPath: "/home/dev/src/matched",
@@ -2749,6 +2759,7 @@ describe("BackupService project imports", () => {
             changedFiles: ["memory/project/alpha-abc/notes.md"],
             localOnlyFiles: [],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
             restoredProjectMemory: [
               { projectPath: "/home/dev/src/alpha", files: ["memory/project/alpha-abc/notes.md"] },
             ],
@@ -2833,6 +2844,7 @@ describe("BackupService project imports", () => {
             commandApprovals: [],
             projectImports: [fresh],
             projectBundleSkipped: false,
+            unsupportedSettings: [],
           }),
         exportTo: () => Promise.reject(new Error("Backup has more than 256 projects")),
       }),

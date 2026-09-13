@@ -261,7 +261,7 @@ describe("backup payload", () => {
     );
   });
 
-  it("restores a settings block, accepts its absence, and rejects a malformed one before writing", async () => {
+  it("restores a settings block, accepts its absence, and skips values it does not understand", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");
     const settings = {
       defaultModel: "anthropic:claude-exec",
@@ -282,7 +282,7 @@ describe("backup payload", () => {
       muxRoot: restoreRoot,
       payload: await readBackupPayload(destination),
     });
-    expect(readBackupSettings(restored.backupPreferences)).toEqual(settings);
+    expect(readBackupSettings(restored.backupPreferences)).toEqual({ settings, unsupported: [] });
 
     // A backup written by a build that predates the block.
     await tamperPayloadFile(destination, "preferences.json", '{"appearance":{"theme":"dark"}}\n');
@@ -290,23 +290,30 @@ describe("backup payload", () => {
       muxRoot: restoreRoot,
       payload: await readBackupPayload(destination),
     });
-    expect(readBackupSettings(older.backupPreferences)).toBeUndefined();
+    expect(readBackupSettings(older.backupPreferences)).toEqual({
+      settings: undefined,
+      unsupported: [],
+    });
     expect(mergeBackupPreferences({}, older.backupPreferences)).toEqual({
       appearance: { theme: "dark" },
     });
 
-    const malformed = '{"settings":{"agentAiDefaults":{"exec":{"thinkingLevel":"bogus"}}}}\n';
-    await tamperPayloadFile(destination, "preferences.json", malformed);
-    await captureRejection(readBackupPayload(destination));
-    const untouched = path.join(tempDir, "untouched");
-    await fs.mkdir(untouched, { recursive: true });
-    await captureRejection(
-      restoreBackupPayload({
-        muxRoot: untouched,
-        payload: withPayloadFileText(payload, "preferences.json", malformed),
-      })
+    // A backup written by a newer build, with a value this build's schema does not know: the
+    // rest of the backup restores and the field is reported rather than failing the restore.
+    await tamperPayloadFile(
+      destination,
+      "preferences.json",
+      '{"settings":{"agentAiDefaults":{"exec":{"thinkingLevel":"bogus"}},"defaultModel":"anthropic:claude-plan"}}\n'
     );
-    expect(await fs.readdir(untouched)).toEqual([]);
+    const newer = await restoreBackupPayload({
+      muxRoot: restoreRoot,
+      payload: await readBackupPayload(destination),
+    });
+    expect(readBackupSettings(newer.backupPreferences)).toEqual({
+      settings: { defaultModel: "anthropic:claude-plan" },
+      unsupported: ["agentAiDefaults"],
+    });
+    expect(await fs.readFile(path.join(restoreRoot, "AGENTS.md"), "utf-8")).toBe("backed up\n");
   });
 
   it("keeps MCP commands and URLs while redacting literal header values", async () => {
