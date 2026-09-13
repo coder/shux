@@ -13,22 +13,27 @@ class TestWindow extends EventEmitter {
   loading = Promise.resolve();
   webContents = Object.assign(new EventEmitter(), {
     getURL: () => this.url,
+    isDestroyed: () => this.destroyed,
     paste: mock(() => undefined),
     executeJavaScriptInIsolatedWorld: mock<
       (worldId: number, scripts: Array<{ code: string }>) => Promise<unknown>
     >(() => Promise.resolve(true)),
     session: {
-      setPermissionRequestHandler:
-        mock<
-          (
-            handler: (
-              contents: unknown,
-              permission: string,
-              callback: (allow: boolean) => void,
-              details: { isMainFrame: boolean; requestingUrl: string }
-            ) => void
+      setPermissionRequestHandler: mock<
+        (
+          handler: (
+            contents: unknown,
+            permission: string,
+            callback: (allow: boolean) => void,
+            details: {
+              isMainFrame: boolean;
+              requestingUrl: string;
+              mediaTypes?: readonly string[];
+              securityOrigin?: string;
+            }
           ) => void
-        >(),
+        ) => void
+      >(),
       setPermissionCheckHandler: mock<(handler: () => boolean) => void>(),
     },
     setWindowOpenHandler: mock<
@@ -74,6 +79,9 @@ function setup(loading = Promise.resolve()) {
   const onDisconnected = mock(() => undefined);
   const onStateChanged = mock<(state: RemoteConnectionState) => void>();
   const openExternal = mock<(url: string) => void>();
+  const requestMicrophoneAccess = mock<
+    (window: BrowserWindow, serverUrl: string, signal: AbortSignal) => Promise<boolean>
+  >(() => Promise.resolve(true));
   const manager = new RemoteConnectionManager({
     createWindow: (windowOptions) => {
       const window = new TestWindow();
@@ -87,6 +95,7 @@ function setup(loading = Promise.resolve()) {
     onDisconnected,
     onStateChanged,
     openExternal,
+    requestMicrophoneAccess,
   });
   managers.push(manager);
   return {
@@ -97,6 +106,7 @@ function setup(loading = Promise.resolve()) {
     onDisconnected,
     onStateChanged,
     openExternal,
+    requestMicrophoneAccess,
     setLoading: (promise: Promise<void>) => {
       loading = promise;
     },
@@ -113,7 +123,197 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function requestAudio(
+  host: TestWindow,
+  requester = host,
+  overrides: Partial<{
+    isMainFrame: boolean;
+    requestingUrl: string;
+    mediaTypes: readonly string[];
+    securityOrigin: string;
+  }> = {}
+): Promise<boolean> {
+  const request = host.webContents.session.setPermissionRequestHandler.mock.calls[0][0];
+  return new Promise((resolve) => {
+    request(requester.webContents, "media", resolve, {
+      isMainFrame: true,
+      requestingUrl: requester.url,
+      mediaTypes: ["audio"],
+      securityOrigin: "https://example.com/",
+      ...overrides,
+    });
+  });
+}
+
 describe("RemoteConnectionManager", () => {
+  test("prompts for each audio request and allows retry after denial or OS failure", async () => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    await manager.connect("https://example.com/?token=private#secret");
+    const window = windows[0];
+    requestMicrophoneAccess.mockResolvedValueOnce(false);
+    expect(await requestAudio(window)).toBe(false);
+    requestMicrophoneAccess.mockRejectedValueOnce(new Error("OS permission unavailable"));
+    expect(await requestAudio(window)).toBe(false);
+    expect(await requestAudio(window)).toBe(true);
+    expect(await requestAudio(window)).toBe(true);
+    expect(requestMicrophoneAccess).toHaveBeenCalledTimes(4);
+    expect(requestMicrophoneAccess.mock.calls[0][0]).toBe(window as unknown as BrowserWindow);
+    expect(requestMicrophoneAccess.mock.calls[0][1]).toBe("https://example.com");
+    expect(window.webContents.session.setPermissionCheckHandler.mock.calls[0][0]()).toBe(false);
+    expect(window.webContents.listenerCount("did-start-navigation")).toBe(0);
+  });
+
+  test.each([
+    { mediaTypes: ["video"] },
+    { mediaTypes: ["audio", "video"] },
+    { mediaTypes: [] },
+    { mediaTypes: undefined },
+    { mediaTypes: ["unknown"] },
+    { mediaTypes: ["audio", "audio"] },
+    { isMainFrame: false },
+    { securityOrigin: "https://other.example.com" },
+    { securityOrigin: "null" },
+    { securityOrigin: undefined },
+    { requestingUrl: "https://other.example.com/" },
+    { requestingUrl: "https://example.com/another-page" },
+  ])("denies unsafe media details without prompting: %j", async (details) => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    await manager.connect("https://example.com/");
+    expect(await requestAudio(windows[0], windows[0], details)).toBe(false);
+    expect(requestMicrophoneAccess).not.toHaveBeenCalled();
+  });
+
+  test("limits microphone requests to focused app windows within the connected app base", async () => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    const base = "https://example.com/@user/workspace/apps/xum/";
+    await manager.connect(base);
+    const window = windows[0];
+    window.focused = false;
+    expect(await requestAudio(window)).toBe(false);
+    window.focused = true;
+    for (const url of [
+      "https://example.com/login",
+      "https://example.com/@user/workspace/apps/other/",
+      "https://other.example.com/",
+      "blob:https://example.com/attachment",
+      "invalid",
+    ]) {
+      window.url = url;
+      expect(await requestAudio(window)).toBe(false);
+    }
+    window.url = base;
+    const unrelated = new TestWindow();
+    unrelated.url = base;
+    expect(await requestAudio(window, unrelated)).toBe(false);
+    for (const url of ["about:blank", "blob:https://example.com/attachment"]) {
+      const popup = new TestWindow();
+      window.webContents.emit("did-create-window", popup, { url });
+      // Even an auth popup that returns to the app must not acquire microphone access.
+      popup.url = base;
+      expect(await requestAudio(window, popup)).toBe(false);
+    }
+    expect(requestMicrophoneAccess).not.toHaveBeenCalled();
+    const app = new TestWindow();
+    app.url = base + "terminal.html";
+    window.webContents.emit("did-create-window", app, { url: app.url });
+    expect(await requestAudio(window, app)).toBe(true);
+    expect(requestMicrophoneAccess.mock.calls[0][0]).toBe(app as unknown as BrowserWindow);
+  });
+
+  test("does not prompt before the connection completes", async () => {
+    const loading = deferred();
+    const { manager, windows, requestMicrophoneAccess } = setup(loading.promise);
+    const connected = manager.connect("https://example.com/");
+    expect(await requestAudio(windows[0])).toBe(false);
+    expect(requestMicrophoneAccess).not.toHaveBeenCalled();
+    loading.resolve();
+    await connected;
+    expect(await requestAudio(windows[0])).toBe(true);
+  });
+
+  test("rejects concurrent prompts without caching their denial", async () => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    await manager.connect("https://example.com/");
+    const prompt = deferred();
+    requestMicrophoneAccess.mockImplementationOnce(async () => {
+      await prompt.promise;
+      return true;
+    });
+    const first = requestAudio(windows[0]);
+    expect(await requestAudio(windows[0])).toBe(false);
+    expect(requestMicrophoneAccess).toHaveBeenCalledTimes(1);
+    prompt.resolve();
+    expect(await first).toBe(true);
+    expect(await requestAudio(windows[0])).toBe(true);
+  });
+
+  test.each([
+    "reload",
+    "navigate",
+    "commit",
+    "crash",
+    "close",
+    "disconnect",
+    "reconnect",
+    "dispose",
+  ])("cancels a pending microphone request promptly on %s", async (action) => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    await manager.connect("https://example.com/");
+    const host = windows[0];
+    const popup = new TestWindow();
+    popup.url = "https://example.com/terminal.html";
+    host.webContents.emit("did-create-window", popup, { url: popup.url });
+    const prompt = deferred();
+    requestMicrophoneAccess.mockImplementationOnce(async () => {
+      await prompt.promise;
+      return true;
+    });
+    const pending = requestAudio(host, popup);
+    const signal = requestMicrophoneAccess.mock.calls[0][2];
+    if (action === "reload" || action === "navigate") {
+      popup.webContents.emit("did-start-navigation", { isMainFrame: true });
+      if (action === "navigate") popup.url = "https://example.com/login";
+    } else if (action === "commit") popup.webContents.emit("did-navigate");
+    else if (action === "crash") popup.webContents.emit("render-process-gone");
+    else if (action === "close") popup.close();
+    else if (action === "dispose") manager.dispose();
+    else {
+      manager.disconnect();
+      if (action === "reconnect") await manager.connect("https://example.com/");
+    }
+    expect(signal.aborted).toBe(true);
+    // The native OS prompt can outlive the request. Its result must not keep the callback pending.
+    expect(await pending).toBe(false);
+    prompt.resolve();
+    await prompt.promise;
+    expect(popup.webContents.listenerCount("did-start-navigation")).toBe(0);
+    expect(popup.webContents.listenerCount("did-navigate")).toBe(0);
+    expect(popup.webContents.listenerCount("render-process-gone")).toBe(0);
+    if (action === "disconnect" || action === "reconnect" || action === "dispose") {
+      const handlers = host.webContents.session.setPermissionRequestHandler.mock.calls;
+      const result = new Promise<boolean>((resolve) => {
+        handlers[handlers.length - 1][0](host.webContents, "media", resolve, {
+          isMainFrame: true,
+          requestingUrl: host.url,
+          mediaTypes: ["audio"],
+        });
+      });
+      expect(await result).toBe(false);
+      expect(await requestAudio(host)).toBe(false);
+    }
+  });
+
+  test.each(["focus", "url"])("rechecks the document after approval changes %s", async (change) => {
+    const { manager, windows, requestMicrophoneAccess } = setup();
+    await manager.connect("https://example.com/");
+    requestMicrophoneAccess.mockImplementationOnce(() => {
+      if (change === "focus") windows[0].focused = false;
+      else windows[0].url = "https://example.com/login";
+      return Promise.resolve(true);
+    });
+    expect(await requestAudio(windows[0])).toBe(change === "focus");
+  });
+
   test("keeps the local window until load completes and shares duplicate connections", async () => {
     const load = deferred();
     const { manager, windows, onConnected, onStateChanged } = setup(load.promise);

@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import type { BrowserWindow, Clipboard } from "electron";
+import type {
+  BaseWindow,
+  BrowserWindow,
+  Clipboard,
+  Dialog,
+  MessageBoxOptions,
+  MessageBoxReturnValue,
+  SystemPreferences,
+} from "electron";
+import type { ElectronApplication, Frame, JSHandle, Page } from "playwright";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { electronTest, electronExpect as expect } from "../electronTest";
@@ -346,4 +355,471 @@ test("remote app popups and blob attachments retain isolation and close on disco
   await page.evaluate(() => window.api!.remoteConnection!.disconnect());
   await returned;
   expect(await page.evaluate(() => window.localStorage.getItem("popout-auth"))).toBeNull();
+});
+
+interface NativeMediaState {
+  prompts: Array<{
+    windowId: number;
+    signal: AbortSignal | undefined;
+    respond: (allow: boolean) => void;
+  }>;
+  status: ReturnType<SystemPreferences["getMediaAccessStatus"]>;
+  statusFailure: boolean;
+  osApproval: boolean;
+  statusRequests: string[];
+  osRequests: string[];
+  restore: () => void;
+}
+
+const microphoneTest = test.extend<{ nativeMedia: JSHandle<NativeMediaState> }>({
+  nativeMedia: async ({ app }, use) => {
+    const state = await app.evaluateHandle(
+      ({ dialog, systemPreferences }: { dialog: Dialog; systemPreferences: SystemPreferences }) => {
+        const originalDialog = dialog.showMessageBox;
+        const originalStatus = systemPreferences.getMediaAccessStatus;
+        const originalRequest = systemPreferences.askForMediaAccess;
+        const state: NativeMediaState = {
+          prompts: [],
+          status: "granted",
+          statusFailure: false,
+          osApproval: true,
+          statusRequests: [],
+          osRequests: [],
+          restore: () => {
+            for (const prompt of state.prompts) prompt.respond(false);
+            dialog.showMessageBox = originalDialog;
+            systemPreferences.getMediaAccessStatus = originalStatus;
+            systemPreferences.askForMediaAccess = originalRequest;
+          },
+        };
+        // Stub native boundaries only. Chromium still runs the installed permission handlers.
+        dialog.showMessageBox = (
+          owner: BaseWindow | MessageBoxOptions,
+          options?: MessageBoxOptions
+        ): Promise<MessageBoxReturnValue> => {
+          if (!("id" in owner) || !options || options.buttons?.length !== 2) {
+            throw new Error("Microphone consent needs a parent window and two buttons");
+          }
+          if (options.cancelId !== 0 || options.defaultId !== 0) {
+            throw new Error("Microphone consent must default to denial");
+          }
+          return new Promise((resolve) => {
+            state.prompts.push({
+              windowId: owner.id,
+              signal: options.signal,
+              // Leave aborted dialogs pending to test late native responses.
+              respond: (allow) => resolve({ response: allow ? 1 : 0, checkboxChecked: false }),
+            });
+          });
+        };
+        systemPreferences.getMediaAccessStatus = (mediaType) => {
+          state.statusRequests.push(mediaType);
+          if (state.statusFailure) throw new Error("Test OS status failure");
+          return state.status;
+        };
+        systemPreferences.askForMediaAccess = (mediaType) => {
+          state.osRequests.push(mediaType);
+          return Promise.resolve(state.osApproval);
+        };
+        return state;
+      }
+    );
+    try {
+      await use(state);
+    } finally {
+      await state.evaluate((state) => state.restore());
+      await state.dispose();
+    }
+  },
+});
+
+async function connectForMicrophone(
+  app: ElectronApplication,
+  local: Page,
+  url: string
+): Promise<Page> {
+  await local.waitForFunction(() => Boolean(window.api?.remoteConnection));
+  const opened = app.waitForEvent("window");
+  await local.evaluate((url) => window.api!.remoteConnection!.connect(url), url);
+  const remote = await opened;
+  await expect(remote.getByRole("heading", { name: "Remote server" })).toBeVisible();
+  await focusNativeWindow(app, remote);
+  return remote;
+}
+
+async function focusNativeWindow(app: ElectronApplication, page: Page): Promise<void> {
+  const window = await app.browserWindow(page);
+  try {
+    await window.evaluate((window) => window.focus());
+    await expect.poll(() => window.evaluate((window) => window.isFocused())).toBe(true);
+  } finally {
+    await window.dispose();
+  }
+}
+
+async function requestMedia(target: Page | Frame, constraints: MediaStreamConstraints) {
+  return target.evaluate(async (constraints) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      Reflect.set(window, "__testMicrophoneStream", stream);
+      return {
+        allowed: true,
+        tracks: stream.getTracks().map((track) => ({ kind: track.kind, state: track.readyState })),
+        error: null,
+      };
+    } catch (error) {
+      return {
+        allowed: false,
+        tracks: [],
+        error: error instanceof Error ? error.name : String(error),
+      };
+    }
+  }, constraints);
+}
+
+async function stopMicrophone(page: Page): Promise<void> {
+  expect(
+    await page.evaluate(() => {
+      const stream: unknown = Reflect.get(window, "__testMicrophoneStream");
+      if (!(stream instanceof MediaStream)) throw new Error("No active test microphone stream");
+      for (const track of stream.getTracks()) track.stop();
+      return stream.getTracks().map((track) => track.readyState);
+    })
+  ).toEqual(["ended"]);
+}
+
+async function respondToMicrophone(
+  state: JSHandle<NativeMediaState>,
+  index: number,
+  allow: boolean
+): Promise<void> {
+  await expect.poll(() => state.evaluate((state) => state.prompts.length)).toBe(index + 1);
+  await state.evaluate((state, response) => state.prompts[response.index].respond(response.allow), {
+    index,
+    allow,
+  });
+}
+
+microphoneTest.describe("remote microphone permissions", () => {
+  microphoneTest.use({ fakeMediaDevices: true });
+
+  microphoneTest(
+    "non-loopback HTTP keeps microphone access unavailable",
+    async ({ app, page, nativeMedia }) => {
+      const url = "http://microphone.invalid/";
+      // Intercept HTTP content without changing Chromium's secure-context rules or host flags.
+      await app.context().route(url, (route) =>
+        route.fulfill({
+          contentType: "text/html",
+          body: "<!doctype html><h1>Remote server</h1>",
+        })
+      );
+      try {
+        const remote = await connectForMicrophone(app, page, url);
+        expect(remote.url()).toBe(url);
+        expect(await remote.evaluate(() => window.isSecureContext)).toBe(false);
+        expect(await requestMedia(remote, { audio: true })).toMatchObject({ allowed: false });
+        expect(await nativeMedia.evaluate((state) => state.prompts.length)).toBe(0);
+      } finally {
+        await app.context().unroute(url);
+      }
+    }
+  );
+
+  microphoneTest(
+    "audio needs consent on approval, denial, and retry; local access remains available",
+    async ({ app, page, remoteServer, nativeMedia }) => {
+      expect(await requestMedia(page, { audio: true })).toMatchObject({ allowed: true });
+      await stopMicrophone(page);
+      const remote = await connectForMicrophone(app, page, remoteServer.url);
+      for (const [index, allow] of [true, false, true].entries()) {
+        await focusNativeWindow(app, remote);
+        const previousAccessRequests = await nativeMedia.evaluate(
+          (state) => state.statusRequests.length + state.osRequests.length
+        );
+        const capture = requestMedia(remote, { audio: true });
+        await expect
+          .poll(() => nativeMedia.evaluate((state) => state.prompts.length))
+          .toBe(index + 1);
+        // OS access starts only after the user approves the native dialog.
+        expect(
+          await nativeMedia.evaluate(
+            (state) => state.statusRequests.length + state.osRequests.length
+          )
+        ).toBe(previousAccessRequests);
+        await respondToMicrophone(nativeMedia, index, allow);
+        if (allow) {
+          expect(await capture).toEqual({
+            allowed: true,
+            tracks: [{ kind: "audio", state: "live" }],
+            error: null,
+          });
+          // Permission checks never expose a reusable grant, even during active capture.
+          expect(
+            await remote.evaluate(async () => {
+              const permission = await navigator.permissions.query({
+                name: "microphone" as PermissionName,
+              });
+              return permission.state;
+            })
+          ).toBe("denied");
+          await stopMicrophone(remote);
+        } else {
+          expect(await capture).toMatchObject({ allowed: false, error: "NotAllowedError" });
+          expect(
+            await nativeMedia.evaluate(
+              (state) => state.statusRequests.length + state.osRequests.length
+            )
+          ).toBe(previousAccessRequests);
+        }
+      }
+      await remote.close();
+      await expect
+        .poll(() => page.evaluate(() => window.api!.remoteConnection!.getState()))
+        .toMatchObject({ status: "disconnected" });
+      expect(await requestMedia(page, { audio: true })).toMatchObject({ allowed: true });
+      await stopMicrophone(page);
+      expect(await nativeMedia.evaluate((state) => state.prompts.length)).toBe(3);
+      expect(await page.evaluate(() => Boolean(window.__ORPC_CLIENT__))).toBe(true);
+    }
+  );
+
+  microphoneTest(
+    "camera, mixed media, subframes, auth, and attachments cannot request microphone consent",
+    async ({ app, page, remoteServer, nativeMedia }) => {
+      const base = remoteServer.url + "/@user/workspace/apps/xum/";
+      const remote = await connectForMicrophone(app, page, base);
+      for (const constraints of [{ video: true }, { audio: true, video: true }]) {
+        expect(await requestMedia(remote, constraints)).toMatchObject({
+          allowed: false,
+          error: "NotAllowedError",
+        });
+      }
+      await remote.evaluate(async (url) => {
+        const frame = document.createElement("iframe");
+        frame.name = "microphone-subframe";
+        frame.allow = "microphone; camera";
+        frame.src = url;
+        const loaded = new Promise<void>((resolve) =>
+          frame.addEventListener("load", () => resolve(), { once: true })
+        );
+        document.body.append(frame);
+        await loaded;
+      }, base + "embedded");
+      const frame = remote.frame("microphone-subframe");
+      assert(frame);
+      expect(await requestMedia(frame, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      const authOpened = app.waitForEvent("window");
+      await remote.getByRole("button", { name: "Sign in", exact: true }).click();
+      const auth = await authOpened;
+      await expect(auth.getByRole("heading", { name: "Auth callback" })).toBeVisible();
+      await focusNativeWindow(app, auth);
+      expect(await requestMedia(auth, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      // Auth windows stay ineligible after a redirect into the selected app.
+      await auth.goto(base + "callback");
+      expect(await requestMedia(auth, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      await auth.close();
+      await focusNativeWindow(app, remote);
+      const attachmentOpened = app.waitForEvent("window");
+      await remote.evaluate(() => {
+        const url = URL.createObjectURL(
+          new Blob(["Microphone attachment"], { type: "text/plain" })
+        );
+        window.open(url, "_blank");
+      });
+      const attachment = await attachmentOpened;
+      await expect(attachment.locator("body")).toContainText("Microphone attachment");
+      await focusNativeWindow(app, attachment);
+      expect(await requestMedia(attachment, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      await attachment.close();
+      // A same-origin login page is not part of the selected path-mounted app.
+      await remote.goto(remoteServer.url + "/login");
+      await focusNativeWindow(app, remote);
+      expect(await requestMedia(remote, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      expect(await nativeMedia.evaluate((state) => state.prompts.length)).toBe(0);
+    }
+  );
+
+  microphoneTest(
+    "only an initially focused app popup can request audio",
+    async ({ app, page, remoteServer, nativeMedia }) => {
+      const remote = await connectForMicrophone(app, page, remoteServer.url);
+      const opened = app.waitForEvent("window");
+      await remote.evaluate(() => window.open("/terminal.html?terminalId=microphone", "_blank"));
+      const popup = await opened;
+      await expect(popup.getByRole("heading", { name: "Remote server" })).toBeVisible();
+      await focusNativeWindow(app, popup);
+      expect(await requestMedia(remote, { audio: true })).toMatchObject({
+        allowed: false,
+        error: "NotAllowedError",
+      });
+      const capture = requestMedia(popup, { audio: true });
+      await expect.poll(() => nativeMedia.evaluate((state) => state.prompts.length)).toBe(1);
+      // Native consent can transfer focus away from the requesting window.
+      const popupWindow = await app.browserWindow(popup);
+      await popupWindow.evaluate((window) => window.blur());
+      await expect.poll(() => popupWindow.evaluate((window) => window.isFocused())).toBe(false);
+      await respondToMicrophone(nativeMedia, 0, true);
+      expect(await capture).toMatchObject({
+        allowed: true,
+        tracks: [{ kind: "audio", state: "live" }],
+      });
+      expect(await nativeMedia.evaluate((state) => state.prompts[0].windowId)).toBe(
+        await popupWindow.evaluate((window) => window.id)
+      );
+      await popupWindow.dispose();
+      await stopMicrophone(popup);
+    }
+  );
+
+  microphoneTest(
+    "navigation and same-URL reload abort stale consent",
+    async ({ app, page, remoteServer, nativeMedia }) => {
+      const remote = await connectForMicrophone(app, page, remoteServer.url);
+      for (const [index, reload] of [true, false].entries()) {
+        const promptIndex = index * 2;
+        const pending = requestMedia(remote, { audio: true }).catch(() => null);
+        await expect
+          .poll(() => nativeMedia.evaluate((state) => state.prompts.length))
+          .toBe(promptIndex + 1);
+        const previousUrl = remote.url();
+        if (reload) {
+          await remote.reload();
+          expect(remote.url()).toBe(previousUrl);
+        } else {
+          await remote.goto(remoteServer.url + "/workspaces/other");
+        }
+        await expect
+          .poll(() =>
+            nativeMedia.evaluate(
+              (state, index) => state.prompts[index].signal?.aborted,
+              promptIndex
+            )
+          )
+          .toBe(true);
+        await respondToMicrophone(nativeMedia, promptIndex, true);
+        expect((await pending)?.allowed).not.toBe(true);
+        await focusNativeWindow(app, remote);
+        const fresh = requestMedia(remote, { audio: true });
+        await respondToMicrophone(nativeMedia, promptIndex + 1, true);
+        expect(await fresh).toMatchObject({ allowed: true });
+        await stopMicrophone(remote);
+      }
+    }
+  );
+
+  microphoneTest(
+    "disconnect closes active capture and aborts pending consent before reconnect",
+    async ({ app, page, remoteServer, nativeMedia }) => {
+      const remote = await connectForMicrophone(app, page, remoteServer.url);
+      const active = requestMedia(remote, { audio: true });
+      await respondToMicrophone(nativeMedia, 0, true);
+      expect(await active).toMatchObject({
+        allowed: true,
+        tracks: [{ kind: "audio", state: "live" }],
+      });
+      const pending = requestMedia(remote, { audio: true }).catch(() => null);
+      await expect.poll(() => nativeMedia.evaluate((state) => state.prompts.length)).toBe(2);
+      const closed = remote.waitForEvent("close");
+      const remoteWindow = await app.browserWindow(remote);
+      await page.evaluate(() => window.api!.remoteConnection!.disconnect());
+      await closed;
+      expect(await remoteWindow.evaluate((window) => window.isDestroyed())).toBe(true);
+      await remoteWindow.dispose();
+      await expect
+        .poll(() => nativeMedia.evaluate((state) => state.prompts[1].signal?.aborted))
+        .toBe(true);
+      await respondToMicrophone(nativeMedia, 1, true);
+      expect((await pending)?.allowed).not.toBe(true);
+      expect(app.windows()).toEqual([page]);
+      const reconnected = await connectForMicrophone(app, page, remoteServer.url);
+      const fresh = requestMedia(reconnected, { audio: true });
+      await respondToMicrophone(nativeMedia, 2, true);
+      expect(await fresh).toMatchObject({ allowed: true });
+      await stopMicrophone(reconnected);
+    }
+  );
+
+  for (const lifecycle of ["close", "crash"] as const) {
+    microphoneTest(
+      lifecycle + " aborts pending microphone consent",
+      async ({ app, page, remoteServer, nativeMedia }) => {
+        const remote = await connectForMicrophone(app, page, remoteServer.url);
+        const pending = requestMedia(remote, { audio: true }).catch(() => null);
+        await expect.poll(() => nativeMedia.evaluate((state) => state.prompts.length)).toBe(1);
+        if (lifecycle === "close") {
+          await remote.close();
+        } else {
+          const window = await app.browserWindow(remote);
+          await window.evaluate((window) => {
+            // Terminate the renderer without waiting for its event loop or debugger.
+            process.kill(window.webContents.getOSProcessId(), "SIGKILL");
+          });
+          await window.dispose();
+        }
+        await expect
+          .poll(() => nativeMedia.evaluate((state) => state.prompts[0].signal?.aborted))
+          .toBe(true);
+        await respondToMicrophone(nativeMedia, 0, true);
+        expect((await pending)?.allowed).not.toBe(true);
+        await expect
+          .poll(() => page.evaluate(() => window.api!.remoteConnection!.getState()))
+          .toMatchObject({ status: "disconnected" });
+      }
+    );
+  }
+
+  microphoneTest.describe("platform microphone checks", () => {
+    microphoneTest.skip(
+      process.platform === "linux",
+      "Linux does not expose microphone OS consent"
+    );
+    microphoneTest(
+      "OS denial and status failures cannot grant remote audio",
+      async ({ app, page, remoteServer, nativeMedia }) => {
+        const remote = await connectForMicrophone(app, page, remoteServer.url);
+        for (const [index, status] of (["denied", "restricted", "granted"] as const).entries()) {
+          await nativeMedia.evaluate((state, status) => {
+            state.status = status;
+            state.statusFailure = status === "granted";
+          }, status);
+          const capture = requestMedia(remote, { audio: true });
+          await respondToMicrophone(nativeMedia, index, true);
+          expect(await capture).toMatchObject({ allowed: false, error: "NotAllowedError" });
+        }
+        expect(await nativeMedia.evaluate((state) => state.statusRequests)).toEqual([
+          "microphone",
+          "microphone",
+          "microphone",
+        ]);
+        expect(await nativeMedia.evaluate((state) => state.osRequests)).toEqual([]);
+        if (process.platform === "darwin") {
+          await nativeMedia.evaluate((state) => {
+            state.status = "not-determined";
+            state.statusFailure = false;
+            state.osApproval = false;
+          });
+          const capture = requestMedia(remote, { audio: true });
+          await respondToMicrophone(nativeMedia, 3, true);
+          expect(await capture).toMatchObject({ allowed: false, error: "NotAllowedError" });
+          expect(await nativeMedia.evaluate((state) => state.osRequests)).toEqual(["microphone"]);
+        }
+      }
+    );
+  });
 });

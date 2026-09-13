@@ -303,6 +303,9 @@
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Xum uses your microphone for voice input when you allow access."
+      },
       "notarize": true
     },
     "linux": {

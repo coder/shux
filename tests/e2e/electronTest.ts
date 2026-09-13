@@ -15,6 +15,7 @@ interface WorkspaceHarness {
 }
 
 interface ElectronFixtures {
+  fakeMediaDevices: boolean;
   app: ElectronApplication;
   page: Page;
   workspace: WorkspaceHarness;
@@ -154,6 +155,7 @@ function buildTarget(target: string): void {
 }
 
 export const electronTest = base.extend<ElectronFixtures>({
+  fakeMediaDevices: [false, { option: true }],
   workspace: async ({}, use, testInfo) => {
     const originalXumRoot = process.env.XUM_ROOT;
     const originalMuxRoot = process.env.MUX_ROOT;
@@ -204,7 +206,7 @@ export const electronTest = base.extend<ElectronFixtures>({
       }
     }
   },
-  app: async ({ workspace }, use, testInfo) => {
+  app: async ({ workspace, fakeMediaDevices }, use, testInfo) => {
     const { configRoot } = workspace;
     const devServerPort = BASE_DEV_SERVER_PORT + testInfo.workerIndex;
 
@@ -308,6 +310,10 @@ export const electronTest = base.extend<ElectronFixtures>({
       // present but not configured correctly (setuid root). In that case Electron hard-fails
       // unless we disable sandboxing.
       const launchArgs = ["."];
+      if (fakeMediaDevices) {
+        // Fake devices preserve the real permission flow. Do not enable fake media UI.
+        launchArgs.unshift("--use-fake-device-for-media-stream");
+      }
       if (process.platform === "linux" || process.getuid?.() === 0) {
         launchArgs.unshift("--no-sandbox");
       }

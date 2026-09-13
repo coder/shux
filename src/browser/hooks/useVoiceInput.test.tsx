@@ -128,17 +128,19 @@ function renderVoiceInput(useRecordingKeybinds = false) {
     })
   );
   const onSend = mock(() => undefined);
+  const onError = mock((_message: string) => undefined);
   const hook = renderHook(() =>
     useVoiceInput({
       useRecordingKeybinds,
       onSend,
+      onError,
       api: { voice: { transcribe } } as unknown as APIClient,
       isTranscriptionAvailable: true,
       onTranscript: mock(() => undefined),
     })
   );
 
-  return { ...hook, transcribe, onSend };
+  return { ...hook, transcribe, onSend, onError };
 }
 
 describe("useVoiceInput", () => {
@@ -277,6 +279,28 @@ describe("useVoiceInput", () => {
     });
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
   });
+
+  test.each(["NotAllowedError", "NotReadableError"])(
+    "returns to idle after %s and permits another recording attempt",
+    async (name) => {
+      const { result, transcribe, onError } = renderVoiceInput();
+      getUserMedia.mockRejectedValueOnce(new DOMException("Microphone unavailable", name));
+      act(() => result.current.start());
+      await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+      expect(result.current.state).toBe("idle");
+      expect(result.current.mediaRecorder).toBeNull();
+      expect(transcribe).not.toHaveBeenCalled();
+
+      act(() => result.current.start());
+      await waitFor(() => expect(result.current.state).toBe("recording"));
+      expect(getUserMedia).toHaveBeenCalledTimes(2);
+      expect(getUserMedia.mock.calls[1][0]).toEqual({ audio: true });
+      act(() => result.current.cancel());
+      await waitFor(() => expect(result.current.state).toBe("idle"));
+      expect(stopTrack).toHaveBeenCalled();
+      expect(transcribe).not.toHaveBeenCalled();
+    }
+  );
 
   test("does not transcribe a silent recording", async () => {
     const { result, transcribe } = renderVoiceInput();

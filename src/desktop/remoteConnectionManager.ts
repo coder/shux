@@ -1,4 +1,4 @@
-import type { BrowserWindow, BrowserWindowConstructorOptions, Event } from "electron";
+import type { BrowserWindow, BrowserWindowConstructorOptions, Event, Session } from "electron";
 import { createHash } from "node:crypto";
 import { getAppProxyBasePathFromPathname } from "@/common/appProxyBasePath";
 import {
@@ -18,11 +18,13 @@ type RemotePopupKind = "app" | "attachment" | "auth";
 
 interface RemoteWindowEntry {
   window: BrowserWindow;
+  session: Session;
   serverUrl: string;
   abort: AbortController;
   loaded: Promise<void>;
   authPopup: BrowserWindow | "opening" | null;
   popups: Map<BrowserWindow, RemotePopupKind>;
+  microphoneRequests: Set<BrowserWindow>;
 }
 
 interface RemoteWindowOptions {
@@ -31,6 +33,11 @@ interface RemoteWindowOptions {
   onDisconnected(): void;
   onStateChanged(state: RemoteConnectionState): void;
   openExternal(url: string): void;
+  requestMicrophoneAccess(
+    window: BrowserWindow,
+    serverUrl: string,
+    signal: AbortSignal
+  ): Promise<boolean>;
 }
 
 const REMOTE_WEB_PREFERENCES = {
@@ -114,11 +121,13 @@ export class RemoteConnectionManager {
     });
     const entry: RemoteWindowEntry = {
       window,
+      session: window.webContents.session,
       serverUrl,
       abort: new AbortController(),
       loaded: Promise.resolve(),
       authPopup: null,
       popups: new Map(),
+      microphoneRequests: new Set(),
     };
     this.entry = entry;
     this.setState({ status: "connecting", serverUrl });
@@ -130,6 +139,7 @@ export class RemoteConnectionManager {
 
   private guardWindow(entry: RemoteWindowEntry): void {
     const contents = entry.window.webContents;
+    // Do not cache grants. Each capture request needs consent, including requests after a denial.
     contents.session.setPermissionCheckHandler(() => false);
     contents.session.setPermissionRequestHandler((requester, permission, callback, details) => {
       const window =
@@ -138,13 +148,29 @@ export class RemoteConnectionManager {
           : [...entry.popups].find(
               ([popup, kind]) => kind === "app" && popup.webContents === requester
             )?.[0];
-      if (permission !== "clipboard-sanitized-write" || !window || !details.isMainFrame) {
+      if (!window || !details.isMainFrame) {
         callback(false);
         return;
       }
-      this.allowClipboardWrite(entry, window, details.requestingUrl).then(callback, () =>
-        callback(false)
-      );
+      if (permission === "clipboard-sanitized-write") {
+        this.allowClipboardWrite(entry, window, details.requestingUrl).then(callback, () =>
+          callback(false)
+        );
+      } else if (
+        permission === "media" &&
+        "mediaTypes" in details &&
+        details.mediaTypes?.length === 1 &&
+        details.mediaTypes[0] === "audio"
+      ) {
+        this.allowMicrophoneAccess(
+          entry,
+          window,
+          details.requestingUrl,
+          details.securityOrigin
+        ).then(callback, () => callback(false));
+      } else {
+        callback(false);
+      }
     });
     this.guardAppWindow(entry, entry.window);
     contents.on("render-process-gone", () => {
@@ -263,6 +289,60 @@ export class RemoteConnectionManager {
     return activated === true && isActiveRequest();
   }
 
+  private async allowMicrophoneAccess(
+    entry: RemoteWindowEntry,
+    window: BrowserWindow,
+    requestingUrl: string,
+    securityOrigin: string | undefined
+  ): Promise<boolean> {
+    const contents = window.webContents;
+    const isCurrentRequest = (): boolean =>
+      this.entry === entry &&
+      this.state.status === "connected" &&
+      (window === entry.window || entry.popups.get(window) === "app") &&
+      !window.isDestroyed() &&
+      !contents.isDestroyed() &&
+      contents.getURL() === requestingUrl;
+    if (
+      !isCurrentRequest() ||
+      !window.isFocused() ||
+      entry.microphoneRequests.has(window) ||
+      !isRemoteAppUrl(entry.serverUrl, requestingUrl) ||
+      securityOrigin == null ||
+      new URL(securityOrigin).origin !== new URL(entry.serverUrl).origin
+    ) {
+      return false;
+    }
+
+    // A URL can survive a reload. Cancel consent when the requesting document leaves instead.
+    const abort = new AbortController();
+    const cancel = (): void => abort.abort();
+    const onNavigation = (event: { isMainFrame: boolean }): void => {
+      if (event.isMainFrame) cancel();
+    };
+    const signal = AbortSignal.any([entry.abort.signal, abort.signal]);
+    entry.microphoneRequests.add(window);
+    contents.on("did-start-navigation", onNavigation);
+    // A request can arrive after navigation starts but before the new document commits.
+    contents.on("did-navigate", cancel);
+    contents.on("render-process-gone", cancel);
+    window.on("closed", cancel);
+    try {
+      // Chromium still enforces secure contexts. This grants only the remote page's audio request.
+      const result = await raceWithAbortAndTimeout(
+        this.options.requestMicrophoneAccess(window, entry.serverUrl, signal),
+        { signal }
+      );
+      return result.kind === "ok" && result.value && !signal.aborted && isCurrentRequest();
+    } finally {
+      contents.removeListener("did-start-navigation", onNavigation);
+      contents.removeListener("did-navigate", cancel);
+      contents.removeListener("render-process-gone", cancel);
+      window.removeListener("closed", cancel);
+      entry.microphoneRequests.delete(window);
+    }
+  }
+
   private registerPopup(
     entry: RemoteWindowEntry,
     source: BrowserWindow,
@@ -342,6 +422,11 @@ export class RemoteConnectionManager {
     if (this.entry !== entry) return;
     this.entry = null;
     entry.abort.abort();
+    // Persistent sessions must stay closed after disconnect, without retaining the old entry.
+    entry.session.setPermissionCheckHandler(() => false);
+    entry.session.setPermissionRequestHandler((_requester, _permission, callback) =>
+      callback(false)
+    );
     for (const popup of entry.popups.keys()) {
       if (!popup.isDestroyed()) popup.destroy();
     }

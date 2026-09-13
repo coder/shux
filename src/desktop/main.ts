@@ -44,6 +44,7 @@ if (process.platform === "darwin") {
 
 import { DesktopWindowManager } from "./desktopWindowManager";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
+import { createRemoteMicrophonePermission } from "./remoteMicrophonePermission";
 import {
   REMOTE_CONNECTION_CHANNELS,
   REMOTE_CONNECTION_RETURN_ACCELERATOR,
@@ -77,6 +78,7 @@ import {
   nativeTheme,
   screen,
   shell,
+  systemPreferences,
 } from "electron";
 
 const getXumEnv = (suffix: string): string | undefined =>
@@ -434,6 +436,12 @@ function timestamp(): string {
 function initializeRemoteConnections(): void {
   const manager = new RemoteConnectionManager({
     createWindow: (options) => new BrowserWindow(options),
+    requestMicrophoneAccess: createRemoteMicrophonePermission({
+      platform: process.platform,
+      showMessageBox: (window, options) => dialog.showMessageBox(window, options),
+      getMediaAccessStatus: (mediaType) => systemPreferences.getMediaAccessStatus(mediaType),
+      askForMediaAccess: (mediaType) => systemPreferences.askForMediaAccess(mediaType),
+    }),
     onConnected: () => mainWindow?.hide(),
     onDisconnected: () => {
       if (!isQuitting) openXumFromTray();
