@@ -339,14 +339,20 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                   {showLiveOutput
                     ? combinedLiveOutput.length > 0
                       ? combinedLiveOutput
-                      : status === "redacted"
-                        ? "Output excluded from shared transcript"
-                        : "No output yet"
+                      : "No output yet"
                     : completedHasOutput
                       ? completedOutput
                       : "No output"}
                 </DetailContent>
               </div>
+            </DetailSection>
+          )}
+
+          {status === "redacted" && (
+            <DetailSection>
+              <DetailContent className="text-muted italic">
+                Output excluded from shared transcript
+              </DetailContent>
             </DetailSection>
           )}
 

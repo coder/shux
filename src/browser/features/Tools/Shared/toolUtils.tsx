@@ -130,18 +130,18 @@ export function getStatusDisplay(status: ToolStatus): React.ReactNode {
           <span className="status-text">interrupted</span>
         </>
       );
-    case "redacted":
-      return (
-        <>
-          <EyeOff aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
-          <span className="status-text">redacted</span>
-        </>
-      );
     case "backgrounded":
       return (
         <>
           <CircleDot aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
           <span className="status-text">backgrounded</span>
+        </>
+      );
+    case "redacted":
+      return (
+        <>
+          <EyeOff aria-hidden="true" className="mr-1 inline-block h-3 w-3 align-[-2px]" />
+          <span className="status-text">redacted</span>
         </>
       );
     default:
