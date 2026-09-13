@@ -7,7 +7,9 @@ import * as path from "node:path";
 import { Err } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
+import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 
 interface TestFixture {
   muxRoot: string;
@@ -258,6 +260,696 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(
       await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
+  });
+
+  test.each([
+    { name: "workspace root", subProject: false },
+    { name: "sub-project execution path", subProject: true },
+  ])(
+    "captures git-excluded staged attachments under the $name and restores them",
+    async ({ subProject }) => {
+      // Attachments are staged relative to the workspace execution path, which a sub-project
+      // workspace moves below the repo root.
+      let stagingRoot = fixture.workspacePath;
+      if (subProject) {
+        await fs.mkdir(path.join(fixture.workspacePath, "pkg"));
+        await fs.writeFile(path.join(fixture.workspacePath, "pkg", "README.md"), "pkg\n", "utf-8");
+        runGit(fixture.workspacePath, ["add", "pkg"]);
+        runGit(fixture.workspacePath, ["commit", "-m", "pkg"]);
+        fixture.metadata.subProjectPath = path.join(fixture.projectPath, "pkg");
+        stagingRoot = path.join(fixture.workspacePath, "pkg");
+      }
+      const bytes = Buffer.from("attachment payload");
+      const staged = await stageWorkspaceAttachment({
+        runtime: new LocalRuntime(stagingRoot),
+        workspacePath: stagingRoot,
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        sizeBytes: bytes.byteLength,
+        dataBase64: bytes.toString("base64"),
+      });
+      expect(staged.success).toBe(true);
+      if (!staged.success) {
+        return;
+      }
+      // Staging excludes the directory, so it is invisible to the untracked-file check.
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+
+      const captureResult = await fixture.service.captureSnapshotForArchive({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(captureResult.success).toBe(true);
+      if (!captureResult.success) {
+        return;
+      }
+      // An older build's restore deletes archive-state wholesale, so the uploads must live
+      // beside it to survive a downgrade.
+      for (const artifact of captureResult.data.projects[0]?.stagedAttachmentDirs ?? []) {
+        expect(artifact.artifactPath.startsWith("archive-state")).toBe(false);
+        expect(
+          await pathExists(
+            path.join(fixture.config.sessionsDir, fixture.workspaceId, artifact.artifactPath)
+          )
+        ).toBe(true);
+      }
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+        if (!workspace) {
+          throw new Error("Missing workspace entry");
+        }
+        workspace.worktreeArchiveSnapshot = captureResult.data;
+        return cfg;
+      });
+
+      runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+      expect(await pathExists(fixture.workspacePath)).toBe(false);
+
+      const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(restoreResult).toEqual({ success: true, data: "restored" });
+
+      // The persisted chat notice keeps pointing at the same execution-path-relative path.
+      expect(await fs.readFile(path.join(stagingRoot, staged.data.stagedPath))).toEqual(bytes);
+      // The recreated worktree gets a fresh info/exclude, so the restore must re-exclude the
+      // directory or the attachments would surface as untracked files.
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+      const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+      expect(await pathExists(path.join(sessionDir, "archive-state"))).toBe(false);
+      expect(await pathExists(path.join(sessionDir, "archive-attachments"))).toBe(false);
+    }
+  );
+
+  test("restores missing staged attachments into an existing matching checkout before clearing the snapshot", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    if (!staged.success) {
+      return;
+    }
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = captureResult.data;
+      return cfg;
+    });
+    // The checkout survived (archive-time deletion failed) but lost its ignored uploads; git
+    // state still matches the snapshot exactly.
+    await fs.rm(path.join(fixture.workspacePath, ".xum"), { recursive: true, force: true });
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult).toEqual({ success: true, data: "skipped" });
+    expect(await fs.readFile(path.join(fixture.workspacePath, staged.data.stagedPath))).toEqual(
+      bytes
+    );
+    expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+    expect(await pathExists(path.join(sessionDir, "archive-state"))).toBe(false);
+    expect(await pathExists(path.join(sessionDir, "archive-attachments"))).toBe(false);
+  });
+
+  test("leaves attachment copies a snapshot does not reference alone when clearing it", async () => {
+    // A downgrade cycle can strand copies here: the older build restores (deleting only
+    // archive-state) and re-archives without stagedAttachmentDirs.
+    const orphan = path.join(
+      fixture.config.sessionsDir,
+      fixture.workspaceId,
+      "archive-attachments",
+      "project",
+      ".xum",
+      "user-attachments",
+      "old-upload",
+      "notes.txt"
+    );
+    await fs.mkdir(path.dirname(orphan), { recursive: true });
+    await fs.writeFile(orphan, "kept", "utf-8");
+    await makeWorkspaceDirty(fixture);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    expect(captureResult.data.projects[0]?.stagedAttachmentDirs).toBeUndefined();
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = captureResult.data;
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult).toEqual({ success: true, data: "restored" });
+    expect(await fs.readFile(orphan, "utf-8")).toBe("kept");
+  });
+
+  test("replaces a stale copy at the captured path but keeps unrelated attachment copies", async () => {
+    const attachmentsRoot = path.join(
+      fixture.config.sessionsDir,
+      fixture.workspaceId,
+      "archive-attachments"
+    );
+    // Same path as the upcoming capture: a leftover the user has since deleted must not return.
+    const stale = path.join(
+      attachmentsRoot,
+      "project",
+      ".xum",
+      "user-attachments",
+      "stale",
+      "old.txt"
+    );
+    // Different storage key: stranded by another cycle, not this snapshot's to remove.
+    const unrelated = path.join(
+      attachmentsRoot,
+      "other",
+      ".xum",
+      "user-attachments",
+      "keep",
+      "k.txt"
+    );
+    for (const file of [stale, unrelated]) {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, "x", "utf-8");
+    }
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    if (!staged.success) {
+      return;
+    }
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const artifact = captureResult.data.projects[0]?.stagedAttachmentDirs?.[0];
+    expect(artifact?.artifactPath).toBe(
+      path.join("archive-attachments", "project", ".xum", "user-attachments")
+    );
+    expect(await pathExists(stale)).toBe(false);
+    expect(await pathExists(unrelated)).toBe(true);
+    expect(
+      await fs.readFile(
+        path.join(
+          attachmentsRoot,
+          "project",
+          path.relative(
+            fixture.workspacePath,
+            path.join(fixture.workspacePath, staged.data.stagedPath)
+          )
+        )
+      )
+    ).toEqual(bytes);
+  });
+
+  test("fails capture when the staged attachment tree contains a symlink", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    if (!staged.success) {
+      return;
+    }
+    // A link into the checkout would be archived as a link to a directory that is about to go.
+    await fs.symlink(
+      path.join(fixture.workspacePath, "tracked.txt"),
+      path.join(fixture.workspacePath, path.dirname(staged.data.stagedPath), "linked.txt")
+    );
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(false);
+    if (captureResult.success) {
+      return;
+    }
+    expect(captureResult.error).toContain("contain a symlink");
+    expect(await pathExists(fixture.workspacePath)).toBe(true);
+  });
+
+  test("never restores into or deletes anything but staged attachment paths from tampered metadata", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+    await fs.writeFile(path.join(sessionDir, "chat.jsonl"), "history\n", "utf-8");
+    const tamper = (repoRelativeDir: string, artifactPath: string) =>
+      fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+        if (!workspace) {
+          throw new Error("Missing workspace entry");
+        }
+        workspace.worktreeArchiveSnapshot = {
+          ...captureResult.data,
+          projects: captureResult.data.projects.map((project) => ({
+            ...project,
+            stagedAttachmentDirs: [{ repoRelativeDir, artifactPath }],
+          })),
+        };
+        return cfg;
+      });
+
+    // Existing checkout matches git state; an artifactPath aimed at chat history must be neither
+    // copied nor removed when the snapshot is cleared.
+    await tamper(path.join(".xum", "user-attachments"), "chat.jsonl");
+    const reconcile = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(reconcile).toEqual({ success: true, data: "skipped" });
+    expect(await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf-8")).toBe("history\n");
+
+    // A repoRelativeDir naming a tracked directory must not receive the payload on a fresh restore.
+    await fs.mkdir(path.join(fixture.workspacePath, "src"));
+    await fs.writeFile(path.join(fixture.workspacePath, "src", "notes.txt"), "code\n", "utf-8");
+    runGit(fixture.workspacePath, ["add", "src"]);
+    runGit(fixture.workspacePath, ["commit", "-m", "src"]);
+    const recapture = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(recapture.success).toBe(true);
+    if (!recapture.success) {
+      return;
+    }
+    const artifactPath = recapture.data.projects[0]?.stagedAttachmentDirs?.[0]?.artifactPath;
+    expect(artifactPath).toBeDefined();
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = {
+        ...recapture.data,
+        projects: recapture.data.projects.map((project) => ({
+          ...project,
+          stagedAttachmentDirs: [{ repoRelativeDir: "src", artifactPath: artifactPath ?? "" }],
+        })),
+      };
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    // The malformed entry is skipped rather than turning every unarchive into the same failure;
+    // its artifact stays behind for manual recovery.
+    expect(restoreResult).toEqual({ success: true, data: "restored" });
+    expect(await fs.readFile(path.join(fixture.workspacePath, "src", "notes.txt"), "utf-8")).toBe(
+      "code\n"
+    );
+    expect(await pathExists(path.join(sessionDir, artifactPath ?? ""))).toBe(true);
+  });
+
+  test("treats a symlinked attachment artifact root as absent and never touches its target", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+    const outsideDir = path.join(fixture.muxRoot, "outside-root");
+    const outsideFile = path.join(
+      outsideDir,
+      "project",
+      ".xum",
+      "user-attachments",
+      "x",
+      "keep.txt"
+    );
+    await fs.mkdir(path.dirname(outsideFile), { recursive: true });
+    await fs.writeFile(outsideFile, "keep", "utf-8");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.symlink(outsideDir, path.join(sessionDir, "archive-attachments"));
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(false);
+    if (captureResult.success) {
+      return;
+    }
+    expect(captureResult.error).toContain("not a plain directory");
+    expect(await fs.readFile(outsideFile, "utf-8")).toBe("keep");
+
+    // A snapshot referencing the entry reconciles the existing checkout without deleting through
+    // the link either.
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = {
+        version: 1,
+        capturedAt: new Date().toISOString(),
+        stateDirPath: "archive-state",
+        projects: [
+          {
+            projectPath: fixture.projectPath,
+            projectName: "project",
+            storageKey: "project",
+            branchName: fixture.workspaceName,
+            trunkBranch: "main",
+            baseSha: fixture.baseSha,
+            headSha: fixture.baseSha,
+            stagedAttachmentDirs: [
+              {
+                repoRelativeDir: path.join(".xum", "user-attachments"),
+                artifactPath: path.join(
+                  "archive-attachments",
+                  "project",
+                  ".xum",
+                  "user-attachments"
+                ),
+              },
+            ],
+          },
+        ],
+      };
+      return cfg;
+    });
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult).toEqual({ success: true, data: "skipped" });
+    expect(await fs.readFile(outsideFile, "utf-8")).toBe("keep");
+  });
+
+  test("sweeps temp directories left behind by an interrupted capture", async () => {
+    const sessionDir = path.join(fixture.config.sessionsDir, fixture.workspaceId);
+    const stale = path.join(sessionDir, "archive-attachments.tmp-stale", "project", "big.bin");
+    await fs.mkdir(path.dirname(stale), { recursive: true });
+    await fs.writeFile(stale, "leftover", "utf-8");
+    await makeWorkspaceDirty(fixture);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    expect(await pathExists(path.dirname(path.dirname(stale)))).toBe(false);
+  });
+
+  test("fails capture when the staging directory resolves outside the checkout", async () => {
+    const outsideDir = path.join(fixture.muxRoot, "outside-attachments");
+    await fs.mkdir(path.join(outsideDir, "upload"), { recursive: true });
+    await fs.writeFile(path.join(outsideDir, "upload", "notes.txt"), "payload", "utf-8");
+    await fs.mkdir(path.join(fixture.workspacePath, ".xum"));
+    await fs.symlink(outsideDir, path.join(fixture.workspacePath, ".xum", "user-attachments"));
+    const excludePath = runGit(fixture.workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
+    await fs.mkdir(path.dirname(path.resolve(fixture.workspacePath, excludePath)), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.resolve(fixture.workspacePath, excludePath),
+      "/.xum/user-attachments\n",
+      "utf-8"
+    );
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(false);
+    if (captureResult.success) {
+      return;
+    }
+    expect(captureResult.error).toContain("resolve outside");
+    expect(await pathExists(fixture.workspacePath)).toBe(true);
+    const sessionDirEntries = await fs.readdir(
+      path.join(fixture.config.sessionsDir, fixture.workspaceId)
+    );
+    expect(sessionDirEntries.filter((entry) => entry.startsWith("archive-"))).toEqual([]);
+  });
+
+  test("captures the contents behind a symlinked staging directory instead of the link", async () => {
+    // The staging directory is a link to an ignored directory elsewhere in the checkout; the
+    // worktree removal would take the target with it, so the copy must hold real files.
+    const storeDir = path.join(fixture.workspacePath, "store");
+    await fs.mkdir(path.join(storeDir, "upload"), { recursive: true });
+    await fs.writeFile(path.join(storeDir, "upload", "notes.txt"), "payload", "utf-8");
+    await fs.mkdir(path.join(fixture.workspacePath, ".xum"));
+    await fs.symlink(storeDir, path.join(fixture.workspacePath, ".xum", "user-attachments"));
+    const excludePath = runGit(fixture.workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
+    await fs.mkdir(path.dirname(path.resolve(fixture.workspacePath, excludePath)), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.resolve(fixture.workspacePath, excludePath),
+      "/.xum/user-attachments\n/store/\n",
+      "utf-8"
+    );
+    expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const artifact = captureResult.data.projects[0]?.stagedAttachmentDirs?.[0];
+    expect(artifact).toBeDefined();
+    if (!artifact) {
+      return;
+    }
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    const artifactDir = path.join(
+      fixture.config.sessionsDir,
+      fixture.workspaceId,
+      artifact.artifactPath
+    );
+    expect((await fs.lstat(artifactDir)).isSymbolicLink()).toBe(false);
+    expect(await fs.readFile(path.join(artifactDir, "upload", "notes.txt"), "utf-8")).toBe(
+      "payload"
+    );
+  });
+
+  test("fails capture when the staged attachment directory cannot be inspected", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+
+    const realStat = fs.stat;
+    const statSpy = spyOn(fs, "stat").mockImplementation(((
+      targetPath: Parameters<typeof fs.stat>[0]
+    ) => {
+      if (String(targetPath).endsWith(path.join(".xum", "user-attachments"))) {
+        return Promise.reject(
+          Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+        );
+      }
+      return realStat(targetPath);
+    }) as typeof fs.stat);
+    try {
+      const captureResult = await fixture.service.captureSnapshotForArchive({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(captureResult.success).toBe(false);
+      if (captureResult.success) {
+        return;
+      }
+      expect(captureResult.error).toContain("EACCES");
+    } finally {
+      statSpy.mockRestore();
+    }
+    const sessionDirEntries = await fs.readdir(
+      path.join(fixture.config.sessionsDir, fixture.workspaceId)
+    );
+    expect(sessionDirEntries.filter((entry) => entry.startsWith("archive-"))).toEqual([]);
+  });
+
+  test("refuses to restore staged attachments through a symlink that leaves the checkout", async () => {
+    const outsideDir = path.join(fixture.muxRoot, "outside");
+    await fs.mkdir(outsideDir);
+    await fs.symlink(outsideDir, path.join(fixture.workspacePath, "link"));
+    runGit(fixture.workspacePath, ["add", "link"]);
+    runGit(fixture.workspacePath, ["commit", "-m", "tracked symlink"]);
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    // Config is user-editable: point the restore target through the repo's symlink.
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = {
+        ...captureResult.data,
+        projects: captureResult.data.projects.map((project) => ({
+          ...project,
+          stagedAttachmentDirs: project.stagedAttachmentDirs?.map((entry) => ({
+            ...entry,
+            repoRelativeDir: path.join("link", ".xum", "user-attachments"),
+          })),
+        })),
+      };
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult.success).toBe(false);
+    if (restoreResult.success) {
+      return;
+    }
+    expect(restoreResult.error).toContain("refusing to restore outside");
+    expect(await pathExists(path.join(outsideDir, "user-attachments"))).toBe(false);
+    expect(await pathExists(fixture.workspacePath)).toBe(false);
+  });
+
+  test("fails restore when a referenced staged attachments artifact is missing", async () => {
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
+
+    const captureResult = await fixture.service.captureSnapshotForArchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(captureResult.success).toBe(true);
+    if (!captureResult.success) {
+      return;
+    }
+    const attachmentArtifacts = captureResult.data.projects[0]?.stagedAttachmentDirs ?? [];
+    expect(attachmentArtifacts.length).toBeGreaterThan(0);
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get(fixture.projectPath)?.workspaces[0];
+      if (!workspace) {
+        throw new Error("Missing workspace entry");
+      }
+      workspace.worktreeArchiveSnapshot = captureResult.data;
+      return cfg;
+    });
+    runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
+    for (const artifact of attachmentArtifacts) {
+      await fs.rm(
+        path.join(fixture.config.sessionsDir, fixture.workspaceId, artifact.artifactPath),
+        { recursive: true, force: true }
+      );
+    }
+
+    const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
+      workspaceId: fixture.workspaceId,
+      workspaceMetadata: fixture.metadata,
+    });
+    expect(restoreResult.success).toBe(false);
+    if (restoreResult.success) {
+      return;
+    }
+    expect(restoreResult.error).toContain("staged attachments artifact is unavailable");
+    // Failed restores clean up the partially recreated checkout and keep the snapshot for retry.
+    expect(await pathExists(fixture.workspacePath)).toBe(false);
+    const storedWorkspace = fixture.config.loadConfigOrDefault().projects.get(fixture.projectPath)
+      ?.workspaces[0];
+    expect(storedWorkspace?.worktreeArchiveSnapshot).toEqual(captureResult.data);
   });
 
   test("falls back to base commit + mailbox replay when the archived head commit is gone", async () => {
@@ -1127,6 +1819,19 @@ describe("WorktreeArchiveSnapshotService", () => {
     await fs.writeFile(path.join(fixture.workspacePath, "a-file.txt"), "a\n", "utf-8");
     await fs.mkdir(path.join(fixture.workspacePath, "cache-dir"));
     await fs.writeFile(path.join(fixture.workspacePath, "cache-dir", "tmp"), "t\n", "utf-8");
+    // Empty directories stay in the lossy list; a container holding only captured staged
+    // attachments does not.
+    await fs.mkdir(path.join(fixture.workspacePath, "empty-dir"));
+    const bytes = Buffer.from("attachment payload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(fixture.workspacePath),
+      workspacePath: fixture.workspacePath,
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    expect(staged.success).toBe(true);
 
     const result = await fixture.service.getUnsupportedUntrackedPaths({
       workspaceId: fixture.workspaceId,
@@ -1135,9 +1840,54 @@ describe("WorktreeArchiveSnapshotService", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.data).toEqual(["a-file.txt", "cache-dir/", "z-file.txt"]);
+      expect(result.data).toEqual(["a-file.txt", "cache-dir/", "empty-dir/", "z-file.txt"]);
     }
   });
+
+  test.each([
+    {
+      name: "an ignored file",
+      // A workspace MCP override is excluded the same way but is not captured by the snapshot.
+      addSibling: async (workspacePath: string) => {
+        await fs.writeFile(path.join(workspacePath, ".xum", "mcp.local.jsonc"), "{}\n", "utf-8");
+        const excludePath = runGit(workspacePath, ["rev-parse", "--git-path", "info/exclude"]);
+        await fs.appendFile(
+          path.resolve(workspacePath, excludePath),
+          "/.xum/mcp.local.jsonc\n",
+          "utf-8"
+        );
+      },
+    },
+    {
+      name: "an empty directory",
+      // Git lists neither empty directories nor their parent when everything else is ignored.
+      addSibling: async (workspacePath: string) => {
+        await fs.mkdir(path.join(workspacePath, ".xum", "empty-dir"));
+      },
+    },
+  ])(
+    "keeps warning about a container that holds $name besides staged attachments",
+    async ({ addSibling }) => {
+      const bytes = Buffer.from("attachment payload");
+      const staged = await stageWorkspaceAttachment({
+        runtime: new LocalRuntime(fixture.workspacePath),
+        workspacePath: fixture.workspacePath,
+        filename: "notes.txt",
+        mediaType: "text/plain",
+        sizeBytes: bytes.byteLength,
+        dataBase64: bytes.toString("base64"),
+      });
+      expect(staged.success).toBe(true);
+      await addSibling(fixture.workspacePath);
+      expect(runGit(fixture.workspacePath, ["status", "--porcelain"])).toBe("");
+
+      const result = await fixture.service.getUnsupportedUntrackedPaths({
+        workspaceId: fixture.workspaceId,
+        workspaceMetadata: fixture.metadata,
+      });
+      expect(result).toEqual({ success: true, data: [".xum/"] });
+    }
+  );
 
   test("captureSnapshotForArchive succeeds with matching acknowledgedUntrackedPaths", async () => {
     // Make workspace dirty (tracked changes) so snapshot captures something meaningful.

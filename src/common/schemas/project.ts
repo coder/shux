@@ -41,6 +41,22 @@ export const WorktreeArchiveSnapshotProjectSchema = z.object({
   unstagedPatchPath: z.string().optional().meta({
     description: "Session-dir-relative path to the unstaged tracked diff artifact.",
   }),
+  stagedAttachmentDirs: z
+    .array(
+      z.object({
+        repoRelativeDir: z.string().meta({
+          description: "Repo-relative staged attachment directory restored into the checkout.",
+        }),
+        artifactPath: z.string().meta({
+          description: "Session-dir-relative directory holding a copy of the staged attachments.",
+        }),
+      })
+    )
+    .optional()
+    .meta({
+      description:
+        "Git-excluded chat attachment directories copied out of the checkout because tracked diffs cannot capture them.",
+    }),
 });
 
 export const WorktreeArchiveSnapshotSchema = z.object({
