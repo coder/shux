@@ -453,8 +453,9 @@ export const InitialLoadingPhone: AppStory = {
   },
 };
 
-// Sending the first message never shows a full-page overlay: the creation view renders the
-// message and the creation card, and the new workspace keeps both until the backend persists it.
+// Sending the first message shows nothing on the project page beyond a locked composer; the new
+// workspace opens with the message and the creation card and keeps both until the backend
+// persists them.
 function createCreationPendingStory(): AppStory {
   const projectPath = "/home/user/projects/xum";
   const typed = "Add a dark mode toggle";
@@ -541,37 +542,37 @@ function createCreationPendingStory(): AppStory {
       });
     });
 
-    await step("Sending renders the message and creation progress, not an overlay", async () => {
-      await userEvent.click(textarea()!);
-      await userEvent.type(textarea()!, typed);
-      await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
-      const pending = await canvas.findByTestId("creation-pending-transcript");
-      await expect(within(pending).getByText(typed)).toBeVisible();
-      await expect(
-        within(pending).getByRole("button", { name: /Creating workspace/ })
-      ).toBeVisible();
-      await expect(within(pending).getByText("Generating name")).toBeVisible();
-      // The composer stays where it was, directly under the pending rows.
-      await expect(textarea()).toBeDisabled();
-      await expect(pending.getBoundingClientRect().bottom).toBeLessThanOrEqual(
-        textarea()!.getBoundingClientRect().top
-      );
-      releaseName();
-      await expect(await canvas.findByText("Creating workspace " + workspaceName)).toBeVisible();
-    });
+    await step(
+      "Sending only locks the composer; the project page shows no transcript",
+      async () => {
+        await userEvent.click(textarea()!);
+        await userEvent.type(textarea()!, typed);
+        await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
+        await waitFor(async () => {
+          await expect(textarea()).toBeDisabled();
+        });
+        releaseName();
+        // Name generation is done and creation is still pending: no rows, no creation card.
+        await expect(canvasElement.querySelector('[data-testid="chat-message"]')).toBeNull();
+        await expect(canvas.queryByText(/Creating workspace/)).toBeNull();
+        await expect(canvas.queryByTestId("message-window")).toBeNull();
+      }
+    );
 
-    await step("The new workspace keeps the message above the live creation card", async () => {
-      releaseCreate();
-      const messageWindow = await canvas.findByTestId("message-window", {}, { timeout: 5000 });
-      await waitFor(async () => {
-        const rows = Array.from(messageWindow.querySelectorAll('[data-testid="chat-message"]'));
-        await expect(rows.length).toBeGreaterThanOrEqual(2);
-        await expect(rows[0].textContent).toContain(typed);
-        await expect(rows[1].textContent).toContain("Creating workspace");
-      });
-      await expect(await canvas.findByText("Running .xum/init")).toBeVisible();
-      await expect(canvas.queryByTestId("creation-pending-transcript")).toBeNull();
-    });
+    await step(
+      "The new workspace opens with the message above the live creation card",
+      async () => {
+        releaseCreate();
+        const messageWindow = await canvas.findByTestId("message-window", {}, { timeout: 5000 });
+        await waitFor(async () => {
+          const rows = Array.from(messageWindow.querySelectorAll('[data-testid="chat-message"]'));
+          await expect(rows.length).toBeGreaterThanOrEqual(2);
+          await expect(rows[0].textContent).toContain(typed);
+          await expect(rows[1].textContent).toContain("Creating workspace");
+        });
+        await expect(await canvas.findByText("Running .xum/init")).toBeVisible();
+      }
+    );
   };
 
   return { render: () => <AppWithMocks setup={setup} />, play };

@@ -73,11 +73,7 @@ import {
   type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import {
-  useWorkspaceName,
-  type WorkspaceNameState,
-  type WorkspaceIdentity,
-} from "@/browser/hooks/useWorkspaceName";
+import { useWorkspaceName, type WorkspaceNameState } from "@/browser/hooks/useWorkspaceName";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -238,10 +234,6 @@ interface UseCreationWorkspaceReturn {
   ) => Promise<CreationSendResult>;
   /** Workspace name/title generation state and actions (for CreationControls) */
   nameState: WorkspaceNameState;
-  /** The confirmed identity being used for creation (null until generation resolves) */
-  creatingWithIdentity: WorkspaceIdentity | null;
-  /** First message of the in-flight send, rendered as a transcript row while isSending */
-  pendingUserMessage: PendingInitialUserMessage | null;
   /** Reload branches (e.g., after git init) */
   reloadBranches: () => Promise<void>;
   /** Runtime availability state for each mode (loading/failed/loaded) */
@@ -340,12 +332,6 @@ export function useCreationWorkspace({
      * so onConfirm trusts the correct project even if the user navigates. */
     projectPath: string;
   } | null>(null);
-  // The confirmed identity being used for workspace creation (set after waitForGeneration resolves)
-  const [creatingWithIdentity, setCreatingWithIdentity] = useState<WorkspaceIdentity | null>(null);
-  // Only meaningful while isSending; stale values are harmless once the send settles.
-  const [pendingUserMessage, setPendingUserMessage] = useState<PendingInitialUserMessage | null>(
-    null
-  );
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
@@ -510,11 +496,10 @@ export function useCreationWorkspace({
         typeof overrideMuxMetadata.rawCommand === "string"
           ? overrideMuxMetadata.rawCommand
           : null;
-      // Transcript row shown by the creation view and, after navigation, by the new workspace
-      // until the backend persists the first message. ChatInput passes the row it already shows
-      // while resolving commands so the handoff keeps one timestamp; otherwise skill sends show
-      // the typed command (rawCommand) rather than the rewritten skill text and attachment-only
-      // sends reuse the attached-files summary already built for naming.
+      // Transcript row the new workspace shows from the moment it opens until the backend
+      // persists the first message. ChatInput passes the row it captured at Send (typed command
+      // for skill sends, attached-files summary for attachment-only sends); the fallback covers
+      // callers that do not.
       const pendingUserMessage: PendingInitialUserMessage | null =
         initialSlashCommand == null
           ? (pendingUserMessageDraft ?? {
@@ -526,15 +511,6 @@ export function useCreationWorkspace({
 
       setIsSending(true);
       setToast(null);
-      setPendingUserMessage(pendingUserMessage);
-      // If user provided a manual name, show it immediately in the creation
-      // progress instead of "Generating name". Auto-generated names still show
-      // the pending step until generation resolves.
-      setCreatingWithIdentity(
-        !workspaceNameState.autoGenerate && workspaceNameState.name.trim()
-          ? { name: workspaceNameState.name.trim(), title: workspaceNameState.name.trim() }
-          : null
-      );
 
       let createdWorkspaceId: string | null = null;
 
@@ -546,9 +522,6 @@ export function useCreationWorkspace({
           setIsSending(false);
           return { success: false };
         }
-
-        // Set the confirmed identity for splash UI display
-        setCreatingWithIdentity(identity);
 
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
@@ -873,20 +846,18 @@ export function useCreationWorkspace({
           if (createdWorkspaceId) {
             workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
           }
-          if (stagingOutcome.staged.length > 0) {
-            // The creation draft was already cleared; without a transferred
-            // draft the staged files would sit in the workspace with no
-            // chips/notice to retry the send with.
-            transferDraftToWorkspace(
-              metadata.id,
-              overrideRawCommand ?? messageText,
-              [
-                ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
-                ...stagingOutcome.staged,
-              ],
-              optionsOverride?.disableWorkspaceAgents === true
-            );
-          }
+          // The workspace exists but holds no message, and the creation draft was already
+          // cleared: hand the draft to the workspace composer (with any staged files) so the
+          // user can fix the model or provider and resend from the chat they landed in.
+          transferDraftToWorkspace(
+            metadata.id,
+            overrideRawCommand ?? messageText,
+            [
+              ...filePartsToChatAttachments(fileParts ?? [], `${Date.now()}-transferred`),
+              ...stagingOutcome.staged,
+            ],
+            optionsOverride?.disableWorkspaceAgents === true
+          );
           if (sendResult.error) {
             // Persist the failure so the workspace view can surface a toast after navigation.
             updatePersistedState(getPendingWorkspaceSendErrorKey(metadata.id), sendResult.error);
@@ -932,7 +903,6 @@ export function useCreationWorkspace({
       settings.trunkBranch,
       waitForGeneration,
       workspaceNameState.autoGenerate,
-      workspaceNameState.name,
       message,
       subProjectPath,
       dynamicWorkflowsEnabled,
@@ -1002,9 +972,6 @@ export function useCreationWorkspace({
     handleSend,
     // Workspace name/title state (for CreationControls)
     nameState: workspaceNameState,
-    // The confirmed identity being used for creation (null until generation resolves)
-    creatingWithIdentity,
-    pendingUserMessage,
     // Reload branches (e.g., after git init)
     reloadBranches: loadBranches,
     // Runtime availability state for each mode

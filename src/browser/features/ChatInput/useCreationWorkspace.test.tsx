@@ -1247,6 +1247,51 @@ describe("useCreationWorkspace", () => {
     expect(errorWrite?.[1]).toMatchObject({ type: "unknown", raw: "orpc disconnected" });
   });
 
+  test("handleSend hands a text-only draft to the new workspace when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    const { workspaceApi } = setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("fix the login bug");
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+
+    // The user lands in the created workspace with nothing persisted; the text must be
+    // waiting in that composer so a model or provider fix can be followed by a plain resend.
+    expect(updatePersistedStateCalls).toContainEqual([
+      getInputKey(TEST_WORKSPACE_ID),
+      "fix the login bug",
+    ]);
+    const attachmentsWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
+    );
+    expect(attachmentsWrite?.[1]).toBeUndefined();
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({
+      type: "unknown",
+      raw: "provider rejected the request",
+    });
+  });
+
   test("handleSend keeps small retryable files when trimming an over-cap transfer", async () => {
     const stageAttachmentMock = mock(
       (_args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> =>

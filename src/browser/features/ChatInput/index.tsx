@@ -151,7 +151,6 @@ import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { trackCommandUsed } from "@/common/telemetry";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 
-import { CreationCenterContent } from "./CreationCenterContent";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { cn } from "@/common/lib/utils";
 import type {
@@ -337,12 +336,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
   const isSending = sendingCount > 0;
-  // Creation sends resolve commands and skill references (which can wait on cold MCP servers)
-  // before useCreationWorkspace takes over, so the transcript row shown during that phase is
-  // captured here and handed to the hook to keep the same row across the handoff.
-  const [creationSendDraft, setCreationSendDraft] = useState<PendingInitialUserMessage | null>(
-    null
-  );
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
@@ -1751,8 +1744,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 transferredDraftProjectDiscovery,
             }
           : null;
-    // Same routing as the creation branch below: an initial /goal without attachments sets a
-    // goal instead of sending a user turn, so only the creation card is previewed for it.
+    // Captured before command resolution so the row the new workspace opens with shows what was
+    // typed (skill sends are rewritten below) and is stamped with the Send time. Same routing as
+    // the creation branch below: an initial /goal without attachments sets a goal instead of
+    // sending a user turn, so it gets no row.
     const creationFileParts = variant === "creation" ? chatAttachmentsToFileParts(attachments) : [];
     const creationPendingUserMessage: PendingInitialUserMessage | null =
       variant === "creation" &&
@@ -1763,7 +1758,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             timestamp: Date.now(),
           }
         : null;
-    setCreationSendDraft(creationPendingUserMessage);
     // Resolving commands/references can include cold MCP server startup and
     // prompt discovery; mark the send in flight so a second Enter cannot start
     // a duplicate send against the same captured draft.
@@ -2461,23 +2455,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   return (
     <Wrapper {...wrapperProps}>
       {creationState.trustDialog}
-      {/* Pending transcript (first message + creation progress) during workspace creation */}
-      {variant === "creation" && (
-        <CreationCenterContent
-          isSending={isSendInFlight}
-          pendingUserMessage={
-            creationState.isSending ? creationState.pendingUserMessage : creationSendDraft
-          }
-          workspaceName={
-            props.kind !== "scratch" && creationState.isSending
-              ? creationState.creatingWithIdentity?.name
-              : null
-          }
-          nameGenerated={creationState.nameState.autoGenerate}
-          kind={props.kind}
-          projectPath={props.projectPath}
-        />
-      )}
 
       {/* Input section - centered card for creation, bottom bar for workspace */}
       <div

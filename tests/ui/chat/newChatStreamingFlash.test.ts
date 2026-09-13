@@ -88,18 +88,6 @@ async function createCreationHarness(options?: {
 
 type WorkspaceSendMessageFn = TestEnvironment["orpc"]["workspace"]["sendMessage"];
 type WorkspaceCreateFn = TestEnvironment["orpc"]["workspace"]["create"];
-type AgentSkillsGetFn = TestEnvironment["orpc"]["agentSkills"]["get"];
-
-function overrideAgentSkillsGet(env: TestEnvironment, override: AgentSkillsGetFn): () => void {
-  const agentSkillsApi = env.orpc.agentSkills as typeof env.orpc.agentSkills & {
-    get: AgentSkillsGetFn;
-  };
-  const originalGet = agentSkillsApi.get;
-  agentSkillsApi.get = override;
-  return () => {
-    agentSkillsApi.get = originalGet;
-  };
-}
 
 function overrideWorkspaceSendMessage(
   env: TestEnvironment,
@@ -255,7 +243,7 @@ describe("New chat streaming flash regression", () => {
     }
   }, 60_000);
 
-  test("shows the first message as a transcript row from the creation view through the new workspace", async () => {
+  test("opens the new workspace with the first message and creation card before the backend persists them", async () => {
     const typed = "Show my first message before the workspace exists";
     const createGate = gate();
     const sendGate = gate();
@@ -289,23 +277,20 @@ describe("New chat streaming flash regression", () => {
     try {
       await app.chat.send(typed);
 
-      // Creation view, before the workspace exists: the transcript-shaped pending rows replace
-      // the old full-page overlay, and the composer stays mounted underneath them.
+      // Creation view, before the workspace exists: the send only locks the composer. No
+      // transcript rows or creation card render on the project page; they belong to the
+      // workspace view the user is taken to next.
       await waitFor(
         () => {
-          const pending = container.querySelector('[data-testid="creation-pending-transcript"]');
-          if (!pending) {
-            throw new Error("Pending creation transcript not rendered yet");
-          }
-          expect(pending.textContent).toContain(typed);
-          const initHeader = pending.querySelector("button[aria-expanded]");
-          expect(initHeader?.textContent).toContain("Creating workspace");
-          expect(pending.textContent).toContain("Generating name");
+          const textarea = container.querySelector("textarea");
+          expect(textarea).not.toBeNull();
+          expect(textarea!.disabled).toBe(true);
         },
         { timeout: 10_000 }
       );
+      expect(chatRows()).toHaveLength(0);
+      expect(container.textContent).not.toContain("Creating workspace");
       expect(container.querySelector('[data-testid="message-window"]')).toBeNull();
-      expect(container.querySelector("textarea")).not.toBeNull();
 
       createGate.release();
       const workspaceId = await waitForCreatedWorkspaceId(app.env, app.projectPath);
@@ -358,60 +343,6 @@ describe("New chat streaming flash regression", () => {
     }
   }, 60_000);
 
-  test("shows the pending transcript while the send is still resolving a slash skill", async () => {
-    // Typed /skill commands are looked up on the backend before creation starts; that lookup
-    // can wait on cold servers, so the transcript must already reflect the send during it.
-    const typed = "/slow-skill do the thing";
-    const lookupGate = gate();
-    let restoreAgentSkillsGet: () => void = () => {};
-    const app = await createCreationHarness({
-      beforeRender: (env) => {
-        const originalGet = env.orpc.agentSkills.get.bind(env.orpc.agentSkills) as AgentSkillsGetFn;
-        restoreAgentSkillsGet = overrideAgentSkillsGet(env, (async (input) => {
-          await lookupGate.wait;
-          return originalGet(input);
-        }) as AgentSkillsGetFn);
-      },
-    });
-    const container = app.view.container;
-    const pendingTranscript = () =>
-      container.querySelector('[data-testid="creation-pending-transcript"]');
-
-    try {
-      await app.chat.send(typed);
-
-      await waitFor(
-        () => {
-          const pending = pendingTranscript();
-          if (!pending) {
-            throw new Error("Pending creation transcript not rendered yet");
-          }
-          expect(pending.textContent).toContain(typed);
-          expect(pending.querySelector("button[aria-expanded]")?.textContent).toContain(
-            "Creating workspace"
-          );
-        },
-        { timeout: 10_000 }
-      );
-      const workspacesDuringLookup = await app.env.orpc.workspace.list({ archived: false });
-      expect(workspacesDuringLookup.some((w) => w.projectPath === app.projectPath)).toBe(false);
-
-      // The skill does not exist, so the resolved send is rejected and the preview is withdrawn.
-      lookupGate.release();
-      await waitFor(
-        () => {
-          expect(container.textContent).toContain("Unknown command");
-          expect(pendingTranscript()).toBeNull();
-        },
-        { timeout: 10_000 }
-      );
-    } finally {
-      lookupGate.release();
-      restoreAgentSkillsGet();
-      await app.dispose();
-    }
-  }, 60_000);
-
   test("keeps exactly one user row through hidden snapshot rows on a skill and @file first send", async () => {
     // Skill invocations and @file mentions make the backend persist hidden synthetic snapshot
     // rows ahead of the durable user row. The pending row must survive them: the DOM is
@@ -424,8 +355,7 @@ describe("New chat streaming flash regression", () => {
     const container = app.view.container;
     const userTextRows = () =>
       Array.from(container.querySelectorAll<HTMLElement>("[data-testid]")).filter((el) => {
-        const testId = el.getAttribute("data-testid");
-        if (testId !== "chat-message" && testId !== "creation-pending-transcript") return false;
+        if (el.getAttribute("data-testid") !== "chat-message") return false;
         // Persisted slash rows render the command as a chip, so match the free text only.
         const text = el.textContent ?? "";
         return text.includes("summarize") && !text.includes("Mock response");
