@@ -1572,6 +1572,61 @@ describe("WorkspaceStore", () => {
       mockChatScript([], { keepOpen: true });
     });
 
+    it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
+      // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
+      // durable message; each live event bumps state, so the row must survive that bump.
+      const workspaceId = "workspace-pending-row-hidden-snapshots";
+      let releaseUserRow!: () => void;
+      const userRowReady = new Promise<void>((resolve) => {
+        releaseUserRow = resolve;
+      });
+
+      mockChatStreamFor(workspaceId, async function* () {
+        yield { type: "caught-up", replay: "full" };
+        yield {
+          type: "message",
+          ...createMuxMessage("skill-snapshot-1", "user", "<agent-skill>body</agent-skill>", {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }),
+        };
+        await userRowReady;
+        yield {
+          type: "message",
+          ...createMuxMessage("user-1", "user", "Build the thing", {
+            historySequence: 2,
+            timestamp: Date.now(),
+          }),
+        };
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      store.markPendingInitialSend(workspaceId, "openai:gpt-4o-mini", {
+        content: "Build the thing",
+        timestamp: Date.now(),
+      });
+
+      const userRows = () =>
+        store.getWorkspaceState(workspaceId).messages.filter((message) => message.type === "user");
+      // The hidden snapshot row is filtered from display, so observe its arrival through the
+      // pending-stream model it resets; the pending row must still be the only visible user row.
+      const sawSnapshot = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).pendingStreamModel === null
+      );
+      expect(sawSnapshot).toBe(true);
+      expect(userRows()).toHaveLength(1);
+      expect(userRows()[0]).toMatchObject({ isPendingSend: true });
+
+      releaseUserRow();
+      const replaced = await waitUntil(() => {
+        const rows = userRows();
+        return rows.length === 1 && rows[0].historyId === "user-1";
+      });
+      expect(replaced).toBe(true);
+    });
+
     it("carries a creation card without marking a pending stream", () => {
       const workspaceId = "workspace-goal-creation-card";
       const internalStore = getInternal<{

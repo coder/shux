@@ -7,6 +7,10 @@ jest.mock("lottie-react", () => ({
   default: () => null,
 }));
 import { waitFor } from "@testing-library/react";
+import { exec } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
 
 import { preloadTestModules, createTestEnvironment, cleanupTestEnvironment } from "../../ipc/setup";
 import { createTempGitRepo, cleanupTempGitRepo, trustProject } from "../../ipc/helpers";
@@ -20,6 +24,7 @@ import {
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 import { ChatHarness } from "../harness";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { HistoryService } from "@/node/services/historyService";
 import { PENDING_INITIAL_USER_MESSAGE_ID } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { getDraftScopeId } from "@/common/constants/storage";
 import type { TestEnvironment } from "../../ipc/setup";
@@ -120,6 +125,9 @@ function overrideWorkspaceCreate(env: TestEnvironment, override: WorkspaceCreate
     workspaceApi.create = originalCreate;
   };
 }
+
+// eslint-disable-next-line local/no-unsafe-child-process
+const execAsync = promisify(exec);
 
 function gate(): { release: () => void; wait: Promise<void> } {
   let release: () => void = () => {};
@@ -400,6 +408,79 @@ describe("New chat streaming flash regression", () => {
     } finally {
       lookupGate.release();
       restoreAgentSkillsGet();
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("keeps exactly one user row through hidden snapshot rows on a skill and @file first send", async () => {
+    // Skill invocations and @file mentions make the backend persist hidden synthetic snapshot
+    // rows ahead of the durable user row. The pending row must survive them: the DOM is
+    // observed on every commit and the visible user text may never drop out once shown.
+    // In-process the two rows usually land in one render, so the deterministic proof of the
+    // guard lives in the aggregator and WorkspaceStore tests; this covers the live backend path
+    // and proves both snapshot kinds were actually emitted.
+    const typed = "/uat-skill summarize @README.md";
+    const app = await createCreationHarness();
+    const container = app.view.container;
+    const userTextRows = () =>
+      Array.from(container.querySelectorAll<HTMLElement>("[data-testid]")).filter((el) => {
+        const testId = el.getAttribute("data-testid");
+        if (testId !== "chat-message" && testId !== "creation-pending-transcript") return false;
+        // Persisted slash rows render the command as a chip, so match the free text only.
+        const text = el.textContent ?? "";
+        return text.includes("summarize") && !text.includes("Mock response");
+      });
+
+    let sawUserText = false;
+    let droppedOut = false;
+    const observer = new MutationObserver(() => {
+      const count = userTextRows().length;
+      if (count > 0) {
+        sawUserText = true;
+      } else if (sawUserText) {
+        droppedOut = true;
+      }
+    });
+    observer.observe(container, { childList: true, subtree: true, characterData: true });
+
+    try {
+      const skillDir = path.join(app.repoPath, ".xum", "skills", "uat-skill");
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: uat-skill\ndescription: UAT skill\n---\nReply with the single word SKILL-OK.\n"
+      );
+      await execAsync("git add . && git commit -q -m 'Add UAT skill'", { cwd: app.repoPath });
+
+      await app.chat.send(typed);
+      const workspaceId = await waitForCreatedWorkspaceId(app.env, app.projectPath);
+      const workspaceChat = new ChatHarness(container, workspaceId);
+      await workspaceChat.expectTranscriptContains("Mock response");
+      await workspaceChat.expectStreamComplete();
+
+      // The durable row replaced the pending one without an intermediate empty state.
+      await waitFor(() => {
+        const rows = userTextRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].getAttribute("data-message-id")).not.toBe(PENDING_INITIAL_USER_MESSAGE_ID);
+      });
+      expect(sawUserText).toBe(true);
+      expect(droppedOut).toBe(false);
+
+      // Prove the run exercised the hidden rows this guards against.
+      const history = await new HistoryService(app.env.config).getHistoryFromLatestBoundary(
+        workspaceId
+      );
+      expect(history.success).toBe(true);
+      const hiddenSnapshots = (history.success ? history.data : []).filter(
+        (message) => message.metadata?.synthetic === true && message.metadata.uiVisible !== true
+      );
+      expect(hiddenSnapshots.some((m) => m.metadata?.agentSkillSnapshot !== undefined)).toBe(true);
+      expect(hiddenSnapshots.some((m) => m.metadata?.fileAtMentionSnapshot !== undefined)).toBe(
+        true
+      );
+    } finally {
+      observer.disconnect();
       await app.dispose();
     }
   }, 60_000);

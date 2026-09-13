@@ -3554,6 +3554,41 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedTypes(aggregator)).toEqual(["workspace-init"]);
     });
 
+    test("keeps the pending row through hidden snapshot rows until the visible first message", () => {
+      // Skill, MCP prompt, and @file sends persist synthetic snapshot rows ahead of the user
+      // row; they never render, so they cannot stand in for the durable first message.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage(
+          "skill-snapshot-1",
+          "user",
+          '<agent-skill name="x">\nbody\n</agent-skill>',
+          {
+            historySequence: 1,
+            timestamp: Date.now(),
+            synthetic: true,
+            agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+          }
+        ),
+      });
+      expect(displayedTypes(aggregator)).toEqual(["user"]);
+      expect(displayedUserRows(aggregator)[0].isPendingSend).toBe(true);
+
+      aggregator.handleMessage({
+        type: "message",
+        ...createMuxMessage("user-1", "user", "Build the thing", {
+          historySequence: 2,
+          timestamp: Date.now(),
+        }),
+      });
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
     test("drops the pending row when the durable first message arrives via bulk history", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);

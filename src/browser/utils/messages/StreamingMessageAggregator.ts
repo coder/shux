@@ -3254,8 +3254,15 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStart = false;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     // The durable first message replaces the presentation-only row for good, so a later
-    // history truncation can never resurrect it.
-    this.clearPendingInitialUserMessage();
+    // history truncation can never resurrect it. Hidden synthetic snapshot rows (skill, MCP
+    // prompt, and @file materializations) precede that message and never render, so they must
+    // not drop the row early.
+    if (
+      incomingMessage.metadata?.synthetic !== true ||
+      incomingMessage.metadata.uiVisible === true
+    ) {
+      this.clearPendingInitialUserMessage();
+    }
     this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
 
     if (muxMeta?.displayStatus) {
