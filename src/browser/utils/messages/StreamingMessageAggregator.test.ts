@@ -3602,6 +3602,39 @@ describe("StreamingMessageAggregator", () => {
       expect(displayedUserRows(aggregator)).toHaveLength(0);
     });
 
+    test("keeps the pending row when bulk history holds only hidden snapshot rows", () => {
+      // Catching up between the persisted snapshot rows and the durable user row must not
+      // leave the transcript without a prompt.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage);
+
+      const skillSnapshot = createMuxMessage(
+        "skill-snapshot-1",
+        "user",
+        '<agent-skill name="x">\nbody\n</agent-skill>',
+        {
+          historySequence: 1,
+          synthetic: true,
+          agentSkillSnapshot: { skillName: "x", scope: "project", sha256: "abc" },
+        }
+      );
+      aggregator.loadHistoricalMessages([skillSnapshot], true);
+      const pendingRows = displayedUserRows(aggregator);
+      expect(pendingRows).toHaveLength(1);
+      expect(pendingRows[0].isPendingSend).toBe(true);
+
+      aggregator.loadHistoricalMessages(
+        [
+          skillSnapshot,
+          createMuxMessage("user-1", "user", "Build the thing", { historySequence: 2 }),
+        ],
+        true
+      );
+      const rows = displayedUserRows(aggregator);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].historyId).toBe("user-1");
+    });
+
     test("shows a stand-in creation card until the backend init replaces it", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       aggregator.markOptimisticPendingStreamStart("openai:gpt-4o-mini", pendingFirstMessage, {

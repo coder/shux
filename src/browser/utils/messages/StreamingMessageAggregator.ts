@@ -99,6 +99,13 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
 
+// Hidden synthetic snapshot rows (skill, MCP prompt, and @file materializations) precede the
+// durable first message and never render, so they must not drop the presentation-only pending
+// row; only a transcript-visible user row replaces it.
+function isTranscriptVisibleUserRow(message: MuxMessage): boolean {
+  return message.metadata?.synthetic !== true || message.metadata.uiVisible === true;
+}
+
 function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
   if (
     message.role !== "user" ||
@@ -1239,7 +1246,9 @@ export class StreamingMessageAggregator {
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
-          this.clearPendingInitialUserMessage();
+          if (isTranscriptVisibleUserRow(message)) {
+            this.clearPendingInitialUserMessage();
+          }
           continue;
         }
 
@@ -3254,13 +3263,8 @@ export class StreamingMessageAggregator {
     this.optimisticPendingStreamStart = false;
     this.optimisticPendingStreamStartIdleCaughtUpCount = 0;
     // The durable first message replaces the presentation-only row for good, so a later
-    // history truncation can never resurrect it. Hidden synthetic snapshot rows (skill, MCP
-    // prompt, and @file materializations) precede that message and never render, so they must
-    // not drop the row early.
-    if (
-      incomingMessage.metadata?.synthetic !== true ||
-      incomingMessage.metadata.uiVisible === true
-    ) {
+    // history truncation can never resurrect it.
+    if (isTranscriptVisibleUserRow(incomingMessage)) {
       this.clearPendingInitialUserMessage();
     }
     this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
