@@ -387,6 +387,42 @@ describe("BackupService against a real repository", () => {
     expect(preview.data.restoreChanges).toEqual([]);
   });
 
+  it("restores a source that reset its settings by clearing the target's overrides", async () => {
+    // The source machine never set (or cleared) these; the backup must still bring the target
+    // back to the defaults rather than leaving the target's own values in place.
+    await pushOrThrow();
+
+    await config.editConfig((current) => ({
+      ...current,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-local", thinkingLevel: "high" } },
+      modelFallbacks: { "openai:gpt-local": { models: ["anthropic:claude-exec"] } },
+      advisorModelString: "openai:gpt-advisor",
+      heartbeatDefaultPrompt: "Local prompt",
+      chatTranscriptFullWidth: true,
+      defaultRuntime: "docker",
+      apiServerPort: 9999,
+    }));
+    const changed = await service.preview(settings);
+    if (!changed.success) throw new Error(changed.error.message);
+    expect(changed.data.restoreChanges).toContainEqual({ status: "M", path: "preferences.json" });
+
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+
+    const loaded = config.loadConfigOrDefault();
+    expect(loaded.agentAiDefaults).toEqual({});
+    expect(loaded.modelFallbacks?.["openai:gpt-local"]).toBeUndefined();
+    expect(loaded.advisorModelString).toBeUndefined();
+    expect(loaded.heartbeatDefaultPrompt).toBeUndefined();
+    expect(loaded.chatTranscriptFullWidth).toBeFalsy();
+    expect(loaded.defaultRuntime).toBeUndefined();
+    expect(loaded.apiServerPort).toBe(9999);
+
+    const preview = await service.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.restoreChanges).toEqual([]);
+  });
+
   it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
     // The backup was pushed while the default managed path was still `mux/`.
     const pushed = await pushOrThrow();

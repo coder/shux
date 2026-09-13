@@ -1,10 +1,24 @@
-import { z } from "zod";
-import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
+import type { z } from "zod";
+import { AppConfigOnDiskSchema, GoalDefaultsSchema } from "@/common/config/schemas/appConfigOnDisk";
+import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
+import { coerceOpenAIReasoningMode, coerceThinkingLevel } from "@/common/types/thinking";
 import { isLayoutPresetsConfigEmpty, normalizeLayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { normalizeGoalDefaults } from "@/constants/goals";
+import {
+  normalizeAiDefaultsModelStrings,
+  normalizeMinThinkingLevelByModel,
+  normalizeModelFallbacks,
+  normalizeOptionalModelString,
+  normalizeOptionalModelStringArray,
+  normalizeRuntimeEnablementId,
+  normalizeRuntimeEnablementOverrides,
+  parseOptionalHeartbeatIntervalMs,
+  parseOptionalNonEmptyString,
+  parseOptionalPositiveInteger,
+} from "@/node/config";
 
 /**
  * The top-level config.json settings a backup carries. Everything else stays local, so an
@@ -16,9 +30,13 @@ import { normalizeGoalDefaults } from "@/constants/goals";
  * - derived from providers.jsonc credentials, which are never exported (see
  *   providerService.syncGatewayLifecycleEffect): routePriority, routeOverrides, and the legacy
  *   muxGatewayEnabled and muxGatewayModels;
- * - save-time projections and internal state: subagentAiDefaults, deleteWorktreeOnArchive,
- *   stopCoderWorkspaceOnArchive, preferredCompactionModel (unused), projects (the project
- *   bundle), viewedSplashScreens, migrations, writeId, settingsBackup, onePasswordAccountName.
+ * - destructive archive policies: coderWorkspaceArchiveBehavior and worktreeArchiveBehavior
+ *   (with their legacy deleteWorktreeOnArchive and stopCoderWorkspaceOnArchive spellings). A
+ *   repository-controlled "delete" would make every later archive remove worktrees and Coder
+ *   workspaces, and unpushed work with them, with no prompt naming the policy;
+ * - save-time projections and internal state: subagentAiDefaults, preferredCompactionModel
+ *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
+ *   settingsBackup, onePasswordAccountName.
  * userPreferences has its own projection, projectBackupPreferences.
  */
 const BACKED_UP_SETTINGS_KEYS = [
@@ -38,8 +56,6 @@ const BACKED_UP_SETTINGS_KEYS = [
   "goalDefaults",
   "chatTranscriptFullWidth",
   "llmDebugLogs",
-  "coderWorkspaceArchiveBehavior",
-  "worktreeArchiveBehavior",
   "runtimeEnablement",
   "defaultRuntime",
   "layoutPresets",
@@ -47,77 +63,128 @@ const BACKED_UP_SETTINGS_KEYS = [
 
 type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
 
-const pickMask = Object.fromEntries(BACKED_UP_SETTINGS_KEYS.map((key) => [key, true])) as Record<
-  BackedUpSettingsKey,
-  true
->;
+/**
+ * A backup's settings block. Every key an export writes is present, so a value the user reset
+ * to its default (cleared agent overrides, deleted fallback chains) round-trips as that default
+ * rather than as a gap the restore would fill from the target. `null` is the JSON spelling of
+ * an unset value; a key that is absent, as in a block an older build wrote, keeps the local value.
+ */
+export type BackupSettings = {
+  [K in BackedUpSettingsKey]?: NonNullable<ProjectsConfig[K]> | null;
+};
 
 /**
- * Rewrapped in a plain z.object because `pick` inherits the on-disk schema's passthrough, which
- * would carry any key of a repository-controlled document into the config.
+ * The canonical in-memory value of each setting, using the same normalization Config applies
+ * on save and load. Export, read, merge, and the post-write check all go through this table, so
+ * a schema-valid but non-canonical document (a padded model string, an unsanitized fallback
+ * chain) compares equal to what config.json holds after the write. Unset resolves to what a
+ * loaded config holds when the key is absent: `undefined` for optional settings, the default
+ * for settings load always fills in.
  */
-export const BackupSettingsSchema = z.object(AppConfigOnDiskSchema.pick(pickMask).shape);
+const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfig[K] } = {
+  agentAiDefaults: (value) => normalizeAiDefaultsModelStrings(normalizeAgentAiDefaults(value)),
+  defaultModel: normalizeOptionalModelString,
+  hiddenModels: normalizeOptionalModelStringArray,
+  minThinkingLevelByModel: normalizeMinThinkingLevelByModel,
+  modelFallbacks: normalizeModelFallbacks,
+  advisorModelString: parseOptionalNonEmptyString,
+  advisorThinkingLevel: coerceThinkingLevel,
+  advisorReasoningMode: coerceOpenAIReasoningMode,
+  // null is how config.json spells an explicit "unlimited" cap and is kept as written.
+  advisorMaxUsesPerTurn: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
+  advisorMaxOutputTokens: (value) => (value === null ? null : parseOptionalPositiveInteger(value)),
+  taskSettings: normalizeTaskSettings,
+  heartbeatDefaultPrompt: parseOptionalNonEmptyString,
+  heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs,
+  goalDefaults: (value) => normalizeGoalDefaults(GoalDefaultsSchema.safeParse(value).data),
+  chatTranscriptFullWidth: (value) => value === true,
+  llmDebugLogs: (value) => value === true,
+  runtimeEnablement: normalizeRuntimeEnablementOverrides,
+  defaultRuntime: normalizeRuntimeEnablementId,
+  layoutPresets: (value) => {
+    const normalized = normalizeLayoutPresetsConfig(value);
+    return isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized;
+  },
+};
 
-export type BackupSettings = z.infer<typeof BackupSettingsSchema>;
+/**
+ * Per-key schemas rather than one picked object: the on-disk schema is passthrough, which would
+ * carry any key of a repository-controlled document into the config, and each key accepts null.
+ */
+function fieldSchema(key: BackedUpSettingsKey): z.ZodType {
+  return AppConfigOnDiskSchema.shape[key].nullable();
+}
+
+function setSetting<K extends BackedUpSettingsKey>(
+  target: BackupSettings,
+  key: K,
+  value: ProjectsConfig[K]
+): void {
+  target[key] = (value ?? null) as BackupSettings[K];
+}
+
+function assignSetting<K extends BackedUpSettingsKey>(
+  target: ProjectsConfig,
+  key: K,
+  value: unknown
+): void {
+  target[key] = NORMALIZE[key](value);
+}
 
 function copyJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
 export function projectBackupSettings(config: ProjectsConfig): BackupSettings {
-  const picked: Partial<Record<BackedUpSettingsKey, unknown>> = {};
+  const projected: BackupSettings = {};
   for (const key of BACKED_UP_SETTINGS_KEYS) {
-    if (config[key] !== undefined) picked[key] = config[key];
+    setSetting(projected, key, NORMALIZE[key](config[key]));
   }
-  // Mirrors what a saved config loads back as, so a fresh install's first export, the export
-  // after its first save, and the post-restore check agree: goalDefaults always resolves to the
-  // effective defaults; an empty agent map, empty layouts, and a false full-width flag are absent.
-  picked.goalDefaults = normalizeGoalDefaults(config.goalDefaults);
-  if (config.agentAiDefaults !== undefined && Object.keys(config.agentAiDefaults).length === 0) {
-    delete picked.agentAiDefaults;
-  }
-  if (config.layoutPresets !== undefined) {
-    const layoutPresets = normalizeLayoutPresetsConfig(config.layoutPresets);
-    if (isLayoutPresetsConfigEmpty(layoutPresets)) delete picked.layoutPresets;
-    else picked.layoutPresets = layoutPresets;
-  }
-  if (config.chatTranscriptFullWidth !== true) delete picked.chatTranscriptFullWidth;
-  return BackupSettingsSchema.parse(copyJson(picked));
+  return copyJson(projected);
 }
 
 /**
- * Throws on a malformed `settings` block so the payload readers reject the backup before a
- * restore writes anything.
+ * Reads and canonicalizes the `settings` block of a preferences document. Throws on a malformed
+ * block, naming the fields, so the payload readers reject the backup before a restore writes
+ * anything and the Backup screen can say what is wrong with the document.
  */
 export function readBackupSettings(document: unknown): BackupSettings | undefined {
   if (!isPlainObject(document) || document.settings === undefined) return undefined;
-  const parsed = BackupSettingsSchema.safeParse(document.settings);
-  if (parsed.success) return parsed.data;
-  // The message reaches the Backup screen, so name the offending fields instead of dumping
-  // the raw issue list.
-  const issues = parsed.error.issues
-    .slice(0, 3)
-    .map((issue) => `${issue.path.map(String).join(".") || "settings"}: ${issue.message}`);
-  throw new Error(`Backup preferences.json has an invalid settings block (${issues.join("; ")})`);
+  const block = document.settings;
+  if (!isPlainObject(block)) {
+    throw new Error("Backup preferences.json has an invalid settings block (expected an object)");
+  }
+  const settings: BackupSettings = {};
+  const issues: string[] = [];
+  for (const key of BACKED_UP_SETTINGS_KEYS) {
+    if (!(key in block)) continue;
+    const parsed = fieldSchema(key).safeParse(block[key]);
+    if (parsed.success) {
+      setSetting(settings, key, NORMALIZE[key](parsed.data));
+      continue;
+    }
+    for (const issue of parsed.error.issues) {
+      issues.push(`${[key, ...issue.path].map(String).join(".")}: ${issue.message}`);
+    }
+  }
+  if (issues.length > 0) {
+    throw new Error(
+      `Backup preferences.json has an invalid settings block (${issues.slice(0, 3).join("; ")})`
+    );
+  }
+  return settings;
 }
 
-/**
- * Each key the backup carries replaces the local value wholesale; absent keys keep the local
- * value, which is how machine-local settings survive a restore.
- */
+/** Each key the block carries replaces the local value; keys it lacks keep the local value. */
 export function mergeBackupSettings(
   current: ProjectsConfig,
   settings: BackupSettings
 ): ProjectsConfig {
-  const { layoutPresets, taskSettings, ...rest } = settings;
-  const merged: ProjectsConfig = { ...current, ...rest };
-  if (taskSettings !== undefined) {
-    merged.taskSettings = normalizeTaskSettings(taskSettings);
+  const merged: ProjectsConfig = { ...current };
+  for (const key of BACKED_UP_SETTINGS_KEYS) {
+    if (key in settings) assignSetting(merged, key, settings[key]);
   }
-  if (layoutPresets !== undefined) {
-    merged.layoutPresets = normalizeLayoutPresetsConfig(layoutPresets);
-  }
-  if (settings.hiddenModels !== undefined) {
+  if (settings.hiddenModels != null) {
     // As Config.updateModelPreferences does: the restored list is now the user's, so the
     // default seeding must not claim it.
     merged.migrations = { ...current.migrations, hiddenModelsInitialized: true };

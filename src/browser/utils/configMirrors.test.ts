@@ -19,6 +19,7 @@ describe("seedConfigMirrors", () => {
     updatePersistedState(DEFAULT_MODEL_KEY, "anthropic:stale");
     updatePersistedState(HIDDEN_MODELS_KEY, ["openai:stale"]);
     updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: "anthropic:stale" } });
+    updatePersistedState(RUNTIME_ENABLEMENT_KEY, { docker: false });
     updatePersistedState(DEFAULT_RUNTIME_KEY, "local");
   });
 
@@ -32,7 +33,7 @@ describe("seedConfigMirrors", () => {
       defaultModel: "anthropic:restored",
       hiddenModels: ["openai:restored"],
       agentAiDefaults: { plan: { thinkingLevel: "high" } },
-      runtimeEnablement: { docker: false },
+      runtimeEnablement: { ssh: false },
       defaultRuntime: "worktree",
     });
 
@@ -43,17 +44,26 @@ describe("seedConfigMirrors", () => {
     expect(readPersistedState<unknown>(AGENT_AI_DEFAULTS_KEY, null)).toEqual({
       plan: { thinkingLevel: "high" },
     });
-    expect(readPersistedState<unknown>(RUNTIME_ENABLEMENT_KEY, null)).toEqual({ docker: false });
+    expect(readPersistedState<unknown>(RUNTIME_ENABLEMENT_KEY, null)).toEqual({ ssh: false });
     expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBe("worktree");
   });
 
-  test("keeps mirrors the backend has no value for and the keys the caller protects", () => {
-    seedConfigMirrors({ hiddenModels: ["openai:restored"] }, new Set([HIDDEN_MODELS_KEY]));
+  test("clears mirrors the backend no longer holds, except the keys the caller protects", () => {
+    seedConfigMirrors(
+      {
+        defaultModel: undefined,
+        hiddenModels: undefined,
+        agentAiDefaults: {},
+        runtimeEnablement: {},
+        defaultRuntime: null,
+      },
+      new Set([HIDDEN_MODELS_KEY])
+    );
 
-    expect(readPersistedState<string | null>(DEFAULT_MODEL_KEY, null)).toBe("anthropic:stale");
+    expect(readPersistedState<string | null>(DEFAULT_MODEL_KEY, null)).toBeNull();
     expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual(["openai:stale"]);
-    expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBe("local");
-    // An absent agent map clears the mirror: the backend's empty map is the truth.
     expect(readPersistedState<unknown>(AGENT_AI_DEFAULTS_KEY, null)).toEqual({});
+    expect(readPersistedState<unknown>(RUNTIME_ENABLEMENT_KEY, null)).toEqual({});
+    expect(readPersistedState<string | null>(DEFAULT_RUNTIME_KEY, null)).toBeNull();
   });
 });

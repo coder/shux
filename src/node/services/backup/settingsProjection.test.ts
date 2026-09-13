@@ -9,8 +9,31 @@ import {
   readBackupSettings,
 } from "./settingsProjection";
 
+/** What a config with none of the portable settings set exports: every key, spelled unset. */
+const UNSET_EXPORT = {
+  agentAiDefaults: {},
+  defaultModel: null,
+  hiddenModels: null,
+  minThinkingLevelByModel: null,
+  modelFallbacks: null,
+  advisorModelString: null,
+  advisorThinkingLevel: null,
+  advisorReasoningMode: null,
+  advisorMaxUsesPerTurn: null,
+  advisorMaxOutputTokens: null,
+  taskSettings: DEFAULT_TASK_SETTINGS,
+  heartbeatDefaultPrompt: null,
+  heartbeatDefaultIntervalMs: null,
+  goalDefaults: DEFAULT_GOAL_DEFAULTS,
+  chatTranscriptFullWidth: false,
+  llmDebugLogs: false,
+  runtimeEnablement: null,
+  defaultRuntime: null,
+  layoutPresets: null,
+};
+
 describe("settingsProjection", () => {
-  it("projects portable settings and leaves machine-local keys behind", () => {
+  it("projects every portable setting and leaves machine-local keys behind", () => {
     const portable = {
       agentAiDefaults: {
         exec: {
@@ -31,6 +54,7 @@ describe("settingsProjection", () => {
       advisorMaxUsesPerTurn: 3,
       advisorMaxOutputTokens: null,
       taskSettings: {
+        ...DEFAULT_TASK_SETTINGS,
         maxParallelAgentTasks: 4,
         maxTaskNestingDepth: 2,
         preserveSubagentsUntilArchive: true,
@@ -44,8 +68,6 @@ describe("settingsProjection", () => {
       },
       chatTranscriptFullWidth: true,
       llmDebugLogs: false,
-      coderWorkspaceArchiveBehavior: "delete",
-      worktreeArchiveBehavior: "snapshot",
       runtimeEnablement: { docker: false },
       defaultRuntime: "worktree",
     } satisfies Partial<ProjectsConfig>;
@@ -54,6 +76,8 @@ describe("settingsProjection", () => {
       ...portable,
       apiServerPort: 4321,
       apiServerBindHost: "0.0.0.0",
+      worktreeArchiveBehavior: "delete",
+      coderWorkspaceArchiveBehavior: "delete",
       terminalDefaultShell: "/bin/fish",
       updateChannel: "nightly",
       muxGovernorUrl: "https://governor.example.com",
@@ -67,25 +91,64 @@ describe("settingsProjection", () => {
 
     const projected = projectBackupSettings(config);
 
-    expect(projected).toEqual(portable);
+    expect(projected).toEqual({ ...portable, layoutPresets: null });
     expect(JSON.stringify(projected)).not.toContain("governor-secret");
     // A copy, not a view: editing the projection must not reach the live config.
     expect(projected.agentAiDefaults).not.toBe(config.agentAiDefaults);
   });
 
-  it("keeps an empty hidden list but drops empty agent defaults and layouts", () => {
-    const projected = projectBackupSettings({
-      projects: new Map(),
-      hiddenModels: [],
-      agentAiDefaults: {},
-      layoutPresets: DEFAULT_LAYOUT_PRESETS_CONFIG,
-      chatTranscriptFullWidth: false,
-    });
-    // goalDefaults always resolves to the effective value, as the config load does.
-    expect(projected).toEqual({ hiddenModels: [], goalDefaults: DEFAULT_GOAL_DEFAULTS });
+  it("exports resets as explicit unset values, the same for a fresh and a saved config", () => {
+    // A fresh install holds none of these keys; a loaded config holds their normalized forms.
+    // Both must export identically or the first push after a save would look like a change.
+    expect(projectBackupSettings({ projects: new Map() })).toEqual(UNSET_EXPORT);
+    expect(
+      projectBackupSettings({
+        projects: new Map(),
+        agentAiDefaults: {},
+        hiddenModels: undefined,
+        layoutPresets: DEFAULT_LAYOUT_PRESETS_CONFIG,
+        chatTranscriptFullWidth: undefined,
+        taskSettings: DEFAULT_TASK_SETTINGS,
+        goalDefaults: DEFAULT_GOAL_DEFAULTS,
+      })
+    ).toEqual(UNSET_EXPORT);
+    // An emptied hidden list is a choice, not an unset value.
+    expect(projectBackupSettings({ projects: new Map(), hiddenModels: [] }).hiddenModels).toEqual(
+      []
+    );
   });
 
-  it("replaces backed-up keys wholesale and keeps the rest of the local config", () => {
+  it("restoring a reset source clears the target's overrides", () => {
+    const target: ProjectsConfig = {
+      projects: new Map(),
+      agentAiDefaults: { exec: { modelString: "openai:gpt-local" } },
+      modelFallbacks: { "openai:gpt-local": { models: ["anthropic:claude-exec"] } },
+      advisorModelString: "openai:gpt-advisor",
+      advisorMaxUsesPerTurn: 2,
+      chatTranscriptFullWidth: true,
+      defaultRuntime: "docker",
+      layoutPresets: { version: 2, slots: [{ slot: 1 }] },
+      apiServerPort: 4321,
+    };
+
+    const merged = mergeBackupSettings(
+      target,
+      readBackupSettings({ settings: projectBackupSettings({ projects: new Map() }) })!
+    );
+
+    expect(merged.agentAiDefaults).toEqual({});
+    expect(merged.modelFallbacks).toBeUndefined();
+    expect(merged.advisorModelString).toBeUndefined();
+    expect(merged.advisorMaxUsesPerTurn).toBeNull();
+    expect(merged.chatTranscriptFullWidth).toBe(false);
+    expect(merged.defaultRuntime).toBeUndefined();
+    expect(merged.layoutPresets).toBeUndefined();
+    expect(merged.apiServerPort).toBe(4321);
+    // The round trip closes: the restored target exports what the source exported.
+    expect(projectBackupSettings(merged)).toEqual(UNSET_EXPORT);
+  });
+
+  it("replaces the keys a sparse block carries and keeps the rest of the local config", () => {
     const current: ProjectsConfig = {
       projects: new Map(),
       agentAiDefaults: { exec: { modelString: "openai:gpt-local" }, review: { enabled: false } },
@@ -96,12 +159,16 @@ describe("settingsProjection", () => {
       migrations: { daybreakModelsHidden: true },
     };
 
-    const merged = mergeBackupSettings(current, {
-      agentAiDefaults: { plan: { modelString: "anthropic:claude-plan" } },
-      hiddenModels: [],
-      taskSettings: { maxParallelAgentTasks: 2 },
-      layoutPresets: { version: 2, slots: [] },
-    });
+    // A block an older build wrote, with only some of the keys.
+    const sparse = readBackupSettings({
+      settings: {
+        agentAiDefaults: { plan: { modelString: "anthropic:claude-plan" } },
+        hiddenModels: [],
+        taskSettings: { maxParallelAgentTasks: 2 },
+        layoutPresets: { version: 2, slots: [] },
+      },
+    })!;
+    const merged = mergeBackupSettings(current, sparse);
 
     expect(merged.agentAiDefaults).toEqual({ plan: { modelString: "anthropic:claude-plan" } });
     expect(merged.hiddenModels).toEqual([]);
@@ -109,7 +176,7 @@ describe("settingsProjection", () => {
     expect(merged.apiServerPort).toBe(4321);
     expect(merged.terminalDefaultShell).toBe("/bin/fish");
     expect(merged.taskSettings).toEqual({ ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 2 });
-    expect(merged.layoutPresets).toEqual(DEFAULT_LAYOUT_PRESETS_CONFIG);
+    expect(merged.layoutPresets).toBeUndefined();
     expect(merged.migrations).toEqual({
       daybreakModelsHidden: true,
       hiddenModelsInitialized: true,
@@ -120,9 +187,34 @@ describe("settingsProjection", () => {
   it("does not touch the hidden-model migration when the backup carries no list", () => {
     const merged = mergeBackupSettings(
       { projects: new Map(), migrations: { daybreakModelsHidden: true } },
-      { defaultModel: "anthropic:claude-plan" }
+      { defaultModel: "anthropic:claude-plan", hiddenModels: null }
     );
     expect(merged.migrations).toEqual({ daybreakModelsHidden: true });
+    expect(merged.hiddenModels).toBeUndefined();
+  });
+
+  it("canonicalizes accepted values the way config.json persists them", () => {
+    // A schema-valid document can still hold spellings the save path would rewrite; reading
+    // them canonically is what makes the post-write comparison hold.
+    const settings = readBackupSettings({
+      settings: {
+        defaultModel: " anthropic:claude-exec ",
+        hiddenModels: ["openai:gpt-a", "openai:gpt-a", " "],
+        modelFallbacks: {
+          "anthropic:claude-exec": { models: ["anthropic:claude-exec", "openai:gpt-plan"] },
+        },
+        heartbeatDefaultPrompt: "  Check in  ",
+        agentAiDefaults: { exec: { modelString: " openai:gpt-exec " } },
+      },
+    });
+
+    expect(settings).toMatchObject({
+      defaultModel: "anthropic:claude-exec",
+      hiddenModels: ["openai:gpt-a"],
+      modelFallbacks: { "anthropic:claude-exec": { models: ["openai:gpt-plan"] } },
+      heartbeatDefaultPrompt: "Check in",
+      agentAiDefaults: { exec: { modelString: "openai:gpt-exec" } },
+    });
   });
 
   it("reads only the portable settings block and rejects a malformed one", () => {
@@ -147,6 +239,6 @@ describe("settingsProjection", () => {
     expect(() => readBackupSettings({ settings: { heartbeatDefaultIntervalMs: 1 } })).toThrow(
       /heartbeatDefaultIntervalMs/
     );
-    expect(() => readBackupSettings({ settings: null })).toThrow();
+    expect(() => readBackupSettings({ settings: null })).toThrow(/expected an object/);
   });
 });
