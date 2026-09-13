@@ -22,6 +22,7 @@ import {
   ScrollText,
 } from "lucide-react";
 import { useSettings } from "@/browser/contexts/SettingsContext";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
@@ -300,30 +301,32 @@ export function SettingsPage(props: SettingsPageProps) {
       >
         <div className="flex min-w-0 items-center gap-2">
           {props.leftSidebarCollapsed && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={props.onToggleLeftSidebarCollapsed}
-              title="Open sidebar"
-              aria-label="Open sidebar menu"
-              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
-            >
-              <Menu className="h-4 w-4" />
-            </Button>
+            <TooltipIfPresent tooltip="Open sidebar" side="bottom">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={props.onToggleLeftSidebarCollapsed}
+                aria-label="Open sidebar menu"
+                className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
+              >
+                <Menu className="h-4 w-4" />
+              </Button>
+            </TooltipIfPresent>
           )}
           <span className="text-foreground text-sm font-semibold">Settings</span>
         </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={close}
-          title="Back"
-          aria-label="Back to previous page"
-          className="text-muted hover:text-foreground px-2"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Back
-        </Button>
+        <TooltipIfPresent tooltip="Back" side="bottom">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={close}
+            aria-label="Back to previous page"
+            className="text-muted hover:text-foreground px-2"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Back
+          </Button>
+        </TooltipIfPresent>
       </div>
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
